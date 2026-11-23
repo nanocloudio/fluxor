@@ -1,136 +1,186 @@
-//! ST7701S Display Driver PIC Module
+//! st7701s — an ST7701S RGB-parallel panel scanned out a band at a time.
 //!
-//! Board-agnostic driver for ST7701S-based RGB parallel displays.
-//! All pin assignments and PIO block selection are configurable via parameters.
+//! The driver takes a `VideoDraw` stream on `draw`, retains the last
+//! committed frame's records, and draws them again every refresh with the
+//! reference rasteriser (`fluxor_sdk::video::raster`), a band of rows at a
+//! time, into a ring of band slots the panel is scanned out from. The draw
+//! list is its frame memory: a few kilobytes of records stand in for a
+//! framebuffer, and a new frame takes effect whole, at the first band of
+//! the first refresh after its COMMIT. `surface0` is a raster input a
+//! SURFACE record places; with no `draw` edge the driver shows `surface0`
+//! scaled to the panel.
 //!
-//! # Initialization
+//! # Timing
 //!
-//! 1. Reset sequence: RST low 20ms → RST high 200ms
-//! 2. Register init via 9-bit GPIO bit-bang SPI (27 commands)
-//! 3. SLEEP_OUT + 120ms → DISPLAY_ON + 120ms
-//! 4. Allocate DMA channel, configure 4 PIO SMs, start scan-out
-//! 5. Enable backlight
+//! Four PIO state machines on two PIO blocks make the panel's timing and
+//! never stop: HSYNC with the pixel clock and VSYNC on the sync block, DE
+//! and the 16 data pins on the data block. The data state machine takes one
+//! word a pixel from its TX FIFO, which a DMA scan list fills
+//! (`platform_dma_fd` `LIST_START`): one entry a band, every entry the same
+//! number of pixels, sent from a ring slot when the driver armed it and as
+//! the fill colour when it did not. No software sits between the list and
+//! the panel, so a band drawn late shows as fill for one refresh and is
+//! counted; sync, porches and the pixel clock never move.
 //!
-//! # Architecture
+//! The sync divider comes from the system clock and `refresh_mhz`: a line
+//! is `2 × (10 + 8 + 10 + width) + 5` sync cycles (two a pixel clock, five
+//! single cycles of the HSYNC program), a frame `height + 8 + 3 + 18`
+//! lines.
 //!
-//! Uses 4 autonomous PIO state machines across 2 PIO blocks:
-//!   - Sync PIO (param `pio_sync`, default 1): hsync SM0 + vsync SM1
-//!   - Data PIO (param `pio_data`, default 2): rgb_de SM0 + rgb SM1
+//! # A step
 //!
-//! All frame timing is handled by PIO hardware with IRQ coordination.
-//! CPU only feeds pixel data via DMA to the rgb SM's TX FIFO.
+//! Read how far the scan has run, read what the inputs hold, then do one
+//! piece of drawing: draw the next band into the scratch, or convert the
+//! scratch into a free ring slot and arm its entry. Nothing waits.
+//!
+//! A band can be armed while the scan is two or more entries short of it.
+//! The renderer works ahead of the scan by up to the ring; when the scan
+//! catches it, it does not chase: it resumes at the first band it can
+//! still finish, and the bands between show as fill.
+//!
+//! The kernel answers from where the scan is, not from where the driver
+//! last read it: an arm it refuses as busy is a band the scan took while
+//! its slot was being filled, and goes out as fill. Around a flash write
+//! the kernel returns every armed entry to fill; the driver does nothing
+//! about it, since the slots it holds come free as the scan passes their
+//! bands, armed or not, and the next band it draws is armed as any other.
+//! The scan's position is the list's control pointer, so it counts bands
+//! modulo the list across a span the kernel's interrupt was held for:
+//! every band count here is used as a difference or modulo `bands`.
 
-#![no_std]
-#![allow(
-    unreachable_patterns,
-    reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
-              exhaustive, which is why the lint fires; the arm exists so that adding a \
-              variant cannot silently bypass the error path. #[expect] is not the \
-              alternative — it fails the build in the configurations where the lint \
-              does not fire"
-)]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 
+use abi::contracts::video_draw as vd;
+use abi::platform::rp::dma_raw::{self, fd as dma_fd};
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
 mod init_seq;
 mod pio_programs;
 
+use fluxor_rt::asset::{self, Asset};
 use fluxor_rt::*;
+use fluxor_sdk::video::raster::{
+    self, Band, Entry, Event, Held, Index, Ingest, Input, Painter, Shape, Slot, Store, Surfaces,
+    Texels, BAND_BPP,
+};
 
 // ============================================================================
-// Constants
+// Limits and geometry
 // ============================================================================
 
-/// Stripe height in display lines — must be large enough that one stripe transfer
-/// outlasts the scheduler tick: at 16MHz PCLK, 60 lines ≈ 1.8ms >> 1ms tick.
-const STRIPE_LINES: u16 = 60;
-/// Maximum stripe buffer size (worst case: 480px wide, 60 lines, 2 bytes/pixel).
-const STRIPE_BUF_SIZE: usize = 480 * 60 * 2; // 57600 bytes
-/// Aligned to 4 bytes for DMA.
-const STRIPE_BUF_WORDS: usize = STRIPE_BUF_SIZE / 4;
+/// The deepest SAVE nesting and the most live rounded clips
+/// (`max_depth` on the `draw` port).
+const MAX_DEPTH: usize = 8;
+/// Resource ids (`max_resources` on the `draw` port).
+const MAX_RESOURCES: usize = 16;
+/// Byte strings the instance holds in place for RES_REF records: the
+/// `pack0` to `pack3` params.
+const PACKS: usize = 4;
+/// Bytes of a `pack` param kept: a program reference.
+const PACK_PARAM: usize = 16;
+/// Records of a retained frame whose rows are indexed; a frame with more
+/// is drawn by walking the rest record by record.
+const INDEX_RECORDS: usize = 256;
+/// The widest panel: the heap figures of the manifest are per row of this.
+const MAX_WIDTH: u16 = 480;
+/// The most ring slots.
+const MAX_SLOTS: usize = 32;
+/// The fewest ring slots, and the fewest bands: one being sent, one the
+/// scan may load at any moment, one to draw into.
+const MIN_SLOTS: usize = 3;
+// A list of the fewest bands is one the kernel starts.
+const _: () = assert!(MIN_SLOTS as u16 >= dma_raw::list_start::MIN_ENTRIES);
+/// The heap besides what the params size: the block header and the padding
+/// between the parts (`heap_per_param.base`).
+const ARENA_BASE: u32 = 128;
+/// Bytes of the held byte strings hashed in one step.
+const HASH_BYTES_PER_STEP: usize = 2048;
+/// Bytes of `surface0` read in one step.
+const INPUT_BYTES_PER_STEP: usize = 4096;
+/// The frame the driver draws when `draw` is not wired: FRAME, one SURFACE
+/// and COMMIT.
+const OWN_FRAME_BYTES: usize = 3 * vd::HEADER + vd::FRAME_LEN + vd::SURFACE_LEN + vd::COMMIT_LEN;
 
-/// Maximum source rows the driver can cache (limits state size).
-const MAX_CACHED_ROWS: usize = 32;
+/// Sync cycles a line spends outside the active pixels: two for each of
+/// the 10 + 8 + 10 porch and pulse clocks, and five single cycles.
+const LINE_BLANK_CYCLES: u32 = 2 * (10 + 8 + 10) + 5;
+/// Lines of a frame outside the active rows: front porch, pulse, back
+/// porch.
+const FRAME_BLANK_LINES: u32 = 8 + 3 + 18;
+/// System cycles the data state machine needs a pixel: its five-instruction
+/// loop and two cycles of input synchronisation, with a cycle to spare.
+const DATA_CYCLES_PER_PIXEL: u32 = 8;
 
-/// Maximum words per decoded line (worst case: 480px wide → 240 u32s).
-const MAX_LINE_WORDS: usize = 240;
-/// MAX_CACHED_ROWS × MAX_LINE_WORDS words = 7680 words = 30720 bytes (per cache).
-const LINE_CACHE_WORDS: usize = MAX_CACHED_ROWS * MAX_LINE_WORDS;
+/// A band can be armed while the scan is this many entries short of it:
+/// the entry being sent and the one after it are the scan's.
+const ARM_LEAD: i32 = 2;
+/// Entries of the first refresh no renderer can arm: the list starts on
+/// entry 0 with entry 1 next.
+const UNARMABLE_AT_START: u32 = ARM_LEAD as u32;
 
-// ============================================================================
-// dev_system opcodes (raw PIO + DMA bridge)
-// ============================================================================
+/// Cookie of the ring's lend on the DMA fd.
+const RING_LEND: u32 = 1;
 
-const PIO_SM_EXEC: u32 = abi::registry::rp_raw::PIO_SM_EXEC;
-const PIO_SM_WRITE_REG: u32 = abi::registry::rp_raw::PIO_SM_WRITE_REG;
-const PIO_SM_ENABLE: u32 = abi::registry::rp_raw::PIO_SM_ENABLE;
-const PIO_INSTR_ALLOC: u32 = abi::registry::rp_raw::PIO_INSTR_ALLOC;
-const PIO_INSTR_WRITE: u32 = abi::registry::rp_raw::PIO_INSTR_WRITE;
-const PIO_PIN_SETUP: u32 = abi::registry::rp_raw::PIO_PIN_SETUP;
-const PIO_GPIOBASE: u32 = abi::registry::rp_raw::PIO_GPIOBASE;
-const PIO_TXF_WRITE: u32 = abi::registry::rp_raw::PIO_TXF_WRITE;
-const PIO_SM_RESTART: u32 = abi::registry::rp_raw::PIO_SM_RESTART;
+const NO_PIN: u8 = 255;
 
-// DMA fd family — st7701s uses async DMA for display scan-out. See
-// `dma_raw::fd` in the platform ABI; a DMA fd handle is of the
-// PLATFORM_DMA_FD contract, so the kernel refuses a channel handle on these
-// opcodes.
-use abi::platform::rp::dma_raw::fd as dma_fd;
+const WIDTH_DEFAULT: u16 = 480;
+const HEIGHT_DEFAULT: u16 = 480;
+const REFRESH_MHZ_DEFAULT: u32 = 60_000;
+const PCLK_MAX_KHZ_DEFAULT: u32 = 18_000;
+const BAND_ROWS_DEFAULT: u16 = 16;
+const RING_ROWS_DEFAULT: u16 = 48;
+const FRAME_BYTES_DEFAULT: u32 = 8192;
+const RESOURCE_BYTES_DEFAULT: u32 = 16_384;
+const RECORD_BYTES_DEFAULT: u32 = 1024;
 
-// 9-bit SPI bit-bang (kernel raw PAC GPIO)
-const SPI9_SEND: u32 = abi::registry::rp_raw::SPI9_SEND;
-const SPI9_RESET: u32 = abi::registry::rp_raw::SPI9_RESET;
-const SPI9_CS_SET: u32 = abi::registry::rp_raw::SPI9_CS_SET;
-
-// PIO SM register indices
+// PIO state machine register indices (`rp_raw::PIO_SM_WRITE_REG`).
 const REG_CLKDIV: u8 = 0;
 const REG_EXECCTRL: u8 = 1;
 const REG_SHIFTCTRL: u8 = 2;
 const REG_PINCTRL: u8 = 3;
 
-// ============================================================================
-// State machine phases
-// ============================================================================
+/// `SHIFTCTRL` with the TX FIFO joined to eight words and every other
+/// field at reset.
+const SHIFTCTRL_JOIN_TX: u32 = 1 << 30;
+/// A divider of one: `CLKDIV` holds 16 integer bits above 8 fraction bits
+/// above 8 reserved.
+const CLKDIV_ONE: u32 = 1 << 16;
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum Phase {
-    InitSeq = 3,
-    SleepOut = 4,
-    AllocDmaFd = 6,
-    ConfigurePioSync = 7,
-    ConfigurePioData = 8,
-    StartSMs = 9,
-    DmaWait = 11,
-    Loading = 13,
-    Error = 255,
+/// `set pindirs, <mask>`.
+const fn set_pindirs(mask: u8) -> u16 {
+    0xE080 | mask as u16
 }
 
 // ============================================================================
-// Module state
+// State
 // ============================================================================
 
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// SLEEP_OUT has been sent; its 120 ms run.
+    SleepOut,
+    /// DISPLAY_ON has been sent; its 120 ms run.
+    DisplayOn,
+    /// Configure the state machines and start the scan.
+    Start,
+    Run,
+    Failed,
+}
+
 #[repr(C)]
-struct St7701sState {
+pub struct State {
     syscalls: *const SyscallTable,
-    in_chan: i32,
+    draw: i32,
     timer_fd: i32,
-
-    // GPIO handles
-    cs_handle: i32,
-    sck_handle: i32,
-    sda_handle: i32,
-    rst_handle: i32,
     bl_handle: i32,
-
-    // State machine
+    dma_fd: i32,
     phase: Phase,
-    init_cmd_idx: u8,
 
-    // Config (from params)
+    // Params.
     cs_pin: u8,
     sck_pin: u8,
     sda_pin: u8,
@@ -141,231 +191,363 @@ struct St7701sState {
     vsync_pin: u8,
     pclk_pin: u8,
     data0_pin: u8,
-    pio_sync: u8, // PIO block for sync SMs (default 1)
-    pio_data: u8, // PIO block for data SMs (default 2)
-    mirror_x: u8, // 1=flip source scan direction (SDIR), panel-dependent
-    _pad_cfg: u8,
+    pio_sync: u8,
+    pio_data: u8,
+    mirror_x: u8,
+    status_s: u8,
     width: u16,
     height: u16,
+    band_rows: u16,
+    ring_rows: u16,
+    underrun_rgb565: u16,
+    refresh_mhz: u32,
+    pclk_max_khz: u32,
+    frame_bytes: u32,
+    resource_bytes: u32,
+    record_bytes: u32,
+    surface_bytes: u32,
+    pack_params: [[u8; PACK_PARAM]; PACKS],
+    pack_lens: [u8; PACKS],
 
-    // DMA FD
-    dma_fd: i32,
+    // What the params come to.
+    /// 0 or 16: the first GPIO of the 32-pin window the PIO blocks drive.
+    gpio_base: u8,
+    /// Entries of the scan list: bands of a refresh.
+    bands: u16,
+    /// Ring slots.
+    slots: u16,
+    /// Bytes of one slot.
+    slot_bytes: u32,
+    /// The sync divider, in 1/256.
+    divider_256: u32,
+    /// The refresh rate the divider gives, mHz.
+    achieved_mhz: u32,
+    /// The time the scan takes over one band, µs.
+    band_us: u32,
 
-    // PIO instruction memory masks (for cleanup)
-    sync_hsync_mask: u32,
-    sync_vsync_mask: u32,
-    data_de_mask: u32,
-    data_rgb_mask: u32,
+    // The rasteriser.
+    resources: [vd::Resource; MAX_RESOURCES],
+    saves: [vd::Saved; MAX_DEPTH],
+    store_slots: [Slot; MAX_RESOURCES],
+    held: [Held<'static>; PACKS],
+    index: [Entry; INDEX_RECORDS],
+    stack: [raster::Saved; MAX_DEPTH],
+    clips: [Shape; MAX_DEPTH],
+    ingest: Option<Ingest<'static>>,
+    painter: Option<Painter<'static>>,
+    surface: Option<Input>,
+    own_frame: [u8; OWN_FRAME_BYTES],
+    own_frame_len: usize,
+    scratch: *mut u8,
+    scratch_bytes: usize,
+    ring: *mut u8,
 
-    // Program origins (needed for wrap config)
-    hsync_origin: u8,
-    vsync_origin: u8,
-    de_origin: u8,
-    rgb_origin: u8,
+    // The scan, as `LIST_STATUS` last answered. Band counts wrap.
+    /// Bands sent since the list started.
+    sent: u32,
+    /// `sent` within its refresh.
+    sent_entry: u16,
+    refreshes: u32,
+    list_underruns: u32,
+    /// The scan has passed the entries no renderer could arm.
+    past_start: bool,
 
-    // Source image info (from params)
-    src_rows: u16, // source image rows (≤MAX_CACHED_ROWS), default 32
+    // The renderer.
+    /// The band being drawn, counted like `sent`.
+    next: u32,
+    /// `next` within its refresh: the list entry it is armed as.
+    next_entry: u16,
+    /// The ring slot the next armed band goes into.
+    slot_cursor: u16,
+    /// For each slot, the band count at which the band armed in it has
+    /// been sent.
+    slot_free_at: [u32; MAX_SLOTS],
+    slot_armed: u32,
+    /// The scratch holds band `next`, drawn and waiting for a slot.
+    drawn: bool,
+    /// Band `next` is black: nothing is retained to draw.
+    black: bool,
+    /// Band `next` is the first drawn of its refresh.
+    first_of_refresh: bool,
+    /// A frame committed and waits for the next refresh.
+    frame_waiting: bool,
+    /// `next` when that frame committed.
+    committed_at: u32,
+    late_frames: u32,
+    /// µs spent on band `next` so far.
+    band_cost_us: u32,
+    /// µs the last finished band took.
+    last_band_us: u32,
+    refresh_cost_us: u32,
+    refresh_bands: u32,
+    render_us_per_band: u32,
 
-    // Runtime geometry — computed from width/height in module_new.
-    line_words: u16, // = width >> 1  (u32 words per decoded line)
-    line_bytes: u16, // = line_words << 2 (bytes per decoded line = width*2)
-    _pad_geo: u16,
-    stripe_pixels: u32, // = width * STRIPE_LINES (u16 DMA transfers per stripe; DMA is 16-bit)
-    stripe_count: u8,   // stripes per frame (height / STRIPE_LINES)
-
-    // Stripe DMA state
-    current_stripe: u8, // 0..stripe_count-1, counts DOWN
-    back_is_b: u8,      // 0: back=stripe_a, 1: back=stripe_b
-    frame_loaded: u8,   // 0: first frame still loading, 1: backlight on
-
-    // Cache display state
-    // row_lookup[d] → cache slot index for display line d.
-    // fill_stripe_from_row_cache regenerates any stripe from the active line cache.
-    has_line_cache: u8, // 0=no cache (test pattern mode), 1=front cache valid
-    active_cache_b: u8, // 0=display from line_cache, 1=display from line_cache_back
-
-    // Background loading state (subsequent frames load while DMA runs)
-    is_loading: u8,      // 1=currently loading into line_cache_back
-    back_ready: u8,      // 1=line_cache_back has a complete frame; swap at next frame boundary
-    load_row: u16,       // current row being loaded (0..src_rows)
-    load_row_off: u16,   // bytes received for current row (0..line_bytes)
-    load_cache_off: u32, // byte offset into line_cache_back (= load_row*line_bytes + load_row_off)
-
-    row_lookup: [u8; 480], // display line → line_cache slot index
-
-    // Two line caches: front (active display) and back (being loaded).
-    // Swapped atomically at frame boundary when back_ready=1.
-    line_cache: [u32; LINE_CACHE_WORDS],
-    line_cache_back: [u32; LINE_CACHE_WORDS],
-
-    // Stripe buffers (word-aligned, at end of struct)
-    stripe_a: [u32; STRIPE_BUF_WORDS],
-    stripe_b: [u32; STRIPE_BUF_WORDS],
+    // Reporting.
+    metrics_at_ms: u64,
+    status_at_us: u64,
+    status_sent: u32,
 }
-
-impl St7701sState {
-    #[inline(always)]
-    fn sys(&self) -> &SyscallTable {
-        unsafe { &*self.syscalls }
-    }
-
-    /// Offset of `stripe_b` in the stripe lend (`stripe_a` is at 0).
-    const STRIPE_B: u32 = (STRIPE_BUF_WORDS * 4) as u32;
-
-    /// Offset of the back buffer in the stripe lend.
-    fn back_buf_offset(&self) -> u32 {
-        if self.back_is_b != 0 {
-            Self::STRIPE_B
-        } else {
-            0
-        }
-    }
-
-    /// Get pointer to the back buffer (the one being filled by CPU).
-    fn back_buf_ptr(&self) -> *mut u32 {
-        if self.back_is_b != 0 {
-            self.stripe_b.as_ptr() as *mut u32
-        } else {
-            self.stripe_a.as_ptr() as *mut u32
-        }
-    }
-}
-
-// ============================================================================
-// Parameters
-// ============================================================================
 
 mod params_def {
-    use super::St7701sState;
-
-    use super::{p_u16, p_u8};
-
+    use super::*;
     fluxor_rt::define_params! {
-        St7701sState;
+        State;
+        1, cs_pin, u8, 18 => |s, d, len| { s.cs_pin = p_u8(d, len, 0, 18); };
+        2, sck_pin, u8, 2 => |s, d, len| { s.sck_pin = p_u8(d, len, 0, 2); };
+        3, sda_pin, u8, 3 => |s, d, len| { s.sda_pin = p_u8(d, len, 0, 3); };
+        4, rst_pin, u8, 19 => |s, d, len| { s.rst_pin = p_u8(d, len, 0, 19); };
+        5, bl_pin, u8, 40 => |s, d, len| { s.bl_pin = p_u8(d, len, 0, 40); };
+        6, de_pin, u8, 20 => |s, d, len| { s.de_pin = p_u8(d, len, 0, 20); };
+        7, hsync_pin, u8, 22 => |s, d, len| { s.hsync_pin = p_u8(d, len, 0, 22); };
+        8, vsync_pin, u8, 21 => |s, d, len| { s.vsync_pin = p_u8(d, len, 0, 21); };
+        9, pclk_pin, u8, 23 => |s, d, len| { s.pclk_pin = p_u8(d, len, 0, 23); };
+        10, data0_pin, u8, 24 => |s, d, len| { s.data0_pin = p_u8(d, len, 0, 24); };
+        11, width, u16, WIDTH_DEFAULT
+            => |s, d, len| { s.width = p_u16(d, len, 0, WIDTH_DEFAULT); };
+        12, height, u16, HEIGHT_DEFAULT
+            => |s, d, len| { s.height = p_u16(d, len, 0, HEIGHT_DEFAULT); };
+        13, pio_sync, u8, 1 => |s, d, len| { s.pio_sync = p_u8(d, len, 0, 1); };
+        14, pio_data, u8, 2 => |s, d, len| { s.pio_data = p_u8(d, len, 0, 2); };
+        15, mirror_x, u8, 1 => |s, d, len| { s.mirror_x = p_u8(d, len, 0, 1); };
+        16, refresh_mhz, u32, REFRESH_MHZ_DEFAULT
+            => |s, d, len| { s.refresh_mhz = p_u32(d, len, 0, REFRESH_MHZ_DEFAULT); };
+        17, pclk_max_khz, u32, PCLK_MAX_KHZ_DEFAULT
+            => |s, d, len| { s.pclk_max_khz = p_u32(d, len, 0, PCLK_MAX_KHZ_DEFAULT); };
+        18, band_rows, u16, BAND_ROWS_DEFAULT
+            => |s, d, len| { s.band_rows = p_u16(d, len, 0, BAND_ROWS_DEFAULT); };
+        19, ring_rows, u16, RING_ROWS_DEFAULT
+            => |s, d, len| { s.ring_rows = p_u16(d, len, 0, RING_ROWS_DEFAULT); };
+        20, frame_bytes, u32, FRAME_BYTES_DEFAULT
+            => |s, d, len| { s.frame_bytes = p_u32(d, len, 0, FRAME_BYTES_DEFAULT); };
+        21, resource_bytes, u32, RESOURCE_BYTES_DEFAULT
+            => |s, d, len| { s.resource_bytes = p_u32(d, len, 0, RESOURCE_BYTES_DEFAULT); };
+        22, record_bytes, u32, RECORD_BYTES_DEFAULT
+            => |s, d, len| { s.record_bytes = p_u32(d, len, 0, RECORD_BYTES_DEFAULT); };
+        23, surface_bytes, u32, 0 => |s, d, len| { s.surface_bytes = p_u32(d, len, 0, 0); };
+        24, underrun_rgb565, u16, 0 => |s, d, len| { s.underrun_rgb565 = p_u16(d, len, 0, 0); };
+        25, status_s, u8, 0 => |s, d, len| { s.status_s = p_u8(d, len, 0, 0); };
+        26, pack0, str, 0 => |s, d, len| { keep_pack(s, 0, d, len); };
+        27, pack1, str, 0 => |s, d, len| { keep_pack(s, 1, d, len); };
+        28, pack2, str, 0 => |s, d, len| { keep_pack(s, 2, d, len); };
+        29, pack3, str, 0 => |s, d, len| { keep_pack(s, 3, d, len); };
+    }
+}
 
-        1, cs_pin, u8, 18
-            => |s, d, len| { s.cs_pin = p_u8(d, len, 0, 18); };
-        2, sck_pin, u8, 2
-            => |s, d, len| { s.sck_pin = p_u8(d, len, 0, 2); };
-        3, sda_pin, u8, 3
-            => |s, d, len| { s.sda_pin = p_u8(d, len, 0, 3); };
-        4, rst_pin, u8, 19
-            => |s, d, len| { s.rst_pin = p_u8(d, len, 0, 19); };
-        5, bl_pin, u8, 40
-            => |s, d, len| { s.bl_pin = p_u8(d, len, 0, 40); };
-        6, de_pin, u8, 20
-            => |s, d, len| { s.de_pin = p_u8(d, len, 0, 20); };
-        7, hsync_pin, u8, 22
-            => |s, d, len| { s.hsync_pin = p_u8(d, len, 0, 22); };
-        8, vsync_pin, u8, 21
-            => |s, d, len| { s.vsync_pin = p_u8(d, len, 0, 21); };
-        9, pclk_pin, u8, 23
-            => |s, d, len| { s.pclk_pin = p_u8(d, len, 0, 23); };
-        10, data0_pin, u8, 24
-            => |s, d, len| { s.data0_pin = p_u8(d, len, 0, 24); };
-        11, width, u16, 480
-            => |s, d, len| { s.width = p_u16(d, len, 0, 480); };
-        12, height, u16, 480
-            => |s, d, len| { s.height = p_u16(d, len, 0, 480); };
-        13, pio_sync, u8, 1
-            => |s, d, len| { s.pio_sync = p_u8(d, len, 0, 1); };
-        14, pio_data, u8, 2
-            => |s, d, len| { s.pio_data = p_u8(d, len, 0, 2); };
-        15, mirror_x, u8, 1
-            => |s, d, len| { s.mirror_x = p_u8(d, len, 0, 1); };
-        16, source_rows, u16, 32
-            => |s, d, len| {
-                let v = p_u16(d, len, 0, 32);
-                s.src_rows = v.clamp(1, 32);
-            };
+fluxor_rt::module_facts! { state: State, arena: ARENA_BASE }
+
+/// Keep the value of `pack<i>`. One too long to be a program reference is
+/// kept as its first bytes, which `asset::open` then answers as a path:
+/// `module_new` refuses it.
+unsafe fn keep_pack(s: &mut State, i: usize, d: *const u8, len: usize) {
+    let n = len.min(PACK_PARAM);
+    let mut k = 0;
+    while k < n {
+        s.pack_params[i][k] = *d.add(k);
+        k += 1;
+    }
+    s.pack_lens[i] = n as u8;
+}
+
+/// `surface0`, as SURFACE records read it.
+struct Rasters<'a>(Option<&'a Input>);
+
+impl Surfaces for Rasters<'_> {
+    fn surface(&self, input: u8) -> Option<Texels<'_>> {
+        if input != 0 {
+            return None;
+        }
+        self.0?.texels()
     }
 }
 
 // ============================================================================
-// 9-bit SPI via kernel raw PAC GPIO (bypasses the HAL_GPIO contract)
+// Log lines
 // ============================================================================
 
-/// Send a 9-bit SPI command + data to the kernel's raw PAC GPIO SPI handler.
-/// Builds arg buffer: [cs, sck, sda, cmd, data_len, data[0..N]]
-unsafe fn spi9_send(s: &St7701sState, cmd: u8, data: &[u8]) {
-    spi9_send_inner(s, cmd, data, false);
+/// One log line under construction.
+struct Line {
+    bytes: [u8; 160],
+    len: usize,
 }
 
-/// Send a 9-bit SPI command but hold CS LOW after (caller must raise CS via spi9_cs_set).
-unsafe fn spi9_send_hold(s: &St7701sState, cmd: u8, data: &[u8]) {
-    spi9_send_inner(s, cmd, data, true);
-}
-
-unsafe fn spi9_send_inner(s: &St7701sState, cmd: u8, data: &[u8], hold_cs: bool) {
-    let sys = s.sys();
-    // Max data per command in init_seq is 16 bytes, so 5+16+1=22 byte arg buffer suffices
-    let mut arg = [0u8; 24];
-    let ap = arg.as_mut_ptr();
-    core::ptr::write_volatile(ap.add(0), s.cs_pin);
-    core::ptr::write_volatile(ap.add(1), s.sck_pin);
-    core::ptr::write_volatile(ap.add(2), s.sda_pin);
-    core::ptr::write_volatile(ap.add(3), cmd);
-    core::ptr::write_volatile(ap.add(4), data.len() as u8);
-    let mut i = 0usize;
-    while i < data.len() {
-        core::ptr::write_volatile(ap.add(5 + i), *data.as_ptr().add(i));
-        i += 1;
+impl Line {
+    fn new(start: &[u8]) -> Line {
+        let mut line = Line {
+            bytes: [0; 160],
+            len: 0,
+        };
+        line.text(start);
+        line
     }
-    let total = 5 + data.len();
-    if hold_cs {
-        core::ptr::write_volatile(ap.add(total), 1);
-        (sys.provider_call)(-1, SPI9_SEND, ap, total + 1, core::ptr::null_mut(), 0);
+
+    fn text(&mut self, text: &[u8]) -> &mut Self {
+        for &b in text {
+            if let Some(slot) = self.bytes.get_mut(self.len) {
+                *slot = b;
+                self.len += 1;
+            }
+        }
+        self
+    }
+
+    fn number(&mut self, value: u32) -> &mut Self {
+        let mut digits = [0u8; 10];
+        // SAFETY: `fmt_u32_raw` writes at most ten digits.
+        let n = unsafe { fmt_u32_raw(digits.as_mut_ptr(), value) };
+        let n = n.min(digits.len());
+        self.text(&digits[..n])
+    }
+
+    unsafe fn send(&self, sys: &SyscallTable, level: u8) {
+        dev_log(sys, level, self.bytes.as_ptr(), self.len);
+    }
+}
+
+unsafe fn refuse(sys: &SyscallTable, why: &[u8]) -> i32 {
+    Line::new(b"[st7701s] refusing to construct: ")
+        .text(why)
+        .send(sys, 1);
+    abi::errno::EINVAL
+}
+
+// ============================================================================
+// Timing
+// ============================================================================
+
+/// The sync divider and what it gives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Timing {
+    /// The divider in 1/256, as the PIO's fractional divider steps.
+    pub divider_256: u32,
+    /// The refresh rate, mHz.
+    pub achieved_mhz: u32,
+    /// The pixel clock, Hz.
+    pub pclk_hz: u32,
+    /// The time the scan takes over `band_rows` lines, µs.
+    pub band_us: u32,
+}
+
+/// Sync cycles of one frame of `width × height` active pixels.
+pub const fn frame_cycles(width: u16, height: u16) -> u64 {
+    (2 * width as u64 + LINE_BLANK_CYCLES as u64) * (height as u64 + FRAME_BLANK_LINES as u64)
+}
+
+/// The divider that brings a `sys_hz` system clock nearest `refresh_mhz`
+/// for a `width × height` panel, rounded to the 1/256 step. `None` when
+/// the rate is zero or the divider leaves what the PIO holds (1 to 65,535
+/// and 255/256).
+pub fn timing(
+    sys_hz: u32,
+    refresh_mhz: u32,
+    width: u16,
+    height: u16,
+    band_rows: u16,
+) -> Option<Timing> {
+    let cycles = frame_cycles(width, height);
+    let wanted = u64::from(refresh_mhz).checked_mul(cycles)?;
+    let scaled = u64::from(sys_hz) * 256_000;
+    let divider = scaled.checked_add(wanted / 2)?.checked_div(wanted)?;
+    if !(256..1 << 24).contains(&divider) {
+        return None;
+    }
+    let achieved = (scaled + divider * cycles / 2).checked_div(divider * cycles)?;
+    // Two sync cycles a pixel clock.
+    let pclk = (u64::from(sys_hz) * 128).checked_div(divider)?;
+    let line_cycles = 2 * u64::from(width) + u64::from(LINE_BLANK_CYCLES);
+    let per_us = u64::from(sys_hz) * 256;
+    let band = (line_cycles * u64::from(band_rows) * divider * 1_000_000 + per_us / 2)
+        .checked_div(per_us)?;
+    Some(Timing {
+        divider_256: divider as u32,
+        achieved_mhz: achieved as u32,
+        pclk_hz: pclk as u32,
+        band_us: (band as u32).max(1),
+    })
+}
+
+/// The first GPIO of the 32-pin window that holds the 16 data pins from
+/// `data0` and the four control pins from `de`: 0 when every pin is below
+/// 32, 16 when every pin is in 16 to 47. `None` when no window holds them.
+pub fn gpio_window(data0: u8, de: u8) -> Option<u8> {
+    let lowest = data0.min(de);
+    let highest = data0.checked_add(15)?.max(de.checked_add(3)?);
+    if highest < 32 {
+        Some(0)
+    } else if lowest >= 16 && highest < 48 {
+        Some(16)
     } else {
-        (sys.provider_call)(-1, SPI9_SEND, ap, total, core::ptr::null_mut(), 0);
+        None
     }
 }
 
-/// Trigger kernel-level 9-bit SPI reset sequence (RST high→low→high + pin init).
-unsafe fn spi9_reset(s: &St7701sState) {
-    let sys = s.sys();
+// ============================================================================
+// Panel registers: 9-bit SPI through the kernel
+// ============================================================================
+
+/// Send one command and its data. With `hold`, chip select stays low after
+/// it, as the panel wants across the delay that follows SLEEP_OUT and
+/// DISPLAY_ON.
+unsafe fn spi9_send(s: &State, cmd: u8, data: &[u8], hold: bool) {
+    let sys = &*s.syscalls;
+    let mut arg = [0u8; 6 + init_seq::MAX_DATA];
+    arg[0] = s.cs_pin;
+    arg[1] = s.sck_pin;
+    arg[2] = s.sda_pin;
+    arg[3] = cmd;
+    let n = data.len().min(init_seq::MAX_DATA);
+    arg[4] = n as u8;
+    for (dst, src) in arg[5..].iter_mut().zip(data.iter().take(n)) {
+        *dst = *src;
+    }
+    let mut total = 5 + n;
+    if hold {
+        arg[total] = 1;
+        total += 1;
+    }
+    (sys.provider_call)(
+        -1,
+        abi::registry::rp_raw::SPI9_SEND,
+        arg.as_mut_ptr(),
+        total,
+        core::ptr::null_mut(),
+        0,
+    );
+}
+
+unsafe fn spi9_reset(s: &State) {
+    let sys = &*s.syscalls;
     let mut arg = [s.rst_pin, s.cs_pin, s.sck_pin, s.sda_pin];
     (sys.provider_call)(
         -1,
-        SPI9_RESET,
+        abi::registry::rp_raw::SPI9_RESET,
         arg.as_mut_ptr(),
-        4,
+        arg.len(),
         core::ptr::null_mut(),
         0,
     );
 }
 
-/// Send one init command from the INIT_SEQ table via kernel SPI.
-unsafe fn spi9_send_init_cmd(s: &St7701sState, cmd: &init_seq::InitCmd) {
-    let data = core::slice::from_raw_parts(cmd.data.as_ptr(), cmd.len as usize);
-    spi9_send(s, cmd.cmd, data);
-}
-
-/// Set CS pin level explicitly (for holding CS across delays).
-unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
-    let sys = s.sys();
+unsafe fn spi9_cs(s: &State, level: u8) {
+    let sys = &*s.syscalls;
     let mut arg = [s.cs_pin, level];
     (sys.provider_call)(
         -1,
-        SPI9_CS_SET,
+        abi::registry::rp_raw::SPI9_CS_SET,
         arg.as_mut_ptr(),
-        2,
+        arg.len(),
         core::ptr::null_mut(),
         0,
     );
 }
 
 // ============================================================================
-// GPIO / Timer helpers
+// GPIO and timer
 // ============================================================================
 
-// Contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
-const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
-
-unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
+unsafe fn gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
     (sys.provider_open)(
-        HAL_GPIO_CONTRACT,
+        abi::registry::gpio::ID as u32,
         abi::registry::gpio::SET_OUTPUT,
         arg.as_mut_ptr(),
         1,
@@ -373,27 +555,27 @@ unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
 }
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
-    let mut lvl = [level];
+    let mut arg = [level];
     (sys.provider_call)(
         handle,
         abi::registry::gpio::SET_LEVEL,
-        lvl.as_mut_ptr(),
+        arg.as_mut_ptr(),
         1,
         core::ptr::null_mut(),
         0,
     );
 }
 
-unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
-    let mut ms_buf = delay_ms.to_le_bytes();
+unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) {
+    let mut ms = delay_ms.to_le_bytes();
     (sys.provider_call)(
         timer_fd,
         abi::registry::timer::SET,
-        ms_buf.as_mut_ptr(),
+        ms.as_mut_ptr(),
         4,
         core::ptr::null_mut(),
         0,
-    )
+    );
 }
 
 unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
@@ -401,445 +583,178 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 }
 
 // ============================================================================
-// PIO bridge helpers
+// PIO
 // ============================================================================
 
-unsafe fn pio_gpiobase(sys: &SyscallTable, pio: u8, base16: u8) -> i32 {
-    let mut arg = [pio, base16];
+/// One call on PIO block `pio`'s raw claim.
+unsafe fn pio_call(sys: &SyscallTable, pio: u8, op: u32, arg: &mut [u8]) -> i32 {
     (sys.provider_call)(
         dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_GPIOBASE,
+        op,
         arg.as_mut_ptr(),
-        2,
+        arg.len(),
         core::ptr::null_mut(),
         0,
     )
 }
 
-unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut u32) -> i32 {
-    let mut arg = [pio, count, 0, 0, 0, 0];
-    let rc = (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_INSTR_ALLOC,
-        arg.as_mut_ptr(),
-        6,
-        core::ptr::null_mut(),
-        0,
-    );
-    if rc >= 0 {
-        let p = arg.as_ptr();
-        *mask_out = u32::from_le_bytes([
-            core::ptr::read_volatile(p.add(2)),
-            core::ptr::read_volatile(p.add(3)),
-            core::ptr::read_volatile(p.add(4)),
-            core::ptr::read_volatile(p.add(5)),
-        ]);
-    }
-    rc
+unsafe fn pio_write_reg(sys: &SyscallTable, pio: u8, sm: u8, reg: u8, value: u32) {
+    let v = value.to_le_bytes();
+    let mut arg = [pio, sm, reg, v[0], v[1], v[2], v[3]];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_SM_WRITE_REG, &mut arg);
 }
 
-unsafe fn pio_instr_write(sys: &SyscallTable, pio: u8, addr: u8, instr: u16) -> i32 {
-    let bytes = instr.to_le_bytes();
-    let mut arg = [pio, addr, bytes[0], bytes[1]];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_INSTR_WRITE,
-        arg.as_mut_ptr(),
-        4,
-        core::ptr::null_mut(),
-        0,
-    )
+unsafe fn pio_enable(sys: &SyscallTable, pio: u8, mask: u8, enable: bool) {
+    let mut arg = [pio, mask, enable as u8];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_SM_ENABLE, &mut arg);
 }
 
-unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio: u8, sm: u8, reg: u8, value: u32) -> i32 {
-    let vb = value.to_le_bytes();
-    let mut arg = [pio, sm, reg, vb[0], vb[1], vb[2], vb[3]];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_SM_WRITE_REG,
-        arg.as_mut_ptr(),
-        7,
-        core::ptr::null_mut(),
-        0,
-    )
-}
-
-unsafe fn pio_sm_enable(sys: &SyscallTable, pio: u8, mask: u8, enable: u8) -> i32 {
-    let mut arg = [pio, mask, enable];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_SM_ENABLE,
-        arg.as_mut_ptr(),
-        3,
-        core::ptr::null_mut(),
-        0,
-    )
-}
-
-unsafe fn pio_sm_restart(sys: &SyscallTable, pio: u8, mask: u8) -> i32 {
+unsafe fn pio_restart(sys: &SyscallTable, pio: u8, mask: u8) {
     let mut arg = [pio, mask];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_SM_RESTART,
-        arg.as_mut_ptr(),
-        2,
-        core::ptr::null_mut(),
-        0,
-    )
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_SM_RESTART, &mut arg);
 }
 
-unsafe fn pio_sm_exec(sys: &SyscallTable, pio: u8, sm: u8, instr: u16) -> i32 {
-    let bytes = instr.to_le_bytes();
-    let mut arg = [pio, sm, bytes[0], bytes[1]];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_SM_EXEC,
-        arg.as_mut_ptr(),
-        4,
-        core::ptr::null_mut(),
-        0,
-    )
+unsafe fn pio_exec(sys: &SyscallTable, pio: u8, sm: u8, instr: u16) {
+    let i = instr.to_le_bytes();
+    let mut arg = [pio, sm, i[0], i[1]];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_SM_EXEC, &mut arg);
 }
 
-unsafe fn pio_txf_write(sys: &SyscallTable, pio: u8, sm: u8, value: u32) -> i32 {
-    let vb = value.to_le_bytes();
-    let mut arg = [pio, sm, vb[0], vb[1], vb[2], vb[3]];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
-        PIO_TXF_WRITE,
-        arg.as_mut_ptr(),
-        6,
-        core::ptr::null_mut(),
-        0,
-    )
+unsafe fn pio_push(sys: &SyscallTable, pio: u8, sm: u8, value: u32) {
+    let v = value.to_le_bytes();
+    let mut arg = [pio, sm, v[0], v[1], v[2], v[3]];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_TXF_WRITE, &mut arg);
 }
 
-unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i32 {
-    let mut arg = [pin, pio_num, pull];
-    (sys.provider_call)(
-        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio_num),
-        PIO_PIN_SETUP,
-        arg.as_mut_ptr(),
-        3,
-        core::ptr::null_mut(),
-        0,
-    )
+unsafe fn pio_pin(sys: &SyscallTable, pin: u8, pio: u8, pull: u8) {
+    let mut arg = [pin, pio, pull];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_PIN_SETUP, &mut arg);
 }
 
-// ============================================================================
-// DMA FD helpers
-// ============================================================================
-
-unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    // fd::CREATE opens against PLATFORM_DMA_FD. The handle names that
-    // contract, so follow-up fd::* ops reach the DMA fd and a handle of
-    // the sibling PLATFORM_DMA (channel) surface is refused.
-    const PLATFORM_DMA_FD: u32 = abi::registry::platform_dma_fd::ID as u32;
-    (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
-}
-
-/// Cookie of the stripe buffers' lend on the DMA fd.
-const STRIPE_LEND: u32 = 1;
-
-/// DMA flags: 16-bit units, the memory side advancing.
-const STRIPE_DMA_FLAGS: u8 =
-    abi::platform::rp::dma_raw::flags::INCR | abi::platform::rp::dma_raw::flags::SIZE_HALF;
-
-/// Start the fd over `count` units at `offset` in the stripe lend, paced by
-/// `dreq` (the data state machine's TX FIFO).
-unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, offset: u32, count: u32, dreq: u8) -> i32 {
-    let mut arg = abi::platform::rp::dma_raw::start::encode(
-        STRIPE_LEND,
-        offset,
-        count,
-        dreq,
-        STRIPE_DMA_FLAGS,
-    );
-    (sys.provider_call)(
-        fd,
-        dma_fd::START,
-        arg.as_mut_ptr(),
-        arg.len(),
-        core::ptr::null_mut(),
-        0,
-    )
-}
-
-/// Queue `count` units at `offset` in the stripe lend behind the transfer
-/// running.
-unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, offset: u32, count: u32) -> i32 {
-    let mut arg = abi::platform::rp::dma_raw::reload::encode(STRIPE_LEND, offset, count);
-    (sys.provider_call)(
-        fd,
-        dma_fd::QUEUE,
-        arg.as_mut_ptr(),
-        arg.len(),
-        core::ptr::null_mut(),
-        0,
-    )
-}
-
-// ============================================================================
-// PIO configuration helpers
-// ============================================================================
-
-/// Relocate a PIO instruction: if it's a JMP, add `origin` to the target address.
-/// PIO instruction encoding: bits [15:13] = opcode, JMP = 000, target in bits [4:0].
-fn relocate_instr(instr: u16, origin: u8) -> u16 {
-    let opcode = (instr >> 13) & 0x07;
-    if opcode == 0 {
-        // JMP instruction: relocate address in bits [4:0]
-        let addr = (instr & 0x1F) + origin as u16;
-        (instr & !0x1F) | (addr & 0x1F)
-    } else {
-        instr
-    }
-}
-
-/// Load a PIO program into instruction memory and return origin.
-/// Relocates JMP targets by adding the origin offset.
-unsafe fn load_program(sys: &SyscallTable, pio: u8, program: &[u16], mask_out: &mut u32) -> i32 {
-    let len = program.len();
-    let origin = pio_instr_alloc(sys, pio, len as u8, mask_out);
+/// Load `program` into block `pio`: its origin, or the kernel's errno. A
+/// JMP's target (the low five bits of an instruction whose top three are
+/// zero) is moved by the origin.
+unsafe fn pio_load(sys: &SyscallTable, pio: u8, program: &[u16]) -> i32 {
+    let mut arg = [pio, program.len() as u8, 0, 0, 0, 0];
+    let origin = pio_call(sys, pio, abi::registry::rp_raw::PIO_INSTR_ALLOC, &mut arg);
     if origin < 0 {
         return origin;
     }
-    let base = origin as u8;
-    let mut i = 0usize;
-    while i < len {
-        let instr = unsafe { *program.as_ptr().add(i) };
-        let relocated = relocate_instr(instr, base);
-        pio_instr_write(sys, pio, base + i as u8, relocated);
-        i += 1;
+    for (i, instr) in program.iter().enumerate() {
+        let placed = if instr >> 13 == 0 {
+            (instr & !0x1F) | ((instr & 0x1F) + origin as u16) & 0x1F
+        } else {
+            *instr
+        };
+        let b = placed.to_le_bytes();
+        let mut arg = [pio, origin as u8 + i as u8, b[0], b[1]];
+        pio_call(sys, pio, abi::registry::rp_raw::PIO_INSTR_WRITE, &mut arg);
     }
     origin
 }
 
-/// Build EXECCTRL register value.
-/// wrap_bottom and wrap_top are absolute addresses (origin + offset).
-/// side_en: enable optional sideset, side_pindir: sideset affects pindirs
-fn build_execctrl(wrap_bottom: u8, wrap_top: u8, side_en: bool, side_pindir: bool) -> u32 {
-    // EXECCTRL register layout (RP2350):
-    // [4:0]   STATUS_N
-    // [5]     STATUS_SEL
-    // [6]     _reserved
-    // [11:7]  WRAP_BOTTOM
-    // [16:12] WRAP_TOP
-    // [28:24] OUT_STICKY/INLINE_OUT_EN/OUT_EN_SEL/JMP_PIN
-    // [29]    SIDE_PINDIR
-    // [30]    SIDE_EN
-    let mut val: u32 = 0;
-    val |= (wrap_bottom as u32 & 0x1F) << 7;
-    val |= (wrap_top as u32 & 0x1F) << 12;
-    if side_en {
-        val |= 1 << 30;
-    }
-    if side_pindir {
-        val |= 1 << 29;
-    }
-    val
+/// `EXECCTRL`: the wrap addresses, with the optional side-set enable the
+/// sync and DE programs use.
+const fn execctrl(wrap_bottom: u8, wrap_top: u8, side_enable: bool) -> u32 {
+    ((wrap_bottom as u32 & 0x1F) << 7)
+        | ((wrap_top as u32 & 0x1F) << 12)
+        | ((side_enable as u32) << 30)
 }
 
-/// Build PINCTRL register value.
-fn build_pinctrl(
+/// The `PINCTRL` fields one state machine is configured with. Pins are
+/// counted from the block's GPIO base.
+#[derive(Clone, Copy)]
+struct Pins {
     out_base: u8,
     out_count: u8,
     set_base: u8,
     set_count: u8,
-    sideset_base: u8,
-    sideset_count: u8,
+    side_base: u8,
+    side_count: u8,
     in_base: u8,
-) -> u32 {
-    // PINCTRL layout:
-    // [4:0]   OUT_BASE
-    // [9:5]   SET_BASE
-    // [14:10] SIDESET_BASE
-    // [19:15] IN_BASE
-    // [25:20] OUT_COUNT
-    // [28:26] SET_COUNT
-    // [31:29] SIDESET_COUNT
-    let mut val: u32 = 0;
-    val |= out_base as u32 & 0x1F;
-    val |= (set_base as u32 & 0x1F) << 5;
-    val |= (sideset_base as u32 & 0x1F) << 10;
-    val |= (in_base as u32 & 0x1F) << 15;
-    val |= (out_count as u32 & 0x3F) << 20;
-    val |= (set_count as u32 & 0x07) << 26;
-    val |= (sideset_count as u32 & 0x07) << 29;
-    val
 }
 
-/// The SHIFTCTRL fields one state machine is configured with.
-#[derive(Clone, Copy)]
-struct ShiftCtrl {
-    autopull: bool,
-    autopush: bool,
-    pull_thresh: u8,
-    push_thresh: u8,
-    out_shiftdir: bool,
-    in_shiftdir: bool,
-    fjoin_tx: bool,
-    fjoin_rx: bool,
-}
-
-impl ShiftCtrl {
-    /// Every field clear: the register's reset layout.
-    const RESET: Self = Self {
-        autopull: false,
-        autopush: false,
-        pull_thresh: 0,
-        push_thresh: 0,
-        out_shiftdir: false,
-        in_shiftdir: false,
-        fjoin_tx: false,
-        fjoin_rx: false,
+impl Pins {
+    const NONE: Pins = Pins {
+        out_base: 0,
+        out_count: 0,
+        set_base: 0,
+        set_count: 0,
+        side_base: 0,
+        side_count: 0,
+        in_base: 0,
     };
-}
 
-/// Build SHIFTCTRL register value.
-fn build_shiftctrl(c: ShiftCtrl) -> u32 {
-    let ShiftCtrl {
-        autopull,
-        autopush,
-        pull_thresh,
-        push_thresh,
-        out_shiftdir,
-        in_shiftdir,
-        fjoin_tx,
-        fjoin_rx,
-    } = c;
-    // SHIFTCTRL layout:
-    // [15:0]  _reserved
-    // [16]    AUTOPUSH
-    // [17]    AUTOPULL
-    // [18]    IN_SHIFTDIR (0=left/MSB first, 1=right/LSB first)
-    // [19]    OUT_SHIFTDIR
-    // [24:20] PUSH_THRESH (0 = 32)
-    // [29:25] PULL_THRESH (0 = 32)
-    // [30]    FJOIN_TX
-    // [31]    FJOIN_RX
-    let mut val: u32 = 0;
-    if autopush {
-        val |= 1 << 16;
-    }
-    if autopull {
-        val |= 1 << 17;
-    }
-    if in_shiftdir {
-        val |= 1 << 18;
-    }
-    if out_shiftdir {
-        val |= 1 << 19;
-    }
-    val |= ((push_thresh as u32) & 0x1F) << 20;
-    val |= ((pull_thresh as u32) & 0x1F) << 25;
-    if fjoin_tx {
-        val |= 1 << 30;
-    }
-    if fjoin_rx {
-        val |= 1 << 31;
-    }
-    val
-}
-
-// ============================================================================
-// Test pattern helpers
-// ============================================================================
-
-/// Fill a stripe buffer with 8-color vertical bars (60px each, RGB565).
-/// Colors rotate by `stripe_idx & 7` positions — 32 stripes per frame, 4 per colour band,
-/// creating a diagonal colour pattern across the display.
-unsafe fn fill_vertical_stripes(buf: *mut u32, width: u16, stripe_idx: u8) {
-    const COLORS: [u16; 8] = [
-        0xF800, 0x07E0, 0x001F, 0x07FF, 0xF81F, 0xFFE0, 0x0000, 0xFFFF,
-    ];
-    let rot = (stripe_idx as usize) & 7;
-    let words_per_line = (width >> 1) as usize;
-    let pixels_per_bar = (width >> 3) as usize;
-    let words_per_bar = pixels_per_bar >> 1;
-
-    let mut line = 0usize;
-    while line < STRIPE_LINES as usize {
-        let line_off = line * words_per_line;
-        let mut bar = 0usize;
-        while bar < 8 {
-            let ci = (bar + rot) & 7;
-            let color = *COLORS.as_ptr().add(ci);
-            let packed = (color as u32) | ((color as u32) << 16);
-            let bar_off = line_off + bar * words_per_bar;
-            let mut w = 0usize;
-            while w < words_per_bar {
-                core::ptr::write_volatile(buf.add(bar_off + w), packed);
-                w += 1;
-            }
-            bar += 1;
-        }
-        line += 1;
+    const fn word(self) -> u32 {
+        (self.out_base as u32 & 0x1F)
+            | ((self.set_base as u32 & 0x1F) << 5)
+            | ((self.side_base as u32 & 0x1F) << 10)
+            | ((self.in_base as u32 & 0x1F) << 15)
+            | ((self.out_count as u32 & 0x3F) << 20)
+            | ((self.set_count as u32 & 0x07) << 26)
+            | ((self.side_count as u32 & 0x07) << 29)
     }
 }
 
-/// Compute row_lookup: maps each display line to its source cache slot.
-/// Uses Bresenham DDA — no division required.
-/// For a 32-row source on a 480-line display: every 15 display lines map to one source row.
-unsafe fn compute_row_lookup(lookup: *mut u8, src_rows: u16, display_height: u16) {
-    let mut acc = 0u32;
-    let mut row = 0u8;
-    let mut d = 0usize;
-    while d < display_height as usize {
-        core::ptr::write_volatile(lookup.add(d), row);
-        acc += src_rows as u32;
-        if acc >= display_height as u32 {
-            acc -= display_height as u32;
-            row += 1;
-        }
-        d += 1;
+/// Make `count` pins from `base` outputs of state machine `sm`, five at a
+/// time (what one `set` reaches), then leave the machine with `pins`.
+unsafe fn pio_outputs(sys: &SyscallTable, pio: u8, sm: u8, base: u8, count: u8, pins: Pins) {
+    let mut done = 0u8;
+    while done < count {
+        let n = (count - done).min(5);
+        let set = Pins {
+            set_base: base + done,
+            set_count: n,
+            ..pins
+        };
+        pio_write_reg(sys, pio, sm, REG_PINCTRL, set.word());
+        pio_exec(sys, pio, sm, set_pindirs((1u8 << n) - 1));
+        done += n;
     }
+    pio_write_reg(sys, pio, sm, REG_PINCTRL, pins.word());
 }
 
-/// Fill a stripe buffer using the row_lookup table.
-/// `line_words` is the actual display width in u32 units (= width/2).
-/// Panel renders last-sent line at the top of each stripe region:
-///   buf[d=0] sent first (bottom), buf[STRIPE_LINES-1] sent last (top).
-/// Reverse index so source row 0 appears at the top.
-unsafe fn fill_stripe_from_row_cache(
-    buf: *mut u32,
-    row_lookup: *const u8,
-    line_cache: *const u32,
-    stripe_idx: u8,
-    line_words: usize,
+/// Configure one state machine: its program's wrap, its pins, its divider.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one state machine's whole configuration, written once for each of the four"
+)]
+unsafe fn pio_machine(
+    sys: &SyscallTable,
+    pio: u8,
+    sm: u8,
+    origin: u8,
+    wrap: (u8, u8),
+    side_enable: bool,
+    pins: Pins,
+    clkdiv: u32,
 ) {
-    let base_line = (stripe_idx as usize) * (STRIPE_LINES as usize);
-    let stripe_lines = STRIPE_LINES as usize;
-    let mut d = 0usize;
-    while d < stripe_lines {
-        let src_row =
-            core::ptr::read_volatile(row_lookup.add(base_line + stripe_lines - 1 - d)) as usize;
-        let cache_src = line_cache.add(src_row * line_words);
-        let dst = buf.add(d * line_words);
-        let mut w = 0usize;
-        while w < line_words {
-            core::ptr::write_volatile(dst.add(w), core::ptr::read_volatile(cache_src.add(w)));
-            w += 1;
-        }
-        d += 1;
-    }
+    pio_write_reg(
+        sys,
+        pio,
+        sm,
+        REG_EXECCTRL,
+        execctrl(origin + wrap.0, origin + wrap.1, side_enable),
+    );
+    pio_write_reg(sys, pio, sm, REG_PINCTRL, pins.word());
+    pio_write_reg(sys, pio, sm, REG_CLKDIV, clkdiv);
+    pio_write_reg(sys, pio, sm, REG_SHIFTCTRL, SHIFTCTRL_JOIN_TX);
 }
 
 // ============================================================================
-// Module exports
+// Construction
 // ============================================================================
 
-fluxor_rt::module_facts! { state: St7701sState }
-
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+/// `n` rounded up to the alignment every part of the heap block starts on.
+const fn aligned(n: usize) -> usize {
+    (n + 7) & !7
+}
 
 /// # Safety
 /// Kernel module-ABI entry point: `state` is the loader-owned instance block
 /// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
 /// the config TLV blob of `params_len` bytes (may be null when it is empty).
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
     in_chan: i32,
@@ -851,820 +766,914 @@ pub unsafe extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -22;
+    if syscalls.is_null() || state.is_null() {
+        return abi::errno::EINVAL;
     }
-    if state_size < core::mem::size_of::<St7701sState>() {
-        return -12;
+    if state_size < core::mem::size_of::<State>() {
+        return abi::errno::ENOMEM;
     }
-
-    let s = unsafe { &mut *(state as *mut St7701sState) };
+    core::ptr::write_bytes(state, 0, core::mem::size_of::<State>());
+    // The tables the rasteriser borrows are reached through `me`: they live
+    // as long as the instance, not as long as this call's `s`.
+    let me = state as *mut State;
+    let s = &mut *me;
     s.syscalls = syscalls as *const SyscallTable;
-
-    unsafe {
+    let sys = &*s.syscalls;
+    if !params.is_null() && params_len > 0 {
+        params_def::parse_tlv(s, params, params_len);
+    } else {
         params_def::set_defaults(s);
-        if !params.is_null() && params_len > 0 {
-            params_def::parse_tlv(s, params, params_len);
+    }
+    s.draw = in_chan;
+    s.timer_fd = -1;
+    s.bl_handle = -1;
+    s.dma_fd = -1;
+
+    // Geometry.
+    if s.width == 0 || s.width > MAX_WIDTH || s.height == 0 {
+        return refuse(sys, b"width is 1 to 480 and height at least 1");
+    }
+    let bands = u32::from(s.height)
+        .checked_div(u32::from(s.band_rows))
+        .unwrap_or(0);
+    if s.band_rows == 0
+        || bands * u32::from(s.band_rows) != u32::from(s.height)
+        || bands < MIN_SLOTS as u32
+    {
+        return refuse(
+            sys,
+            b"band_rows must divide height into three or more bands",
+        );
+    }
+    let slots = u32::from(s.ring_rows)
+        .checked_div(u32::from(s.band_rows))
+        .unwrap_or(0);
+    if slots * u32::from(s.band_rows) != u32::from(s.ring_rows)
+        || slots < MIN_SLOTS as u32
+        || slots > MAX_SLOTS as u32
+        || slots > bands
+    {
+        return refuse(
+            sys,
+            b"ring_rows must be 3 to 32 bands of band_rows, and no more than height",
+        );
+    }
+    if s.frame_bytes == 0 || (s.record_bytes as usize) < vd::HEADER + vd::BORDER_LEN {
+        return refuse(
+            sys,
+            b"frame_bytes must be non-zero and record_bytes at least 84",
+        );
+    }
+    s.bands = bands as u16;
+    s.slots = slots as u16;
+    s.slot_bytes = u32::from(s.band_rows) * u32::from(s.width) * 2;
+
+    // Pins: 16 data pins in a row, then DE, VSYNC, HSYNC and PCLK in a
+    // row, in that order, all inside one 32-pin window.
+    if s.vsync_pin != s.de_pin.wrapping_add(1)
+        || s.hsync_pin != s.de_pin.wrapping_add(2)
+        || s.pclk_pin != s.de_pin.wrapping_add(3)
+    {
+        return refuse(
+            sys,
+            b"de_pin, vsync_pin, hsync_pin and pclk_pin must be consecutive, in that order",
+        );
+    }
+    let Some(gpio_base) = gpio_window(s.data0_pin, s.de_pin) else {
+        return refuse(
+            sys,
+            b"the 16 data pins and the four control pins must all lie in GPIO 0-31 or all in 16-47",
+        );
+    };
+    let data_end = u32::from(s.data0_pin) + 16;
+    if u32::from(s.de_pin) < data_end && u32::from(s.de_pin) + 4 > u32::from(s.data0_pin) {
+        return refuse(sys, b"the control pins overlap the data pins");
+    }
+    if s.pio_sync > 2 || s.pio_data > 2 || s.pio_sync == s.pio_data {
+        return refuse(
+            sys,
+            b"pio_sync and pio_data must be two different PIO blocks",
+        );
+    }
+    s.gpio_base = gpio_base;
+
+    // Timing.
+    let sys_hz = dev_sys_clock_hz(sys);
+    let Some(t) = timing(sys_hz, s.refresh_mhz, s.width, s.height, s.band_rows) else {
+        return refuse(sys, b"refresh_mhz is outside what the sync divider reaches");
+    };
+    if u64::from(t.pclk_hz) > u64::from(s.pclk_max_khz) * 1000
+        || t.pclk_hz > sys_hz / DATA_CYCLES_PER_PIXEL
+    {
+        Line::new(b"[st7701s] refusing to construct: refresh_mhz ")
+            .number(s.refresh_mhz)
+            .text(b" needs a pixel clock of ")
+            .number(t.pclk_hz / 1000)
+            .text(b" kHz, above pclk_max_khz ")
+            .number(s.pclk_max_khz)
+            .text(b" or an eighth of the system clock ")
+            .number(sys_hz / DATA_CYCLES_PER_PIXEL / 1000)
+            .text(b" kHz")
+            .send(sys, 1);
+        return abi::errno::EINVAL;
+    }
+    s.divider_256 = t.divider_256;
+    s.achieved_mhz = t.achieved_mhz;
+    s.band_us = t.band_us;
+
+    // The byte strings RES_REF records resolve against: each `pack` param
+    // names a program of this instance, read where the node image holds it.
+    let mut held = 0usize;
+    for i in 0..PACKS {
+        let len = usize::from(s.pack_lens[i]);
+        if len == 0 {
+            continue;
         }
-        // Compute runtime geometry from params (must be done after parse_tlv).
-        s.line_words = s.width >> 1;
-        s.line_bytes = s.line_words << 2;
-        // DMA is 16-bit (SIZE_HALFWORD) transfers — count is in pixels, not u32 words.
-        s.stripe_pixels = (s.width as u32) * (STRIPE_LINES as u32);
-        s.stripe_count = match s.height {
-            240 => 4,
-            360 => 6,
-            _ => 8, // 480 and any other value
+        let param = s.pack_params[i];
+        let Ok(Asset::InPlace(bytes)) = asset::open(sys, &param[..len]) else {
+            return refuse(
+                sys,
+                b"a `pack` param must name an asset the node image keeps readable in place",
+            );
         };
-        // Build row_lookup: maps each display line to its source cache slot.
-        // Must be called after params so src_rows and height are final.
-        compute_row_lookup(s.row_lookup.as_mut_ptr(), s.src_rows, s.height);
+        core::ptr::write(
+            (&raw mut s.held).cast::<Held<'static>>().add(held),
+            Held::new(bytes),
+        );
+        held += 1;
     }
 
-    s.in_chan = in_chan;
-    s.timer_fd = -1;
-    s.cs_handle = -1;
-    s.sck_handle = -1;
-    s.sda_handle = -1;
-    s.rst_handle = -1;
-    s.bl_handle = -1;
-    s.phase = Phase::InitSeq;
-    s.init_cmd_idx = 0;
-    s.dma_fd = -1;
-    s.current_stripe = 0;
-    s.back_is_b = 0;
-    s.sync_hsync_mask = 0;
-    s.sync_vsync_mask = 0;
-    s.data_de_mask = 0;
-    s.data_rgb_mask = 0;
+    // One block from the heap: the read buffer, two retained frames, the
+    // resource arena, the scratch band, the ring, and two buffers for
+    // `surface0`.
+    let scratch_bytes = usize::from(s.band_rows) * usize::from(s.width) * BAND_BPP;
+    let ring_bytes = s.slot_bytes as usize * slots as usize;
+    let parts = [
+        s.record_bytes as usize,
+        s.frame_bytes as usize,
+        s.frame_bytes as usize,
+        s.resource_bytes as usize,
+        scratch_bytes,
+        ring_bytes,
+        s.surface_bytes as usize,
+        s.surface_bytes as usize,
+    ];
+    let mut total = 0usize;
+    for part in parts {
+        total = total.saturating_add(aligned(part));
+    }
+    let Ok(total32) = u32::try_from(total) else {
+        return abi::errno::ENOMEM;
+    };
+    let block = (sys.heap_alloc)(total32);
+    if block.is_null() {
+        Line::new(b"[st7701s] refusing to construct: the heap cannot hold the ")
+            .number(total32)
+            .text(b" bytes the params size (heap.arena_bytes below what heap_per_param sizes)")
+            .send(sys, 1);
+        return abi::errno::ENOMEM;
+    }
+    core::ptr::write_bytes(block, 0, total);
+    let mut at = 0usize;
+    let mut carve = |len: usize| {
+        let p = block.add(at);
+        at += aligned(len);
+        p
+    };
+    let carry = carve(parts[0]);
+    let frame_a = carve(parts[1]);
+    let frame_b = carve(parts[2]);
+    let arena = carve(parts[3]);
+    s.scratch = carve(parts[4]);
+    s.scratch_bytes = scratch_bytes;
+    s.ring = carve(parts[5]);
+    let surface_chan = dev_channel_port(sys, 0, 1);
+    let cap = s.surface_bytes as usize;
+    let buffers = if cap == 0 {
+        [core::ptr::null_mut(); 2]
+    } else {
+        [carve(cap), carve(cap)]
+    };
+    core::ptr::write(
+        &raw mut s.surface,
+        Some(Input::new(surface_chan, buffers, cap)),
+    );
 
-    unsafe {
-        let sys = &*s.syscalls;
+    let limits = vd::Limits {
+        ops: vd::OPS_ALL,
+        pixmap_formats: (1 << vd::PIXMAP_RGBA8) | (1 << vd::PIXMAP_RGB565),
+        glyph_formats: (1 << vd::GLYPH_A1) | (1 << vd::GLYPH_A8),
+        max_width: s.width,
+        max_height: s.height,
+        max_depth: MAX_DEPTH as u8,
+        max_resources: MAX_RESOURCES as u16,
+        resource_bytes: s.resource_bytes,
+        frame_bytes: s.frame_bytes,
+        band_rows: 0,
+        damage_full: true,
+        surfaces: 1,
+    };
+    // SAFETY: each slice is a distinct part of this instance's state or
+    // heap block, both of which live, unmoved, as long as the instance; the
+    // state was zeroed above, and each table is filled before it is read.
+    let sequence = vd::Sequence::new(limits, &mut (*me).resources, &mut (*me).saves);
+    let store = Store::new(
+        &mut (*me).store_slots,
+        core::slice::from_raw_parts_mut(arena, parts[3]),
+        core::slice::from_raw_parts_mut((&raw mut s.held).cast::<Held<'static>>(), held),
+    );
+    core::ptr::write(
+        &raw mut s.ingest,
+        Some(Ingest::new(
+            sequence,
+            store,
+            core::slice::from_raw_parts_mut(carry, parts[0]),
+            [
+                core::slice::from_raw_parts_mut(frame_a, parts[1]),
+                core::slice::from_raw_parts_mut(frame_b, parts[2]),
+            ],
+            Index::new(&mut (*me).index),
+        )),
+    );
+    core::ptr::write(
+        &raw mut s.painter,
+        Some(Painter::new(&mut (*me).stack, &mut (*me).clips)),
+    );
+    if s.draw < 0 {
+        write_own_frame(s);
+    }
 
-        s.timer_fd = (sys.provider_open)(
-            TIMER_CONTRACT,
-            abi::registry::timer::CREATE,
-            core::ptr::null_mut(),
-            0,
-        );
-        if s.timer_fd < 0 {
-            return -12;
-        }
-
-        // BL pin still needs GPIO claim (stays as SIO output after SPI init)
-        s.bl_handle = claim_gpio_output(sys, s.bl_pin);
+    // The panel: reset, registers, SLEEP_OUT.
+    s.timer_fd = (sys.provider_open)(
+        abi::registry::timer::ID as u32,
+        abi::registry::timer::CREATE,
+        core::ptr::null_mut(),
+        0,
+    );
+    if s.timer_fd < 0 {
+        return s.timer_fd;
+    }
+    if s.bl_pin != NO_PIN {
+        s.bl_handle = gpio_output(sys, s.bl_pin);
         if s.bl_handle < 0 {
             return s.bl_handle;
         }
-        gpio_set(sys, s.bl_handle, 1); // BL off (active-low)
-
-        // Kernel-level reset: configures SIO pins + RST high→low→high (~240ms blocking)
-        spi9_reset(s);
-
-        // SPI init: send all register commands via kernel raw PAC GPIO
-        let mut idx = 0usize;
-        while idx < init_seq::INIT_SEQ_LEN {
-            let cmd_ptr = init_seq::INIT_SEQ.as_ptr().add(idx);
-            spi9_send_init_cmd(s, &*cmd_ptr);
-            idx += 1;
-        }
-
-        // SDIR: source scan direction (panel-dependent, configurable via mirror_x param)
-        if s.mirror_x != 0 {
-            spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x10]); // CMD2 Bank 0
-            spi9_send(s, 0xC7, &[0x04]); // SDIR: mirror source
-            spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x00]); // back to CMD1
-        }
-
-        // SLEEP_OUT + 120ms delay (CS stays LOW during delay, matching vendor BSP)
-        spi9_send_hold(s, init_seq::CMD_SLEEP_OUT, &[]);
-        timer_set(sys, s.timer_fd, 120);
+        // The backlight is active low: dark until the scan runs.
+        gpio_set(sys, s.bl_handle, 1);
     }
-
+    spi9_reset(s);
+    for i in 0..init_seq::INIT_SEQ_LEN {
+        // SAFETY: `i` is inside the table.
+        let cmd = &*init_seq::INIT_SEQ.as_ptr().add(i);
+        spi9_send(s, cmd.cmd, &cmd.data[..usize::from(cmd.len)], false);
+    }
+    if s.mirror_x != 0 {
+        // Command bank 0, source scan direction reversed, command bank off.
+        spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x10], false);
+        spi9_send(s, 0xC7, &[0x04], false);
+        spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x00], false);
+    }
+    spi9_send(s, init_seq::CMD_SLEEP_OUT, &[], true);
+    timer_set(sys, s.timer_fd, 120);
+    s.phase = Phase::SleepOut;
     0
 }
 
-#[no_mangle]
-#[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
-    let s = unsafe { &mut *(state as *mut St7701sState) };
-    let sys = unsafe { &*s.syscalls };
-
-    match s.phase {
-        Phase::InitSeq => {
-            // SLEEP_OUT timer (set in module_new after SPI init)
-            if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return StepReturn::Continue;
-            }
-            unsafe {
-                // Raise CS from SLEEP_OUT hold, then send DISPLAY_ON with CS hold
-                spi9_cs_set(s, 1);
-                // DISPLAY_ON + 120ms delay (CS stays LOW during delay)
-                spi9_send_hold(s, init_seq::CMD_DISPLAY_ON, &[]);
-                timer_set(sys, s.timer_fd, 120);
-            }
-            s.phase = Phase::SleepOut;
-            StepReturn::Continue
+/// The frame drawn when `draw` is not wired: `surface0`, whole, scaled to
+/// the panel. A source reaching past the surface is cut to it, so the
+/// largest source there is names whatever the surface's extent turns out
+/// to be.
+fn write_own_frame(s: &mut State) {
+    let panel = vd::PRect {
+        x: 0,
+        y: 0,
+        w: s.width,
+        h: s.height,
+    };
+    let records = [
+        vd::Record::Frame {
+            generation: 0,
+            revision: 1,
+            damage: panel,
+        },
+        vd::Record::Surface {
+            input: 0,
+            filter: vd::FILTER_NEAREST,
+            src: vd::PRect {
+                x: 0,
+                y: 0,
+                w: u16::MAX,
+                h: u16::MAX,
+            },
+            dst: vd::Rect {
+                x: 0,
+                y: 0,
+                w: i32::from(s.width) * vd::FX_ONE,
+                h: i32::from(s.height) * vd::FX_ONE,
+            },
+        },
+        vd::Record::Commit { revision: 1 },
+    ];
+    let mut len = 0usize;
+    for record in &records {
+        let Some(room) = s.own_frame.get_mut(len..) else {
+            break;
+        };
+        if let Some(n) = vd::write(room, record) {
+            len += n;
         }
-
-        Phase::SleepOut => {
-            // DISPLAY_ON timer
-            if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return StepReturn::Continue;
-            }
-            unsafe {
-                spi9_cs_set(s, 1); // Raise CS from DISPLAY_ON hold
-                dev_log(sys, 3, b"[lcd] display on".as_ptr(), 16);
-            }
-            s.phase = Phase::AllocDmaFd;
-            StepReturn::Burst
-        }
-
-        Phase::AllocDmaFd => {
-            let fd = unsafe { dma_fd_create(sys) };
-            // Both stripes, one span, lent on the fd the transfers run on.
-            let lent = fd >= 0
-                && unsafe {
-                    dev_lend_open(
-                        sys,
-                        fd,
-                        LEND_IN,
-                        STRIPE_LEND,
-                        s.stripe_a.as_mut_ptr() as *mut u8,
-                        STRIPE_BUF_WORDS * 8,
-                    )
-                } >= 0;
-            if !lent {
-                let fd = if fd < 0 { fd } else { -12 };
-                unsafe {
-                    dev_log(sys, 1, b"[lcd] DMA FD alloc fail".as_ptr(), 23);
-                }
-                s.phase = Phase::Error;
-                return StepReturn::error(fd);
-            }
-            s.dma_fd = fd;
-            s.phase = Phase::ConfigurePioSync;
-            StepReturn::Burst
-        }
-
-        Phase::ConfigurePioSync => {
-            let pio = s.pio_sync;
-            const GPIO_BASE: u8 = 16;
-            let pio_hsync = s.hsync_pin - GPIO_BASE;
-            let pio_vsync = s.vsync_pin - GPIO_BASE;
-            // PCLK is sideset bit1 of hsync SM, base at hsync_pin
-            // So sideset_base = hsync_pin (PIO-relative), which covers hsync(bit0) and pclk(bit1)
-            // This requires pclk_pin = hsync_pin + 1 (which is 22+1=23, correct)
-
-            unsafe {
-                // Set GPIOBASE=16
-                pio_gpiobase(sys, pio, 1);
-
-                // Disable all SMs on this PIO
-                pio_sm_enable(sys, pio, 0x0F, 0);
-
-                // Load hsync program → SM0
-                let origin = load_program(
-                    sys,
-                    pio,
-                    &pio_programs::HSYNC_PROGRAM,
-                    &mut s.sync_hsync_mask,
-                );
-                if origin < 0 {
-                    dev_log(sys, 1, b"[lcd] hsync load fail".as_ptr(), 21);
-                    s.phase = Phase::Error;
-                    return StepReturn::error(origin);
-                }
-                s.hsync_origin = origin as u8;
-
-                // Load vsync program → SM1
-                let origin = load_program(
-                    sys,
-                    pio,
-                    &pio_programs::VSYNC_PROGRAM,
-                    &mut s.sync_vsync_mask,
-                );
-                if origin < 0 {
-                    dev_log(sys, 1, b"[lcd] vsync load fail".as_ptr(), 21);
-                    s.phase = Phase::Error;
-                    return StepReturn::error(origin);
-                }
-                s.vsync_origin = origin as u8;
-
-                // Configure SM0 (hsync): sideset 2 opt (PCLK+HSYNC)
-                let h_wrap_bot = s.hsync_origin + pio_programs::HSYNC_WRAP_TARGET;
-                let h_wrap_top = s.hsync_origin + pio_programs::HSYNC_WRAP;
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_EXECCTRL,
-                    build_execctrl(
-                        h_wrap_bot,
-                        h_wrap_top,
-                        pio_programs::HSYNC_SIDESET_OPT,
-                        false,
-                    ),
-                );
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0),
-                );
-                // sideset_count=3 for 2-bit opt sideset (2 value + 1 enable)
-                // sideset_base = hsync pin (PIO-relative), pclk = hsync+1
-
-                // HSYNC SM clock divider: sys_clk / (pclk_freq * 2)
-                // 240MHz / (16MHz * 2) = 7.5 → Q16.16 = 0x0007_8000
-                let hsync_clkdiv: u32 = 0x0007_8000;
-
-                pio_sm_write_reg(sys, pio, 0, REG_CLKDIV, hsync_clkdiv);
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_SHIFTCTRL,
-                    build_shiftctrl(ShiftCtrl {
-                        fjoin_tx: true,
-                        ..ShiftCtrl::RESET
-                    }),
-                );
-                // fjoin_tx=true for 8-deep TX FIFO
-
-                // Configure SM1 (vsync): sideset 1 opt (VSYNC)
-                let v_wrap_bot = s.vsync_origin + pio_programs::VSYNC_WRAP_TARGET;
-                let v_wrap_top = s.vsync_origin + pio_programs::VSYNC_WRAP;
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_EXECCTRL,
-                    build_execctrl(
-                        v_wrap_bot,
-                        v_wrap_top,
-                        pio_programs::VSYNC_SIDESET_OPT,
-                        false,
-                    ),
-                );
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0),
-                );
-                // sideset_count=2 for 1-bit opt sideset (1 value + 1 enable)
-                // VSYNC SM runs at full sysclk (div 1.0)
-                pio_sm_write_reg(sys, pio, 1, REG_CLKDIV, 1 << 16);
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_SHIFTCTRL,
-                    build_shiftctrl(ShiftCtrl {
-                        fjoin_tx: true,
-                        ..ShiftCtrl::RESET
-                    }),
-                );
-
-                // Setup pin funcsel for PIO
-                pio_pin_setup(sys, s.hsync_pin, pio, 0); // pull=none
-                pio_pin_setup(sys, s.pclk_pin, pio, 0);
-                pio_pin_setup(sys, s.vsync_pin, pio, 0);
-
-                // Set sideset pins as outputs via SET PINDIRS
-                // HSYNC SM0: 2 sideset pins (hsync, pclk)
-                let _set_pindirs_2 = 0xE082u16; // set pindirs, 2 (binary: 00010)...
-                                                // Actually: set pindirs, 0b11 = set pindirs, 3 — but set only has 5 bits for data.
-                                                // We need SET PINDIRS, with count matching sideset_count-1 pins.
-                                                // Better approach: temporarily set SET_BASE and SET_COUNT to the sideset pins.
-                                                // Then execute SET PINDIRS, <mask>.
-                                                // For hsync SM: sideset pins are hsync_pin and hsync_pin+1 (pclk).
-                                                // set_base = pio_hsync, set_count = 2, then SET PINDIRS, 0b11 (=3)
-                                                // First save and restore pinctrl.
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_hsync, 2, pio_hsync, 3, 0),
-                );
-                pio_sm_exec(sys, pio, 0, 0xE083); // set pindirs, 3 (both bits = output)
-
-                // Restore SM0 pinctrl for normal operation
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0),
-                );
-
-                // VSYNC SM1: 1 sideset pin
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_vsync, 1, pio_vsync, 2, 0),
-                );
-                pio_sm_exec(sys, pio, 1, 0xE081); // set pindirs, 1
-
-                // Restore SM1 pinctrl
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0),
-                );
-
-                // Push initial values to TX FIFOs
-                // HSYNC SM0 gets width-1 (stored in Y via bootstrap)
-                pio_txf_write(sys, pio, 0, (s.width - 1) as u32);
-                // VSYNC SM1 gets height-1 (stored in OSR via bootstrap)
-                pio_txf_write(sys, pio, 1, (s.height - 1) as u32);
-
-                // JMP SM0 to hsync origin, SM1 to vsync origin
-                pio_sm_exec(sys, pio, 0, s.hsync_origin as u16); // JMP hsync_origin
-                pio_sm_exec(sys, pio, 1, s.vsync_origin as u16); // JMP vsync_origin
-            }
-
-            s.phase = Phase::ConfigurePioData;
-            StepReturn::Burst
-        }
-
-        Phase::ConfigurePioData => {
-            let pio = s.pio_data;
-            const GPIO_BASE: u8 = 16;
-            let pio_de = s.de_pin - GPIO_BASE;
-            let pio_data0 = s.data0_pin - GPIO_BASE;
-
-            unsafe {
-                // Set GPIOBASE=16
-                pio_gpiobase(sys, pio, 1);
-
-                // Disable all SMs
-                pio_sm_enable(sys, pio, 0x0F, 0);
-
-                // Load rgb_de program → SM0
-                let origin =
-                    load_program(sys, pio, &pio_programs::RGB_DE_PROGRAM, &mut s.data_de_mask);
-                if origin < 0 {
-                    dev_log(sys, 1, b"[lcd] rgb_de load fail".as_ptr(), 22);
-                    s.phase = Phase::Error;
-                    return StepReturn::error(origin);
-                }
-                s.de_origin = origin as u8;
-
-                // Load rgb program → SM1
-                let origin =
-                    load_program(sys, pio, &pio_programs::RGB_PROGRAM, &mut s.data_rgb_mask);
-                if origin < 0 {
-                    dev_log(sys, 1, b"[lcd] rgb load fail".as_ptr(), 19);
-                    s.phase = Phase::Error;
-                    return StepReturn::error(origin);
-                }
-                s.rgb_origin = origin as u8;
-
-                // Configure SM0 (rgb_de): sideset 1 opt (DE)
-                let de_wrap_bot = s.de_origin + pio_programs::RGB_DE_WRAP_TARGET;
-                let de_wrap_top = s.de_origin + pio_programs::RGB_DE_WRAP;
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_EXECCTRL,
-                    build_execctrl(
-                        de_wrap_bot,
-                        de_wrap_top,
-                        pio_programs::RGB_DE_SIDESET_OPT,
-                        false,
-                    ),
-                );
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0),
-                );
-                // sideset_count=2 for 1-bit opt (1 value + 1 enable), in_base=0 (wait pin N = PIO pin N)
-                pio_sm_write_reg(sys, pio, 0, REG_CLKDIV, 1 << 16); // full speed
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_SHIFTCTRL,
-                    build_shiftctrl(ShiftCtrl {
-                        fjoin_tx: true,
-                        ..ShiftCtrl::RESET
-                    }),
-                );
-
-                // Configure SM1 (rgb): no sideset, OUT 16 pins
-                let rgb_wrap_bot = s.rgb_origin + pio_programs::RGB_WRAP_TARGET;
-                let rgb_wrap_top = s.rgb_origin + pio_programs::RGB_WRAP;
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_EXECCTRL,
-                    build_execctrl(rgb_wrap_bot, rgb_wrap_top, false, false),
-                );
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_PINCTRL,
-                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0),
-                );
-                // out_base=data0, out_count=16, in_base=0 (wait pin N = PIO pin N)
-                pio_sm_write_reg(sys, pio, 1, REG_CLKDIV, 1 << 16); // full speed
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_SHIFTCTRL,
-                    build_shiftctrl(ShiftCtrl {
-                        fjoin_tx: true,
-                        ..ShiftCtrl::RESET
-                    }),
-                );
-                // autopull=false, pull_thresh=0(default), out_shiftdir=LEFT/MSB(vendor default), fjoin_tx=true
-
-                // Setup data pins for PIO
-                let mut i = 0u8;
-                while i < 16 {
-                    pio_pin_setup(sys, s.data0_pin + i, pio, 2); // pull-up
-                    i += 1;
-                }
-                // DE pin
-                pio_pin_setup(sys, s.de_pin, pio, 0);
-
-                // Set data pins as outputs via SM1 SET PINDIRS (5 pins at a time max)
-                // Save pinctrl, set SET_BASE/COUNT, exec SET PINDIRS, restore
-                let mut pin = pio_data0;
-                let mut remaining: u8 = 16;
-                while remaining > 0 {
-                    let count = if remaining > 5 { 5 } else { remaining };
-                    let mask = (1u8 << count) - 1;
-                    pio_sm_write_reg(
-                        sys,
-                        pio,
-                        1,
-                        REG_PINCTRL,
-                        build_pinctrl(pio_data0, 16, pin, count, 0, 0, pio_de),
-                    );
-                    pio_sm_exec(sys, pio, 1, 0xE080 | mask as u16); // set pindirs, mask
-                    pin += count;
-                    remaining -= count;
-                }
-
-                // Set DE pin as output via SM0
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_de, 1, pio_de, 2, pio_de),
-                );
-                pio_sm_exec(sys, pio, 0, 0xE081); // set pindirs, 1
-
-                // Restore pinctrl for both SMs
-                // in_base=0 so `wait N pin M` maps directly to PIO-relative pin M
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    0,
-                    REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0),
-                );
-                pio_sm_write_reg(
-                    sys,
-                    pio,
-                    1,
-                    REG_PINCTRL,
-                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0),
-                );
-
-                // Push initial values
-                // rgb_de SM0 gets height-1
-                pio_txf_write(sys, pio, 0, (s.height - 1) as u32);
-                // rgb SM1 gets width-1
-                pio_txf_write(sys, pio, 1, (s.width - 1) as u32);
-
-                // JMP to program origins
-                pio_sm_exec(sys, pio, 0, s.de_origin as u16);
-                pio_sm_exec(sys, pio, 1, s.rgb_origin as u16);
-            }
-
-            s.phase = Phase::StartSMs;
-            StepReturn::Burst
-        }
-
-        Phase::StartSMs => {
-            if s.in_chan >= 0 {
-                // Channel mode: defer PIO + DMA until first frame is cached.
-                // Loading phase reads src_rows lines directly into line_cache.
-                // PIO SMs start only after the first cache is fully populated.
-                s.frame_loaded = 0;
-                s.back_is_b = 0;
-                s.load_row = 0;
-                s.load_row_off = 0;
-                s.load_cache_off = 0;
-                s.current_stripe = 0;
-                s.has_line_cache = 0;
-                s.active_cache_b = 0;
-                s.is_loading = 0;
-                s.back_ready = 0;
-                unsafe {
-                    dev_log(sys, 3, b"[lcd] loading from channel".as_ptr(), 26);
-                }
-                s.phase = Phase::Loading;
-                return StepReturn::Burst;
-            }
-
-            // Test pattern mode: start PIO + DMA immediately.
-            // Descending DMA order (stripe_count-1 → 0): last transfer = stripe 0 = display top.
-            let sc = s.stripe_count;
-            unsafe {
-                pio_sm_restart(sys, s.pio_data, 0x03);
-                pio_sm_exec(sys, s.pio_data, 0, s.de_origin as u16);
-                pio_sm_exec(sys, s.pio_data, 1, s.rgb_origin as u16);
-                pio_sm_enable(sys, s.pio_data, 0x03, 1);
-
-                pio_sm_restart(sys, s.pio_sync, 0x03);
-                pio_sm_exec(sys, s.pio_sync, 0, s.hsync_origin as u16);
-                pio_sm_exec(sys, s.pio_sync, 1, s.vsync_origin as u16);
-                pio_sm_enable(sys, s.pio_sync, 0x03, 1);
-
-                gpio_set(sys, s.bl_handle, 0);
-                s.frame_loaded = 1;
-
-                fill_vertical_stripes(s.stripe_a.as_mut_ptr(), s.width, sc - 1);
-                fill_vertical_stripes(s.stripe_b.as_mut_ptr(), s.width, sc - 2);
-            }
-
-            let dreq = (s.pio_data * 8) + 1;
-
-            let rc = unsafe { dma_fd_start(sys, s.dma_fd, 0, s.stripe_pixels, dreq) };
-            if rc < 0 {
-                unsafe {
-                    dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
-                }
-                s.phase = Phase::Error;
-                return StepReturn::error(rc);
-            }
-
-            let rc =
-                unsafe { dma_fd_queue(sys, s.dma_fd, St7701sState::STRIPE_B, s.stripe_pixels) };
-            if rc < 0 {
-                unsafe {
-                    dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
-                }
-                s.phase = Phase::Error;
-                return StepReturn::error(rc);
-            }
-
-            s.back_is_b = 0;
-            s.current_stripe = sc - 3; // stripe_count-1 and stripe_count-2 already queued
-            s.phase = Phase::DmaWait;
-            StepReturn::Continue
-        }
-
-        Phase::Loading => {
-            // First-frame load: read src_rows lines directly into line_cache.
-            // Each line is line_bytes bytes (= width * 2). img_decode must be
-            // configured with height == src_rows so it emits exactly src_rows lines.
-            // After all rows are cached, fill stripe_a/b and start PIO+DMA.
-            let lb = s.line_bytes as usize;
-            let src_rows = s.src_rows as usize;
-            let dst_base = s.line_cache.as_mut_ptr() as *mut u8;
-
-            while (s.load_row as usize) < src_rows {
-                let remaining = lb - s.load_row_off as usize;
-                let chan_poll = unsafe { (sys.channel_poll)(s.in_chan, POLL_IN) };
-                if chan_poll & (POLL_IN as i32) == 0 {
-                    return StepReturn::Continue; // yield — wait for more data
-                }
-                let dst = unsafe { dst_base.add(s.load_cache_off as usize) };
-                let read = unsafe { (sys.channel_read)(s.in_chan, dst, remaining) };
-                if read <= 0 {
-                    return StepReturn::Continue;
-                }
-                let r = read as u16;
-                s.load_row_off += r;
-                s.load_cache_off += r as u32;
-                if s.load_row_off >= s.line_bytes {
-                    s.load_row += 1;
-                    s.load_row_off = 0;
-                }
-            }
-
-            // All src_rows cached. Reset load state for background loads.
-            s.load_row = 0;
-            s.load_row_off = 0;
-            s.load_cache_off = 0;
-            s.has_line_cache = 1;
-            s.active_cache_b = 0; // display from line_cache (front)
-
-            let sc = s.stripe_count;
-            let lw = s.line_words as usize;
-
-            // Populate stripe_a (stripe sc-1) and stripe_b (stripe sc-2) from cache.
-            // DMA sends them first; descending order means sc-1 → 0, so stripe 0 is last = top.
-            unsafe {
-                fill_stripe_from_row_cache(
-                    s.stripe_a.as_mut_ptr(),
-                    s.row_lookup.as_ptr(),
-                    s.line_cache.as_ptr(),
-                    sc - 1,
-                    lw,
-                );
-                fill_stripe_from_row_cache(
-                    s.stripe_b.as_mut_ptr(),
-                    s.row_lookup.as_ptr(),
-                    s.line_cache.as_ptr(),
-                    sc - 2,
-                    lw,
-                );
-            }
-
-            // Start all 4 PIO SMs with bootstrap values pushed into TX FIFOs.
-            unsafe {
-                pio_sm_enable(sys, s.pio_data, 0x03, 0);
-                pio_sm_enable(sys, s.pio_sync, 0x03, 0);
-                pio_sm_restart(sys, s.pio_data, 0x03);
-                pio_sm_restart(sys, s.pio_sync, 0x03);
-
-                pio_txf_write(sys, s.pio_data, 0, (s.height - 1) as u32);
-                pio_txf_write(sys, s.pio_data, 1, (s.width - 1) as u32);
-                pio_txf_write(sys, s.pio_sync, 0, (s.width - 1) as u32);
-                pio_txf_write(sys, s.pio_sync, 1, (s.height - 1) as u32);
-
-                pio_sm_exec(sys, s.pio_data, 0, s.de_origin as u16);
-                pio_sm_exec(sys, s.pio_data, 1, s.rgb_origin as u16);
-                pio_sm_exec(sys, s.pio_sync, 0, s.hsync_origin as u16);
-                pio_sm_exec(sys, s.pio_sync, 1, s.vsync_origin as u16);
-
-                pio_sm_enable(sys, s.pio_data, 0x03, 1);
-                pio_sm_enable(sys, s.pio_sync, 0x03, 1);
-            }
-
-            // Start DMA chain: stripe_a first, stripe_b queued.
-            let dreq = (s.pio_data * 8) + 1;
-
-            let rc = unsafe { dma_fd_start(sys, s.dma_fd, 0, s.stripe_pixels, dreq) };
-            if rc < 0 {
-                unsafe {
-                    dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
-                }
-                s.phase = Phase::Error;
-                return StepReturn::error(rc);
-            }
-            let rc =
-                unsafe { dma_fd_queue(sys, s.dma_fd, St7701sState::STRIPE_B, s.stripe_pixels) };
-            if rc < 0 {
-                unsafe {
-                    dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
-                }
-                s.phase = Phase::Error;
-                return StepReturn::error(rc);
-            }
-
-            if s.frame_loaded == 0 {
-                s.frame_loaded = 1;
-                unsafe {
-                    gpio_set(sys, s.bl_handle, 0);
-                }
-            }
-            s.current_stripe = sc - 3; // sc-1 and sc-2 already queued; next fill is sc-3
-            s.back_is_b = 0;
-            unsafe {
-                dev_log(sys, 3, b"[lcd] cached, go".as_ptr(), 16);
-            }
-            s.phase = Phase::DmaWait;
-            StepReturn::Continue
-        }
-
-        Phase::DmaWait => {
-            // ── Step 1: DMA ping-pong ────────────────────────────────────────
-            let poll = unsafe { dev_fd_poll(sys, s.dma_fd, POLL_IN) };
-            if poll & (POLL_IN as i32) != 0 {
-                let lw = s.line_words as usize;
-
-                // Select the display cache (front). No PIO restart on frame switch —
-                // the swap below is atomic at the frame boundary.
-                let cache_ptr = if s.active_cache_b != 0 {
-                    s.line_cache_back.as_ptr()
-                } else {
-                    s.line_cache.as_ptr()
-                };
-
-                if s.has_line_cache != 0 {
-                    unsafe {
-                        fill_stripe_from_row_cache(
-                            s.back_buf_ptr(),
-                            s.row_lookup.as_ptr(),
-                            cache_ptr,
-                            s.current_stripe,
-                            lw,
-                        );
-                    }
-                } else {
-                    unsafe {
-                        fill_vertical_stripes(s.back_buf_ptr(), s.width, s.current_stripe);
-                    }
-                }
-
-                let rc =
-                    unsafe { dma_fd_queue(sys, s.dma_fd, s.back_buf_offset(), s.stripe_pixels) };
-                if rc < 0 {
-                    unsafe {
-                        dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
-                    }
-                    s.phase = Phase::Error;
-                    return StepReturn::error(rc);
-                }
-                s.back_is_b ^= 1;
-
-                // Count down; wrap at 0 → stripe_count-1 (frame boundary).
-                if s.current_stripe == 0 {
-                    s.current_stripe = s.stripe_count - 1;
-
-                    // Frame boundary: atomically swap to the newly-loaded back cache.
-                    if s.back_ready != 0 {
-                        s.active_cache_b ^= 1;
-                        s.back_ready = 0;
-                        s.is_loading = 0;
-                    }
-                } else {
-                    s.current_stripe -= 1;
-                }
-            }
-
-            // ── Step 2: Background loading ───────────────────────────────────
-            // Start a new background load as soon as upstream has data and no load is pending.
-            if s.in_chan >= 0 && s.is_loading == 0 && s.back_ready == 0 {
-                let chan_poll = unsafe { (sys.channel_poll)(s.in_chan, POLL_IN) };
-                if chan_poll & (POLL_IN as i32) != 0 {
-                    s.is_loading = 1;
-                    s.load_row = 0;
-                    s.load_row_off = 0;
-                    s.load_cache_off = 0;
-                }
-            }
-
-            if s.is_loading != 0 {
-                let lb = s.line_bytes as usize;
-                let src_rows = s.src_rows as usize;
-                let dst_base = s.line_cache_back.as_mut_ptr() as *mut u8;
-
-                // Drain as much channel data as available into the back cache.
-                loop {
-                    if (s.load_row as usize) >= src_rows {
-                        break;
-                    }
-                    let chan_poll = unsafe { (sys.channel_poll)(s.in_chan, POLL_IN) };
-                    if chan_poll & (POLL_IN as i32) == 0 {
-                        break;
-                    }
-                    let remaining = lb - s.load_row_off as usize;
-                    let dst = unsafe { dst_base.add(s.load_cache_off as usize) };
-                    let read = unsafe { (sys.channel_read)(s.in_chan, dst, remaining) };
-                    if read <= 0 {
-                        break;
-                    }
-                    let r = read as u16;
-                    s.load_row_off += r;
-                    s.load_cache_off += r as u32;
-                    if s.load_row_off >= s.line_bytes {
-                        s.load_row += 1;
-                        s.load_row_off = 0;
-                    }
-                }
-
-                if (s.load_row as usize) >= src_rows {
-                    s.back_ready = 1;
-                    s.is_loading = 0;
-                }
-            }
-
-            StepReturn::Continue
-        }
-
-        _ => StepReturn::error(-1),
     }
+    s.own_frame_len = len;
 }
 
 // ============================================================================
-// Panic handler
+// Starting the scan
 // ============================================================================
 
-// Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
-// module_step_wasm definitions.
+/// Configure the four state machines, start the scan list and release the
+/// sync machines. The kernel's errno when a step fails.
+unsafe fn start(s: &mut State) -> Result<(), i32> {
+    let sys = &*s.syscalls;
+    let (sync, data) = (s.pio_sync, s.pio_data);
+    let rel = |pin: u8| pin - s.gpio_base;
+    let (de, vsync, hsync) = (rel(s.de_pin), rel(s.vsync_pin), rel(s.hsync_pin));
+    let data0 = rel(s.data0_pin);
+    // The data programs wait on input pins 4 to 7 for DE, VSYNC, HSYNC and
+    // PCLK: the input base sits four pins below DE, around the window.
+    let in_base = (de + 32 - 4) % 32;
+
+    // Sync block: machine 0 makes HSYNC and, one pin up, the pixel clock;
+    // machine 1 makes VSYNC, counting machine 0's lines.
+    let mut base = [sync, (s.gpio_base == 16) as u8];
+    pio_call(sys, sync, abi::registry::rp_raw::PIO_GPIOBASE, &mut base);
+    pio_enable(sys, sync, 0x0F, false);
+    let hsync_origin = pio_load(sys, sync, &pio_programs::HSYNC_PROGRAM);
+    let vsync_origin = pio_load(sys, sync, &pio_programs::VSYNC_PROGRAM);
+    if hsync_origin < 0 || vsync_origin < 0 {
+        return Err(hsync_origin.min(vsync_origin));
+    }
+    let (hsync_origin, vsync_origin) = (hsync_origin as u8, vsync_origin as u8);
+    let hsync_pins = Pins {
+        side_base: hsync,
+        side_count: 3,
+        ..Pins::NONE
+    };
+    let vsync_pins = Pins {
+        side_base: vsync,
+        side_count: 2,
+        ..Pins::NONE
+    };
+    pio_machine(
+        sys,
+        sync,
+        0,
+        hsync_origin,
+        (pio_programs::HSYNC_WRAP_TARGET, pio_programs::HSYNC_WRAP),
+        pio_programs::HSYNC_SIDESET_OPT,
+        hsync_pins,
+        s.divider_256 << 8,
+    );
+    pio_machine(
+        sys,
+        sync,
+        1,
+        vsync_origin,
+        (pio_programs::VSYNC_WRAP_TARGET, pio_programs::VSYNC_WRAP),
+        pio_programs::VSYNC_SIDESET_OPT,
+        vsync_pins,
+        CLKDIV_ONE,
+    );
+    pio_pin(sys, s.hsync_pin, sync, 0);
+    pio_pin(sys, s.pclk_pin, sync, 0);
+    pio_pin(sys, s.vsync_pin, sync, 0);
+    pio_outputs(sys, sync, 0, hsync, 2, hsync_pins);
+    pio_outputs(sys, sync, 1, vsync, 1, vsync_pins);
+
+    // Data block: machine 0 makes DE from the sync pins; machine 1 puts a
+    // pixel on the 16 data pins each pixel clock DE is high.
+    let mut base = [data, (s.gpio_base == 16) as u8];
+    pio_call(sys, data, abi::registry::rp_raw::PIO_GPIOBASE, &mut base);
+    pio_enable(sys, data, 0x0F, false);
+    let de_origin = pio_load(sys, data, &pio_programs::RGB_DE_PROGRAM);
+    let rgb_origin = pio_load(sys, data, &pio_programs::RGB_PROGRAM);
+    if de_origin < 0 || rgb_origin < 0 {
+        return Err(de_origin.min(rgb_origin));
+    }
+    let (de_origin, rgb_origin) = (de_origin as u8, rgb_origin as u8);
+    let de_pins = Pins {
+        side_base: de,
+        side_count: 2,
+        in_base,
+        ..Pins::NONE
+    };
+    let rgb_pins = Pins {
+        out_base: data0,
+        out_count: 16,
+        in_base,
+        ..Pins::NONE
+    };
+    pio_machine(
+        sys,
+        data,
+        0,
+        de_origin,
+        (pio_programs::RGB_DE_WRAP_TARGET, pio_programs::RGB_DE_WRAP),
+        pio_programs::RGB_DE_SIDESET_OPT,
+        de_pins,
+        CLKDIV_ONE,
+    );
+    pio_machine(
+        sys,
+        data,
+        1,
+        rgb_origin,
+        (pio_programs::RGB_WRAP_TARGET, pio_programs::RGB_WRAP),
+        false,
+        rgb_pins,
+        CLKDIV_ONE,
+    );
+    for i in 0..16 {
+        pio_pin(sys, s.data0_pin + i, data, 2);
+    }
+    pio_pin(sys, s.de_pin, data, 0);
+    pio_outputs(sys, data, 1, data0, 16, rgb_pins);
+    pio_outputs(sys, data, 0, de, 1, de_pins);
+
+    // Each program begins by pulling one word: the HSYNC and pixel
+    // machines the width less one, the VSYNC and DE machines the height
+    // less one.
+    for (pio, origins) in [
+        (sync, [hsync_origin, vsync_origin]),
+        (data, [de_origin, rgb_origin]),
+    ] {
+        pio_restart(sys, pio, 0x03);
+        pio_exec(sys, pio, 0, u16::from(origins[0]));
+        pio_exec(sys, pio, 1, u16::from(origins[1]));
+    }
+    pio_push(sys, sync, 0, u32::from(s.width) - 1);
+    pio_push(sys, sync, 1, u32::from(s.height) - 1);
+    pio_push(sys, data, 0, u32::from(s.height) - 1);
+    pio_push(sys, data, 1, u32::from(s.width) - 1);
+
+    // The data machines run first and take their words, so the FIFO the
+    // list fills holds pixels only; then the list, every entry fill; then
+    // the sync machines, whose first frame the list is waiting for.
+    pio_enable(sys, data, 0x03, true);
+    let fd = (sys.provider_open)(
+        abi::registry::platform_dma_fd::ID as u32,
+        dma_fd::CREATE,
+        core::ptr::null(),
+        0,
+    );
+    if fd < 0 {
+        return Err(fd);
+    }
+    s.dma_fd = fd;
+    let ring_bytes = s.slot_bytes as usize * usize::from(s.slots);
+    let lent = dev_lend_open(sys, fd, LEND_IN, RING_LEND, s.ring, ring_bytes);
+    if lent < 0 {
+        return Err(lent);
+    }
+    // The pixel machine's TX FIFO: machine 1 of the data block.
+    let dreq = data * 8 + 1;
+    let mut arg = dma_raw::list_start::encode(
+        RING_LEND,
+        s.bands,
+        dreq,
+        dma_raw::flags::SIZE_HALF,
+        u32::from(s.underrun_rgb565),
+        s.slot_bytes / 2,
+    );
+    let rc = (sys.provider_call)(
+        fd,
+        dma_fd::LIST_START,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc < 0 {
+        return Err(rc);
+    }
+    pio_enable(sys, sync, 0x03, true);
+    if s.bl_handle >= 0 {
+        gpio_set(sys, s.bl_handle, 0);
+    }
+
+    s.next = UNARMABLE_AT_START;
+    s.next_entry = UNARMABLE_AT_START as u16;
+    s.first_of_refresh = true;
+    s.status_at_us = dev_micros(sys);
+    Line::new(b"[st7701s] scanning ")
+        .number(u32::from(s.width))
+        .text(b"x")
+        .number(u32::from(s.height))
+        .text(b" refresh_mhz=")
+        .number(s.achieved_mhz)
+        .text(b" divider=")
+        .number(s.divider_256 >> 8)
+        .text(b"+")
+        .number(s.divider_256 & 0xFF)
+        .text(b"/256 bands=")
+        .number(u32::from(s.bands))
+        .text(b" band_us=")
+        .number(s.band_us)
+        .text(b" ring=")
+        .number(u32::from(s.slots))
+        .text(b" gpio_base=")
+        .number(u32::from(s.gpio_base))
+        .send(sys, 3);
+    Ok(())
+}
+
+// ============================================================================
+// Running
+// ============================================================================
+
+/// Read how far the scan has run.
+unsafe fn read_scan(s: &mut State) {
+    let sys = &*s.syscalls;
+    let mut status = [0u8; dma_raw::list_status::LEN];
+    let rc = (sys.provider_call)(
+        s.dma_fd,
+        dma_fd::LIST_STATUS,
+        status.as_mut_ptr(),
+        status.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    let Some((position, underruns)) = (rc >= 0)
+        .then(|| dma_raw::list_status::decode(&status))
+        .flatten()
+    else {
+        return;
+    };
+    let passed = position.wrapping_sub(s.sent);
+    s.sent = position;
+    s.list_underruns = underruns;
+    if !s.past_start && s.sent >= UNARMABLE_AT_START {
+        s.past_start = true;
+    }
+    let bands = u32::from(s.bands);
+    let entry = u32::from(s.sent_entry) + passed % bands.max(1);
+    s.refreshes = s
+        .refreshes
+        .wrapping_add(passed.checked_div(bands).unwrap_or(0))
+        .wrapping_add((entry >= bands) as u32);
+    s.sent_entry = (if entry >= bands { entry - bands } else { entry }) as u16;
+}
+
+/// Bands that went out as fill after a renderer could have armed them: a
+/// wrapping count, as the list's is.
+fn underruns(s: &State) -> u32 {
+    let unarmable = if s.past_start {
+        UNARMABLE_AT_START
+    } else {
+        s.sent.min(UNARMABLE_AT_START).min(s.list_underruns)
+    };
+    s.list_underruns.wrapping_sub(unarmable)
+}
+
+/// Take records from `draw` until the buffered bytes end or a frame
+/// commits.
+unsafe fn read_draw(s: &mut State) {
+    let sys = &*s.syscalls;
+    let Some(ingest) = s.ingest.as_mut() else {
+        return;
+    };
+    // No stream is taken until every held byte string has its digest.
+    if s.draw < 0 || !ingest.prepare(HASH_BYTES_PER_STEP) {
+        return;
+    }
+    let space = ingest.space();
+    if !space.is_empty() {
+        let n = (sys.channel_read)(s.draw, space.as_mut_ptr(), space.len());
+        if n > 0 {
+            ingest.filled(n as usize);
+        }
+    }
+    loop {
+        match ingest.advance() {
+            Event::NeedMore => return,
+            Event::Ended | Event::Opened => {}
+            Event::Faulted { fault, offset } => {
+                Line::new(b"[st7701s] stream refused: ")
+                    .text(raster::fault_text(fault))
+                    .text(b" at byte ")
+                    .number(offset.min(u64::from(u32::MAX)) as u32)
+                    .send(sys, 1);
+            }
+            Event::Committed => {
+                if !s.frame_waiting {
+                    s.frame_waiting = true;
+                    s.committed_at = s.next;
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Move the renderer `count` bands on.
+fn advance(s: &mut State, count: u32) {
+    let bands = u32::from(s.bands).max(1);
+    s.next = s.next.wrapping_add(count);
+    let entry = u32::from(s.next_entry) + count % bands;
+    if entry >= bands || count >= bands {
+        s.first_of_refresh = true;
+    }
+    s.next_entry = (if entry >= bands { entry - bands } else { entry }) as u16;
+    s.band_cost_us = 0;
+}
+
+/// What the first band of a refresh starts with: the mean cost of the
+/// refresh before, the frame that committed, the raster frame that is
+/// ready. A refresh shows one frame.
+unsafe fn begin_refresh(s: &mut State) {
+    if let Some(mean) = s.refresh_cost_us.checked_div(s.refresh_bands) {
+        s.render_us_per_band = mean;
+    }
+    s.refresh_cost_us = 0;
+    s.refresh_bands = 0;
+    if s.frame_waiting {
+        s.frame_waiting = false;
+        if s.next.wrapping_sub(s.committed_at) > u32::from(s.bands) {
+            s.late_frames = s.late_frames.wrapping_add(1);
+        }
+        if let (Some(ingest), Some(painter)) = (s.ingest.as_mut(), s.painter.as_mut()) {
+            ingest.present(painter);
+        }
+    }
+    if let Some(surface) = s.surface.as_mut() {
+        surface.commit();
+    }
+}
+
+/// Draw band `next` into the scratch.
+unsafe fn draw_band(s: &mut State) {
+    let region = vd::PRect {
+        x: 0,
+        y: s.next_entry * s.band_rows,
+        w: s.width,
+        h: s.band_rows,
+    };
+    let own = Index::new(&mut []);
+    let (Some(ingest), Some(painter)) = (s.ingest.as_ref(), s.painter.as_mut()) else {
+        s.black = true;
+        return;
+    };
+    let surfaces = Rasters(s.surface.as_ref());
+    let retained = if s.draw < 0 {
+        // Nothing to show before the surface has a frame.
+        surfaces
+            .surface(0)
+            .and(s.own_frame.get(..s.own_frame_len))
+            .map(|frame| (frame, &own))
+    } else {
+        ingest.frame()
+    };
+    let Some((frame, index)) = retained else {
+        s.black = true;
+        return;
+    };
+    s.black = false;
+    let pixels = core::slice::from_raw_parts_mut(s.scratch, s.scratch_bytes);
+    let Some(mut band) = Band::new(pixels, region) else {
+        s.black = true;
+        return;
+    };
+    // A band the frame's first operation paints whole needs no black
+    // under it.
+    let painted = index
+        .backdrop()
+        .is_some_and(|d| raster::intersect(d, region) == Some(region));
+    if !painted {
+        band.clear();
+    }
+    raster::replay(frame, index, painter, &mut band, ingest.store(), &surfaces);
+}
+
+/// Convert the scratch into ring slot `slot`, or black it.
+unsafe fn fill_slot(s: &mut State, slot: usize) {
+    let bytes = s.slot_bytes as usize;
+    let out = core::slice::from_raw_parts_mut(s.ring.add(slot * bytes), bytes);
+    if s.black {
+        out.fill(0);
+        return;
+    }
+    let region = vd::PRect {
+        x: 0,
+        y: s.next_entry * s.band_rows,
+        w: s.width,
+        h: s.band_rows,
+    };
+    let pixels = core::slice::from_raw_parts_mut(s.scratch, s.scratch_bytes);
+    let Some(band) = Band::new(pixels, region) else {
+        out.fill(0);
+        return;
+    };
+    let row_bytes = usize::from(s.width) * 2;
+    for i in 0..usize::from(s.band_rows) {
+        if let Some(row) = out.get_mut(i * row_bytes..(i + 1) * row_bytes) {
+            band.row_rgb565(i32::from(region.y) + i as i32, row);
+        }
+    }
+}
+
+/// One piece of drawing: whether there may be another to do at once.
+unsafe fn render(s: &mut State) -> Result<bool, i32> {
+    let sys = &*s.syscalls;
+    let ahead = s.next.wrapping_sub(s.sent) as i32;
+    if !s.drawn {
+        if ahead < ARM_LEAD {
+            // The scan has caught the renderer. It does not chase: it
+            // resumes at the first band it can still finish, one past the
+            // nearest it could arm for each band period a band has been
+            // costing.
+            let lead = 1 + s.last_band_us / s.band_us.max(1);
+            let lead = lead.min(u32::from(s.bands)) as i32;
+            advance(s, (ARM_LEAD + lead - ahead) as u32);
+        }
+        if s.first_of_refresh {
+            s.first_of_refresh = false;
+            begin_refresh(s);
+        }
+        let began = dev_micros(sys);
+        draw_band(s);
+        s.band_cost_us = dev_micros(sys).wrapping_sub(began) as u32;
+        s.drawn = true;
+        return Ok(true);
+    }
+    if ahead < ARM_LEAD {
+        // Drawn too late to arm: it goes out as fill.
+        s.last_band_us = s.band_cost_us.max(s.band_us);
+        s.drawn = false;
+        return Ok(true);
+    }
+    let slot = usize::from(s.slot_cursor);
+    let busy =
+        s.slot_armed & (1 << slot) != 0 && (s.sent.wrapping_sub(s.slot_free_at[slot]) as i32) < 0;
+    // Its entry still belongs to the band a refresh earlier until the scan
+    // has sent that one.
+    if busy || ahead >= i32::from(s.bands) {
+        return Ok(false);
+    }
+    let began = dev_micros(sys);
+    fill_slot(s, slot);
+    let mut arg = dma_raw::list_arm::encode(s.next_entry, slot as u32 * s.slot_bytes);
+    let rc = (sys.provider_call)(
+        s.dma_fd,
+        dma_fd::LIST_ARM,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    let cost = s
+        .band_cost_us
+        .wrapping_add(dev_micros(sys).wrapping_sub(began) as u32);
+    if rc >= 0 {
+        s.slot_armed |= 1 << slot;
+        s.slot_free_at[slot] = s.next.wrapping_add(1);
+        s.slot_cursor = if slot + 1 >= usize::from(s.slots) {
+            0
+        } else {
+            slot as u16 + 1
+        };
+    } else if rc != abi::errno::EBUSY {
+        return Err(rc);
+    }
+    // Refused as busy, the scan took the entry while the slot was being
+    // filled: it goes out as fill, and the slot stays free.
+    s.last_band_us = cost;
+    s.refresh_cost_us = s.refresh_cost_us.wrapping_add(cost);
+    s.refresh_bands += 1;
+    s.drawn = false;
+    advance(s, 1);
+    Ok(true)
+}
+
+/// Emit the counters once a second, and the status line every `status_s`.
+unsafe fn report(s: &mut State) {
+    let sys = &*s.syscalls;
+    let now_ms = dev_millis(sys);
+    if now_ms.wrapping_sub(s.metrics_at_ms) >= 1000 {
+        s.metrics_at_ms = now_ms;
+        if dev_telemetry_enabled(sys) {
+            let me = dev_self_index(sys);
+            if me >= 0 {
+                let (me, t) = (me as u16, dev_micros(sys));
+                let counter = abi::contracts::telemetry::METRIC_COUNTER;
+                let level = abi::contracts::telemetry::METRIC_UPDOWN;
+                dev_telemetry_metric(sys, -1, me, t, counter, 0, u64::from(s.refreshes));
+                dev_telemetry_metric(sys, -1, me, t, counter, 1, u64::from(underruns(s)));
+                dev_telemetry_metric(sys, -1, me, t, counter, 2, u64::from(s.late_frames));
+                dev_telemetry_metric(sys, -1, me, t, level, 3, u64::from(s.render_us_per_band));
+                dev_telemetry_metric(sys, -1, me, t, level, 4, u64::from(s.achieved_mhz));
+            }
+        }
+    }
+    if s.status_s == 0 {
+        return;
+    }
+    let now = dev_micros(sys);
+    let elapsed = now.wrapping_sub(s.status_at_us);
+    if elapsed < u64::from(s.status_s) * 1_000_000 {
+        return;
+    }
+    // The rate the scan ran at since the last line, from bands sent.
+    let bands = u64::from(s.sent.wrapping_sub(s.status_sent));
+    let measured = (bands * 1_000_000_000)
+        .checked_div(u64::from(s.bands) * elapsed)
+        .unwrap_or(0);
+    s.status_at_us = now;
+    s.status_sent = s.sent;
+    Line::new(b"[st7701s] measured_mhz=")
+        .number(measured.min(u64::from(u32::MAX)) as u32)
+        .text(b" refreshes=")
+        .number(s.refreshes)
+        .text(b" underruns=")
+        .number(underruns(s))
+        .text(b" late_frames=")
+        .number(s.late_frames)
+        .text(b" render_us_per_band=")
+        .number(s.render_us_per_band)
+        .text(b" band_us=")
+        .number(s.band_us)
+        .send(sys, 3);
+}
+
+unsafe fn fail(s: &mut State, what: &[u8], rc: i32) -> StepReturn {
+    Line::new(b"[st7701s] ")
+        .text(what)
+        .text(b" failed: errno ")
+        .number(rc.unsigned_abs())
+        .send(&*s.syscalls, 1);
+    s.phase = Phase::Failed;
+    StepReturn::error(rc)
+}
+
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_step"]
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
+    let s = &mut *(state as *mut State);
+    let sys = &*s.syscalls;
+    match s.phase {
+        Phase::SleepOut => {
+            if timer_expired(sys, s.timer_fd) {
+                spi9_cs(s, 1);
+                spi9_send(s, init_seq::CMD_DISPLAY_ON, &[], true);
+                timer_set(sys, s.timer_fd, 120);
+                s.phase = Phase::DisplayOn;
+            }
+            StepReturn::Continue
+        }
+        Phase::DisplayOn => {
+            if timer_expired(sys, s.timer_fd) {
+                spi9_cs(s, 1);
+                s.phase = Phase::Start;
+                return StepReturn::Burst;
+            }
+            StepReturn::Continue
+        }
+        Phase::Start => match start(s) {
+            Ok(()) => {
+                s.phase = Phase::Run;
+                StepReturn::Burst
+            }
+            Err(rc) if rc == abi::errno::ENOMEM => fail(
+                s,
+                b"starting the scan (no DMA channel is free, or the kernel's list table has no room for this many bands)",
+                rc,
+            ),
+            Err(rc) => fail(s, b"starting the scan", rc),
+        },
+        Phase::Run => {
+            read_scan(s);
+            if let Some(surface) = s.surface.as_mut() {
+                surface.pump(sys, INPUT_BYTES_PER_STEP);
+            }
+            read_draw(s);
+            let more = match render(s) {
+                Ok(more) => more,
+                Err(rc) => return fail(s, b"arming a band", rc),
+            };
+            report(s);
+            if more {
+                StepReturn::Burst
+            } else {
+                StepReturn::Continue
+            }
+        }
+        Phase::Failed => StepReturn::error(abi::errno::EIO),
+    }
+}
+
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_init"]
+pub extern "C" fn module_init(_syscalls: *const c_void) {}
+
 fluxor_rt::wasm_entry!();

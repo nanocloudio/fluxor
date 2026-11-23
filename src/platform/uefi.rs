@@ -1026,13 +1026,15 @@ fn start_graph() -> Result<usize, &'static str> {
     // SAFETY: this core's timer.
     unsafe { timer::timer_set(period) };
 
+    domains::install(&PLATFORM);
+    fluxor::kernel::sys::counters::install(&COUNTERS);
     let staged = scheduler::prepare_graph().map_err(|_| "prepare_failed")?;
     if let Err(why) = domains::cross::bridge_edges() {
         log::error!("[graph] {why}");
         scheduler::splice::abandon(staged);
         return Err("bridge_failed");
     }
-    let loaded = match domains::instantiate(staged) {
+    let loaded = match domains::instantiate(staged, &PLATFORM) {
         Ok(loaded) => loaded,
         Err(domains::InstantiateError::OwnerPlan(_)) => return Err("owner_plan_invalid"),
         Err(domains::InstantiateError::Refused(_)) => return Err("module_failed"),
@@ -1155,16 +1157,42 @@ impl CpuMeter {
 
 static mut RUNNING: Option<Running> = None;
 
+/// The `counters` contract's source: the generic timer as a system clock.
+/// A virtual machine's performance monitors are its host's to grant, so the
+/// cache counters are absent here.
+static COUNTERS: fluxor::kernel::sys::counters::Source = fluxor::kernel::sys::counters::Source {
+    cycles_clock: fluxor::abi::contracts::counters::CLOCK_SYSTEM,
+    icache_scope: fluxor::abi::contracts::counters::SCOPE_NONE,
+    cycles_hz: fluxor::arch::aarch64::counters::timer_hz,
+    read: fluxor::arch::aarch64::counters::timer_read,
+};
+
 /// What this platform does around the shared domain loop.
 static PLATFORM: domains::Platform = domains::Platform {
-    has_core: smp::online,
+    core_id: fluxor::arch::aarch64::smp::core_id,
+    signal: fluxor::arch::aarch64::smp::signal,
+    wait_event: fluxor::arch::aarch64::smp::wait_event,
+    wait_interrupt: fluxor::arch::aarch64::smp::wait_interrupt,
+    park: fluxor::arch::aarch64::smp::park,
+    counter: fluxor::arch::aarch64::smp::counter,
+    us_to_ticks: fluxor::arch::aarch64::smp::us_to_ticks,
+    interrupts: fluxor::arch::aarch64::smp::interrupts,
+    set_tick: fluxor::arch::aarch64::smp::set_tick,
+    has_core: |domain_id| smp::online(domains::domain_core(domain_id)),
     after_pass,
     after_step,
 };
 
-/// After each pass of domain 0: the boot core's upkeep, and the summary when
-/// it is due.
-fn after_pass(domain_id: usize, _core_id: usize, _mode: fluxor_contracts::boot_config::ExecMode) {
+/// After each pass: every domain's heartbeat and domain 0's pending rebuild;
+/// then, for domain 0, the boot core's upkeep, and the summary when it is
+/// due.
+fn after_pass(
+    domain_id: usize,
+    _core_id: usize,
+    _mode: fluxor_contracts::boot_config::ExecMode,
+    passes: u32,
+) {
+    domains::primary_upkeep(domain_id, passes, &PLATFORM);
     if domain_id != 0 {
         return;
     }

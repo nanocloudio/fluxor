@@ -1,17 +1,24 @@
-//! `wasm_browser_canvas` native module: VideoRaster sink that presents
-//! frames to an HTML `<canvas>` through the host shim's
+//! `wasm_browser_canvas` native module: `VideoRaster` sink that presents
+//! region rasters on an HTML `<canvas>` through the host shim's
 //! `host_canvas_present` import.
 //!
-//! Pixel format is RGB565 little-endian by default. A self-describing
-//! (`header`) frame may declare [`RASTER_RGBA8`] instead, for producers whose
-//! source is already 8 bits per channel — a GPU readback, say. Narrowing
-//! those to RGB565 on the way to a canvas that will widen them again throws
-//! away three bits of red and blue for nothing.
+//! Every record on the input is a region header
+//! (`abi::contracts::video_raster`) and that region's pixels. The header is
+//! read and checked here; the shim is handed plain pixels and a rectangle.
+//! A frame's regions are staged by the shim and shown together at the
+//! frame's last region, so a frame of several regions appears whole. A
+//! damage frame changes only its regions; the rest of the canvas keeps its
+//! picture.
 //!
-//! State is heap-allocated on the module's own heap (with the frame
-//! buffer, 154 KiB at QVGA RGB565). Its arena state holds the
-//! `*mut CanvasState` pointer.
+//! A record the contract refuses is counted and skipped, the frame it
+//! belonged to is abandoned, the canvas keeps what it last showed, and the
+//! stream is scanned forward for the next header of the surface in use.
+//!
+//! The instance lives on the module's own heap with one region buffer sized
+//! for a whole surface of `width` x `height` in the widest format; its
+//! arena state holds the `*mut CanvasState` pointer.
 
+use crate::abi::contracts::video_raster::{self, Frames, Header};
 use crate::abi::platform::native::wasm::wasm_browser_canvas as tags;
 use crate::kernel::exec::scheduler;
 use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
@@ -19,94 +26,95 @@ use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
 extern "C" {
-    /// Present a frame to the host canvas. `ptr`/`len` is in the kernel's
-    /// linear memory; the shim copies the bytes into a `Uint8ClampedArray`
-    /// and blits via Canvas 2D. `format` is one of the `RASTER_*` values.
-    fn host_canvas_present(ptr: *const u8, len: usize, width: u32, height: u32, format: u32);
+    /// Stage one region of a frame, and show the frame when it is complete.
+    /// `ptr`/`len` are the region's pixels in the kernel's linear memory,
+    /// `width` x `height` of them in `format` (a `video_raster::FORMAT_*`
+    /// value), rows top to bottom; `x`, `y` place the region on a surface of
+    /// `surface_w` x `surface_h`. `flags` are `PRESENT_*`.
+    fn host_canvas_present(
+        ptr: *const u8,
+        len: usize,
+        width: u32,
+        height: u32,
+        format: u32,
+        x: u32,
+        y: u32,
+        surface_w: u32,
+        surface_h: u32,
+        flags: u32,
+    );
 }
 
-// The SRF1 `fmt` byte. Mirrored by the `host_canvas_present` shim in
-// `src/platform/wasm/host/host_shims.js`, which is the only other reader:
-// JavaScript cannot include Rust, and the wasm-only build of this file is
-// unreachable from a host test, so the two sides are held together by naming
-// each other rather than by a drift guard.
+/// `host_canvas_present` flag: the region opens a frame; regions the shim
+/// staged for a frame that never completed are dropped.
+const PRESENT_FIRST: u32 = 1;
+/// `host_canvas_present` flag: the region completes its frame; the shim
+/// shows every staged region.
+const PRESENT_LAST: u32 = 2;
 
-/// RGB565, little-endian, two bytes per pixel. The default, and what a frame
-/// carrying no self-describing header is.
-pub(crate) const RASTER_RGB565: u8 = 0;
-/// RGBA8888, four bytes per pixel in R, G, B, A byte order. The alpha byte is
-/// carried and ignored — the canvas is presented opaque — because dropping it
-/// would make the row stride disagree with every producer that already has
-/// its pixels in this shape, a GPU readback among them.
-pub(crate) const RASTER_RGBA8: u8 = 1;
+/// Bytes per pixel of the widest raster format, which sizes the region
+/// buffer: a stream chooses its format per surface.
+const WIDEST_PIXEL: usize = 4;
+const _: () = assert!(matches!(
+    video_raster::bytes_per_pixel(video_raster::FORMAT_RGBA8),
+    Some(WIDEST_PIXEL)
+));
+const _: () = assert!(video_raster::FORMAT_COUNT == 2);
 
-/// Bytes per pixel for a raster format. An unrecognised byte reads as RGB565,
-/// which is what a producer that declares no format emits.
-const fn bytes_per_pixel(format: u8) -> usize {
-    match format {
-        RASTER_RGBA8 => 4,
-        _ => 2,
-    }
-}
-
-// CanvasState's frame buffer is heap-allocated separately (sized
-// to `width * height * 2`) so the State struct stays small. A
-// 1080p RGB565 frame is 4 MiB — far too big to inline, and even
-// a 540p frame (~1 MiB) would push the per-module heap past
-// arena-friendly sizes when more than one canvas instance exists.
-// Self-describing-frame header: `[magic "SRF1"][w:u16 LE][h:u16 LE][fmt:u8][flags:u8]`.
-// Matches sector/modules/common/sector_raster.rs and linux_display's `header` mode.
-const SRF1_MAGIC: &[u8; 4] = b"SRF1";
-const SRF1_HDR_LEN: usize = 10;
+/// Bytes of a header that name its surface: the magic, the surface's extent
+/// and the format. A resynchronising scan looks for these.
+const SURFACE_KEY: usize = video_raster::OFF_FLAGS;
 
 #[repr(C)]
 pub(crate) struct CanvasState {
     pub in_chan: i32,
-    pub width: u16,
-    pub height: u16,
-    pub frames: u32,
-    pub buf_len: u32,
+    /// The largest surface this canvas accepts: its `width` and `height`.
+    pub max_w: u16,
+    pub max_h: u16,
+    /// The frame rules for surfaces up to that extent.
+    pub frames: Frames,
+    /// Header bytes read so far, and how many.
+    pub carry: [u8; video_raster::HEADER],
+    pub carry_len: u8,
+    /// Whether `region` is admitted and its pixels are being read.
+    pub in_region: bool,
+    pub region: Header,
+    /// `PRESENT_*` for the region being read.
+    pub region_flags: u32,
+    /// Pixel bytes of the region read so far.
+    pub got: u32,
+    /// The surface of the last admitted region, as the leading bytes of its
+    /// headers; `surface_known` once one was admitted.
+    pub surface_key: [u8; SURFACE_KEY],
+    pub surface_known: bool,
+    /// Frames shown.
+    pub frames_shown: u32,
+    /// Records refused.
+    pub refused: u32,
     pub buf_cap: u32,
     pub buf_ptr: *mut u8,
-    // When set, each frame is prefixed with an SRF1 header and `width`/`height` are
-    // taken from the STREAM (bounded by `buf_cap`), not the config. `hdr_pos` tracks
-    // how much of the current frame's header has been read.
-    pub header_mode: bool,
-    pub hdr: [u8; SRF1_HDR_LEN],
-    pub hdr_pos: u8,
-    /// The current frame's pixel format, from the SRF1 header's `fmt` byte.
-    /// Without a header there is nothing to declare it, so it stays RGB565.
-    pub format: u8,
 }
 
 /// The per-module heap the constructor seats is its manifest's `HEAP_SEAT`:
-/// the state and slack, and a backing buffer at `width` x `height` sized for
-/// the widest format, because a self-describing stream chooses its format per
-/// frame and a buffer that only fits RGB565 would refuse an RGBA8 frame at
-/// runtime rather than at composition.
+/// the instance, and a region buffer at `width` x `height` in the widest
+/// format, so a stream's choice of format is never refused for room.
 const SEAT: [u32; 6] = crate::abi::platform::native::wasm::wasm_browser_canvas::HEAP_SEAT;
 const _: () = assert!(
-    SEAT[0] as usize >= core::mem::size_of::<CanvasState>() + 256
-        && SEAT[1] as usize == bytes_per_pixel(RASTER_RGBA8),
-    "the declared heap seat holds the state and an RGBA8 frame"
+    SEAT[0] as usize >= super::heap_for::<CanvasState>() + 32 && SEAT[1] as usize == WIDEST_PIXEL,
+    "the declared heap seat holds the instance and a region buffer in the widest format"
 );
 
-/// Allocate a `CanvasState` on the kernel heap and return its raw
-/// pointer. The constructor stashes the pointer in the arena state;
-/// `step` recovers it via pointer-deref.
-unsafe fn alloc_state(
-    in_chan: i32,
-    width: u16,
-    height: u16,
-    header_mode: bool,
-) -> *mut CanvasState {
+/// Allocate a `CanvasState` on the module heap and return its raw pointer.
+/// The constructor stashes the pointer in the arena state; `step` recovers
+/// it by pointer-deref.
+unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut CanvasState {
     let table = syscalls::get_syscall_table();
     let state_size = core::mem::size_of::<CanvasState>() as u32;
     let raw = (table.heap_alloc)(state_size) as *mut CanvasState;
     if raw.is_null() {
         return core::ptr::null_mut();
     }
-    let buf_cap = (width as u32) * (height as u32) * bytes_per_pixel(RASTER_RGBA8) as u32;
+    let buf_cap = (width as u32) * (height as u32) * WIDEST_PIXEL as u32;
     let buf_ptr = (table.heap_alloc)(buf_cap);
     if buf_ptr.is_null() {
         return core::ptr::null_mut();
@@ -115,24 +123,67 @@ unsafe fn alloc_state(
         raw,
         CanvasState {
             in_chan,
-            width,
-            height,
-            frames: 0,
-            buf_len: 0,
+            max_w: width,
+            max_h: height,
+            frames: Frames::new(width, height),
+            carry: [0u8; video_raster::HEADER],
+            carry_len: 0,
+            in_region: false,
+            region: Header::whole(1, 1, video_raster::FORMAT_RGB565),
+            region_flags: 0,
+            got: 0,
+            surface_key: [0u8; SURFACE_KEY],
+            surface_known: false,
+            frames_shown: 0,
+            refused: 0,
             buf_cap,
             buf_ptr,
-            header_mode,
-            hdr: [0u8; SRF1_HDR_LEN],
-            hdr_pos: 0,
-            format: RASTER_RGB565,
         },
     );
     raw
 }
 
-/// Step function. Reads any pending bytes from the
-/// input channel into the frame buffer; once the buffer holds a full
-/// frame's worth (`width * height * 2`), presents it and resets.
+/// How many bytes to drop from the front of a refused header so that what
+/// remains could still open a header worth decoding: the smallest shift, at
+/// least one, after which the kept bytes agree with `want` as far as either
+/// reaches. The whole carry when no such shift exists.
+fn resync_shift(carry: &[u8], want: &[u8]) -> usize {
+    (1..carry.len())
+        .find(|&k| {
+            let rest = &carry[k..];
+            let n = rest.len().min(want.len());
+            rest[..n] == want[..n]
+        })
+        .unwrap_or(carry.len())
+}
+
+impl CanvasState {
+    /// Count a refused record, abandon the frame it belonged to, and keep
+    /// only the carry bytes that could open the next header.
+    fn refuse(&mut self, fault: video_raster::Fault) {
+        if self.refused == 0 || self.refused.is_power_of_two() {
+            log::warn!(
+                "[canvas] raster record refused ({fault:?}); {} refused so far",
+                self.refused + 1
+            );
+        }
+        self.refused = self.refused.wrapping_add(1);
+        // The frame in progress is abandoned: the next admitted region
+        // starts one.
+        self.frames.abandon();
+        let shift = if self.surface_known {
+            resync_shift(&self.carry, &self.surface_key)
+        } else {
+            resync_shift(&self.carry, &video_raster::MAGIC)
+        };
+        self.carry.copy_within(shift.., 0);
+        self.carry_len = (self.carry.len() - shift) as u8;
+    }
+}
+
+/// Step function. Reads region records from the input channel: a header,
+/// checked against the frame rules, then that region's pixels, handed to
+/// the shim once whole.
 ///
 /// # Safety
 /// `state` is this module's own arena state, exclusively the
@@ -152,78 +203,72 @@ unsafe extern "C" fn canvas_step(state: *mut u8) -> i32 {
         }
 
         loop {
-            // Header phase (opt-in): collect the SRF1 header, then take geometry from
-            // the STREAM (bounded by buf_cap) rather than the config.
-            if st.header_mode && (st.hdr_pos as usize) < SRF1_HDR_LEN {
-                let pos = st.hdr_pos as usize;
-                let n = channel::channel_read(
-                    st.in_chan,
-                    st.hdr.as_mut_ptr().add(pos),
-                    SRF1_HDR_LEN - pos,
-                );
+            if !st.in_region {
+                let have = st.carry_len as usize;
+                if have < video_raster::HEADER {
+                    let n = channel::channel_read(
+                        st.in_chan,
+                        st.carry.as_mut_ptr().add(have),
+                        video_raster::HEADER - have,
+                    );
+                    if n <= 0 {
+                        break;
+                    }
+                    st.carry_len += n as u8;
+                    continue;
+                }
+                let admitted = Header::decode(&st.carry)
+                    .and_then(|header| st.frames.admit(&header).map(|a| (header, a)));
+                let (header, admitted) = match admitted {
+                    Ok(pair) => pair,
+                    Err(fault) => {
+                        st.refuse(fault);
+                        continue;
+                    }
+                };
+                // A surface within the configured extent in any format fits
+                // the buffer, and a region is no larger than its surface.
+                debug_assert!(header.pixel_len() <= u64::from(st.buf_cap));
+                st.surface_key.copy_from_slice(&st.carry[..SURFACE_KEY]);
+                st.surface_known = true;
+                st.region = header;
+                st.region_flags = if admitted.frame_start {
+                    PRESENT_FIRST
+                } else {
+                    0
+                } | if admitted.last { PRESENT_LAST } else { 0 };
+                st.got = 0;
+                st.carry_len = 0;
+                st.in_region = true;
+            }
+
+            let need = st.region.pixel_len() as usize;
+            let got = st.got as usize;
+            if got < need {
+                let n = channel::channel_read(st.in_chan, st.buf_ptr.add(got), need - got);
                 if n <= 0 {
                     break;
                 }
-                st.hdr_pos += n as u8;
-                if (st.hdr_pos as usize) < SRF1_HDR_LEN {
-                    continue; // header still partial — wait for more bytes
-                }
-                if &st.hdr[0..4] == SRF1_MAGIC {
-                    let w = u16::from_le_bytes([st.hdr[4], st.hdr[5]]);
-                    let h = u16::from_le_bytes([st.hdr[6], st.hdr[7]]);
-                    let fmt = st.hdr[8];
-                    let need = (w as usize) * (h as usize) * bytes_per_pixel(fmt);
-                    if w > 0 && h > 0 && need <= st.buf_cap as usize {
-                        st.width = w;
-                        st.height = h;
-                        st.format = fmt;
-                    }
-                } else {
-                    st.header_mode = false; // not SRF1 — stop parsing to avoid desync
-                }
-                st.buf_len = 0;
-            }
-
-            let frame_size =
-                (st.width as usize) * (st.height as usize) * bytes_per_pixel(st.format);
-            if frame_size == 0 || frame_size > st.buf_cap as usize {
-                return -1;
-            }
-            let cur = st.buf_len as usize;
-            if cur >= frame_size {
-                host_canvas_present(
-                    st.buf_ptr,
-                    frame_size,
-                    st.width as u32,
-                    st.height as u32,
-                    u32::from(st.format),
-                );
-                st.frames = st.frames.wrapping_add(1);
-                if st.header_mode {
-                    // Exact-frame reads (below) leave no residual; expect the next header.
-                    st.buf_len = 0;
-                    st.hdr_pos = 0;
-                } else {
-                    let residual = cur - frame_size;
-                    if residual > 0 {
-                        core::ptr::copy(st.buf_ptr.add(frame_size), st.buf_ptr, residual);
-                    }
-                    st.buf_len = residual as u32;
-                }
+                st.got = (got + n as usize) as u32;
                 continue;
             }
-            // In header mode read no further than this frame, so the next frame's
-            // header stays in the channel for the header phase; else fill the buffer.
-            let want = if st.header_mode {
-                frame_size - cur
-            } else {
-                st.buf_cap as usize - cur
-            };
-            let n = channel::channel_read(st.in_chan, st.buf_ptr.add(cur), want);
-            if n <= 0 {
-                break;
+            let r = st.region;
+            host_canvas_present(
+                st.buf_ptr,
+                need,
+                u32::from(r.w),
+                u32::from(r.h),
+                u32::from(r.format),
+                u32::from(r.x),
+                u32::from(r.y),
+                u32::from(r.surface_w),
+                u32::from(r.surface_h),
+                st.region_flags,
+            );
+            if r.is_last() {
+                st.frames_shown = st.frames_shown.wrapping_add(1);
             }
-            st.buf_len = (cur + n as usize) as u32;
+            st.in_region = false;
         }
         0
     }
@@ -242,11 +287,9 @@ pub static WASM_BROWSER_CANVAS: NativeVtable = super::heap_native(
 unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     let mut width = 0u16;
     let mut height = 0u16;
-    let mut header = false;
     super::walk_tlv(init.params, |tag, value| match tag {
         tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
         tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
-        tags::TAG_HEADER => header = super::tlv_u32(value) != 0,
         _ => {}
     });
     let in_chan = scheduler::module_port(init.slot, tags::PORT_PIXELS);
@@ -258,7 +301,7 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
             init.slot,
             &crate::abi::platform::native::wasm::wasm_browser_canvas::HEAP_SEAT,
             init.params,
-            || alloc_state(in_chan, width, height, header).cast(),
+            || alloc_state(in_chan, width, height).cast(),
         )
     }
 }

@@ -394,6 +394,8 @@ mod bootsel {
                     0,
                 )
             };
+            // Still running: the liveness watchdog goes back on.
+            crate::platform::rp_watchdog::arm();
             Err(BootselError::Refused(rc))
         }
     }
@@ -440,6 +442,8 @@ mod bootsel {
                     0,
                 )
             };
+            // Still running: the liveness watchdog goes back on.
+            crate::platform::rp_watchdog::arm();
             Err(BootselError::Refused(rc))
         }
     }

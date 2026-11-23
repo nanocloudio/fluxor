@@ -2,17 +2,18 @@
 //! cadence under the interrupt contract ([`super::interrupt`]).
 //!
 //! The module's standard `module_step(state)` is called directly from the
-//! handler. On RP a hardware alarm interrupt runs [`handler`]; on bcm2712 the
-//! module timer is polled ([`poll`]) by the domain loop of the `timer`
+//! handler. On RP a hardware alarm interrupt on the domain's core runs
+//! [`handler_on`] for that core's slots, at that core's period; on bcm2712
+//! the module timer is polled ([`poll`]) by the domain loop of the `timer`
 //! domain, or by a `tick` domain's loop when the `timer` domain has no core
-//! of its own.
+//! of its own, and [`handler`] steps every slot.
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::interrupt::{
     bridge_row, claim_slot, enter, leave, InterruptMetrics, SlotLatch, MAX_BRIDGES,
 };
-use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
+use crate::kernel::exec::scheduler::{ModuleId, MAX_DOMAINS, NO_MODULE};
 use crate::kernel::module::loader::ModuleStepFn;
 use crate::kernel::sys::hal;
 
@@ -36,6 +37,8 @@ struct TimerSlot {
     metrics: InterruptMetrics,
     /// Module index in the scheduler.
     module_index: ModuleId,
+    /// The core the module's domain runs on.
+    core: u8,
     /// Dispatch state and latched outcome.
     latch: SlotLatch,
 }
@@ -49,6 +52,7 @@ impl TimerSlot {
             out_bridges: [-1; MAX_BRIDGES],
             metrics: InterruptMetrics::new(),
             module_index: NO_MODULE,
+            core: 0,
             latch: SlotLatch::new(),
         }
     }
@@ -69,6 +73,12 @@ static mut COUNT: u8 = 0;
 /// The module timer's period in microseconds (set when it starts).
 static mut PERIOD_US: u32 = 0;
 
+/// Each core's own period in microseconds, one entry for each core a domain
+/// can run on: the shortest among the `timer` domains that core runs, 0 for
+/// a core that runs none. A platform whose
+/// cores each have a module-timer alarm arms each from its own entry.
+static CORE_PERIOD_US: [AtomicU32; MAX_DOMAINS] = [const { AtomicU32::new(0) }; MAX_DOMAINS];
+
 /// Whether the module timer is running.
 pub static TIMER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -88,6 +98,7 @@ pub fn register_module(
     step_fn: ModuleStepFn,
     state_ptr: *mut u8,
     module_index: ModuleId,
+    core: u8,
     budget_cycles: u32,
     in_bridges: &[i8],
     out_bridges: &[i8],
@@ -112,12 +123,15 @@ pub fn register_module(
         slot.step_fn = step_fn;
         slot.state_ptr = state_ptr;
         slot.module_index = module_index;
+        slot.core = core;
         slot.metrics.budget_cycles = budget_cycles;
         slot.in_bridges = bridge_row(in_bridges);
         slot.out_bridges = bridge_row(out_bridges);
         slot.latch.arm(module_index);
 
-        log::info!("[timer] registered slot={idx} mod={module_index} budget={budget_cycles}cy");
+        log::info!(
+            "[timer] registered slot={idx} mod={module_index} core={core} budget={budget_cycles}cy"
+        );
         idx as i32
     }
 }
@@ -134,6 +148,9 @@ pub(super) unsafe fn clear_slots() {
     }
     COUNT = 0;
     PERIOD_US = 0;
+    for p in CORE_PERIOD_US.iter() {
+        p.store(0, Ordering::Release);
+    }
     TIMER_ACTIVE.store(false, Ordering::Release);
     TICK_COUNT.store(0, Ordering::Release);
 }
@@ -156,6 +173,26 @@ pub(super) unsafe fn clear_slots() {
 /// functions.
 #[inline(never)]
 pub unsafe fn handler() {
+    step_slots(None);
+}
+
+/// The `timer` handler of one core: steps the registered modules whose
+/// domain runs on `core`, and no other core's. For a platform that fires
+/// each core's module timer on that core.
+///
+/// # Safety
+/// As [`handler`]; called on `core`.
+#[inline(never)]
+pub unsafe fn handler_on(core: u8) {
+    step_slots(Some(core));
+}
+
+/// Step every dispatching slot, or only those of `only`'s core.
+///
+/// # Safety
+/// As [`handler`].
+#[inline(always)]
+unsafe fn step_slots(only: Option<u8>) {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     if !enter() {
         return;
@@ -165,7 +202,7 @@ pub unsafe fn handler() {
     let slots = &raw mut SLOTS;
     let saved_module = crate::kernel::exec::scheduler::current_module_index();
     for slot in (*slots).iter_mut().take(count) {
-        if !slot.latch.is_active() {
+        if !slot.latch.is_active() || only.is_some_and(|core| slot.core != core) {
             continue;
         }
 
@@ -238,6 +275,22 @@ pub fn ticks() -> u32 {
 pub fn period_us() -> u32 {
     // SAFETY: a u32 static; aligned read.
     unsafe { PERIOD_US }
+}
+
+/// Core `core`'s own period in microseconds; 0 when it runs no `timer`
+/// domain.
+pub fn core_period_us(core: usize) -> u32 {
+    CORE_PERIOD_US
+        .get(core)
+        .map_or(0, |p| p.load(Ordering::Acquire))
+}
+
+/// Set core `core`'s own period, before [`start`]: the shortest among the
+/// `timer` domains it runs.
+pub fn set_core_period_us(core: usize, period_us: u32) {
+    if let Some(p) = CORE_PERIOD_US.get(core) {
+        p.store(period_us, Ordering::Release);
+    }
 }
 
 /// Set the module timer's period in microseconds (called by platform start).

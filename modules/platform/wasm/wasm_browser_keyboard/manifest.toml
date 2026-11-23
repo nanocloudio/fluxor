@@ -6,10 +6,12 @@ builtin = true
 # which the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Browser keyboard input source. Listens for DOM keydown/keyup
-# events on the host page and emits `input::key::MSG_EVENT` records
-# on the output port. The host shim normalises DOM event quirks
-# (focus / blur transitions, sticky keys, repeat) before forwarding.
+# Browser keyboard input source. The host page listens for DOM
+# keydown/keyup events and this module emits them as
+# `input::key::MSG_EVENT` records on the output port. A held key is
+# reported once, a keydown an input method owns is not reported, and
+# a key whose effect arrived on `TextEvents` (through
+# `wasm_browser_accessibility`'s text field) carries `KEY_TEXT`.
 #
 # The keyboard-only counterpart of `wasm_browser_dom_input`, one
 # module per input class as the capability-surface model asks. Used by

@@ -75,6 +75,19 @@ ram_size = "0x08000000"
 flash_base = "0x00000000"
 flash_size = "0x00000000"
 
+# Which core runs each execution domain: domain d on core d, for as many
+# cores as the machine brings online.
+[smp]
+cores = 4
+domain_cores = [0, 1, 2, 3]
+
+# What the hardware counters a module reads through the `counters` contract
+# count: the facts of the target capabilities `counter.cycles` and
+# `counter.icache`. Cycles are the virtual counter every core shares; a guest
+# is offered no performance monitors, so there is no instruction-cache count.
+[counters]
+cycles = "system"
+
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module
 # requires a contract that neither the kernel (`channel`, `timer`, `event`,

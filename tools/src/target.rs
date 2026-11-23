@@ -16,6 +16,10 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
+/// The domain-to-core map's rules, shared with the kernel and its build
+/// script.
+pub use fluxor_contracts::core_map;
+
 // ── TOML deserialization structs ────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -28,6 +32,8 @@ struct TomlSiliconFile {
     kernel: Option<TomlKernelConfig>,
     isolation: Option<TomlIsolationConfig>,
     providers: Option<TomlProviders>,
+    counters: Option<TomlCounters>,
+    smp: Option<TomlSmp>,
     /// Platform stack defaults — used by host descriptors (e.g.
     /// `[platform.net] provider = "host"`); silicon files omit it. Values are
     /// `toml::Value` so structured sections (e.g. `[platform.pcie] aliases`,
@@ -44,6 +50,185 @@ struct TomlKernelConfig {
     ram_static_max_kb: Option<u32>,
     kernel_stack_reserve_kb: Option<u32>,
     kernel_stack_kb: Option<u32>,
+}
+
+/// `[smp]`: the cores that run a domain loop and the core of each domain.
+#[derive(Deserialize)]
+struct TomlSmp {
+    cores: u8,
+    domain_cores: Vec<u8>,
+    secondary_stack: Option<TomlSecondaryStack>,
+}
+
+/// `[smp] secondary_stack`: the stack a core other than 0 runs on. Its
+/// base is the kernel build's.
+#[derive(Deserialize)]
+struct TomlSecondaryStack {
+    size_kb: u32,
+    reserve_kb: u32,
+}
+
+/// Which core runs each execution domain on a target (`[smp]`), and the
+/// stack a core other than 0 steps its modules on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmpFacts {
+    /// The cores that run a domain loop.
+    pub cores: u8,
+    /// The core each domain steps on, by domain index.
+    pub domain_cores: [u8; core_map::DOMAINS],
+    /// `(size, kernel reserve)` of a secondary core's stack in KiB, where
+    /// the target states one: its ungated modules step on the size less
+    /// the reserve.
+    pub secondary_stack_kb: Option<(u32, u32)>,
+}
+
+impl Default for SmpFacts {
+    /// One core running every domain: a target that states no `[smp]`.
+    fn default() -> Self {
+        Self {
+            cores: 1,
+            domain_cores: [0; core_map::DOMAINS],
+            secondary_stack_kb: None,
+        }
+    }
+}
+
+impl SmpFacts {
+    fn from_toml(raw: Option<&TomlSmp>, path: &Path) -> Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        if let Err(e) = core_map::validate(&raw.domain_cores, raw.cores) {
+            use core_map::MapError as E;
+            let why = match e {
+                E::Length => format!(
+                    "names {} domains; a map names {}",
+                    raw.domain_cores.len(),
+                    core_map::DOMAINS
+                ),
+                E::NoCores => "is for a target that runs no core".to_string(),
+                E::PrimaryNotOnBootCore => "puts domain 0 off core 0".to_string(),
+                E::CoreOutOfRange { domain } => format!(
+                    "puts domain {domain} on core {}, but the target runs {} cores",
+                    raw.domain_cores[domain], raw.cores
+                ),
+                E::SecondaryShared { core } => {
+                    format!("gives core {core} more than one domain; a core other than 0 runs one")
+                }
+            };
+            return Err(Error::Config(format!(
+                "{}: [smp] domain_cores {:?} {why}",
+                path.display(),
+                raw.domain_cores
+            )));
+        }
+        let mut domain_cores = [0u8; core_map::DOMAINS];
+        domain_cores.copy_from_slice(&raw.domain_cores);
+        let secondary_stack_kb = match &raw.secondary_stack {
+            Some(s) if s.reserve_kb >= s.size_kb => {
+                return Err(Error::Config(format!(
+                    "{}: [smp] secondary_stack reserves {} KiB of a {} KiB stack; nothing \
+                     is left for a module",
+                    path.display(),
+                    s.reserve_kb,
+                    s.size_kb
+                )))
+            }
+            Some(s) => Some((s.size_kb, s.reserve_kb)),
+            None => None,
+        };
+        Ok(Self {
+            cores: raw.cores,
+            domain_cores,
+            secondary_stack_kb,
+        })
+    }
+
+    /// The core `domain` steps on.
+    pub fn domain_core(&self, domain: u8) -> u8 {
+        core_map::core_of(&self.domain_cores, usize::from(domain)) as u8
+    }
+
+    /// Whether the kernel bridges cores: some domain steps off core 0, so
+    /// an edge between two cores is two channels joined by a ring.
+    pub fn bridges_cores(&self) -> bool {
+        core_map::has_secondary(&self.domain_cores)
+    }
+
+    /// Whether an edge between `from` and `to` crosses cores.
+    pub fn crosses_cores(&self, from: u8, to: u8) -> bool {
+        core_map::crosses_cores(&self.domain_cores, usize::from(from), usize::from(to))
+    }
+}
+
+/// The `[smp]` facts of the target named `target` (a silicon, host or board
+/// name), as the project resolves it. A name no registry knows is one core
+/// running every domain.
+pub fn smp_of(target: &str) -> SmpFacts {
+    load_target(target, &crate::project::root())
+        .map(|d| d.smp)
+        .unwrap_or_default()
+}
+
+/// `[counters]`: what the target's hardware counters count. The table's
+/// other keys (register offsets) are the platform's.
+#[derive(Deserialize, Default)]
+struct TomlCounters {
+    cycles: Option<String>,
+    icache: Option<String>,
+}
+
+/// What a target's counters count (`[counters]`): the facts of the target
+/// capabilities `counter.cycles` and `counter.icache`. `None` is a counter
+/// the target does not have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CounterFacts {
+    /// `counter.cycles` `clock`: `core` (a per-core cycle counter) or
+    /// `system` (a clock every core shares).
+    pub cycles: Option<&'static str>,
+    /// `counter.icache` `scope`: `core` or `node` (one count for every
+    /// core and owner).
+    pub icache: Option<&'static str>,
+}
+
+impl CounterFacts {
+    fn from_toml(raw: Option<&TomlCounters>, path: &Path) -> Result<Self> {
+        if raw.is_none() {
+            return Err(Error::Config(format!(
+                "{}: no [counters] table; every silicon and host target states what its \
+                 counters count (`cycles = \"core\" | \"system\"`, `icache = \"core\" | \
+                 \"node\"`; a counter the target does not have is left out)",
+                path.display()
+            )));
+        }
+        let admitted = |capability: &str, fact: &str, key: &str, value: Option<&String>| {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let values = fluxor_contracts::vocabulary::facts_for(capability)
+                .and_then(|facts| facts.iter().find(|(name, _)| *name == fact))
+                .map_or(&[][..], |(_, values)| *values);
+            values
+                .iter()
+                .find(|v| **v == value.as_str())
+                .copied()
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "{}: [counters] {key} = \"{value}\" is not a `{capability}` `{fact}` \
+                         (one of: {})",
+                        path.display(),
+                        values.join(", ")
+                    ))
+                })
+        };
+        let raw_cycles = raw.and_then(|c| c.cycles.as_ref());
+        let raw_icache = raw.and_then(|c| c.icache.as_ref());
+        Ok(Self {
+            cycles: admitted("counter.cycles", "clock", "cycles", raw_cycles)?,
+            icache: admitted("counter.icache", "scope", "icache", raw_icache)?,
+        })
+    }
 }
 
 /// `[providers]`: the contracts the target's platform answers.
@@ -330,6 +515,10 @@ struct TomlBoardFile {
     /// `qemu-virt` carries the QEMU virt RAM map; a real board's RAM origin is
     /// selected by its `board-*` cargo feature at link time.)
     memory: Option<TomlMemoryConfig>,
+    /// What this machine's counters count, where that is not what its
+    /// silicon's do: an emulated machine has no performance monitors a
+    /// guest kernel may program. Present, it is the board's whole answer.
+    counters: Option<TomlCounters>,
     /// Platform stack defaults (e.g. [platform.net] phy="wifi", nic="cyw43").
     /// `toml::Value` values so structured sections parse (see SiliconToml).
     platform:
@@ -443,8 +632,9 @@ pub struct TargetDescriptor {
     /// this file. The host-class kernels state theirs in
     /// `src/kernel/config.rs` (`capacity::kernel_buffer_arena`).
     pub buffer_arena_kb: Option<u32>,
-    /// The loader's ceiling on one module's code, in KiB (`[kernel]
-    /// module_code_kb`); `None` where the silicon states none.
+    /// The loader's ceiling on one module's code, in KiB: `[kernel]
+    /// module_code_kb` where the kernel's is per die (RP), else the kernel
+    /// profile's `MAX_MODULE_CODE_SIZE`. `None` for a target with no kernel.
     pub module_code_kb: Option<u32>,
     /// Ceiling on the kernel image's static RAM — `.data` + `.bss` +
     /// `.uninit` — in KiB (`[kernel] ram_static_max_kb`). `None` where the
@@ -470,6 +660,10 @@ pub struct TargetDescriptor {
     /// The contracts the target's platform registers a provider for
     /// (`[providers]`), by whose modules call it.
     pub providers: PlatformProviders,
+    /// What the target's counters count (`[counters]`).
+    pub counters: CounterFacts,
+    /// Which core runs each execution domain (`[smp]`).
+    pub smp: SmpFacts,
 }
 
 /// The contracts a target's platform answers (`[providers]`), named as a
@@ -586,6 +780,18 @@ impl TargetDescriptor {
                 .map(|kb| (u64::from(kb) * 1024, "the isolated module stack"));
         }
         self.kernel_stack_limit()
+    }
+
+    /// What a secondary core's stack leaves a module that steps on it: the
+    /// stack (`[smp] secondary_stack`) less the kernel's own reserve. `None`
+    /// where the target states no such stack.
+    pub fn secondary_stack_limit(&self) -> Option<(u64, &'static str)> {
+        self.smp.secondary_stack_kb.map(|(size, reserve)| {
+            (
+                u64::from(size - reserve) * 1024,
+                "a secondary core's stack less the kernel's reserve",
+            )
+        })
     }
 
     /// What the kernel stack leaves a module that steps on it: the stack less
@@ -708,10 +914,11 @@ fn platform_string_defaults(
 /// 2. Check `<project_root>/targets/host/{name}.toml` — host class.
 /// 3. Check `<project_root>/targets/silicon/{name}.toml`.
 /// 4. **Fall back to the install root** (when discovered — see
-///    `project::install_root`) and repeat 1+2 against it. Lets an
+///    `project::install_root`) and repeat 1–3 against it. Lets an
 ///    external user project reuse bundled targets without copying
 ///    them.
-/// 4. Error: unknown target.
+/// 5. Error: unknown target, naming the install-root discovery when it
+///    found nothing.
 pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> {
     // Try project root first.
     if let Some(desc) = try_load_target_under(name, project_root)? {
@@ -720,7 +927,19 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
     // Then install root, if discovered.
     if let Some(install) = crate::project::install_root() {
         if install.path != project_root {
-            if let Some(desc) = try_load_target_under(name, &install.path)? {
+            let found =
+                try_load_target_under(name, &install.path).map_err(|e| match &install.source {
+                    crate::project::InstallDiscoverySource::LiveTree { .. } => {
+                        Error::Config(format!(
+                            "target '{name}' from the live Fluxor tree {} (a workspace \
+                             `live_trees` entry): {e} — fix the tree, or remove it from \
+                             `live_trees` to build against published Fluxor",
+                            install.path.display()
+                        ))
+                    }
+                    _ => e,
+                })?;
+            if let Some(desc) = found {
                 return Ok(desc);
             }
         }
@@ -728,9 +947,22 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
 
     let available = list_targets(project_root);
     let main = if available.is_empty() {
-        "none (missing targets/ directory?)".to_string()
+        "none".to_string()
     } else {
         available.join(", ")
+    };
+    let discovery = if crate::project::install_root().is_none() {
+        format!(
+            " No target catalog beyond the project's own `targets/`: no \
+             ${} directory, no workspace `live_trees` checkout with `stacks/` and \
+             `targets/`, no synced catalog at `{}` (`fluxor update` or `fluxor sync` \
+             stages it from a pinned `fluxor` dependency), and no install beside \
+             the running `fluxor`.",
+            crate::project::ENV_INSTALL_ROOT,
+            crate::project::SYNCED_CATALOG
+        )
+    } else {
+        String::new()
     };
     // "Did you mean …?" hint — small Levenshtein with a cheap
     // threshold. Most typos are 1-2 character distance from the
@@ -742,7 +974,7 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
         None => String::new(),
     };
     Err(Error::Config(format!(
-        "Unknown target '{name}'.{did_you_mean} Available: {main}"
+        "Unknown target '{name}'.{did_you_mean} Available: {main}.{discovery}"
     )))
 }
 
@@ -866,6 +1098,21 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
     let p = &silicon.peripherals;
     let isolation = IsolationFacts::from_toml(silicon.isolation.as_ref(), &silicon.target.id)?;
     let providers = PlatformProviders::from_toml(silicon.providers.as_ref(), path)?;
+    // The loader's ceiling is the silicon TOML's figure where the kernel's
+    // is per die (RP), else the kernel profile's own. A runtime with no
+    // kernel profile (validation-only silicon) has none.
+    let module_code_kb = silicon
+        .kernel
+        .as_ref()
+        .and_then(|k| k.module_code_kb)
+        .or_else(|| {
+            crate::runtime_abi::runtime(&silicon.target.runtime)
+                .filter(|_| build.is_some())
+                .and_then(|_| crate::capacity::kernel_module_code_ceiling(&silicon.target.runtime))
+                .and_then(|bytes| u32::try_from(bytes / 1024).ok())
+        });
+    let counters = CounterFacts::from_toml(silicon.counters.as_ref(), path)?;
+    let smp = SmpFacts::from_toml(silicon.smp.as_ref(), path)?;
     // A target names a runtime from the table and an ABI that runtime
     // loads; anything else would send its modules to a shelf nothing
     // builds and admit modules that cannot run there.
@@ -931,7 +1178,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         platform_defaults: platform_string_defaults(silicon.platform),
         state_arena_kb,
         buffer_arena_kb: silicon.kernel.as_ref().and_then(|k| k.buffer_arena_kb),
-        module_code_kb: silicon.kernel.as_ref().and_then(|k| k.module_code_kb),
+        module_code_kb,
         ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
         kernel_stack_reserve_kb: silicon
             .kernel
@@ -942,6 +1189,8 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         kernel_stack_kb: silicon.kernel.as_ref().and_then(|k| k.kernel_stack_kb),
         isolated_stack_kb: silicon.isolation.as_ref().and_then(|i| i.isolated_stack_kb),
         providers,
+        counters,
+        smp,
     })
 }
 
@@ -1003,6 +1252,9 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     // Board memory map overrides the silicon default (silicon describes the die,
     // the board/emulator places RAM/flash). A board without its own [memory]
     // keeps whatever the silicon declared (typically none).
+    if board.counters.is_some() {
+        desc.counters = CounterFacts::from_toml(board.counters.as_ref(), board_path)?;
+    }
     if let Some(m) = board.memory {
         let reserve = desc.memory.as_ref().map_or(0, |m| m.kernel_flash_reserve);
         desc.memory = Some(MemoryConfig {

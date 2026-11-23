@@ -50,10 +50,11 @@ Source: `src/kernel/exec/scheduler/pass.rs`,
 One pass engine steps every cooperative domain on every target:
 `pass::run(domain, kind)` runs either a tick pass (`PassKind::Tick`) or a
 wake pass over latched wake bits (`PassKind::Wake(&mask)`), and returns
-`PassResult { result, deadline_us, burst }`. A single-core loop (RP, Linux,
-WASM) runs every domain in order through `pass::tick_all()` and
-`pass::wake_all()`; a domain loop on its own core calls `pass::run` for
-its one domain and takes only its own wakes (`pass::take_domain_wakes`).
+`PassResult { result, deadline_us, burst }`. A loop that passes over every
+domain of its core (RP core 0, Linux, WASM) runs them in index order through
+`pass::tick_all()` and `pass::wake_all()`; a domain loop with one domain
+(bcm2712, uefi, RP2350 core 1) calls `pass::run` for it and takes only its
+own wakes (`pass::take_domain_wakes`).
 A graph steps the same way whether it is the only resident graph or one
 of many, admitted at boot or live: the node's graph takes the live add's
 path (`prepare_graph` stages it through `splice::admit_boot`;
@@ -430,10 +431,11 @@ its `rate_hz`, required and a whole number of microseconds per period
 `rate_hz` on any other mode, or `tick_us` on a `timer` domain, is refused.
 
 A graph declares at most `MAX_DOMAINS` (4) domains, indexed 0..3 in
-declaration order. A domain's core is its index: on the SMP targets
-(bcm2712, uefi) domain d runs on core d, and on RP, Linux and wasm every
-domain runs on the one thread, in index order. The core follows from the
-index and is never declared: a domain entry takes `name`, `exec`, its
+declaration order. A domain runs on the core its target maps its index to
+(`[smp] domain_cores` in the target's TOML): on bcm2712 and uefi domain d
+runs on core d; on RP2350 domain 1 runs on core 1 and domains 0, 2 and 3 on
+core 0; on RP2040, Linux and wasm every domain runs on the one thread, in
+index order. The core follows from the index and is never declared: a domain entry takes `name`, `exec`, its
 cadence and its adaptive settings, and the builder refuses `cores:`,
 `tier:` and `exec_mode:` on one.
 

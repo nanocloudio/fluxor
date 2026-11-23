@@ -122,8 +122,10 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // from `crates/fluxor-rt/src/wasm_entry.rs`: it owns state allocation
     // (on the module's own heap) and calls the module's `module_new`. Args
     // are four i32 LE values: in_chan, out_chan, ctrl_chan, arena_size (the
-    // heap arena the module's manifest declares, 0 for none).
-    let arena_size = module.manifest_arena_bytes() as u32;
+    // heap arena the build sized for this instance from its params, or the
+    // one the module's manifest declares; 0 for none).
+    let arena_size = scheduler::params_heap_arena_bytes(init.params)
+        .unwrap_or_else(|| module.manifest_arena_bytes()) as u32;
     let mut args = [0u8; 16];
     args[0..4].copy_from_slice(&in_chan.to_le_bytes());
     args[4..8].copy_from_slice(&out_chan.to_le_bytes());

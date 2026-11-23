@@ -139,12 +139,40 @@ server answers a path with a query), the kernel runs off the main thread:
 minimal `window` / `document` stub) and runs `kernel_init` plus the
 `kernel_step` loop there. The page keeps the `AudioContext` and input capture;
 the canvas is transferred to the worker as an `OffscreenCanvas`, so
-WebGPU present happens worker-side. PCM crosses to the page by
+WebGPU present and the 2D canvas sink (§4.2) paint worker-side. The
+accessibility mirror (§4.8) is DOM and stays on the page: the worker
+posts it each checked batch. PCM crosses to the page by
 `postMessage`, and the page pushes the live audio-clock lead back to
 the worker on a ~10 ms timer so the audio-paced sink keeps draining as
 the clock advances. This keeps a CPU-bound core from monopolising the
 page: audio scheduling, GPU promise completion, presentation, and
 input stay live on the main thread.
+
+Input is captured on the page in either mode, into one queue per input
+class (`__fluxor_<class>_queue`: keyboard, pointer, button, gamepad, action,
+surface traits, and the mirror's text edits and accessibility actions) plus
+the `wasm_browser_dom_input` queue, and each is drained by its `host_*_pop`
+import where the kernel steps. In worker mode the page posts every
+non-empty queue to the worker in one `input` message on a ~16 ms timer
+(`postInputBatch` in `host_shims.js`), and the worker appends the records
+to its own queues in the order they were captured.
+
+A graph need not hold the module that drains a class, so every queue has a
+cap, on the page and in the worker: past it a queue loses its oldest
+records. The kernel-side sources lose nothing they have taken: a record
+the output channel refuses is held and written first on the next step.
+
+Gamepads have no events for state, so the page polls
+`navigator.getGamepads()` once per animation frame (`installGamepadPoller`)
+and queues `GamepadEvents` records only when a pad changes: a connection
+record then a state snapshot on attach, a state snapshot on any button or
+axis change, and a connection record then a released snapshot on detach.
+Indices past the contract's four slots are not reported. A presentation
+overlay may also draw pads on the page; one slot table,
+`__fluxor_gamepad_slots`, keeps the two apart. A drawn pad holds the slot
+its shell declares. A pad the browser reports takes the slot of its own
+`Gamepad.index` when nobody holds it, else the lowest free slot, and moves
+when a drawn pad claims the one it had.
 
 ---
 
@@ -161,8 +189,11 @@ capability is one Rust file with one extern block plus one shim
 implementation.
 
 ```text
-// Raster present (canvas native module); format 0 = RGB565, 1 = RGBA8888.
-host_canvas_present(ptr, len, width: u32, height: u32, format: u32)
+// Raster present (canvas native module): one region of a frame, as pixels
+// and a rectangle. format 0 = RGB565, 1 = RGBA8; flags 1 = the region opens
+// a frame, 2 = it completes one.
+host_canvas_present(ptr, len, width: u32, height: u32, format: u32,
+                    x: u32, y: u32, surface_w: u32, surface_h: u32, flags: u32)
 
 // Realtime audio sink (AudioWorklet ring).
 host_audio_play(ptr, len, sample_rate: u32, channels: u32)
@@ -180,6 +211,13 @@ host_gamepad_pop(buf, len) -> i32          // GamepadEvents records
 host_button_pop(buf, len) -> i32           // debounced button bytes
 host_action_pop(buf, len) -> i32           // FNV-hashed action records
 host_surface_traits_pop(buf, len) -> i32   // SurfaceTraits records
+
+// Accessibility mirror and its text field (§4.8).
+host_a11y_open(tree_wired: u32)            // mirror a tree, or text only
+host_a11y_stage(ptr, len)                  // one checked tree record
+host_a11y_commit(apply: u32)               // apply the staged batch, or drop it
+host_a11y_action_pop(buf, len) -> i32      // AccessibilityActions records
+host_a11y_text_pop(buf, len) -> i32        // text edits, by field
 
 // WebSocket transport (byte tunnel).
 host_ws_open(url_ptr, url_len) -> i32      // handle; opens asynchronously
@@ -232,8 +270,10 @@ host_gpu_service_*                         // the GPU contract's device half
 host_camera_frame(buf, len) -> i32         // [w:u16][h:u16][luma w*h] frames
 host_scan_result(ptr, len)
 
-// Shared-surface capture (§4.7): bytes written, 0 none yet, negative = ended.
-host_display_frame(buf, len) -> i32
+// Shared-surface capture (§4.7): RGB565 pixels into buf and the frame's
+// width and height into extent; pixel bytes written, 0 none yet, negative =
+// ended.
+host_display_frame(buf, len, extent) -> i32
 
 // Kernel-log scrollback widget.
 host_terminal_emit(ptr, len)
@@ -271,13 +311,14 @@ Input sources (one per class, per [input_capability_surface.md](input_capability
 
 | Module | Output port → content type | Notes |
 |--------|----------------------------|-------|
-| `wasm_browser_keyboard` | `events` → `KeyEvents` | DOM `KeyboardEvent` → 8-byte key records |
-| `wasm_browser_pointer`  | `events` → `PointerEvents` | mouse / touch / stylus, unified |
+| `wasm_browser_keyboard` | `events` → `KeyEvents` | DOM `KeyboardEvent` → 8-byte key records; §4.9 |
+| `wasm_browser_pointer`  | `events` → `PointerEvents` | mouse / touch / stylus, unified, and the wheel; §4.9 |
 | `wasm_browser_gamepad`  | `events` → `GamepadEvents` | Gamepad API state snapshots |
 | `wasm_browser_button`   | `raw` → `OctetStream` | debounced tap transitions on the player surface |
 | `wasm_browser_action`   | `commands` → `FmpMessage` | overlay controls → FNV-hashed semantic commands |
 | `wasm_browser_dom_input`| `events` → `InputBinaryState` | keyboard-state snapshots on a single port |
-| `wasm_browser_surface_traits` | `events` → `SurfaceTraits` | viewport / modality / audio-config authority |
+| `wasm_browser_surface_traits` | `events` → `SurfaceTraits` | viewport / device-pixel-ratio / modality / audio-config authority; §4.9 |
+| `wasm_browser_accessibility` | `tree` in (`AccessibilityTree`), `actions` out (`AccessibilityActions`), `text` out (`TextEvents`) | the DOM mirror of a drawn UI and its text field; §4.8 |
 | `wasm_browser_midi_in` / `wasm_browser_midi_out` | `events` ↔ `MidiEvents` | registered stubs: `midi_in` emits nothing, `midi_out` drains and discards its input; Web MIDI is not wired |
 
 Two further modules sit alongside the sources rather than in the
@@ -302,7 +343,7 @@ Media, transport, and diagnostics:
 | `host_browser_fetch`    | `bytes` out (`OctetStream`) | §4.6 |
 | `wasm_browser_http`     | `request_in` in (`ExchangeRequest`), `response_out` out (`ExchangeResponse`) | §4.6 |
 | `wasm_browser_camera`   | `frames` out (`OctetStream`) | luma frames from `getUserMedia`, for a downstream decoder |
-| `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | `SRF1` RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
+| `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
 | `wasm_browser_scan_out` | `result` in (`OctetStream`) | surfaces a decoded byte result (e.g. a scanned token) in the page |
 | `wasm_browser_terminal` | none | drains the kernel log ring (`LOG_RING_DRAIN`) into a DOM scrollback via `host_terminal_emit`; the wasm analogue of UART logging |
 | `wasm_browser_video_codec` | `encoded` in (`OctetStream`) | a manifest only: no module is registered under the name, so a graph naming it does not load |
@@ -341,15 +382,36 @@ rp2350 audio sinks.
 
 Source: `src/platform/wasm/canvas.rs`.
 
-Params: `width` (u16, required), `height` (u16, required), `header`
-(u16, default 0). Without a header every frame is `width` × `height`
-RGB565 little-endian, the same as `st7701s` and `linux_display`. With
-`header` set, each frame opens with a 10-byte SRF1 header,
-`[magic "SRF1"][w: u16 LE][h: u16 LE][fmt: u8][flags: u8]`, and takes its
-size from it, bounded by the configured `width` × `height`; `fmt` is 0
-for RGB565 or 1 for RGBA8888 (alpha carried and ignored). The shim
-converts to RGBA in JS and presents with Canvas 2D `putImageData`. The
-module declares `capabilities = ["video.raster", "display.scanout",
+Params: `width` (u16, required), `height` (u16, required): the largest
+surface the canvas accepts, which sizes its buffer. The stream states
+its own surface. Every record on `pixels` is the region header of the
+`VideoRaster` contract
+(`crates/fluxor-abi/src/contracts/video_raster.rs`, 20 bytes) and that
+region's pixels, in RGB565 or RGBA8 as the header says (alpha carried
+and ignored); there is no headerless form. The canvas element takes the
+extent of the surface in the stream.
+
+The header has one definition. The module reads and checks it and hands
+the shim plain pixels and a rectangle; no host file parses or writes
+it.
+
+- A frame's regions are staged and painted together at the region
+  flagged `LAST`, so a frame of several regions appears whole.
+- A frame whose regions carry `DAMAGE` changes only those rectangles;
+  the rest of the canvas keeps its picture. A frame without it tiles
+  the whole surface top to bottom (one region is the common case).
+- A record the contract refuses (a region outside its surface, an
+  unknown format or flag, a surface past `width` × `height`, a broken
+  tiling, a surface change inside a frame) is counted and skipped. The
+  frame it belonged to is abandoned, the canvas keeps what it last
+  showed, and the stream is scanned forward for the next header of the
+  surface in use.
+
+The port declares the facts `formats = [rgb565, rgba8]` and
+`regions = [damage, bands]`, so a producer that declares what it sends
+is checked against them when the graph is composed. The shim converts
+to RGBA in JS and paints with Canvas 2D `putImageData`. The module
+declares `capabilities = ["video.raster", "display.scanout",
 "presentation.clock"]`.
 
 ### 4.3 `wasm_browser_image_codec` — encoded image → RGB565
@@ -357,9 +419,11 @@ module declares `capabilities = ["video.raster", "display.scanout",
 Source: `src/platform/wasm/image_codec.rs`.
 
 The wasm analogue of the Linux host image codec: `encoded` bytes in,
-RGB565 `VideoRaster` out, with the decode delegated to the browser via
-`createImageBitmap` plus an `OffscreenCanvas`. Params: `width`,
-`height` (required), `max_bytes` (default 16 MiB).
+`VideoRaster` out, with the decode delegated to the browser via
+`createImageBitmap` plus an `OffscreenCanvas`. Each image goes out as
+one region record covering the whole `width` × `height` surface in
+RGB565; the module writes the header. Params: `width`, `height`
+(required), `max_bytes` (default 16 MiB).
 
 ### 4.4 `wasm_browser_gpu` / `wasm_browser_compute` — generic GPU surfaces
 
@@ -496,23 +560,178 @@ produces pixels it does not — the screen, window, or tab the person
 picked in the browser's own share dialog. `getDisplayMedia` is the only
 API for it, so capture is JS and the graph side is a pump.
 
-Params: `width` / `height` (u16, required) and `header` (u16, default
-1). The dimensions are the *backing* size, not the shared size: the
-person choosing what to share decides the geometry and may change it
-mid-session, so frames carry the SRF1 header (§4.2) and the buffer
-bounds what a frame may claim. Larger surfaces are scaled to fit rather
-than refused. The module declares `capabilities = ["video.raster",
-"display.capture"]`.
+Params: `width` / `height` (u16, required). The dimensions are the
+*backing* size, not the shared size: the person choosing what to share
+decides the extent and may change it mid-session, so each frame is one
+region record whose header (§4.2) states the surface that arrived, and
+the buffer bounds what a frame may be. Larger surfaces are scaled to
+fit rather than refused. The shim hands over pixels and their extent;
+the module writes the header. The module declares `capabilities =
+["video.raster", "display.capture"]`.
 
-Frames are RGB565-LE, so `capture.pixels -> display.pixels` resolves
-against `linux_display`, `st7701s`, and `wasm_browser_canvas` with no
-converter; `header = 0` drops the header for a consumer that has no
-header mode and a capture that is known to be fixed-size.
+Frames are RGB565, so `capture.pixels -> display.pixels` resolves
+against any raster display that takes RGB565, `wasm_browser_canvas`
+among them, with no converter.
 
 Ending is one-way. When the person stops sharing — through the
 browser's UI, which the page never sees otherwise — the current frame
 finishes and the module latches. It does not pull again, because
 pulling again means a fresh picker.
+
+### 4.8 `wasm_browser_accessibility` — the mirror of a drawn UI
+
+Source: `src/platform/wasm/accessibility.rs`; the mirror in
+`host_shims.js` (`createAccessibilityMirror`).
+
+An application that draws its own controls into a raster is opaque to
+assistive technology and to the platform's text machinery. It publishes
+an accessibility tree (`AccessibilityTree`,
+`crates/fluxor-abi/src/contracts/accessibility.rs`); this module mirrors
+the tree into the page and reports back what was done to it.
+
+| Port | Content type | Carries |
+|------|--------------|---------|
+| `tree` in | `AccessibilityTree` | the application's nodes, in batches ended by `APPLY` |
+| `actions` out | `AccessibilityActions` | `ACTIVATE`, `FOCUS`, `SET_VALUE`, `RESYNC` |
+| `text` out | `TextEvents` | `COMMIT`, `COMPOSE`, `DELETE`, `SELECT` from the mirror's text fields |
+
+**Batches are all or nothing.** The module parses every record and
+checks every batch before the page is touched: a node whose parent is
+not in the tree, a cycle, more nodes than the port's `max_nodes` fact
+(1,024), a string past its limit, text that is not UTF-8, an unknown
+role or a secret carrying a value rejects the whole batch. The page
+keeps the tree it showed, the reason is logged, and the module sends
+`RESYNC` on `actions`; it then ignores batches until one opens with
+`TREE`. It sends `RESYNC` at its start too. A checked batch is applied
+in one synchronous pass, so the page never shows part of one.
+
+**Where.** One subtree inside the display surface element, laid over
+its canvas, with `translate="no"`. An element's CSS bounds are its
+node's bounds ÷ 64 × (the canvas's shown width ÷ its raster width): the
+inverse of the pointer mapping (§4.9), recomputed on every presented
+frame and every resize. Bounds keep magnifiers, touch exploration and
+the input method's window on the drawn control.
+
+**Elements.** A node is a `<div>` with its ARIA role, states, name and
+description, and takes no pointer events. It is never a native button
+or link: a native button turns Enter and Space into a click, which
+would activate the control a second time beside the key record, and a
+link carries no URL. An editable node is an `<input>` or `<textarea>`;
+a slider or spinbutton is a native range or number input, which is what
+some screen readers adjust. Those take pointer events, so a tap focuses
+them natively and a phone raises its keyboard; the event still reaches
+the surface's pointer listeners, so the application sees the same tap.
+Elements are transparent, never `opacity: 0` or `visibility: hidden`,
+which assistive technology may skip; the application draws its own
+focus ring.
+
+**Focus.** The application's focused node is the mirror's one tab stop,
+so Tab from page chrome enters there. A `FOCUS` record moves DOM focus
+only when focus is already in the mirror or on the page body: the
+application never takes focus from page chrome. A focus change the
+mirror did not cause is a `FOCUS` action, with `NO_NODE` when focus
+leaves the surface.
+
+**Actions.** A click on a mirrored control (assistive technology's
+"press") is `ACTIVATE`; a value set on a native range is `SET_VALUE`,
+and the element waits for the application's echo. Keys are never
+actions: every key reaches the application as a key record.
+
+**Text.** A mirror text field is controlled: the application owns its
+value and selection, and the element changes only by echo of the tree,
+except while an input method composes.
+
+- A `beforeinput` outside a composition is stopped and translated. An
+  insert (typing, autocorrect, paste, drop, a line break) is a `SELECT`
+  when the element's selection is not where the application last put
+  it, then `COMMIT`; text past 1,024 bytes is split at scalar
+  boundaries with `CONTINUES` on all but the last. A deletion is
+  `DELETE`, measured on the value in grapheme clusters, words or lines
+  as the input type says, in scalar values. Undo and redo are stopped
+  and not translated: the key reaches the application unflagged.
+- A composition is reported from its composition events alone:
+  `COMPOSE START`, a `COMPOSE` per update with the input method's
+  highlighted range, `COMPOSE END`, then `COMMIT` when it produced
+  text. The `beforeinput` types a composition raises are never
+  translated; one browser sends `insertFromComposition` after
+  `compositionend`, and translating it would commit the text twice.
+  An echo that arrives mid-composition waits for its end.
+- A change the browser makes that cannot be stopped is undone at the
+  `input` event that follows; an `input` with no `beforeinput` before
+  it (autofill) replaces the whole value.
+- A selection the user moves is `SELECT`; the mirror's own echo is not.
+
+Offsets on the wire are Unicode scalar values; the mirror converts from
+the DOM's UTF-16 units.
+
+With `tree` unwired the mirror is one text field over the surface,
+focused by the first tap on it, and its records carry `NO_TARGET` and
+no offsets.
+
+**Secrets.** A secret node carries no value, and none enters the page.
+Its element is a password field holding one bullet per scalar of the
+length the node states, so offsets and deletion work. What the user
+types, pastes or autofills into it goes to the application on `text`
+and is never left in the DOM.
+
+**What the page can see.** The mirror puts the application's names,
+values and descriptions into the page DOM, where the browser's
+extensions can read them; that is what makes them reachable. Text
+reaches only the module wired to `text`. Application strings enter the
+page through `textContent`, `value` and `setAttribute` with attribute
+names from fixed tables, never as markup and never as a URL, so a
+module cannot inject script or navigation through its tree.
+
+**Worker mode.** The module runs where the kernel steps and the mirror
+where the DOM is. The worker posts `{ type: 'a11y', open }` once and
+`{ type: 'a11y', bytes }` per applied batch; the mirror's actions and
+text edits return through the `accessibility_action` and `text` input
+queues.
+
+### 4.9 Pointer, wheel, keys and device pixel ratio
+
+Two pixel spaces are in play. *Logical pixels* are the viewport's (CSS
+pixels); size classes key on them. *Surface pixels* are the pixels of
+the raster a surface presents: its canvas's own `width` × `height`,
+whatever size the page shows it at. Pointer positions, pixel wheel
+deltas and accessibility bounds are all in surface pixels, through one
+mapping (`surfaceGeometry` in `host_shims.js`). A canvas whose control
+was transferred to a worker keeps the attributes it left with, so in
+worker mode the page takes the raster's extent from each frame the
+worker reports showing.
+
+**Device pixel ratio.** `wasm_browser_surface_traits` reports
+`dpr_eighths`: `devicePixelRatio` in eighths, to the nearest eighth,
+within 1..=255 (a reported ratio is never 0, which means unreported). A
+producer renders at viewport × `dpr_eighths` ÷ 8 for its raster to be
+presented 1:1. A window moved to a screen of another density, or a
+page zoom, fires no `resize`, so the publisher also listens on a
+`resolution` media query for the ratio in force and arms one for the
+next ratio each time it fires; a ratio change bumps the epoch like a
+resize.
+
+**Wheel.** A `wheel` listener on each display surface, not passive so
+it can keep the page from scrolling, queues `KIND_WHEEL` pointer
+records (`installWheel`). CSS-pixel deltas become `WHEEL_PIXELS` in
+eighths of a surface pixel; line deltas become `WHEEL_DETENTS` at
+three lines a detent; a page is the surface's height. At most one
+record per unit goes out per animation frame, the deltas summed and
+the last position carried; a sum past one record is split, never
+clamped. A wheel event with Ctrl held is the browser's zoom and a
+trackpad's pinch: it is neither forwarded nor stopped, and reaches the
+application as a ratio change.
+
+**Keys.** The keyboard producer (`installKeyboard`) posts each key
+record one task after its keydown. The browser raises the `beforeinput`
+a key causes inside the keydown's own task, so by then the mirror has
+said whether its text field translated it; such a key carries
+`KEY_TEXT`, and the application does not apply it a second time. A
+keydown an input method owns produces no key record. A held key is
+reported once. Outside the mirror the page stops Enter, Shift, Space
+and the arrows from scrolling or activating page chrome; in a mirror
+text field those must type, so there the caret and focus keys are
+stopped instead (arrows, Home, End, PageUp, PageDown, Tab, Ctrl/Meta+A)
+and reach the application as plain keys.
 
 ---
 
@@ -651,6 +870,13 @@ A browser-host integration is healthy when:
   application code touches WebAudio.
 - Input identity is preserved end-to-end; the input native modules emit
   source-side records with no application mapping.
+- The host's own copies of contract values (the mirror's role table and
+  record constants, the key and wheel constants) equal the contract's:
+  each is declared on a line naming the contract constant it stands
+  for, and `fluxor ci` compares them.
+- `fluxor ci` has no browser. The `wasm-host-shims (node)` phase drives
+  the real host files against a small DOM; a screen reader, an input
+  method and a phone keyboard are checked by hand.
 - Every kernel-side wasm extern has a matching `host_*` shim entry,
   and the shims behave as the native modules above rely on when driven from
   a fake linear memory under `node` — the `wasm-host-shims (node)`

@@ -363,15 +363,33 @@ impl<'a> Pack<'a> {
 
     /// The strike for `ppem`, when the pack has one.
     pub fn strike(&self, ppem: u16) -> Option<Strike<'a>> {
+        Strike::parse(self.strike_bytes(ppem)?)
+    }
+
+    /// The bytes of the strike for `ppem`, when the pack has one: from the
+    /// strike's first byte to the next strike's, or to the end of the
+    /// strikes section for the last. They are a sub-slice of the pack, so
+    /// a reader that keeps the pack in place can name the strike by its
+    /// offset in it.
+    pub fn strike_bytes(&self, ppem: u16) -> Option<&'a [u8]> {
         let s = self.section(TAG_STRIKES)?;
         let n = self.strikes();
+        let mut start = None;
         for i in 0..n {
             if u16_at(s, 4 + i * 8)? == ppem {
-                let off = u32_at(s, 4 + i * 8 + 4)? as usize;
-                return Strike::parse(s.get(off..)?);
+                start = Some(u32_at(s, 4 + i * 8 + 4)? as usize);
+                break;
             }
         }
-        None
+        let start = start?;
+        let mut end = s.len();
+        for i in 0..n {
+            let off = u32_at(s, 4 + i * 8 + 4)? as usize;
+            if off > start && off < end {
+                end = off;
+            }
+        }
+        s.get(start..end)
     }
 }
 
@@ -397,14 +415,16 @@ pub struct Strike<'a> {
 }
 
 impl<'a> Strike<'a> {
+    /// The strike at the front of `s`; `None` when its tables do not fit.
     pub fn parse(s: &'a [u8]) -> Option<Strike<'a>> {
         let ppem = u16_at(s, 0)?;
         let count = u32_at(s, 4)? as usize;
-        let ids_len = (count * 2 + 3) & !3;
-        let ids = s.get(8..8 + count * 2)?;
-        let e0 = 8 + ids_len;
-        let entries = s.get(e0..e0 + count.checked_mul(STRIKE_ENTRY)?)?;
-        let bits = s.get(e0 + count * STRIKE_ENTRY..)?;
+        let ids_end = count.checked_mul(2)?.checked_add(8)?;
+        let ids = s.get(8..ids_end)?;
+        let e0 = ids_end.checked_add(3)? & !3;
+        let e1 = e0.checked_add(count.checked_mul(STRIKE_ENTRY)?)?;
+        let entries = s.get(e0..e1)?;
+        let bits = s.get(e1..)?;
         Some(Strike {
             ppem,
             count,
@@ -423,29 +443,83 @@ impl<'a> Strike<'a> {
         self.count == 0
     }
 
-    /// The bitmap for `glyph`, when the strike has it. A glyph that draws
+    /// Whether the strike's bytes are exactly its header, tables and the
+    /// bitmaps its entries name in `format`: every bitmap lies inside the
+    /// bitmap bytes and the last one ends them. A strike handed over as a
+    /// byte string of a stated length (a draw-list resource) is usable only
+    /// when this holds.
+    pub fn covers(&self, format: u8) -> bool {
+        let mut end = 0usize;
+        for i in 0..self.count {
+            let e = i * STRIKE_ENTRY;
+            let (Some(w), Some(h), Some(off)) = (
+                u16_at(self.entries, e),
+                u16_at(self.entries, e + 2),
+                u32_at(self.entries, e + 8),
+            ) else {
+                return false;
+            };
+            let Some(stop) = (off as usize).checked_add(row_bytes(format, w) * h as usize) else {
+                return false;
+            };
+            if stop > self.bits.len() {
+                return false;
+            }
+            end = end.max(stop);
+        }
+        end == self.bits.len()
+    }
+
+    /// The rows the glyph at position `index` of the entry table covers:
+    /// its bitmap's first row above the baseline and its height. `None`
+    /// past the strike.
+    #[inline]
+    pub fn rows(&self, index: usize) -> Option<(i16, u16)> {
+        if index >= self.count {
+            return None;
+        }
+        let e = index * STRIKE_ENTRY;
+        Some((
+            u16_at(self.entries, e + 6)? as i16,
+            u16_at(self.entries, e + 2)?,
+        ))
+    }
+
+    /// The bitmap of the glyph at position `index` of the entry table, its
+    /// rows in `format`: how a reader that names glyphs by position (a draw
+    /// list) looks one up, with no search. `None` past the strike, or when
+    /// the entry names bytes the strike does not hold. A glyph that draws
     /// nothing (a space) has a 0×0 bitmap.
-    pub fn bitmap(&self, glyph: u16, format: u8) -> Option<Bitmap<'a>> {
+    pub fn entry(&self, index: usize, format: u8) -> Option<Bitmap<'a>> {
+        if index >= self.count {
+            return None;
+        }
+        let e = index * STRIKE_ENTRY;
+        let w = u16_at(self.entries, e)?;
+        let h = u16_at(self.entries, e + 2)?;
+        let left = u16_at(self.entries, e + 4)? as i16;
+        let top = u16_at(self.entries, e + 6)? as i16;
+        let off = u32_at(self.entries, e + 8)? as usize;
+        let len = row_bytes(format, w).checked_mul(h as usize)?;
+        let data = self.bits.get(off..off.checked_add(len)?)?;
+        Some(Bitmap {
+            w,
+            h,
+            left,
+            top,
+            data,
+        })
+    }
+
+    /// The position in the entry table of the font's glyph `glyph`, when
+    /// the strike has it.
+    pub fn position(&self, glyph: u16) -> Option<usize> {
         let (mut lo, mut hi) = (0usize, self.count);
         while lo < hi {
             let mid = lo.midpoint(hi);
             let g = u16_at(self.ids, mid * 2)?;
             if g == glyph {
-                let e = mid * STRIKE_ENTRY;
-                let w = u16_at(self.entries, e)?;
-                let h = u16_at(self.entries, e + 2)?;
-                let left = u16_at(self.entries, e + 4)? as i16;
-                let top = u16_at(self.entries, e + 6)? as i16;
-                let off = u32_at(self.entries, e + 8)? as usize;
-                let row = row_bytes(format, w);
-                let data = self.bits.get(off..off + row * h as usize)?;
-                return Some(Bitmap {
-                    w,
-                    h,
-                    left,
-                    top,
-                    data,
-                });
+                return Some(mid);
             }
             if g < glyph {
                 lo = mid + 1;
@@ -454,6 +528,12 @@ impl<'a> Strike<'a> {
             }
         }
         None
+    }
+
+    /// The bitmap for the font's glyph `glyph`, when the strike has it. A
+    /// glyph that draws nothing (a space) has a 0×0 bitmap.
+    pub fn bitmap(&self, glyph: u16, format: u8) -> Option<Bitmap<'a>> {
+        self.entry(self.position(glyph)?, format)
     }
 }
 

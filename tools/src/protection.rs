@@ -220,6 +220,31 @@ pub fn code_plannable(code: u64, model: fluxor_contracts::isolation::RegionModel
     .is_ok()
 }
 
+/// Why an isolated instance's program region of `len` bytes cannot be
+/// granted under `model` at one of the addresses it has (`bases`: a
+/// placement's name and the region's first byte there), or `None`. The
+/// kernel grants the region read-only as one MPU region, which must draw it
+/// exactly, or the instance's load fails at boot.
+pub fn program_region_refusal(
+    len: u64,
+    bases: &[(&str, u64)],
+    model: fluxor_contracts::isolation::RegionModel,
+) -> Option<String> {
+    use fluxor_contracts::isolation::{region_plan, Access, Span};
+    bases.iter().find_map(|&(place, base)| {
+        region_plan(
+            &[Span {
+                base,
+                len,
+                access: Access::Read,
+            }],
+            model,
+        )
+        .err()
+        .map(|e| format!("at {base:#010x} ({place}) the MPU cannot draw it exactly ({e:?})"))
+    })
+}
+
 /// One gated module as admission sees it.
 pub struct Gated<'a> {
     pub name: &'a str,

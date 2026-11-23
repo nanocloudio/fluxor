@@ -1,103 +1,293 @@
-// linux_display native module — RGB565 sink. Three modes:
-//   file   write each frame to a PPM file on disk
-//   window blit into a winit/softbuffer host window (host-window feature)
-//   null   discard
+// linux_display native module — `VideoRaster` sink with frame memory.
+//
+// Every record on `pixels` is a region header
+// (`abi::contracts::video_raster`) and that region's pixels, RGB565 or
+// RGBA8 as the header says. The stream states its surface; the display
+// takes surfaces up to the extent its `pixels` port declares. A frame's
+// regions are shown together at its last one, and a damage frame changes
+// only its regions. A record the contract refuses is counted and skipped,
+// the picture stays as last presented, and the stream is scanned forward
+// for the next header (`fluxor::platform::linux::display_surface`).
+//
+// Three modes present the picture:
+//   file    each presented frame is written as a PPM file
+//   window  a host window shows it, each surface pixel `scale` x `scale`
+//           window pixels (host-window feature)
+//   null    nothing
+//
+// In window mode the window is also an input source. `pointer` carries
+// pointer and wheel records, `keys` key records and `text` committed text
+// and input-method compositions, all as the window reports them
+// (`fluxor::platform::linux::window_input`). Positions are in surface
+// pixels. The optional `tree` input is the application's accessibility
+// tree: while its focused node is editable the window allows its input
+// method and places it at that node; otherwise the input method is off.
 //
 // Params are declared in `modules/platform/linux/linux_display/manifest.toml`
 // and packed into the kernel's TLV stream by the config tool.
 
+use fluxor::platform::linux::display_surface::{Picture, RasterSink};
+use fluxor::platform::linux::ime_target::{Area, ImeTarget};
+
 #[cfg(feature = "host-window")]
 mod window_backend {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    };
+    use std::num::NonZeroU32;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use winit::application::ApplicationHandler;
-    use winit::dpi::LogicalSize;
-    use winit::event::WindowEvent;
-    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-    use winit::window::{Window, WindowAttributes, WindowId};
 
-    /// Publish the current logical content geometry into the Surface Traits
-    /// authority's shared slot (`super::SURFACE_WINDOW_GEOM`, packed
-    /// `(w << 16) | h`). Dimensions are clamped to u16.
+    use fluxor::abi::contracts::input::{key, pointer};
+    use fluxor::platform::linux::display_surface::Picture;
+    use fluxor::platform::linux::ime_target::Area;
+    use fluxor::platform::linux::input_queue::{RecordQueue, Wheel};
+    use fluxor::platform::linux::window_input::{
+        self, key_code_for_char, key_codes, KeyInput, TextInput,
+    };
+    use winit::application::ApplicationHandler;
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
+    use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+    use winit::keyboard::{Key, NamedKey};
+    use winit::platform::scancode::PhysicalKeyExtScancode;
+    use winit::platform::wayland::EventLoopBuilderExtWayland;
+    use winit::platform::x11::EventLoopBuilderExtX11;
+    use winit::window::{ImePurpose, Window, WindowAttributes, WindowId};
+
+    /// Publish the surface's extent into the Surface Traits authority's
+    /// shared slot (`super::SURFACE_WINDOW_GEOM`, packed `(w << 16) | h`).
     fn publish_surface_geom(w: u32, h: u32) {
         let packed = ((w.min(0xFFFF)) << 16) | h.min(0xFFFF);
         super::SURFACE_WINDOW_GEOM.store(packed, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Window backend: a dedicated thread owns the winit event loop;
-    /// the linux_display step thread submits RGB565 frames into a
-    /// shared latest-frame slot. Drop semantics: backend keeps
-    /// running for the program lifetime.
+    /// Which of the display's input outputs the graph wired. An unwired
+    /// output's records are never queued.
+    #[derive(Clone, Copy)]
+    pub struct Wired {
+        pub pointer: bool,
+        pub keys: bool,
+        pub text: bool,
+    }
+
+    /// The picture to show, as the step last presented it.
+    #[derive(Default)]
+    struct Frame {
+        width: u32,
+        height: u32,
+        pixels: Vec<u32>,
+        fresh: bool,
+    }
+
+    /// The window's input, queued for the step.
+    #[derive(Default)]
+    struct Input {
+        pointer: RecordQueue,
+        keys: RecordQueue,
+        text: RecordQueue,
+    }
+
+    /// Where the input method should stand, as the step last decided.
+    #[derive(Default)]
+    struct ImeRequest {
+        area: Option<Area>,
+        fresh: bool,
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        frame: Mutex<Frame>,
+        input: Mutex<Input>,
+        ime: Mutex<ImeRequest>,
+    }
+
+    /// Window backend: a dedicated thread owns the event loop and the
+    /// window; the display's step hands it pictures and input-method
+    /// placement, and takes its input queues. The thread sleeps until the
+    /// window system or the step wakes it, and lives as long as the
+    /// program.
     pub struct WindowBackend {
-        latest: Arc<Mutex<Vec<u16>>>,
-        wake: Arc<AtomicBool>,
+        shared: Arc<Shared>,
+        proxy: Option<EventLoopProxy<()>>,
     }
 
     impl WindowBackend {
-        pub fn spawn(width: u32, height: u32, scale: u32) -> Self {
-            let latest = Arc::new(Mutex::new(vec![0u16; (width * height) as usize]));
-            let wake = Arc::new(AtomicBool::new(false));
-            let latest_for_thread = Arc::clone(&latest);
-            let wake_for_thread = Arc::clone(&wake);
-            // The thread owns the EventLoop. winit insists the
-            // EventLoop be created on the thread that runs it.
-            thread::Builder::new()
+        pub fn spawn(width: u32, height: u32, scale: u32, wired: Wired) -> Self {
+            let shared = Arc::new(Shared::default());
+            let for_thread = Arc::clone(&shared);
+            let (proxy_tx, proxy_rx) = mpsc::channel();
+            // The thread owns the event loop: the windowing library ties
+            // one to the thread that created it.
+            let spawned = thread::Builder::new()
                 .name("fluxor-display".into())
                 .spawn(move || {
-                    let event_loop = EventLoop::new().expect("event loop");
-                    event_loop.set_control_flow(ControlFlow::Poll);
+                    let mut builder = EventLoop::<()>::with_user_event();
+                    EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+                    EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+                    let event_loop = match builder.build() {
+                        Ok(event_loop) => event_loop,
+                        Err(e) => {
+                            log::warn!("[linux_display] no window system: {e}");
+                            return;
+                        }
+                    };
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                    if proxy_tx.send(event_loop.create_proxy()).is_err() {
+                        return;
+                    }
                     let mut app = WindowApp {
                         width,
                         height,
-                        scale,
+                        scale: scale.max(1),
+                        wired,
                         window: None,
-                        context: None,
                         surface: None,
-                        latest: latest_for_thread,
-                        wake: wake_for_thread,
-                        scaled_buf: vec![0u32; (width * scale * height * scale) as usize],
+                        shared: for_thread,
+                        cursor: (0, 0),
+                        buttons: 0,
+                        modifiers: 0,
+                        text: TextInput::default(),
                     };
                     if let Err(e) = event_loop.run_app(&mut app) {
-                        log::warn!("[linux_display] event loop exited: {}", e);
+                        log::warn!("[linux_display] event loop exited: {e}");
                     }
-                })
-                .expect("spawn fluxor-display thread");
-            Self { latest, wake }
+                });
+            if let Err(e) = spawned {
+                log::warn!("[linux_display] window thread: {e}");
+            }
+            // The thread answers once its event loop exists, or drops the
+            // sender when there is no window system to open one on.
+            let proxy = proxy_rx.recv().ok();
+            Self { shared, proxy }
         }
 
-        pub fn submit(&self, rgb565: &[u8]) {
-            let mut guard = self.latest.lock().unwrap();
-            let n = guard.len().min(rgb565.len() / 2);
-            for i in 0..n {
-                guard[i] = u16::from_le_bytes([rgb565[2 * i], rgb565[2 * i + 1]]);
+        fn wake(&self) {
+            if let Some(proxy) = &self.proxy {
+                // An error means the event loop has ended: nothing to wake.
+                let _ = proxy.send_event(());
             }
-            self.wake.store(true, Ordering::Release);
+        }
+
+        /// Show `picture`.
+        pub fn submit(&self, picture: Picture<'_>) {
+            if let Ok(mut frame) = self.shared.frame.lock() {
+                frame.width = u32::from(picture.width);
+                frame.height = u32::from(picture.height);
+                frame.pixels.clear();
+                frame.pixels.extend_from_slice(picture.pixels);
+                frame.fresh = true;
+            }
+            self.wake();
+        }
+
+        /// Place the input method at `area`, or turn it off.
+        pub fn set_ime(&self, area: Option<Area>) {
+            if let Ok(mut ime) = self.shared.ime.lock() {
+                ime.area = area;
+                ime.fresh = true;
+            }
+            self.wake();
+        }
+
+        /// Hand queued input to the three writers, each while it takes
+        /// records; a refused record stays queued.
+        pub fn relay(
+            &self,
+            pointer: impl FnMut(&[u8]) -> bool,
+            keys: impl FnMut(&[u8]) -> bool,
+            text: impl FnMut(&[u8]) -> bool,
+        ) {
+            if let Ok(mut input) = self.shared.input.lock() {
+                input.pointer.relay(pointer);
+                input.keys.relay(keys);
+                input.text.relay(text);
+            }
         }
     }
 
     struct WindowApp {
+        /// The extent of the surface shown, in surface pixels.
         width: u32,
         height: u32,
         scale: u32,
+        wired: Wired,
         window: Option<Arc<Window>>,
-        context: Option<softbuffer::Context<Arc<Window>>>,
         surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-        latest: Arc<Mutex<Vec<u16>>>,
-        wake: Arc<AtomicBool>,
-        scaled_buf: Vec<u32>,
+        shared: Arc<Shared>,
+        /// The pointer's last position, in surface pixels.
+        cursor: (i16, i16),
+        buttons: u8,
+        modifiers: u8,
+        text: TextInput,
     }
 
-    impl ApplicationHandler for WindowApp {
+    fn button_bit(button: MouseButton) -> u8 {
+        match button {
+            MouseButton::Left => pointer::BTN_PRIMARY,
+            MouseButton::Right => pointer::BTN_SECONDARY,
+            MouseButton::Middle => pointer::BTN_TERTIARY,
+            MouseButton::Back => pointer::BTN_BACK,
+            MouseButton::Forward => pointer::BTN_FORWARD,
+            MouseButton::Other(_) => 0,
+        }
+    }
+
+    /// The key contract's `key_code` for a window's logical key.
+    fn key_code(key: &Key) -> u16 {
+        match key {
+            Key::Character(s) => s.chars().next().map_or(0, key_code_for_char),
+            Key::Named(named) => match named {
+                NamedKey::Backspace => key_codes::BACKSPACE,
+                NamedKey::Tab => key_codes::TAB,
+                NamedKey::Enter => key_codes::ENTER,
+                NamedKey::Shift => key_codes::SHIFT,
+                NamedKey::Control => key_codes::CONTROL,
+                NamedKey::Alt | NamedKey::AltGraph => key_codes::ALT,
+                NamedKey::Pause => key_codes::PAUSE,
+                NamedKey::CapsLock => key_codes::CAPS_LOCK,
+                NamedKey::Escape => key_codes::ESCAPE,
+                NamedKey::Space => key_codes::SPACE,
+                NamedKey::PageUp => key_codes::PAGE_UP,
+                NamedKey::PageDown => key_codes::PAGE_DOWN,
+                NamedKey::End => key_codes::END,
+                NamedKey::Home => key_codes::HOME,
+                NamedKey::ArrowLeft => key_codes::ARROW_LEFT,
+                NamedKey::ArrowUp => key_codes::ARROW_UP,
+                NamedKey::ArrowRight => key_codes::ARROW_RIGHT,
+                NamedKey::ArrowDown => key_codes::ARROW_DOWN,
+                NamedKey::PrintScreen => key_codes::PRINT_SCREEN,
+                NamedKey::Insert => key_codes::INSERT,
+                NamedKey::Delete => key_codes::DELETE,
+                NamedKey::Super | NamedKey::Meta => key_codes::META,
+                NamedKey::ContextMenu => key_codes::CONTEXT_MENU,
+                NamedKey::NumLock => key_codes::NUM_LOCK,
+                NamedKey::ScrollLock => key_codes::SCROLL_LOCK,
+                NamedKey::F1 => key_codes::F1,
+                NamedKey::F2 => key_codes::F1 + 1,
+                NamedKey::F3 => key_codes::F1 + 2,
+                NamedKey::F4 => key_codes::F1 + 3,
+                NamedKey::F5 => key_codes::F1 + 4,
+                NamedKey::F6 => key_codes::F1 + 5,
+                NamedKey::F7 => key_codes::F1 + 6,
+                NamedKey::F8 => key_codes::F1 + 7,
+                NamedKey::F9 => key_codes::F1 + 8,
+                NamedKey::F10 => key_codes::F1 + 9,
+                NamedKey::F11 => key_codes::F1 + 10,
+                NamedKey::F12 => key_codes::F1 + 11,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    impl ApplicationHandler<()> for WindowApp {
         fn resumed(&mut self, event_loop: &ActiveEventLoop) {
             if self.window.is_some() {
                 return;
             }
+            // Window pixels, not points: a surface pixel is exactly
+            // `scale` x `scale` of them on a display of any density.
             let attrs = WindowAttributes::default()
                 .with_title("fluxor display")
-                .with_inner_size(LogicalSize::new(
+                .with_inner_size(PhysicalSize::new(
                     self.width * self.scale,
                     self.height * self.scale,
                 ))
@@ -105,34 +295,79 @@ mod window_backend {
             let window = match event_loop.create_window(attrs) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
-                    log::warn!("[linux_display] create_window failed: {}", e);
+                    log::warn!("[linux_display] create_window failed: {e}");
                     event_loop.exit();
                     return;
                 }
             };
-            let context = match softbuffer::Context::new(Arc::clone(&window)) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("[linux_display] softbuffer context: {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
-            let surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            let surface = softbuffer::Context::new(Arc::clone(&window))
+                .and_then(|context| softbuffer::Surface::new(&context, Arc::clone(&window)));
+            let surface = match surface {
                 Ok(s) => s,
                 Err(e) => {
-                    log::warn!("[linux_display] softbuffer surface: {}", e);
+                    log::warn!("[linux_display] window surface: {e}");
                     event_loop.exit();
                     return;
                 }
             };
+            window.set_ime_allowed(false);
             self.window = Some(window);
-            self.context = Some(context);
             self.surface = Some(surface);
-            // Publish the initial logical content geometry to the Surface
-            // Traits authority. `width`/`height` are the unscaled content size
-            // — the viewport an adaptive consumer reasons about.
             publish_surface_geom(self.width, self.height);
+        }
+
+        fn user_event(&mut self, _event_loop: &ActiveEventLoop, _wake: ()) {
+            let Some(window) = self.window.as_ref() else {
+                return;
+            };
+            let extent = self.shared.frame.lock().ok().and_then(|mut frame| {
+                let fresh = std::mem::take(&mut frame.fresh);
+                fresh.then_some((frame.width, frame.height))
+            });
+            if let Some((width, height)) = extent {
+                if (width, height) != (self.width, self.height) {
+                    self.width = width;
+                    self.height = height;
+                    // The answer is the window system's; the picture is
+                    // drawn into whatever extent the window has.
+                    let _ = window.request_inner_size(PhysicalSize::new(
+                        width * self.scale,
+                        height * self.scale,
+                    ));
+                    publish_surface_geom(width, height);
+                }
+                window.request_redraw();
+            }
+            let request = self.shared.ime.lock().ok().and_then(|mut ime| {
+                let fresh = std::mem::take(&mut ime.fresh);
+                fresh.then_some(ime.area)
+            });
+            if let Some(area) = request {
+                match area {
+                    Some(area) => {
+                        let scale = self.scale as i32;
+                        window.set_ime_purpose(if area.secret {
+                            ImePurpose::Password
+                        } else {
+                            ImePurpose::Normal
+                        });
+                        window.set_ime_allowed(true);
+                        window.set_ime_cursor_area(
+                            PhysicalPosition::new(area.x * scale, area.y * scale),
+                            PhysicalSize::new(
+                                (area.w * scale).max(1) as u32,
+                                (area.h * scale).max(1) as u32,
+                            ),
+                        );
+                    }
+                    None => {
+                        window.set_ime_allowed(false);
+                        if let Ok(mut input) = self.shared.input.lock() {
+                            self.text.end(&mut input.text);
+                        }
+                    }
+                }
+            }
         }
 
         fn window_event(
@@ -144,44 +379,161 @@ mod window_backend {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::RedrawRequested => self.redraw(),
+                WindowEvent::ModifiersChanged(mods) => {
+                    // Key and pointer records share one modifier byte.
+                    let state = mods.state();
+                    let held = |down: bool, bit: u8| if down { bit } else { 0 };
+                    self.modifiers = held(state.shift_key(), key::MOD_SHIFT)
+                        | held(state.control_key(), key::MOD_CTRL)
+                        | held(state.alt_key(), key::MOD_ALT)
+                        | held(state.super_key(), key::MOD_META);
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor = window_input::surface_point(position.x, position.y, self.scale);
+                    self.pointer(pointer::KIND_MOVE, 0, self.buttons, self.cursor);
+                }
+                WindowEvent::CursorEntered { .. } => {
+                    self.pointer(pointer::KIND_ENTER, 0, self.buttons, self.cursor);
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    self.pointer(pointer::KIND_LEAVE, 0, self.buttons, self.cursor);
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    let bit = button_bit(button);
+                    let kind = if state == ElementState::Pressed {
+                        self.buttons |= bit;
+                        pointer::KIND_DOWN
+                    } else {
+                        self.buttons &= !bit;
+                        pointer::KIND_UP
+                    };
+                    self.pointer(kind, 0, self.buttons, self.cursor);
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let (unit, (dx, dy)) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            (pointer::WHEEL_DETENTS, window_input::wheel_from_lines(x, y))
+                        }
+                        MouseScrollDelta::PixelDelta(by) => (
+                            pointer::WHEEL_PIXELS,
+                            window_input::wheel_from_pixels(by.x, by.y, self.scale),
+                        ),
+                    };
+                    if self.wired.pointer {
+                        if let Ok(mut input) = self.shared.input.lock() {
+                            input.pointer.push_wheel(&Wheel {
+                                pointer_id: 0,
+                                unit,
+                                buttons: self.buttons,
+                                modifiers: self.modifiers,
+                                x: self.cursor.0,
+                                y: self.cursor.1,
+                                dx,
+                                dy,
+                            });
+                        }
+                    }
+                }
+                WindowEvent::Touch(touch) => {
+                    // Pointer 0 is the mouse; contacts follow it.
+                    let id = (touch.id % 255) as u8 + 1;
+                    let at =
+                        window_input::surface_point(touch.location.x, touch.location.y, self.scale);
+                    let (kind, buttons) = match touch.phase {
+                        TouchPhase::Started => (pointer::KIND_DOWN, pointer::BTN_PRIMARY),
+                        TouchPhase::Moved => (pointer::KIND_MOVE, pointer::BTN_PRIMARY),
+                        TouchPhase::Ended => (pointer::KIND_UP, 0),
+                        TouchPhase::Cancelled => (pointer::KIND_CANCEL, 0),
+                    };
+                    self.pointer(kind, id, buttons, at);
+                }
+                WindowEvent::KeyboardInput {
+                    event,
+                    is_synthetic: false,
+                    ..
+                } => {
+                    if let Ok(mut input) = self.shared.input.lock() {
+                        let input = &mut *input;
+                        let mut unwired = RecordQueue::default();
+                        let keys = if self.wired.keys {
+                            &mut input.keys
+                        } else {
+                            &mut unwired
+                        };
+                        self.text.key(
+                            &KeyInput {
+                                pressed: event.state == ElementState::Pressed,
+                                repeat: event.repeat,
+                                modifiers: self.modifiers,
+                                key_code: key_code(&event.logical_key),
+                                scan_code: event
+                                    .physical_key
+                                    .to_scancode()
+                                    .map_or(0, |code| code.min(u32::from(u16::MAX)) as u16),
+                                text: event.text.as_deref(),
+                            },
+                            self.wired.text,
+                            keys,
+                            &mut input.text,
+                        );
+                    }
+                }
+                WindowEvent::Ime(ime) if self.wired.text => {
+                    if let Ok(mut input) = self.shared.input.lock() {
+                        match ime {
+                            Ime::Preedit(preedit, cursor) => {
+                                self.text.preedit(&preedit, cursor, &mut input.text);
+                            }
+                            Ime::Commit(committed) => {
+                                self.text.commit(&committed, &mut input.text);
+                            }
+                            Ime::Disabled => self.text.end(&mut input.text),
+                            Ime::Enabled => {}
+                        }
+                    }
+                }
+                WindowEvent::Focused(false) => {
+                    if let Ok(mut input) = self.shared.input.lock() {
+                        self.text.end(&mut input.text);
+                    }
+                }
                 WindowEvent::Resized(size) => {
-                    // Republish the logical content geometry so the Surface
-                    // Traits authority emits a fresh record (and the consumer
-                    // re-adapts). Physical → logical via the integer scale.
-                    let scale = self.scale.max(1);
-                    publish_surface_geom(size.width / scale, size.height / scale);
+                    publish_surface_geom(size.width / self.scale, size.height / self.scale);
                 }
                 _ => {}
-            }
-        }
-
-        fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-            // Pull the wake flag once per loop iteration. If new pixels
-            // arrived, ask the window to repaint. This couples the
-            // display refresh rate to producer cadence rather than
-            // free-running at 60Hz with no work to do.
-            if self.wake.swap(false, Ordering::AcqRel) {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
             }
         }
     }
 
     impl WindowApp {
+        fn pointer(&mut self, kind: u8, id: u8, buttons: u8, at: (i16, i16)) {
+            if !self.wired.pointer {
+                return;
+            }
+            if let Ok(mut input) = self.shared.input.lock() {
+                input.pointer.push(&window_input::pointer_record(
+                    kind,
+                    id,
+                    buttons,
+                    self.modifiers,
+                    at.0,
+                    at.1,
+                ));
+            }
+        }
+
+        /// Draw the picture into the window: each surface pixel as
+        /// `scale` x `scale` window pixels from the top-left corner, black
+        /// where the window reaches past the picture.
         fn redraw(&mut self) {
             let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
             else {
                 return;
             };
             let size = window.inner_size();
-            let w = match std::num::NonZeroU32::new(size.width) {
-                Some(v) => v,
-                None => return,
-            };
-            let h = match std::num::NonZeroU32::new(size.height) {
-                Some(v) => v,
-                None => return,
+            let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+            else {
+                return;
             };
             if surface.resize(w, h).is_err() {
                 return;
@@ -189,81 +541,53 @@ mod window_backend {
             let mut buffer = match surface.buffer_mut() {
                 Ok(b) => b,
                 Err(e) => {
-                    log::warn!("[linux_display] surface.buffer_mut: {}", e);
+                    log::warn!("[linux_display] surface.buffer_mut: {e}");
                     return;
                 }
             };
-            // Snapshot the latest frame under the lock then convert
-            // RGB565 → 0xRRGGBB, scaling each source pixel into a
-            // `scale × scale` block. softbuffer expects ARGB u32.
-            let scaled_w = self.width * self.scale;
-            let scaled_h = self.height * self.scale;
-            let needed = (scaled_w * scaled_h) as usize;
-            if self.scaled_buf.len() != needed {
-                self.scaled_buf.resize(needed, 0);
-            }
-            {
-                let src = self.latest.lock().unwrap();
-                let scale = self.scale as usize;
-                let sw = self.width as usize;
-                let sh = self.height as usize;
-                for sy in 0..sh {
-                    for sx in 0..sw {
-                        let v = src[sy * sw + sx];
-                        let r5 = ((v >> 11) & 0x1F) as u32;
-                        let g6 = ((v >> 5) & 0x3F) as u32;
-                        let b5 = (v & 0x1F) as u32;
-                        let r = (r5 << 3) | (r5 >> 2);
-                        let g = (g6 << 2) | (g6 >> 4);
-                        let b = (b5 << 3) | (b5 >> 2);
-                        let pixel = (r << 16) | (g << 8) | b;
-                        for dy in 0..scale {
-                            let row = (sy * scale + dy) * (sw * scale);
-                            for dx in 0..scale {
-                                self.scaled_buf[row + sx * scale + dx] = pixel;
-                            }
+            let Ok(frame) = self.shared.frame.lock() else {
+                return;
+            };
+            let scale = self.scale as usize;
+            let (src_w, src_h) = (frame.width as usize, frame.height as usize);
+            for (y, row) in buffer.chunks_exact_mut(size.width as usize).enumerate() {
+                let src_row = (y / scale < src_h)
+                    .then(|| frame.pixels.get(y / scale * src_w..(y / scale + 1) * src_w))
+                    .flatten();
+                match src_row {
+                    Some(src_row) => {
+                        for (x, out) in row.iter_mut().enumerate() {
+                            *out = src_row.get(x / scale).copied().unwrap_or(0);
                         }
                     }
+                    None => row.fill(0),
                 }
             }
-            // Copy into the surface buffer, clipping to whichever is
-            // smaller in case the OS resized us behind our back.
-            let copy_len = buffer.len().min(self.scaled_buf.len());
-            buffer[..copy_len].copy_from_slice(&self.scaled_buf[..copy_len]);
+            drop(frame);
             if let Err(e) = buffer.present() {
-                log::warn!("[linux_display] buffer.present: {}", e);
+                log::warn!("[linux_display] buffer.present: {e}");
             }
         }
     }
 }
 
-use std::io::Write;
 use std::path::Path;
-
 
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
 // generated into `abi::platform::native`. `mode` selects file=0, null=1, window=2.
-// `header`, when set, prefixes each frame on `pixels` with a self-describing
-// header and takes geometry from the STREAM rather than the width/height
-// config — so a producer can resize without the two ends agreeing on a config.
-// See sector/modules/common/sector_raster.rs (`SRF1`).
 use fluxor::abi::platform::native::linux::linux_display as display_tags;
 use fluxor::abi::platform::native::linux::linux_display::{
-    TAG_HEADER as DISPLAY_TAG_HEADER, TAG_HEIGHT as DISPLAY_TAG_HEIGHT,
-    TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH, TAG_SCALE as DISPLAY_TAG_SCALE,
-    TAG_WIDTH as DISPLAY_TAG_WIDTH,
+    TAG_HEIGHT as DISPLAY_TAG_HEIGHT, TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH,
+    TAG_SCALE as DISPLAY_TAG_SCALE, TAG_WIDTH as DISPLAY_TAG_WIDTH,
 };
-// When set, each frame on `pixels` is prefixed with a self-describing header and the
-// display takes its geometry from the STREAM, not the `width`/`height` config — so a
-// producer can resize without the two ends agreeing on a config. See
-// sector/modules/common/sector_raster.rs (`SRF1`).
-const SRF1_MAGIC: &[u8; 4] = b"SRF1";
-const SRF1_HDR_LEN: usize = 10; // magic(4) + w(2) + h(2) + format(1) + flags(1)
-/// Max per-axis dimension a stream-supplied SRF1 header may request. The
-/// u16 header field can encode up to 65535, so an unbounded `w*h*2` resize is
-/// ~8 GiB and can OOM-kill the host. Bound it to the same 4096 ceiling the
-/// module manifest enforces on configured geometry; a larger header is rejected.
-const SRF1_MAX_DIM: usize = 4096;
+
+/// The largest surface the display takes on either axis: the `width` and
+/// `height` facts of its `pixels` port.
+const DISPLAY_MAX_EXTENT: u16 = 4096;
+
+/// Stream bytes one step takes from each input, so a step's work is bounded
+/// whatever the producer has queued.
+const DISPLAY_STEP_BYTES: usize = 256 * 1024;
 
 const DISPLAY_MODE_FILE: u8 = 0;
 const DISPLAY_MODE_NULL: u8 = 1;
@@ -279,20 +603,22 @@ enum DisplayMode {
 
 struct LinuxDisplayState {
     in_chan: i32,
+    tree_chan: i32,
+    #[cfg(feature = "host-window")]
+    pointer_chan: i32,
+    #[cfg(feature = "host-window")]
+    keys_chan: i32,
+    #[cfg(feature = "host-window")]
+    text_chan: i32,
     failed: bool,
     mode: DisplayMode,
-    width: usize,
-    height: usize,
-    frame_size: usize,
     path_template: String,
-    scratch: Vec<u8>,
-    scratch_pos: usize,
+    sink: RasterSink,
     frame_counter: u32,
-    // Self-describing-frame mode: collect a per-frame SRF1 header and size geometry
-    // from it. `hdr_pos` is how much of the current frame's header is buffered.
-    header_mode: bool,
-    hdr: [u8; SRF1_HDR_LEN],
-    hdr_pos: usize,
+    /// The accessibility tree followed for the input method, when `tree`
+    /// is wired, and the placement last handed to the window.
+    ime: Option<ImeTarget>,
+    ime_area: Option<Area>,
     #[cfg(feature = "host-window")]
     window: Option<window_backend::WindowBackend>,
 }
@@ -334,29 +660,49 @@ fn render_path_template(template: &str, counter: u32) -> String {
     }
 }
 
-fn write_ppm(path: &str, width: usize, height: usize, rgb565: &[u8]) -> std::io::Result<()> {
+fn write_ppm(path: &str, picture: Picture<'_>) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut f = std::fs::File::create(path)?;
-    write!(f, "P6\n{width} {height}\n255\n")?;
-    let mut rgb888 = Vec::with_capacity(width * height * 3);
-    for pixel in rgb565.chunks_exact(2) {
-        let lo = pixel[0] as u16;
-        let hi = pixel[1] as u16;
-        let v = (hi << 8) | lo; // little-endian RGB565
-        let r5 = ((v >> 11) & 0x1F) as u8;
-        let g6 = ((v >> 5) & 0x3F) as u8;
-        let b5 = (v & 0x1F) as u8;
-        // 5/6-bit → 8-bit with bit replication for full dynamic range.
-        rgb888.push((r5 << 3) | (r5 >> 2));
-        rgb888.push((g6 << 2) | (g6 >> 4));
-        rgb888.push((b5 << 3) | (b5 >> 2));
+    std::fs::write(path, picture.to_ppm())
+}
+
+/// Write `record` whole to `chan`. Whether the channel took it.
+#[cfg(feature = "host-window")]
+fn display_write(chan: i32, record: &[u8]) -> bool {
+    // SAFETY: `record` is readable for its length; the channel copies it.
+    let written = unsafe { channel::channel_write(chan, record.as_ptr(), record.len()) };
+    written > 0 && written as usize == record.len()
+}
+
+impl LinuxDisplayState {
+    /// Present one completed frame in the configured mode.
+    fn present(&mut self, picture: Picture<'_>) {
+        match self.mode {
+            DisplayMode::File => {
+                if self.failed {
+                    return;
+                }
+                let path = render_path_template(&self.path_template, self.frame_counter);
+                if let Err(e) = write_ppm(&path, picture) {
+                    log::warn!("[linux_display] write {path} failed: {e}");
+                    self.failed = true;
+                } else if self.frame_counter < 4 || self.frame_counter.is_multiple_of(60) {
+                    log::info!("[linux_display] wrote {path}");
+                }
+            }
+            DisplayMode::Null => {}
+            #[cfg(feature = "host-window")]
+            DisplayMode::Window => {
+                if let Some(w) = self.window.as_ref() {
+                    w.submit(picture);
+                }
+            }
+        }
+        self.frame_counter = self.frame_counter.wrapping_add(1);
     }
-    f.write_all(&rgb888)?;
-    Ok(())
 }
 
 /// # Safety
@@ -366,96 +712,66 @@ unsafe extern "C" fn linux_display_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxDisplayState` by the loader.
     let st = unsafe { instance_state::<LinuxDisplayState>(state) };
 
-    if st.failed || st.in_chan < 0 {
-        return 0;
-    }
-
     let mut buf = [0u8; 4096];
-    // SAFETY: stack buffer of 4096 bytes; `channel_read` writes ≤ `buf.len()`.
-    let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
-    if n <= 0 {
-        return 0;
+    if st.in_chan >= 0 {
+        let mut taken = 0usize;
+        while taken < DISPLAY_STEP_BYTES {
+            // SAFETY: `channel_read` writes at most `buf.len()` bytes.
+            let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            taken += n;
+            // The sink is lent out of the state while it calls back into
+            // it to present.
+            let mut sink = std::mem::replace(&mut st.sink, RasterSink::new(0, 0));
+            sink.feed(
+                &buf[..n],
+                |picture| st.present(picture),
+                |fault, refused| {
+                    if refused.is_power_of_two() {
+                        log::warn!(
+                            "[linux_display] raster record refused ({fault:?}); {refused} refused so far"
+                        );
+                    }
+                },
+            );
+            st.sink = sink;
+        }
     }
 
-    let mut consumed = 0usize;
-    let n = n as usize;
-    while consumed < n {
-        // Header phase (opt-in): collect the SRF1 header at each frame start and
-        // self-configure geometry from it — the producer decides the frame size.
-        if st.header_mode && st.hdr_pos < SRF1_HDR_LEN {
-            let want = SRF1_HDR_LEN - st.hdr_pos;
-            let take = (n - consumed).min(want);
-            st.hdr[st.hdr_pos..st.hdr_pos + take].copy_from_slice(&buf[consumed..consumed + take]);
-            st.hdr_pos += take;
-            consumed += take;
-            if st.hdr_pos == SRF1_HDR_LEN {
-                if &st.hdr[0..4] == SRF1_MAGIC {
-                    let w = (st.hdr[4] as usize) | ((st.hdr[5] as usize) << 8);
-                    let h = (st.hdr[6] as usize) | ((st.hdr[7] as usize) << 8);
-                    if w == 0 || h == 0 || w > SRF1_MAX_DIM || h > SRF1_MAX_DIM {
-                        // Reject a stream-supplied geometry outside the bound
-                        // rather than resize `scratch` to a multi-GiB buffer;
-                        // fall back to the configured geometry (raw mode).
-                        log::warn!(
-                            "[linux_display] header dims {w}x{h} out of range (max {SRF1_MAX_DIM}); raw fallback {}x{}",
-                            st.width,
-                            st.height
-                        );
-                        st.header_mode = false;
-                    } else if w != st.width || h != st.height {
-                        st.width = w;
-                        st.height = h;
-                        st.frame_size = w * h * 2;
-                        st.scratch.resize(st.frame_size, 0);
-                    }
-                } else {
-                    log::warn!(
-                        "[linux_display] header mode: frame magic mismatch; raw fallback {}x{}",
-                        st.width,
-                        st.height
-                    );
-                    st.header_mode = false;
+    if st.tree_chan >= 0 {
+        if let Some(ime) = st.ime.as_mut() {
+            let mut taken = 0usize;
+            while taken < DISPLAY_STEP_BYTES {
+                // SAFETY: `channel_read` writes at most `buf.len()` bytes.
+                let n = unsafe { channel::channel_read(st.tree_chan, buf.as_mut_ptr(), buf.len()) };
+                if n <= 0 {
+                    break;
                 }
-                st.scratch_pos = 0;
+                taken += n as usize;
+                ime.feed(&buf[..n as usize]);
             }
-            continue;
-        }
-        if st.frame_size == 0 {
-            break; // no geometry yet (header pending) — nothing to accumulate
-        }
-        let want = st.frame_size - st.scratch_pos;
-        let take = (n - consumed).min(want);
-        st.scratch[st.scratch_pos..st.scratch_pos + take]
-            .copy_from_slice(&buf[consumed..consumed + take]);
-        st.scratch_pos += take;
-        consumed += take;
-
-        if st.scratch_pos == st.frame_size {
-            match st.mode {
-                DisplayMode::File => {
-                    let path = render_path_template(&st.path_template, st.frame_counter);
-                    if let Err(e) = write_ppm(&path, st.width, st.height, &st.scratch) {
-                        log::warn!("[linux_display] write {path} failed: {e}");
-                        st.failed = true;
-                        return 0;
-                    } else if st.frame_counter < 4 || st.frame_counter % 60 == 0 {
-                        log::info!("[linux_display] wrote {path}");
-                    }
-                }
-                DisplayMode::Null => {}
+            let area = ime.area();
+            if area != st.ime_area {
+                st.ime_area = area;
                 #[cfg(feature = "host-window")]
-                DisplayMode::Window => {
-                    if let Some(w) = st.window.as_ref() {
-                        w.submit(&st.scratch);
-                    }
+                if let Some(w) = st.window.as_ref() {
+                    w.set_ime(area);
                 }
             }
-            st.frame_counter = st.frame_counter.wrapping_add(1);
-            st.scratch_pos = 0;
-            if st.header_mode {
-                st.hdr_pos = 0; // expect the next frame's header
-            }
         }
+    }
+
+    #[cfg(feature = "host-window")]
+    if let Some(w) = st.window.as_ref() {
+        let (pointer, keys, text) = (st.pointer_chan, st.keys_chan, st.text_chan);
+        w.relay(
+            |record| display_write(pointer, record),
+            |record| display_write(keys, record),
+            |record| display_write(text, record),
+        );
     }
     0
 }
@@ -467,7 +783,6 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> Result<Box<LinuxDisp
     let mut width: usize = 0;
     let mut height: usize = 0;
     let mut scale: usize = 1;
-    let mut header_mode = false;
     let mut path = String::new();
     walk_tlv(params, |tag, value| match tag {
         DISPLAY_TAG_MODE => mode_raw = tlv_u8(value),
@@ -475,20 +790,28 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> Result<Box<LinuxDisp
         DISPLAY_TAG_WIDTH => width = tlv_u32(value) as usize,
         DISPLAY_TAG_HEIGHT => height = tlv_u32(value) as usize,
         DISPLAY_TAG_SCALE => scale = (tlv_u32(value) as usize).max(1),
-        DISPLAY_TAG_HEADER => header_mode = tlv_u32(value) != 0,
         _ => {}
     });
     let mode = resolve_mode(mode_raw);
-    let frame_size = width * height * 2;
     let mode_str = match mode {
         DisplayMode::File => "file",
         DisplayMode::Null => "null",
         #[cfg(feature = "host-window")]
         DisplayMode::Window => "window",
     };
+    let in_chan = scheduler::module_port(module_idx, display_tags::PORT_PIXELS);
+    let tree_chan = scheduler::module_port(module_idx, display_tags::PORT_TREE);
+    let pointer_chan = scheduler::module_port(module_idx, display_tags::PORT_POINTER);
+    let keys_chan = scheduler::module_port(module_idx, display_tags::PORT_KEYS);
+    let text_chan = scheduler::module_port(module_idx, display_tags::PORT_TEXT);
     log::info!(
-        "[linux_display] mode={mode_str} {width}x{height} scale={scale} ({frame_size} bytes/frame) header={header_mode} path='{path}'",
+        "[linux_display] mode={mode_str} window {width}x{height} scale={scale} path='{path}'",
     );
+    if mode_str != "window" && (pointer_chan >= 0 || keys_chan >= 0 || text_chan >= 0) {
+        log::warn!(
+            "[linux_display] pointer, keys and text come from the window; mode={mode_str} sends none"
+        );
+    }
 
     #[cfg(feature = "host-window")]
     let window = if matches!(mode, DisplayMode::Window) {
@@ -496,29 +819,38 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> Result<Box<LinuxDisp
             width as u32,
             height as u32,
             scale as u32,
+            window_backend::Wired {
+                pointer: pointer_chan >= 0,
+                keys: keys_chan >= 0,
+                text: text_chan >= 0,
+            },
         ))
     } else {
         None
     };
-    let in_chan = scheduler::module_port(module_idx, display_tags::PORT_PIXELS);
     let st = Box::new(LinuxDisplayState {
-            in_chan,
-            failed: false,
-            mode,
-            width,
-            height,
-            frame_size,
-            path_template: path,
-            scratch: vec![0u8; frame_size],
-            scratch_pos: 0,
-            frame_counter: 0,
-            header_mode,
-            hdr: [0u8; SRF1_HDR_LEN],
-            hdr_pos: 0,
-            #[cfg(feature = "host-window")]
-            window,
-        });
-    log::info!("[inst] module {module_idx} = linux_display (native) in={in_chan}");
+        in_chan,
+        tree_chan,
+        #[cfg(feature = "host-window")]
+        pointer_chan,
+        #[cfg(feature = "host-window")]
+        keys_chan,
+        #[cfg(feature = "host-window")]
+        text_chan,
+        failed: false,
+        mode,
+        path_template: path,
+        sink: RasterSink::new(DISPLAY_MAX_EXTENT, DISPLAY_MAX_EXTENT),
+        frame_counter: 0,
+        ime: (tree_chan >= 0).then(ImeTarget::new),
+        ime_area: None,
+        #[cfg(feature = "host-window")]
+        window,
+    });
+    log::info!(
+        "[inst] module {module_idx} = linux_display (native) in={in_chan} tree={tree_chan} \
+         pointer={pointer_chan} keys={keys_chan} text={text_chan}"
+    );
     Ok(st)
 }
 
@@ -529,4 +861,5 @@ impl HostNative for LinuxDisplayState {
 }
 
 /// The `linux_display` native module.
-pub static LINUX_DISPLAY: NativeVtable = host_vtable::<LinuxDisplayState>(linux_display_step, native::linux_display::STATE_BYTES);
+pub static LINUX_DISPLAY: NativeVtable =
+    host_vtable::<LinuxDisplayState>(linux_display_step, native::linux_display::STATE_BYTES);

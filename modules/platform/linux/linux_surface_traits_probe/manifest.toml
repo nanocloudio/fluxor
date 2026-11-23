@@ -6,12 +6,12 @@ builtin = true
 # the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Demo consumer of the Surface Traits surface on Linux. Reads
-# `input::surface_traits::MSG_TRAITS` records from its input port and logs the
-# decoded fields via log::info!, so the whole round-trip is observable on a
-# headless Linux box: linux_surface_traits → channel → this probe. Not a
-# production module — it is the live check that the surface works end to end.
-# Plug/unplug a USB input device and watch the epoch bump.
+# A consumer of the Surface Traits surface on Linux that logs what it
+# reads. Each `input::surface_traits::MSG_TRAITS` record on its input is
+# decoded with the contract's reader and logged by field (viewport, size
+# classes, displays, `dpr_eighths`, modalities, epoch), so the round trip
+# linux_surface_traits → channel → this probe can be watched on a host
+# with no display. Plug or unplug a USB input device and the epoch moves.
 
 [[ports]]
 name = "events"
@@ -21,4 +21,4 @@ required = true
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "Linux-host demo probe — logs decoded surface-state to stdout, not an on-silicon data path"
+exempt = "Linux-host probe — logs decoded surface-state to stdout, not an on-silicon data path"

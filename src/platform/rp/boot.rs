@@ -68,6 +68,12 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 #[cfg(feature = "rp")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Reset() -> ! {
+    // A reset of this core alone (a panic's `SYSRESETREQ` resets only the
+    // core that asked) leaves the other core running the image whose statics
+    // are about to be initialised again. Reset it into the bootrom's wait
+    // before anything else.
+    #[cfg(feature = "smp")]
+    crate::platform::rp_core1::reset();
     // SAFETY: the linker's own region symbols, and this runs once, before
     // anything reads a static.
     let initialised = unsafe {
@@ -166,17 +172,21 @@ pub fn stack_peak() -> (usize, usize) {
     (top - word as usize, top - floor)
 }
 
-/// The deepest the stack has been at the moment the scheduler called into a
-/// module, in bytes below the top: the kernel's own share of the stack under
-/// a module, which `kernel_stack_reserve_kb` must cover.
+/// Cores with a stack of their own to fence.
 #[cfg(feature = "rp")]
-static mut ENTRY_DEPTH: usize = 0;
+const STACKS: usize = 2;
 
-/// The armed fence: the lowest address the stack may reach while the module
-/// being called runs, or 0 when disarmed.
+/// The deepest each core's stack has been at the moment the scheduler called
+/// into a module, in bytes below its top: the kernel's own share of the stack
+/// under a module, which the core's reserve must cover. Each entry is its
+/// own core's.
 #[cfg(feature = "rp")]
-static mut FENCE: usize = 0;
-
+static mut ENTRY_DEPTH: [usize; STACKS] = [0; STACKS];
+/// Each core's armed fence: the lowest address its stack may reach while the
+/// module being called runs, or 0 when disarmed. Each entry is its own
+/// core's.
+#[cfg(feature = "rp")]
+static mut FENCE: [usize; STACKS] = [0; STACKS];
 /// Words the fence spans: 128 bytes. A frame that crosses the fence is seen
 /// when it writes into it, and a frame's pushed registers and spilled locals
 /// write far more densely than one word in 128; only a frame that reserves
@@ -184,31 +194,55 @@ static mut FENCE: usize = 0;
 #[cfg(feature = "rp")]
 const FENCE_WORDS: usize = 32;
 
-/// Arm the stack fence for a module call whose admitted depth is `depth`
-/// bytes (0 disarms). The fence sits `KERNEL_STACK_RESERVE + depth` below the
-/// top of the stack — the bound the composer admitted the graph against —
-/// and holds [`STACK_PAINT`], so it is invisible to [`stack_peak`].
+/// The calling core's stack: `(core, floor, top, kernel reserve)`. Core 0
+/// steps on the stack the linker leaves above the statics; a second core
+/// that runs a domain steps on its own.
+#[cfg(feature = "rp")]
+#[inline]
+fn this_stack() -> (usize, usize, usize, usize) {
+    #[cfg(feature = "smp")]
+    if crate::platform::chip::core_id() != 0 {
+        let (floor, top) = crate::platform::rp_core1::stack_bounds();
+        return (
+            1,
+            floor,
+            top,
+            crate::platform::chip::SECONDARY_STACK_RESERVE,
+        );
+    }
+    (
+        0,
+        &raw const __stack_limit as usize,
+        &raw const __stack_top as usize,
+        crate::platform::chip::KERNEL_STACK_RESERVE,
+    )
+}
+
+/// Arm the calling core's stack fence for a module call whose admitted depth
+/// is `depth` bytes (0 disarms). The fence sits the core's kernel reserve
+/// plus `depth` below the top of its stack — the bound the composer admitted
+/// the graph against — and holds [`STACK_PAINT`], so it is invisible to
+/// [`stack_peak`].
 #[cfg(feature = "rp")]
 pub fn stack_fence_arm(depth: usize) {
-    let top = &raw const __stack_top as usize;
-    let floor = &raw const __stack_limit as usize;
+    let (core, floor, top, reserve) = this_stack();
     let sp: usize;
     // SAFETY: reads the stack pointer; no memory access.
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
     };
-    // SAFETY: single-threaded runtime; the scheduler is the only caller.
+    // SAFETY: this core's entries; its scheduler loop is the only caller.
     unsafe {
-        if top - sp > ENTRY_DEPTH {
-            ENTRY_DEPTH = top - sp;
+        if top - sp > ENTRY_DEPTH[core] {
+            ENTRY_DEPTH[core] = top - sp;
         }
-        FENCE = 0;
+        FENCE[core] = 0;
     }
     if depth == 0 {
         return;
     }
     let Some(at) = top
-        .checked_sub(crate::platform::chip::KERNEL_STACK_RESERVE + depth + FENCE_WORDS * 4)
+        .checked_sub(reserve + depth + FENCE_WORDS * 4)
         .map(|a| a & !3)
     else {
         return;
@@ -224,15 +258,17 @@ pub fn stack_fence_arm(depth: usize) {
         // and above the region's floor: free stack, no live frame.
         unsafe { core::ptr::write_volatile((at as *mut u32).add(i), STACK_PAINT) };
     }
-    // SAFETY: single-threaded runtime.
-    unsafe { FENCE = at };
+    // SAFETY: this core's entry.
+    unsafe { FENCE[core] = at };
 }
 
-/// Whether the stack stayed above the armed fence since it was armed.
+/// Whether the calling core's stack stayed above its armed fence since it
+/// was armed.
 #[cfg(feature = "rp")]
 pub fn stack_fence_intact() -> bool {
-    // SAFETY: single-threaded runtime.
-    let at = unsafe { FENCE };
+    let (core, ..) = this_stack();
+    // SAFETY: this core's entry.
+    let at = unsafe { FENCE[core] };
     if at == 0 {
         return true;
     }
@@ -241,13 +277,26 @@ pub fn stack_fence_intact() -> bool {
         .all(|i| unsafe { core::ptr::read_volatile((at as *const u32).add(i)) } == STACK_PAINT)
 }
 
-/// The deepest the stack has been at a module call, in bytes below the top.
+/// The deepest core 0's stack has been at a module call, in bytes below the
+/// top.
 #[cfg(feature = "rp")]
 pub fn stack_entry_depth() -> usize {
-    // SAFETY: single-word read on the only thread.
-    unsafe { ENTRY_DEPTH }
+    stack_entry_depth_on(0)
 }
 
+/// The deepest `core`'s stack has been at a module call, in bytes below its
+/// top.
+#[cfg(feature = "rp")]
+pub fn stack_entry_depth_on(core: usize) -> usize {
+    // SAFETY: a single-word read of a value only `core` writes.
+    unsafe {
+        core::ptr::read_volatile(
+            (&raw const ENTRY_DEPTH)
+                .cast::<usize>()
+                .add(core.min(STACKS - 1)),
+        )
+    }
+}
 /// A system exception that should never be taken.
 ///
 /// Parks rather than returning. Returning from an unexpected exception
@@ -342,6 +391,13 @@ pub unsafe extern "C" fn fluxor_fault_report(frame: *const u32) -> ! {
         (0, 0, 0)
     };
 
+    // A fault on the second core is the node's, and core 0 owns the console
+    // and the reset: core 1 hands it over from a whole stack.
+    #[cfg(feature = "smp")]
+    if crate::platform::chip::core_id() != 0 {
+        // SAFETY: the assembly entry in `rp_core1`; it does not return.
+        unsafe { crate::platform::rp_core1::fluxor_rp_core1_fault(pc, lr, cfsr, bfar) }
+    }
     // SAFETY: the runtime defines it; the linker enforces that.
     unsafe { fluxor_fault_park(pc, lr, cfsr, hfsr, bfar) }
 }
@@ -473,6 +529,10 @@ pub unsafe extern "C" fn DefaultInterruptHandler() {
     let active = unsafe { core::ptr::read_volatile(SCB_ICSR as *const u32) } & 0x1ff;
     if active >= 16 {
         let irq = (active - 16) as u16;
+        #[cfg(feature = "smp")]
+        if crate::platform::chip::core_id() != 0 {
+            crate::platform::rp_core1::count_interrupt();
+        }
         if crate::kernel::exec::irq::irq_trampoline(irq) < 0 {
             crate::arch::cortex_m::nvic_mask(irq);
         }
@@ -517,6 +577,28 @@ const fn interrupt_table() -> [Vector; crate::platform::chip::IRQ_COUNT] {
         t[TIMER_IRQ_MODULE_TIMER as usize] =
             Vector::isr(crate::platform::rp_step_guard::TIMER1_IRQ_1);
         t[TIMER_IRQ_SCHEDULER as usize] = Vector::isr(crate::platform::rp_timer::TIMER1_IRQ_2);
+    }
+    // Core 1's three alarms, on its own instance. The table is shared by
+    // both cores; these lines are enabled in core 1's NVIC alone.
+    #[cfg(feature = "smp")]
+    {
+        use crate::platform::chip::{
+            SECONDARY_TIMER_IRQ_MODULE_TIMER, SECONDARY_TIMER_IRQ_SCHEDULER,
+            SECONDARY_TIMER_IRQ_STEP_GUARD,
+        };
+        t[SECONDARY_TIMER_IRQ_STEP_GUARD as usize] =
+            Vector::isr(crate::platform::rp_step_guard::TIMER0_IRQ_1);
+        t[SECONDARY_TIMER_IRQ_SCHEDULER as usize] =
+            Vector::isr(crate::platform::rp_core1::TIMER0_IRQ_2);
+        t[SECONDARY_TIMER_IRQ_MODULE_TIMER as usize] =
+            Vector::isr(crate::platform::rp_step_guard::TIMER0_IRQ_3);
+    }
+    // The DMA's two lines: the scan lists' completion interrupt, on core 0
+    // and on a second core.
+    {
+        use crate::platform::rp_dma::IRQ_LINES;
+        t[IRQ_LINES[0] as usize] = Vector::isr(crate::platform::rp_providers::DMA_IRQ_0);
+        t[IRQ_LINES[1] as usize] = Vector::isr(crate::platform::rp_providers::DMA_IRQ_1);
     }
     #[cfg(feature = "chip-rp2040")]
     {

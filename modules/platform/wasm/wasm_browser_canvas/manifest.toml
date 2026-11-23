@@ -6,29 +6,37 @@ builtin = true
 # which the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Browser canvas raster sink. Consumes `VideoRaster` frames on the
-# input port and presents them to a `<canvas>` element through the
+# Browser canvas raster sink. Consumes `VideoRaster` records on the
+# input port and presents them on a `<canvas>` element through the
 # host shim's `host_canvas_present` import.
 #
-# Pixel format is RGB565 little-endian (matches `st7701s` and
-# `linux_display`). Other formats are added by extending the host
-# import.
+# Every record is a region header (`abi::contracts::video_raster`) and
+# that region's pixels, in RGB565 or RGBA8 as the header says. The
+# stream states its surface: `width` and `height` are the largest
+# surface the canvas accepts and size its buffer; the canvas takes the
+# extent of the surface in the stream. A frame's regions are shown
+# together at its last one. A damage frame changes only its regions,
+# and the rest of the canvas keeps its picture.
 
-# Truthful AV capabilities, parallel to `linux_display` / `st7701s`: a
-# paced raster present surface. Lets the
-# `display` platform stack resolve a wasm variant and lets cross-target
-# graph-shape checks treat all three display sinks interchangeably.
+# The capabilities of a paced raster present surface, as `linux_display`
+# declares them: the `display` platform stack resolves a wasm variant, and
+# a graph that sends pixels to `display.pixels` builds for either.
 capabilities = ["video.raster", "display.scanout", "presentation.clock"]
 
-# Logical sink port `pixels` — uniform with `linux_display.pixels` and
-# `st7701s.pixels`, so `<producer>.pixels -> display.pixels` resolves on
-# every target. The kernel resolves this native module's input by
-# port index, so the rename is a wiring-name change only.
+# The sink port `pixels`, named as `linux_display.pixels` is, so
+# `<producer>.pixels -> display.pixels` resolves on every target whose
+# display takes pixels. The kernel resolves this native module's input by
+# port index.
 [[ports]]
 name = "pixels"
 direction = "input"
 content_type = "VideoRaster"
 required = true
+# What the canvas takes: both raster formats, and frames whose regions
+# update the retained picture as well as frames that tile the surface.
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage", "bands"]
 
 [[params]]
 name = "width"
@@ -42,24 +50,14 @@ tag = 11
 type = "u16"
 required = true
 
-# When 1, each frame on `pixels` is prefixed with a self-describing SRF1 header
-# (magic + w + h + format) and the canvas presents at the geometry carried in the
-# STREAM rather than the width/height config (which becomes the max/backing size).
-# Lets a producer resize without both ends agreeing on a static config. Mirrors
-# linux_display's `header` param.
-[[params]]
-name = "header"
-tag = 12
-type = "u16"
-default = 0
-
 # Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"
 
 [capacities]
 # The module heap the kernel seats for an instance, from the state arena:
-# its instance, and 4 bytes per pixel of `width` x `height`. `fluxor abi-regen` emits it as
+# its instance, and a region buffer of 4 bytes per pixel of `width` x `height`
+# (a whole surface in the widest format). `fluxor abi-regen` emits it as
 # `HEAP_SEAT`, which the kernel seats by and the build charges by
 # (`fluxor_contracts::state_arena::heap_seat_bytes`).
 heap_seat = 296

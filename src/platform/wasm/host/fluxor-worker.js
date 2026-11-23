@@ -5,8 +5,12 @@
 //
 // The kernel's host imports run synchronously inside kernel_step, so they run
 // HERE, in the Worker. That works because:
-//   - WebGPU (compute + present) runs in a Worker, drawing into an
-//     OffscreenCanvas transferred from the page (host_shims `offscreenSurface`).
+//   - WebGPU (compute + present) and the 2D canvas sink run in a Worker, drawing
+//     into an OffscreenCanvas transferred from the page (host_shims
+//     `offscreenSurface`).
+//   - the accessibility mirror is DOM, so it stays on the page: checked tree
+//     batches are posted to it, and its actions and text edits come back with
+//     the rest of the input.
 //   - fetch / WebSocket / crypto / performance / OPFS all exist in Workers.
 //   - audio has no AudioContext in a Worker, so host_audio_play / host_audio_lead_us
 //     are overridden to postMessage PCM to the page (which schedules it) and to read
@@ -65,12 +69,18 @@ self.addEventListener('unhandledrejection', (e) => {
 self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'input') {
-    // Repopulate the queues host_shims' host_*_pop functions drain. Keyboard uses
-    // the injected inputQueue; pointer/button use the self.__fluxor_*_queue globals
-    // host_shims lazily creates (window === self here).
-    if (m.keyboard && m.keyboard.length) inputQueue.push(...m.keyboard);
-    if (m.pointer && m.pointer.length) (self.__fluxor_pointer_queue || (self.__fluxor_pointer_queue = [])).push(...m.pointer);
-    if (m.button && m.button.length) (self.__fluxor_button_queue || (self.__fluxor_button_queue = [])).push(...m.button);
+    // Repopulate the queues host_shims' host_*_pop functions drain. `dom` is the
+    // wasm_browser_dom_input queue injected into buildHostImports; `queues` holds
+    // every per-class queue the page captured (keyboard, pointer, button, gamepad,
+    // action, surface traits, text, accessibility actions), which land in the
+    // self.__fluxor_*_queue globals host_shims drains (window === self here).
+    // Every queue is capped: a class no module in the graph drains loses its
+    // oldest records instead of growing. The page posts input only after `boot`,
+    // whose handler loads host_shims before it first yields.
+    if (self.fluxor) {
+      self.fluxor.putDomInput(inputQueue, m.dom);
+      self.fluxor.putInputQueues(self, m.queues);
+    }
     return;
   }
   if (m.type === 'audio-lead') {
@@ -92,7 +102,11 @@ self.onmessage = async (e) => {
       onLog: (level, msg) => postMessage({ type: 'log', level, msg }),
       onPanic: (msg) => postMessage({ type: 'panic', msg }),
       onCanvasFrame: (w, h) => postMessage({ type: 'canvas-frame', w, h }),
-      offscreenSurface: m.canvas,     // OffscreenCanvas for the GPU present
+      // The accessibility mirror is DOM, so it is on the page: what the native
+      // module says to it (`{ type: 'a11y', open }`, `{ type: 'a11y', bytes }`,
+      // each batch already checked) crosses here.
+      onAccessibility: (msg) => postMessage(msg, msg.bytes ? [msg.bytes.buffer] : []),
+      offscreenSurface: m.canvas,     // OffscreenCanvas the page shows: GPU present or 2D canvas
       fetchUrlOverride: (req) => m.assetUrl || req,
       assetBank: m.assetBank || new Map(),
       manifestUrl: m.manifestUrl,

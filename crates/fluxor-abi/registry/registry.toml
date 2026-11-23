@@ -375,7 +375,7 @@ route = "class"
   [[contract.op]]
   name = "FLASH_LAYOUT"
   op = 0x2A
-  gate = { handle = "global", arg = "out", max = 20 }
+  gate = { handle = "global", arg = "out", max = 24 }
 
   [[contract.op]]
   name = "MODULE_FLOW_BUDGET"
@@ -1983,6 +1983,21 @@ route = "class"
   op = 0x89
   gate = { handle = "minted", arg = "in", max = 12 }
 
+  [[contract.op]]
+  name = "LIST_START"
+  op = 0x8A
+  gate = { handle = "minted", arg = "in", max = 16 }
+
+  [[contract.op]]
+  name = "LIST_ARM"
+  op = 0x8B
+  gate = { handle = "minted", arg = "in", max = 8 }
+
+  [[contract.op]]
+  name = "LIST_STATUS"
+  op = 0x8C
+  gate = { handle = "minted", arg = "out", max = 8 }
+
 [[contract]]
 name = "reconfigure"
 reach = "kernel"
@@ -2661,6 +2676,23 @@ manifest = true
   op = 0x02
   gate = { handle = "minted", arg = "none", max = 0 }
   closes = true
+
+[[contract]]
+# Cycle and instruction-cache counters (`contracts::counters`): served by the
+# kernel, reached by `grants = ["counters"]`.
+name = "counters"
+id = 0x2D
+route = "class"
+
+  [[contract.op]]
+  name = "DESCRIBE"
+  op = 0x00
+  gate = { handle = "global", arg = "out", max = 16 }
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x01
+  gate = { handle = "global", arg = "out", max = 16 }
 
 [[msgset]]
 name = "net_tlv"

@@ -20,17 +20,10 @@ use core::ffi::c_void;
 use abi::contracts::workload as wl;
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_contracts::graph::{self, plan, EdgeRecord, Endpoint, GraphSpec, ModuleRecord};
+use fluxor_contracts::params_tlv::{TLV_END, TLV_MAGIC, TLV_VERSION};
 
 use fluxor_rt::*;
-
-/// The composed graph's magic ("FLXG" as a little-endian u32), as
-/// `fluxor_contracts::graph::MAGIC` defines it. The graph is written here by
-/// hand, little-endian, to the layout `fluxor_contracts::graph` documents.
-const GRAPH_MAGIC: u32 = u32::from_le_bytes(*b"FLXG");
-/// Bytes of a module record before its params.
-const MODULE_HEAD_LEN: u16 = 20;
-const EP_NEW: u8 = 0;
-const EP_CALLER: u8 = 4;
 
 /// CREATE header + a composed graph of at most two modules and two edges.
 const ARG_BYTES: usize = 256;
@@ -192,87 +185,62 @@ pub unsafe extern "C" fn module_new(
     0
 }
 
-/// A cursor over the CREATE buffer that reports overflow instead of panicking.
-struct Out<'b> {
-    buf: &'b mut [u8],
-    n: usize,
-    ok: bool,
+/// The most modules and edges a churn or fault workload declares.
+const WORKLOAD_MODULES: usize = 2;
+const WORKLOAD_EDGES: usize = 2;
+
+/// A one-entry params TLV: tag 1 = `v` as a u8.
+const fn params_u8(v: u8) -> [u8; 9] {
+    [TLV_MAGIC, TLV_VERSION, 5, 0, 1, 1, v, TLV_END, 0]
 }
 
-impl Out<'_> {
-    fn u8(&mut self, v: u8) {
-        match self.buf.get_mut(self.n) {
-            Some(b) => {
-                *b = v;
-                self.n += 1;
-            }
-            None => self.ok = false,
-        }
-    }
-    fn le16(&mut self, v: u16) {
-        for b in v.to_le_bytes() {
-            self.u8(b);
-        }
-    }
-    fn le32(&mut self, v: u32) {
-        for b in v.to_le_bytes() {
-            self.u8(b);
-        }
-    }
-    /// Zeros up to the next 4-byte boundary of the graph, which starts at
-    /// `start`.
-    fn pad4(&mut self, start: usize) {
-        while !(self.n - start).is_multiple_of(4) {
-            self.u8(0);
-        }
+/// A module of the workload: `name` with params `params`, in domain 0, on
+/// the node's default step budget.
+fn module<'p>(name: &[u8], params: &'p [u8]) -> ModuleRecord<'p> {
+    ModuleRecord {
+        name_hash: graph::name_hash(name),
+        params,
+        ..ModuleRecord::default()
     }
 }
 
-/// FNV-1a over a module type name: the hash a module is resolved by.
-fn type_hash(name: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &c in name {
-        h ^= c as u32;
-        h = h.wrapping_mul(0x0100_0193);
+/// Compose `modules` joined by `edges` and encode the graph into `out`, as
+/// the composer composes a workload: the fan pass, then the stepping order.
+/// The bytes written, or `None` when the graph does not compose or fit.
+fn compose_into(
+    modules: &[ModuleRecord<'_>],
+    edges: &[EdgeRecord],
+    out: &mut [u8],
+) -> Option<usize> {
+    let plan_modules = [plan::PlanModule::default(); WORKLOAD_MODULES];
+    let plan_modules = plan_modules.get(..modules.len())?;
+    // A fan adds a module and an edge; a churn workload fans nothing, so
+    // room for one of each says so rather than assuming it.
+    let mut all = [EdgeRecord::default(); WORKLOAD_EDGES + 1];
+    all.get_mut(..edges.len())?.copy_from_slice(edges);
+    let mut fans = [plan::Fan {
+        dir: plan::FanDir::Out,
+        of: 0,
+        port: 0,
+        kind: plan::FrameKind::Stream,
+        domain: 0,
+    }; 1];
+    let groups = fluxor_contracts::ring_size::buffer_groups(edges.len());
+    let counts = plan::fan_pass(plan_modules, &mut all, edges.len(), &mut fans, groups).ok()?;
+    if counts.fans != 0 {
+        return None;
     }
-    h
-}
-
-/// One module record whose params are a single u8 entry (tag 1), in domain
-/// 0, on the node's default step budget, padded to 4 bytes from `start`.
-fn module_u8(o: &mut Out<'_>, start: usize, name: &[u8], tag1: u8) {
-    // SDK TLV: [FE 01][payload_len LE] [tag][len][value] [FF 00]
-    let params = [0xFE, 0x01, 5, 0, 1, 1, tag1, 0xFF, 0x00];
-    o.le16(MODULE_HEAD_LEN + params.len() as u16); // entry_len
-    o.u8(0); // flags: not pre-pass
-    o.u8(0); // domain
-    o.le32(type_hash(name));
-    o.le32(0); // step_deadline_us: the node's default
-    o.le32(0); // burst_us: deadline × BURST_MULTIPLIER
-    o.u8(0); // fault_policy: skip
-    o.u8(0);
-    o.u8(0);
-    o.u8(0);
-    for b in params {
-        o.u8(b);
-    }
-    o.pad4(start);
-}
-
-/// One edge record: `(kind, port, index)` at each end, a local stream edge
-/// asking for `bytes` of ring.
-fn edge(o: &mut Out<'_>, from: (u8, u8, u16), to: (u8, u8, u16), bytes: u32) {
-    o.u8(from.0);
-    o.u8(from.1);
-    o.le16(from.2);
-    o.u8(to.0);
-    o.u8(to.1);
-    o.le16(to.2);
-    o.u8(0); // class: local
-    o.u8(0); // buffer_group: none
-    o.u8(0); // rate_class
-    o.u8(0); // flags
-    o.le32(bytes);
+    let edges = &all[..counts.edges];
+    let mut order = [0u16; WORKLOAD_MODULES];
+    let mut indeg = [0u16; WORKLOAD_MODULES];
+    plan::order(modules.len(), edges, false, &mut order, &mut indeg).ok()?;
+    let spec = GraphSpec {
+        order: &order[..modules.len()],
+        modules,
+        edges,
+        ..GraphSpec::default()
+    };
+    graph::encode_into(&spec, out).ok()
 }
 
 /// Lay the CREATE header and composed graph for workload `id` into `s.arg`;
@@ -295,62 +263,41 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
     // Pack mode: the churn workload brings its modules — the pack reference
     // and its pin come first in the source section, the graph after them.
     let pack = fault_mode.is_none() && s.pack_len > 0 && s.pin_set != 0;
-    let pin = s.pin;
+    let mut at = wl::CREATE_HEADER_SIZE;
     if pack {
         s.arg[17] = wl::SOURCE_FMOD_PACK;
-    }
-    let mut o = Out {
-        buf: &mut s.arg[wl::CREATE_HEADER_SIZE..],
-        n: 0,
-        ok: true,
-    };
-    if pack {
         // The pack's bytes travel as the call's `data`; the reference
-        // carries its pins.
-        o.u8(1); // pin_count
-        o.u8(0);
-        o.u8(0);
-        o.u8(0);
-        for b in pin {
-            o.u8(b);
-        }
+        // carries its pins: a count, three zero bytes, then each pin.
+        s.arg[at] = 1;
+        at += 4;
+        s.arg[at..at + 32].copy_from_slice(&s.pin);
+        at += 32;
     }
-    let start = o.n;
-    let (modules, edges): (u16, u16) = match fault_mode {
-        None => (2, 2),
-        Some(_) => (1, 0),
+    let (source, relay) = (params_u8(0), params_u8(1));
+    let fault = params_u8(fault_mode.unwrap_or(0));
+    let churn = [
+        module(b"churn_probe", &source),
+        module(b"churn_probe", &relay),
+    ];
+    let faulting = [module(b"test_fault", &fault)];
+    let link = |from, to| EdgeRecord {
+        from,
+        to,
+        buffer_bytes: chan,
+        ..EdgeRecord::default()
     };
-    o.le32(GRAPH_MAGIC);
-    o.le16(0); // flags: the workload's own authority
-    o.le16(modules);
-    o.le16(edges);
-    o.le16(0);
-    for _ in 0..16 {
-        o.u8(0); // owner_uid: the kernel copies the header identity in
-    }
-    o.le32(0); // state_cap
-    o.le32(0); // buffer_cap
-
-    // The stepping order: declaration order, upstream first.
-    for k in 0..modules {
-        o.le16(k);
-    }
-    o.pad4(start);
-    match fault_mode {
-        None => {
-            module_u8(&mut o, start, b"churn_probe", 0); // source
-            module_u8(&mut o, start, b"churn_probe", 1); // relay
-            edge(&mut o, (EP_NEW, 0, 0), (EP_NEW, 0, 1), chan);
-            edge(&mut o, (EP_NEW, 0, 1), (EP_CALLER, 0, 0), chan);
-        }
-        Some(mode) => {
-            module_u8(&mut o, start, b"test_fault", mode);
-        }
-    }
-    if !o.ok {
+    let churn_edges = [
+        link(Endpoint::New(0), Endpoint::New(1)),
+        link(Endpoint::New(1), Endpoint::Caller(0)),
+    ];
+    let (modules, edges): (&[ModuleRecord<'_>], &[EdgeRecord]) = match fault_mode {
+        None => (&churn, &churn_edges),
+        Some(_) => (&faulting, &[]),
+    };
+    let Some(n) = compose_into(modules, edges, &mut s.arg[at..]) else {
         return 0;
-    }
-    let src_len = o.n;
+    };
+    let src_len = at + n - wl::CREATE_HEADER_SIZE;
     let l = (src_len as u16).to_le_bytes();
     s.arg[40] = l[0];
     s.arg[41] = l[1];

@@ -514,6 +514,44 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
     spawn_scenario(&s, scenario_path, flags, _verbose)
 }
 
+/// While held, what this process writes to stdout goes to stderr.
+struct StdoutToStderr {
+    /// The process's own stdout, kept to put back.
+    saved: i32,
+}
+
+impl StdoutToStderr {
+    fn hold() -> Self {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        // SAFETY: `dup` and `dup2` over the process's standard descriptors;
+        // a failed `dup` answers -1, which `drop` leaves alone.
+        let saved = unsafe {
+            let saved = libc::dup(1);
+            if saved >= 0 {
+                libc::dup2(2, 1);
+            }
+            saved
+        };
+        Self { saved }
+    }
+}
+
+impl Drop for StdoutToStderr {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        if self.saved >= 0 {
+            // SAFETY: `saved` is the descriptor `hold` duplicated; it is
+            // put back as stdout and closed once.
+            unsafe {
+                libc::dup2(self.saved, 1);
+                libc::close(self.saved);
+            }
+        }
+    }
+}
+
 /// Spawn a scenario: build every wasm component (passive — its wasm bundle is
 /// served from the document root) and every other component (active —
 /// one `fluxor-linux` process each), plus the synthesised host if
@@ -552,6 +590,7 @@ fn spawn_scenario(
     }
 
     // --- 1: build every component, classified by effective target. ---
+    let images = RunImages::new(&crate::project::root_for_config(scenario_path))?;
     let mut actives: Vec<ActiveComponent> = Vec::new();
     for (comp_name, comp) in &scenario.components {
         let target = scenario::effective_target(scenario_path, comp);
@@ -585,7 +624,8 @@ fn spawn_scenario(
             target,
             merged_yaml.display()
         );
-        let build = build_one(&merged_yaml, None, verbose)?;
+        let image = (target == "linux").then(|| images.image(&format!("component/{comp_name}")));
+        let build = build_one(&merged_yaml, image.as_deref(), verbose)?;
         if build.family != "linux" {
             return Err(Error::Config(format!(
                 "scenario {}: component `{}` built for family {:?}; only linux components \
@@ -614,7 +654,7 @@ fn spawn_scenario(
             scenario.name,
             host_yaml.display()
         );
-        let host_build = build_one(&host_yaml, None, verbose)?;
+        let host_build = build_one(&host_yaml, Some(&images.image("host")), verbose)?;
         if host_build.family != "linux" {
             return Err(Error::Config(format!(
                 "scenario {}: synthesised host built for family {:?}; expected linux",
@@ -644,6 +684,41 @@ fn spawn_scenario(
         run_actives_sequential(&scenario.name, &linux_bin, actives, flags, scenario_path)
     } else {
         run_actives_parallel(&scenario.name, &linux_bin, actives, flags, scenario_path)
+    }
+}
+
+/// The node images one `fluxor run` builds and runs, in a directory of its
+/// own: `target/linux/runs/<pid>/` under the project. A runtime reads its
+/// image for as long as it runs, so a run never shares one: another run of
+/// the same graph, or of a graph of the same name (every scenario's
+/// synthesised `host.yaml`), builds into its own directory and cannot
+/// rewrite an image under a running process. The directory goes when the
+/// run ends.
+struct RunImages {
+    dir: PathBuf,
+}
+
+impl RunImages {
+    fn new(project_root: &Path) -> Result<Self> {
+        let dir = project_root
+            .join("target/linux/runs")
+            .join(std::process::id().to_string());
+        // A directory a run that died left under this process id holds
+        // nothing this run reads.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// Where the image `label` names is built: `<label>/node.img`.
+    fn image(&self, label: &str) -> PathBuf {
+        self.dir.join(label).join("node.img")
+    }
+}
+
+impl Drop for RunImages {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1141,10 +1216,29 @@ fn cmd_run(
 
     // Synced fmods and the runtime binary live under `target/`, which
     // `cargo clean` wipes; refill lockfile-recorded holes before running.
-    fluxor_tools::store_sync::ensure_synced(&crate::project::root_for_config(config_path))
+    let project_root = crate::project::root_for_config(config_path);
+    fluxor_tools::store_sync::ensure_synced(&project_root)
         .map_err(|e| Error::Config(e.to_string()))?;
 
-    let result = build_one_from(config_path, None, module_root, verbose)?;
+    // A linux run builds its node image into a directory of its own.
+    let family =
+        resolve_target(&stack_expand::load_graph(config_path, &project_root)?, None)?.family;
+    let images = if family == "linux" {
+        Some(RunImages::new(&project_root)?)
+    } else {
+        None
+    };
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("graph");
+    let image_path = images.as_ref().map(|i| i.image(stem));
+    // A linux run's stdout is the graph's own (a `cli` graph writes its
+    // output there), so the build's report goes to stderr.
+    let result = {
+        let _report = (family == "linux").then(StdoutToStderr::hold);
+        build_one_from(config_path, image_path.as_deref(), module_root, verbose)?
+    };
 
     if ca.is_some() && result.family != "linux" {
         return Err(Error::Config(
@@ -1196,6 +1290,9 @@ fn cmd_run(
                 }
             }
             let status = run_tied(&mut cmd)?;
+            // The run is over: its images go before a signal ends this
+            // process, which would skip the drop.
+            drop(images);
             exit_if_signalled(&status);
 
             if !status.success() {

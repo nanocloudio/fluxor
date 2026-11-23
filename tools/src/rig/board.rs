@@ -423,7 +423,7 @@ mod tests {
     /// resolve the wrong layer.
     struct EnvGuard {
         keys: Vec<(String, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::project::tests::EnvLockGuard,
     }
 
     impl EnvGuard {

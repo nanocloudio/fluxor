@@ -86,3 +86,9 @@ pub use wasm::*;
 
 /// A datagram endpoint bound by name, over the `datagram` contract.
 pub mod datagram_endpoint;
+
+/// The cycle and instruction-cache counters, over the `counters` contract.
+pub mod counters;
+
+/// A module's assets: a program read in place or streamed, or a file.
+pub mod asset;

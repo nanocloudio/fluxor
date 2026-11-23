@@ -218,12 +218,13 @@ fn check_arenas_unbuilt(
 ) -> Result<()> {
     let store_fb = store_cli::lock_store_resolver(project_root, target.module_abi(), None);
     let store = || store_fb.as_deref().map(|f| f as _);
-    let built = parse_modules_from_config_multi(config, modules_dir, extra_dirs, store())
-        .and_then(|mut packed| {
+    let built = parse_modules_from_config_multi(config, modules_dir, extra_dirs, store()).and_then(
+        |mut packed| {
             let fans = config::fan_types(blob)?;
             crate::modules::add_fan_modules(&mut packed, &fans, modules_dir, extra_dirs, store())?;
             Ok(packed)
-        });
+        },
+    );
     if let Ok(packed) = built {
         if !packed_image {
             return check_arenas(config, blob, &packed, target, extra_dirs, project_root);
@@ -492,9 +493,10 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
         Some(install) => {
             let (source_tag, project_name) = match &install.source {
                 crate::project::InstallDiscoverySource::EnvVar => ("env_var", None),
-                crate::project::InstallDiscoverySource::WorkspaceMember { project_name } => {
-                    ("workspace_member", Some(project_name.clone()))
+                crate::project::InstallDiscoverySource::LiveTree { project_name } => {
+                    ("live_tree", Some(project_name.clone()))
                 }
+                crate::project::InstallDiscoverySource::SyncedCatalog => ("synced_catalog", None),
                 crate::project::InstallDiscoverySource::ExePrefixShare => {
                     ("exe_prefix_share", None)
                 }
@@ -761,7 +763,9 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
         Vec::new()
     };
 
-    let search_paths: Vec<String> = config::extract_module_search_paths(&probe, config_path)
+    let search_dirs = config::extract_module_search_paths(&probe, config_path);
+    let rejected = rejected_manifests(&probe, &search_dirs, project_root);
+    let search_paths: Vec<String> = search_dirs
         .iter()
         .map(|p| p.display().to_string())
         .collect();
@@ -787,6 +791,7 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
         "resolved_target": resolved,
         "expanded_stack_modules": expanded_stack_modules,
         "module_search_paths": search_paths,
+        "rejected_manifests": rejected,
         "connectors": connectors,
     })
 }
@@ -1100,8 +1105,11 @@ fn format_discovery_source(source: &crate::project::DiscoverySource) -> &'static
 fn format_install_source(source: &crate::project::InstallDiscoverySource) -> String {
     match source {
         crate::project::InstallDiscoverySource::EnvVar => "$FLUXOR_INSTALL_ROOT override".into(),
-        crate::project::InstallDiscoverySource::WorkspaceMember { project_name } => {
-            format!("workspace member `{project_name}`")
+        crate::project::InstallDiscoverySource::LiveTree { project_name } => {
+            format!("live tree `{project_name}` (workspace `live_trees`)")
+        }
+        crate::project::InstallDiscoverySource::SyncedCatalog => {
+            format!("synced catalog `{}`", crate::project::SYNCED_CATALOG)
         }
         crate::project::InstallDiscoverySource::ExePrefixShare => {
             "exe-prefix `<prefix>/share/fluxor/`".into()
@@ -1296,7 +1304,29 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
         }
     }
 
+    // Manifests found on those paths, or pinned, that the graph cannot be
+    // checked against.
+    let refusals = rejected_manifests(&probe, &search_paths, project_root);
+    if !refusals.is_empty() {
+        println!("  rejected manifests:");
+        for r in &refusals {
+            println!("    {r}");
+        }
+    }
+
     Ok(())
+}
+
+/// The refusals for every module of `probe` whose manifest is found but
+/// rejected, resolved for the graph's own target.
+fn rejected_manifests(
+    probe: &serde_json::Value,
+    search_paths: &[std::path::PathBuf],
+    project_root: &Path,
+) -> Vec<String> {
+    let extra: Vec<&Path> = search_paths.iter().map(|p| p.as_path()).collect();
+    let target = resolve_target(probe, None).ok().map(|d| d.id);
+    config::module_manifest_refusals(&probe["modules"], &extra, target.as_deref(), project_root)
 }
 
 fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &Path) -> Result<()> {
@@ -1365,7 +1395,10 @@ fn module_table_bytes(
     let table = crate::modules::build_module_table_with_programs(&modules, &programs)?;
     Ok((
         table,
-        modules.iter().map(|m| (m.name.clone(), m.data.len())).collect(),
+        modules
+            .iter()
+            .map(|m| (m.name.clone(), m.data.len()))
+            .collect(),
     ))
 }
 
@@ -1664,7 +1697,10 @@ fn build_one_from(
             let (table, _) = module_table_bytes(yaml_path, Some(&modules_dir), &config_data)?;
             let seed = crate::signing::seed(None, &project_root)?;
             let image = crate::node_image::compose(&table, &config_data, 0, seed.as_ref())?;
-            std::fs::write(&output_path, &image)?;
+            // Renamed into place: a runtime still reading the image this
+            // replaces keeps the bytes it opened.
+            crate::store_sync::write_file_atomic(&output_path, &image, false)
+                .map_err(|e| Error::Config(e.to_string()))?;
             println!(
                 "node image {}: modules {} B, config {} B, {}",
                 output_path.display(),
@@ -1711,8 +1747,7 @@ fn build_one_from(
 
             let config_bin = generate_config_bytes(yaml_path, Some(modules_dir.as_path()))?;
             std::fs::write(&config_bin_path, &config_bin)?;
-            let (modules_bin, _) =
-                module_table_bytes(yaml_path, Some(&modules_dir), &config_bin)?;
+            let (modules_bin, _) = module_table_bytes(yaml_path, Some(&modules_dir), &config_bin)?;
             std::fs::write(&modules_bin_path, &modules_bin)?;
 
             let kernel_bytes = std::fs::read(&kernel_wasm_path)?;

@@ -26,7 +26,7 @@ pub(crate) mod test_env {
     /// mutex. The mutex itself lives in `project::tests` (which is
     /// reachable from both lib and bin test targets) so independent
     /// test modules can't accidentally race against each other.
-    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+    pub fn lock() -> crate::project::tests::EnvLockGuard {
         match crate::project::tests::ENV_LOCK.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -38,7 +38,7 @@ pub(crate) mod test_env {
     /// drop — so a panic inside a test does not leak mutated state
     /// to subsequent tests.
     pub struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::project::tests::EnvLockGuard,
         saved: Vec<(&'static str, Option<String>)>,
     }
 
@@ -182,6 +182,97 @@ mod scheduler_validation_tests {
             msg.contains("failed to parse") && msg.contains("typo_mod"),
             "expected fail-closed parse diagnostic naming the module, got: {msg}"
         );
+    }
+
+    // ---- A rejected manifest is reported as rejected, where it was found ----
+
+    #[test]
+    fn a_rejected_manifest_is_refused_naming_its_path_and_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("net_driver");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        // A NetProto output with no `max_record`: found, and rejected.
+        let manifest = mod_dir.join("manifest.toml");
+        std::fs::write(
+            &manifest,
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\n\
+             [[ports]]\nname = \"net_out\"\ndirection = \"output\"\n\
+             content_type = \"NetProto\"\n",
+        )
+        .expect("write manifest");
+        let modules = json!([{"name": "uplink", "type": "net_driver"}]);
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+
+        let err = assert_module_manifests_resolvable(&modules, &extras, None, dir.path())
+            .expect_err("a found but rejected manifest refuses the graph");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("module 'uplink' (type 'net_driver') was found at")
+                && msg.contains(&manifest.display().to_string())
+                && msg.contains("max_record")
+                && !msg.contains("no manifest found"),
+            "{msg}"
+        );
+
+        // A module found nowhere is left to the checks that name it.
+        let absent = json!([{"name": "elsewhere", "type": "not_on_any_path"}]);
+        assert_module_manifests_resolvable(&absent, &extras, None, dir.path())
+            .expect("an absent manifest is not a rejected one");
+    }
+
+    /// One resolution for every graph: a module's pin is authoritative and
+    /// carries its port names with no source tree present; an unpinned
+    /// module falls back to the search paths; a pin the store cannot serve
+    /// is refused, never replaced by a copy on disk.
+    #[test]
+    fn a_module_type_resolves_from_its_pin_before_any_tree() {
+        let pinned = "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\n\
+                      [[ports]]\nname = \"pinned_in\"\ndirection = \"input\"\n\
+                      content_type = \"OctetStream\"\n";
+        let on_disk = "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\n\
+                       [[ports]]\nname = \"disk_in\"\ndirection = \"input\"\n\
+                       content_type = \"OctetStream\"\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        for ty in ["anchor", "local_only"] {
+            std::fs::create_dir_all(dir.path().join(ty)).unwrap();
+            std::fs::write(dir.path().join(ty).join("manifest.toml"), on_disk).unwrap();
+        }
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let toml = pinned.to_string();
+        let pins: crate::store_cli::BoxedManifestResolver = Box::new(move |ty: &str| match ty {
+            "anchor" | "pinned_only" => crate::modules::ManifestPin::Resolved(toml.clone()),
+            "broken" => crate::modules::ManifestPin::Failed("blob missing".into()),
+            _ => crate::modules::ManifestPin::NotPinned,
+        });
+        let port = |ty: &str| match type_manifest(ty, ty, None, &extras, None, Some(&pins)) {
+            TypeManifest::Found(m) => m.ports.iter().filter_map(|p| p.name.clone()).collect(),
+            TypeManifest::Rejected(why) => vec![format!("rejected: {why}")],
+            TypeManifest::Absent => vec!["absent".to_string()],
+        };
+        assert_eq!(port("pinned_only"), ["pinned_in"], "a pin needs no source tree");
+        assert_eq!(port("anchor"), ["pinned_in"], "a pin wins over a copy on disk");
+        assert_eq!(port("local_only"), ["disk_in"], "an unpinned module reads its tree");
+        assert_eq!(port("nowhere"), ["absent"]);
+        let broken = port("broken");
+        assert!(
+            broken[0].starts_with("rejected:") && broken[0].contains("blob missing"),
+            "{broken:?}"
+        );
+    }
+
+    #[test]
+    fn wiring_a_declared_module_with_no_manifest_offers_no_misspelling() {
+        let names = vec!["linux_net".to_string(), "ip".to_string()];
+        let manifests = std::collections::HashMap::new();
+        let msg = resolve_port_spec("linux_net.net_out", true, &manifests, &names).unwrap_err();
+        assert!(
+            msg.contains("module 'linux_net' is declared but no manifest was found")
+                && !msg.contains("Did you mean")
+                && !msg.contains("the module name is misspelled"),
+            "{msg}"
+        );
+        let typo = resolve_port_spec("linux_nte.net_out", true, &manifests, &names).unwrap_err();
+        assert!(typo.contains("Did you mean 'linux_net'?"), "{typo}");
     }
 
     // ---- High-1: timer-class admission is fail-closed for mechanism (b) ----
@@ -2303,7 +2394,7 @@ mod module_discovery_tests {
     /// `super::test_env`) so the sibling `scheduler_validation_tests`
     /// module — which also mutates `$FLUXOR_PROJECT_ROOT` — shares
     /// the same mutex and we do not race across modules.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn env_lock() -> crate::project::tests::EnvLockGuard {
         super::test_env::lock()
     }
 
@@ -3694,6 +3785,7 @@ mod continuity_tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -4379,6 +4471,7 @@ mod rate_class_resolution_tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -5413,6 +5506,7 @@ mod port_capability_tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -5708,6 +5802,236 @@ mod port_capability_tests {
     }
 }
 
+/// A param given an asset is one its module declares it opens as one.
+#[cfg(test)]
+mod asset_param_tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use crate::schema::{ParamSchema, ParamType, SchemaParam};
+
+    fn pic(body: &str) -> Manifest {
+        Manifest::from_toml_str_for_target(&format!("version = \"0.1.0\"\n{body}"), None)
+            .expect("manifest parses")
+    }
+
+    fn schema() -> ParamSchema {
+        let p = |tag, name: &str, ptype| SchemaParam {
+            tag,
+            ptype,
+            name: name.to_string(),
+            default: 0,
+            enums: std::collections::HashMap::new(),
+        };
+        ParamSchema::from_params(vec![
+            p(1, "fonts", ParamType::Str),
+            p(2, "document", ParamType::StrChunked),
+            p(3, "scale", ParamType::U8),
+        ])
+    }
+
+    const VIEW: &str = "[[params]]\nname = \"fonts\"\nasset = true\n\n\
+                        [[params]]\nname = \"document\"\nasset = true\n";
+
+    #[test]
+    fn a_declared_asset_param_is_accepted() {
+        let m = pic(VIEW);
+        assert_eq!(m.asset_params, ["fonts", "document"]);
+        assert!(m.params.is_empty(), "a PIC manifest states no schema");
+        let entry = json!({"name": "v", "type": "view", "fonts": "program:0",
+                           "document": "asset://page.doc", "asset_params": ["document", "fonts"]});
+        check_asset_params(&entry, "v", "view", Some(&m), Some(&schema())).unwrap();
+        // Without the built schema the manifest's word stands.
+        check_asset_params(&entry, "v", "view", Some(&m), None).unwrap();
+        // An entry that names no asset asks nothing.
+        check_asset_params(&json!({"name": "v", "fonts": "/a/path"}), "v", "view", None, None)
+            .unwrap();
+    }
+
+    /// On every family: the value is a URL, a path or a program reference,
+    /// and a module that does not open it as an asset would misread it.
+    #[test]
+    fn an_asset_in_a_param_not_declared_one_is_refused() {
+        let entry = json!({"name": "v", "type": "view", "title": "/p/target/assets/k/page.doc",
+                           "asset_params": ["title"]});
+        for manifest in [Some(pic(VIEW)), Some(pic("")), None] {
+            let e = check_asset_params(&entry, "v", "view", manifest.as_ref(), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("module 'v'")
+                    && e.contains("`title`")
+                    && e.contains("module type 'view'")
+                    && e.contains("asset = true"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_asset_param_the_module_does_not_have_as_a_string_is_refused() {
+        let m = pic("[[params]]\nname = \"scale\"\nasset = true\n\n[[params]]\nname = \"gone\"\nasset = true\n");
+        for param in ["scale", "gone"] {
+            let entry = json!({"name": "v", "asset_params": [param]});
+            let e = check_asset_params(&entry, "v", "view", Some(&m), Some(&schema()))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(param) && e.contains("no string param"), "{e}");
+        }
+    }
+
+    /// A PIC manifest's `[[params]]` marks asset params and states nothing
+    /// else; a native module's schema marks a `str` param.
+    #[test]
+    fn the_manifest_states_asset_params_in_their_place() {
+        let bad = |body: &str| {
+            Manifest::from_toml_str_for_target(&format!("version = \"0.1.0\"\n{body}"), None)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(bad("[[params]]\nname = \"fonts\"\n").contains("define_params!"));
+        assert!(
+            bad("[[params]]\nname = \"fonts\"\nasset = true\ntag = 7\ntype = \"str\"\n")
+                .contains("state nothing else")
+        );
+        let native = "builtin = true\n[[params]]\nname = \"path\"\ntag = 10\ntype = \"str\"\nasset = true\n\n\
+                      [[params]]\nname = \"rate\"\ntag = 11\ntype = \"u32\"\ndefault = 1\n";
+        let m = pic(native);
+        assert_eq!(m.asset_params, ["path"]);
+        assert_eq!(m.params.len(), 2);
+        assert!(bad(
+            "builtin = true\n[[params]]\nname = \"rate\"\ntag = 11\ntype = \"u32\"\nasset = true\n"
+        )
+        .contains("marks a `str` param"));
+        assert!(bad("builtin = true\n[[params]]\nname = \"rate\"\ntag = 11\n").contains("missing `type`"));
+    }
+}
+
+/// Modules in a domain a core other than 0 runs.
+#[cfg(test)]
+mod secondary_core_tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use std::collections::HashMap;
+
+    fn manifest(body: &str) -> Manifest {
+        Manifest::from_toml_str_for_target(
+            &format!("version = \"0.1.0\"\nhardware_targets = [\"rp2350\", \"rp2040\"]\n{body}"),
+            None,
+        )
+        .expect("manifest parses")
+    }
+
+    fn smp(target: &str) -> crate::target::SmpFacts {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::target::load_target(target, &root).expect("target loads").smp
+    }
+
+    /// A graph of `modules` (name, domain, manifest) on `target`.
+    fn check(target: &str, modules: &[(&str, &str, Manifest)]) -> Result<()> {
+        let config = json!({
+            "execution": {"domains": [{"name": "main"}, {"name": "second"}, {"name": "third"}]},
+            "modules": modules
+                .iter()
+                .map(|(name, domain, _)| json!({"name": name, "domain": domain}))
+                .collect::<Vec<_>>(),
+        });
+        let manifests: HashMap<String, Manifest> = modules
+            .iter()
+            .map(|(name, _, m)| ((*name).to_string(), m.clone()))
+            .collect();
+        let list = config["modules"].as_array().unwrap().clone();
+        validate_secondary_core_modules(&config, &list, &manifests, &smp(target), target)
+    }
+
+    const FLASH: &str = "grants = [\"flash\"]\nprovider_contracts = [\"runtime_params\"]\n";
+    const NEEDS_PARAMS: &str = "grants = [\"runtime_params\"]\n";
+
+    #[test]
+    fn a_plain_module_runs_on_core_1() {
+        check("pico2w", &[("compute", "second", manifest(""))]).unwrap();
+    }
+
+    /// RP2040 steps every domain on core 0, so nothing is refused there.
+    #[test]
+    fn rp2040_runs_the_same_graph_on_one_core() {
+        check(
+            "pico",
+            &[
+                ("store", "second", manifest(FLASH)),
+                ("ota", "second", manifest("grants = [\"reconfigure.ota\"]\n")),
+                ("user", "second", manifest(NEEDS_PARAMS)),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_flash_or_ota_module_is_refused_on_core_1() {
+        for (grant, body) in [
+            ("flash", FLASH.to_string()),
+            ("reconfigure.ota", "grants = [\"reconfigure.ota\"]\n".to_string()),
+        ] {
+            let e = check("pico2w", &[("m", "second", manifest(&body))])
+                .expect_err(grant)
+                .to_string();
+            assert!(
+                e.contains("module 'm'")
+                    && e.contains("domain 'second'")
+                    && e.contains("pico2w runs on core 1")
+                    && e.contains(grant)
+                    && e.contains("core 0's"),
+                "{e}"
+            );
+            // Domain 2 shares core 0's loop.
+            check("pico2w", &[("m", "third", manifest(&body))]).unwrap();
+            check("pico2w", &[("m", "main", manifest(&body))]).unwrap();
+        }
+    }
+
+    /// A provider call runs on the caller's core: a core-1 module that calls
+    /// a contract the flash driver provides would run flash code there.
+    #[test]
+    fn a_core_1_module_calling_a_flash_backed_provider_is_refused() {
+        let e = check(
+            "pico2w",
+            &[
+                ("store", "main", manifest(FLASH)),
+                ("user", "second", manifest(NEEDS_PARAMS)),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("module 'user'")
+                && e.contains("runtime_params")
+                && e.contains("module 'store'")
+                && e.contains("ENOTSUP"),
+            "{e}"
+        );
+        // The same caller on core 0, and a provider that holds no flash.
+        check(
+            "pico2w",
+            &[
+                ("store", "main", manifest(FLASH)),
+                ("user", "third", manifest(NEEDS_PARAMS)),
+            ],
+        )
+        .unwrap();
+        check(
+            "pico2w",
+            &[
+                (
+                    "ram_store",
+                    "main",
+                    manifest("provider_contracts = [\"runtime_params\"]\n"),
+                ),
+                ("user", "second", manifest(NEEDS_PARAMS)),
+            ],
+        )
+        .unwrap();
+    }
+}
+
 /// `[ports.facts]` on encoded ports: parsed against the surface's schema,
 /// compared across each edge, and fan-in refused.
 #[cfg(test)]
@@ -5743,6 +6067,304 @@ mod port_fact_tests {
         (json!({ "wiring": wiring }), m)
     }
 
+    /// No fact of these graphs is bound to a param.
+    fn no_bound_params(_: &Value, _: &str) -> Result<BoundParam> {
+        Ok(BoundParam::NoSchema)
+    }
+
+    /// A port of content type `ct` named `p`, with `facts`.
+    fn port(direction: &str, ct: &str, facts: &str) -> Manifest {
+        manifest(&format!(
+            "[[ports]]\nname = \"p\"\ndirection = \"{direction}\"\ncontent_type = \"{ct}\"\n\
+             [ports.facts]\n{facts}\n"
+        ))
+    }
+
+    /// One edge `a.p -> b.p` of content type `ct` between ports declaring
+    /// `sent` and `taken`.
+    fn edge_of(ct: &str, sent: &str, taken: &str) -> Result<()> {
+        let (cfg, m) = graph(
+            &[
+                ("a", port("output", ct, sent)),
+                ("b", port("input", ct, taken)),
+            ],
+            json!([{"from": "a.p", "to": "b.p"}]),
+        );
+        validate_port_facts(&cfg, &m, &no_bound_params)
+    }
+
+    /// A floor: the consumer's refresh must not exceed what the producer
+    /// sustains.
+    #[test]
+    fn a_floor_fact_refuses_a_consumer_above_the_producer() {
+        let e = edge_of("VideoDraw", "refresh_mhz = 40000", "refresh_mhz = 45000")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("at least 45000") && e.contains("sustains 40000") && e.contains("a.p"),
+            "{e}"
+        );
+        edge_of("VideoDraw", "refresh_mhz = 60000", "refresh_mhz = 45000").unwrap();
+        edge_of("VideoDraw", "refresh_mhz = 45000", "refresh_mhz = 45000").unwrap();
+    }
+
+    /// Every ceiling fact: the producer above the consumer is refused, at or
+    /// below it accepted.
+    #[test]
+    fn each_ceiling_fact_refuses_a_producer_above_the_consumer() {
+        for (ct, fact) in [
+            ("AccessibilityTree", "max_nodes"),
+            ("VideoRaster", "width"),
+            ("VideoRaster", "height"),
+            ("VideoDraw", "max_depth"),
+            ("VideoDraw", "max_resources"),
+            ("VideoDraw", "resource_bytes"),
+            ("VideoDraw", "frame_bytes"),
+            ("VideoDraw", "surfaces"),
+            ("AudioEncoded", "max_payload"),
+        ] {
+            let e = edge_of(ct, &format!("{fact} = 2048"), &format!("{fact} = 1024"))
+                .expect_err(fact)
+                .to_string();
+            assert!(
+                e.contains("goes up to 2048")
+                    && e.contains("at most 1024")
+                    && e.contains(fact)
+                    && !e.contains(" bytes"),
+                "{e}"
+            );
+            edge_of(ct, &format!("{fact} = 1024"), &format!("{fact} = 2048")).expect(fact);
+            edge_of(ct, &format!("{fact} = 1024"), &format!("{fact} = 1024")).expect(fact);
+        }
+    }
+
+    /// Every numeric fact a port may declare is compared by a rule this
+    /// suite exercises: a fact added to the vocabulary without a row here
+    /// fails.
+    #[test]
+    fn every_numeric_fact_rule_has_a_composer_test() {
+        use fluxor_contracts::vocabulary::{FactRule, NUMERIC_FACT_RULES};
+        const CEILINGS: &[&str] = &[
+            "max_nodes",
+            "width",
+            "height",
+            "max_depth",
+            "max_resources",
+            "resource_bytes",
+            "frame_bytes",
+            "surfaces",
+            "max_payload",
+            // Judged by the banding rule on an edge.
+            "band_rows",
+        ];
+        const FLOORS: &[&str] = &["refresh_mhz"];
+        for (fact, rule) in NUMERIC_FACT_RULES {
+            match rule {
+                FactRule::Ceiling => assert!(CEILINGS.contains(fact), "ceiling `{fact}` untested"),
+                FactRule::Floor => assert!(FLOORS.contains(fact), "floor `{fact}` untested"),
+                FactRule::Exact | FactRule::Subset => {}
+            }
+        }
+    }
+
+    /// The banding rule: a consumer that retains no frame takes only a
+    /// banded stream, in bands no taller than its own; one that retains
+    /// frames takes any stream. It is judged whether or not the producer
+    /// declares `band_rows`.
+    #[test]
+    fn a_consumer_retaining_no_frame_takes_only_bands_within_its_own() {
+        let retains_nothing = "frame_bytes = 0\nband_rows = 16";
+        // Unbanded producers: undeclared, and declared 0.
+        for sent in ["max_depth = 4", "band_rows = 0", "frame_bytes = 4096"] {
+            let e = edge_of("VideoDraw", sent, retains_nothing)
+                .expect_err(sent)
+                .to_string();
+            assert!(
+                e.contains("retains no frame") && e.contains("band_rows") && e.contains("a.p"),
+                "{e}"
+            );
+        }
+        // Bands taller than the consumer's.
+        let e = edge_of("VideoDraw", "band_rows = 32", retains_nothing)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("producer declares 32") && e.contains("consumer declares 16"), "{e}");
+        // Bands within it; the producer's frame size is not held to a
+        // consumer that retains none.
+        edge_of("VideoDraw", "band_rows = 16\nframe_bytes = 4096", retains_nothing).unwrap();
+        edge_of("VideoDraw", "band_rows = 8", retains_nothing).unwrap();
+        // A consumer that retains nothing and states no band height takes
+        // any banded stream.
+        edge_of("VideoDraw", "band_rows = 64", "frame_bytes = 0").unwrap();
+        // A consumer that retains frames bands for itself: any stream, and
+        // its own `band_rows` is no ceiling on the producer's.
+        edge_of("VideoDraw", "band_rows = 64", "frame_bytes = 8192\nband_rows = 16").unwrap();
+        edge_of("VideoDraw", "max_depth = 4", "frame_bytes = 8192\nband_rows = 16").unwrap();
+        edge_of("VideoDraw", "band_rows = 64", "band_rows = 16").unwrap();
+    }
+
+    /// The fan-in refusal names the input as a record stream, whatever its
+    /// content type.
+    #[test]
+    fn fan_in_onto_any_record_stream_input_is_refused() {
+        for ct in ["VideoDraw", "VideoRaster", "TextEvents", "AccessibilityTree"] {
+            let (cfg, m) = graph(
+                &[
+                    ("a", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"))),
+                    ("b", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"))),
+                    ("rx", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"input\"\ncontent_type = \"{ct}\"\n"))),
+                ],
+                json!([{"from": "a.p", "to": "rx.p"}, {"from": "b.p", "to": "rx.p"}]),
+            );
+            let e = validate_port_facts(&cfg, &m, &no_bound_params)
+                .expect_err(ct)
+                .to_string();
+            assert!(
+                e.contains("record-stream input")
+                    && e.contains("2 producers")
+                    && !e.contains("encoded"),
+                "{e}"
+            );
+        }
+    }
+
+    /// A fact bound to a param takes each instance's value: the graph's, or
+    /// the schema default.
+    #[test]
+    fn a_param_bound_fact_is_read_per_instance() {
+        use crate::schema::{ParamSchema, ParamType, SchemaParam};
+        let panel = port(
+            "input",
+            "VideoDraw",
+            "refresh_mhz = { param = \"refresh_mhz\" }",
+        );
+        assert_eq!(
+            panel.ports[0].fact_params.get("refresh_mhz").map(String::as_str),
+            Some("refresh_mhz")
+        );
+        assert!(!panel.ports[0].facts.contains_key("refresh_mhz"));
+        let schema = ParamSchema::from_params(vec![
+            SchemaParam {
+                tag: 1,
+                ptype: ParamType::U32,
+                name: "refresh_mhz".to_string(),
+                default: 40000,
+                enums: HashMap::new(),
+            },
+            SchemaParam {
+                tag: 2,
+                ptype: ParamType::Str,
+                name: "label".to_string(),
+                default: 0,
+                enums: HashMap::new(),
+            },
+        ]);
+        let param_of =
+            |entry: &Value, param: &str| -> Result<BoundParam> { Ok(bound_param_in(entry, &schema, param)) };
+        let run = |modules: Value| {
+            let m: HashMap<String, Manifest> = [
+                ("src", port("output", "VideoDraw", "refresh_mhz = 45000")),
+                ("slow", panel.clone()),
+                ("fast", panel.clone()),
+            ]
+            .into_iter()
+            .map(|(n, man)| (n.to_string(), man))
+            .collect();
+            let cfg = json!({
+                "modules": modules,
+                "wiring": [{"from": "src.p", "to": "slow.p"}],
+            });
+            let slow = validate_port_facts(&cfg, &m, &param_of);
+            let cfg = json!({
+                "modules": cfg["modules"],
+                "wiring": [{"from": "src.p", "to": "fast.p"}],
+            });
+            (slow, validate_port_facts(&cfg, &m, &param_of))
+        };
+        // `slow` runs at its default (40 Hz, within the producer's 45);
+        // `fast` is set to 60 Hz, past it.
+        let (slow, fast) = run(json!([
+            {"name": "src"},
+            {"name": "slow", "type": "panel"},
+            {"name": "fast", "type": "panel", "refresh_mhz": 60000},
+        ]));
+        slow.unwrap();
+        let e = fast.unwrap_err().to_string();
+        assert!(e.contains("at least 60000") && e.contains("fast.p"), "{e}");
+        // Set under `params:`, the same.
+        let (slow, fast) = run(json!([
+            {"name": "slow", "params": {"refresh_mhz": 50000}},
+            {"name": "fast", "params": {"refresh_mhz": 45000}},
+        ]));
+        assert!(slow.unwrap_err().to_string().contains("at least 50000"));
+        fast.unwrap();
+
+        // A binding to a param the module does not declare as an integer.
+        for bad in ["label", "absent"] {
+            let m: HashMap<String, Manifest> = [
+                ("src", port("output", "VideoDraw", "refresh_mhz = 45000")),
+                (
+                    "sink",
+                    port(
+                        "input",
+                        "VideoDraw",
+                        &format!("refresh_mhz = {{ param = \"{bad}\" }}"),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .map(|(n, man)| (n.to_string(), man))
+            .collect();
+            let cfg = json!({
+                "modules": [{"name": "sink"}],
+                "wiring": [{"from": "src.p", "to": "sink.p"}],
+            });
+            let e = validate_port_facts(&cfg, &m, &param_of)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(bad) && e.contains("integer param") && e.contains("sink.p"),
+                "{e}"
+            );
+        }
+        // A module whose schema is not at hand leaves the fact undeclared.
+        let m: HashMap<String, Manifest> = [
+            ("src", port("output", "VideoDraw", "refresh_mhz = 1")),
+            ("sink", panel.clone()),
+        ]
+        .into_iter()
+        .map(|(n, man)| (n.to_string(), man))
+        .collect();
+        let cfg = json!({"wiring": [{"from": "src.p", "to": "sink.p"}]});
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
+    }
+
+    /// Only a numeric fact binds to a param, and the table names the param
+    /// and nothing else.
+    #[test]
+    fn a_fact_binding_is_checked_at_parse() {
+        let bad = |facts: &str, ct: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ndirection = \"input\"\n\
+                     content_type = \"{ct}\"\n[ports.facts]\n{facts}\n"
+                ),
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(bad("refresh_mhz = { param = 3 }", "VideoDraw").contains("{ param ="));
+        assert!(bad("refresh_mhz = { param = \"\" }", "VideoDraw").contains("{ param ="));
+        assert!(
+            bad("refresh_mhz = { param = \"a\", scale = 2 }", "VideoDraw").contains("{ param =")
+        );
+        assert!(bad("ops = { param = \"a\" }", "VideoDraw").contains("string"));
+        // Every numeric port fact binds the same way.
+        let m = port("output", "VideoRaster", "width = { param = \"w\" }");
+        assert_eq!(m.ports[0].fact_params.get("width").map(String::as_str), Some("w"));
+    }
+
     #[test]
     fn a_producer_whose_codecs_the_consumer_takes_is_accepted() {
         let (cfg, m) = graph(
@@ -5752,7 +6374,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "enc.media_out", "to": "tx.media_in"}]),
         );
-        validate_port_facts(&cfg, &m).unwrap();
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
     }
 
     /// Subset, not intersection: a demuxer that MAY emit MP3 must not bind an
@@ -5766,7 +6388,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "demux.media_out", "to": "dec.media_in"}]),
         );
-        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
         assert!(e.contains("mp3") && e.contains("demux.media_out"), "{e}");
     }
 
@@ -5779,7 +6401,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
-        assert!(validate_port_facts(&cfg, &m).is_err());
+        assert!(validate_port_facts(&cfg, &m, &no_bound_params).is_err());
         let (cfg, m) = graph(
             &[
                 ("a", out_port("max_payload = 2048")),
@@ -5787,7 +6409,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
-        assert!(validate_port_facts(&cfg, &m).is_err());
+        assert!(validate_port_facts(&cfg, &m, &no_bound_params).is_err());
         let (cfg, m) = graph(
             &[
                 ("a", out_port("max_payload = 1000")),
@@ -5795,7 +6417,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
-        validate_port_facts(&cfg, &m).unwrap();
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
     }
 
     #[test]
@@ -5807,7 +6429,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
-        validate_port_facts(&cfg, &m).unwrap();
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
     }
 
     #[test]
@@ -5820,7 +6442,7 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "rx.media_in"}, {"from": "b.media_out", "to": "rx.media_in"}]),
         );
-        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
         assert!(
             e.contains("rx.media_in") && e.contains("2 producers"),
             "{e}"
@@ -5892,7 +6514,7 @@ mod port_fact_tests {
             ],
             edge.clone(),
         );
-        validate_port_facts(&cfg, &m).unwrap();
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
 
         let (cfg, m) = graph(
             &[
@@ -5904,7 +6526,7 @@ mod port_fact_tests {
             ],
             edge.clone(),
         );
-        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
         assert!(
             e.contains("http") && e.contains("req.request_out") && e.contains("binding"),
             "{e}"
@@ -5919,7 +6541,7 @@ mod port_fact_tests {
                 ],
                 edge.clone(),
             );
-            validate_port_facts(&cfg, &m).unwrap();
+            validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
         }
     }
 
@@ -5944,7 +6566,7 @@ mod port_fact_tests {
                 {"from": "b.request_out", "to": "prov.request_in"}
             ]),
         );
-        validate_port_facts(&cfg, &m).unwrap();
+        validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
     }
 
     #[test]
@@ -6188,6 +6810,7 @@ mod framed_edge_tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -7161,6 +7784,7 @@ mod record_limit_tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,

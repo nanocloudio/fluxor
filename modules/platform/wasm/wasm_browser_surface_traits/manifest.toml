@@ -8,8 +8,9 @@ state_bytes_64 = 1
 
 # Browser surface-traits authority. The host runtime publisher
 # (FluxorOverlay.installSurfaceTraits) coalesces resize / visualViewport /
-# pointer-class / gamepad connect-disconnect / audio changes to at most one
-# record per animation frame; this native module drains that queue via
+# device-pixel-ratio / pointer-class / gamepad connect-disconnect / audio
+# changes to at most one record per animation frame; this native module
+# drains that queue via
 # `host_surface_traits_pop` and emits 24-byte
 # `input::surface_traits::MSG_TRAITS` records on the output port.
 #

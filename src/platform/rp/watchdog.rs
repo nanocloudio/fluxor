@@ -105,23 +105,84 @@ pub fn recover_from_wedge() {
     }
 }
 
-/// Start the watchdog's tick. RP2350 feeds it from its own TICKS
-/// generator, which does not run until enabled; RP2040's watchdog tick is the
-/// one its timer already uses.
-fn start_tick() {
+/// Start the watchdog's tick, one a microsecond of the crystal.
+///
+/// RP2350 feeds the watchdog from its own generator in the TICKS block,
+/// which does not run until enabled. RP2040's generator is the watchdog's
+/// own `TICK` register, and the same tick is the one its timer counts
+/// (datasheet 4.6.4, 4.7.2): out of power-on the register reads enabled with
+/// a divider of zero, and neither the watchdog nor the timer counts until a
+/// divider is written.
+///
+/// The tick divides `clk_ref`. Before the crystal is selected `clk_ref` runs
+/// from the ring oscillator (RP2040: 1.8 to 12 MHz, nominally 6.5, datasheet
+/// 2.17), so a tick started then is slow by up to the ratio of the two and a
+/// timeout loaded against it is long, never short of what a 12 MHz crystal
+/// gives: the bound a boot that dies before its clocks is held to. Once the
+/// clock tree has put `clk_ref` on the crystal the same divider is exact.
+pub fn start_tick() {
+    let cycles = crate::platform::chip::XOSC_HZ / 1_000_000;
     #[cfg(not(feature = "chip-rp2040"))]
     {
         const WATCHDOG_TICK_CTRL: usize = 0x30;
         const WATCHDOG_TICK_CYCLES: usize = 0x34;
         let base = crate::platform::chip::TICKS_BASE as usize;
-        let cycles = crate::platform::chip::XOSC_HZ / 1_000_000;
         // SAFETY: TICKS registers from the silicon TOML; boot thread.
         unsafe {
             write32(base + WATCHDOG_TICK_CYCLES, cycles);
             write32(base + WATCHDOG_TICK_CTRL, 1);
         }
     }
+    #[cfg(feature = "chip-rp2040")]
+    {
+        // SAFETY: the watchdog's own register; boot thread.
+        unsafe {
+            if let Some(stopped) = rp2040_tick::restart(read32(rp2040_tick::TICK), cycles) {
+                // The divider with the generator stopped, then the enable:
+                // the divider is taken when the generator starts.
+                write32(rp2040_tick::TICK, stopped);
+                write32(rp2040_tick::TICK, stopped | rp2040_tick::ENABLE);
+            }
+        }
+    }
 }
+
+/// RP2040's `WATCHDOG.TICK` (datasheet table 571): `CYCLES` in bits 8:0,
+/// `ENABLE` bit 9, the read-only `RUNNING` bit 10 and `COUNT` above it.
+pub mod rp2040_tick {
+    #[cfg(feature = "chip-rp2040")]
+    pub(super) const TICK: usize = crate::platform::chip::WATCHDOG_CTRL as usize + 0x2C;
+    pub const CYCLES: u32 = 0x1FF;
+    pub const ENABLE: u32 = 1 << 9;
+
+    /// The value to write, generator stopped, to run the tick at one in
+    /// `cycles` of `clk_ref`, given what the register reads now; `None` when
+    /// it already runs at that divider, so a second start does not stop a
+    /// tick the timer is counting.
+    pub const fn restart(now: u32, cycles: u32) -> Option<u32> {
+        let cycles = cycles & CYCLES;
+        if now & (ENABLE | CYCLES) == ENABLE | cycles {
+            None
+        } else {
+            Some(cycles)
+        }
+    }
+}
+
+// A zero divider never ticks, and one over nine bits is a different one.
+// The register out of power-on (enabled, divider zero) and a stopped
+// generator are started; one running at the divider, whatever its status
+// bits read, is left alone.
+const _: () = {
+    use rp2040_tick::{restart, CYCLES, ENABLE};
+    let mhz = crate::platform::chip::XOSC_HZ / 1_000_000;
+    assert!(mhz >= 1 && mhz <= CYCLES);
+    assert!(matches!(restart(ENABLE, 12), Some(12)));
+    assert!(matches!(restart(12, 12), Some(12)));
+    assert!(matches!(restart(ENABLE | 6, 12), Some(12)));
+    assert!(restart(ENABLE | 12, 12).is_none());
+    assert!(restart((5 << 11) | (1 << 10) | ENABLE | 12, 12).is_none());
+};
 
 /// The longest the counter holds: its 24-bit load value at this chip's
 /// tick rate. Bounds the boot, from clock bring-up to the domain loop.

@@ -2049,6 +2049,90 @@ pub fn validate_provider_domains(
     Ok(())
 }
 
+/// Refuse a module placed in a domain a core other than 0 runs when it needs
+/// what only core 0 does.
+///
+/// Flash operations and an over-the-air update stop the other core for
+/// their length, and the kernel takes them on core 0 alone. So a module in a
+/// domain `smp` steps on another core is refused when:
+///
+///   - its manifest holds the `flash` or the `reconfigure.ota` grant; or
+///   - it requires a contract whose provider in the graph holds the `flash`
+///     grant: a provider call runs the provider's code on the caller's core,
+///     where the kernel answers the flash operation `ENOTSUP`.
+///
+/// `modules` is every module the composer validates, each with its manifest
+/// by name; `target` names the target in the refusal.
+pub fn validate_secondary_core_modules(
+    config: &Value,
+    modules: &[Value],
+    manifests: &HashMap<String, Manifest>,
+    smp: &crate::target::SmpFacts,
+    target: &str,
+) -> Result<()> {
+    const CORE_0_GRANTS: &[&str] = &["flash", "reconfigure.ota"];
+    if !smp.bridges_cores() {
+        return Ok(());
+    }
+    let holds = |m: &Manifest, grant: &str| crate::manifest::grant_names(m.grants).contains(&grant);
+    let named = |m: &Value| m.get("name").and_then(Value::as_str).map(str::to_string);
+    for m in modules {
+        let Some(name) = named(m) else {
+            continue;
+        };
+        let Some(manifest) = manifests.get(&name) else {
+            continue;
+        };
+        let domain = resolve_domain_id(m, config)?;
+        let core = smp.domain_core(domain);
+        if core == 0 {
+            continue;
+        }
+        let domain_name = m.get("domain").and_then(Value::as_str).unwrap_or("?");
+        let placed = format!(
+            "module '{name}' is in domain '{domain_name}', which {target} runs on core {core}"
+        );
+        let remedy = "Place it in a domain core 0 runs";
+        if let Some(grant) = CORE_0_GRANTS.iter().find(|g| holds(manifest, g)) {
+            return Err(Error::Config(format!(
+                "{placed}, and it holds the `{grant}` grant: flash and over-the-air updates \
+                 are core 0's. {remedy}."
+            )));
+        }
+        // The contracts it may call: a bit of its first grant word each (its
+        // `[[resources]]` claims and the contracts its `grants` name), less
+        // a claim its configuration never exercises.
+        for contract in 0..64u16 {
+            if manifest.grants[0] & (1u64 << contract) == 0 {
+                continue;
+            }
+            let idle_claim = manifest.resources.iter().any(|r| {
+                u16::from(r.device_class) == contract
+                    && !r.exercised_by(|p| entry_str_param(config, m, p))
+            });
+            if idle_claim {
+                continue;
+            }
+            let provider = modules.iter().filter_map(named).find(|p| {
+                *p != name
+                    && manifests
+                        .get(p)
+                        .is_some_and(|pm| pm.provider_contracts.contains(&contract) && holds(pm, "flash"))
+            });
+            if let Some(provider) = provider {
+                let contract = fluxor_abi::registry::contract_name(contract).unwrap_or("unknown");
+                return Err(Error::Config(format!(
+                    "{placed}, and it requires `{contract}`, which module '{provider}' \
+                     provides holding the `flash` grant: a provider call runs the provider's \
+                     code on the caller's core, and flash is core 0's, so the call would \
+                     answer ENOTSUP. {remedy}."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a graph whose edge contracts do not meet across their edges.
 ///
 /// A port that reaches an edge contract (`contract = "storage.block"`) binds
@@ -2390,31 +2474,99 @@ pub fn validate_port_capabilities(
     Ok(())
 }
 
+/// What a param a fact is bound to resolves to, for one module instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundParam {
+    /// The value the graph sets, or the param's schema default.
+    Value(u32),
+    /// The module's schema has no integer param of that name.
+    NotAnInteger,
+    /// The module's schema is not at hand (its artefact is not built).
+    NoSchema,
+}
+
+/// Resolves the param a fact is bound to: a module entry of the graph and a
+/// param name, to its value for that instance.
+pub type BoundParamOf<'a> = &'a dyn Fn(&Value, &str) -> Result<BoundParam>;
+
+/// The facts port `port` of instance `spec`'s module carries on this graph:
+/// the ones its manifest states, and each param-bound one at the value the
+/// instance's param holds. A bound fact whose module schema is not at hand
+/// is left undeclared.
+fn instance_port_facts(
+    config: &Value,
+    spec: &str,
+    port: &crate::manifest::PortSpec,
+    param_of: BoundParamOf<'_>,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut facts = port.facts.clone();
+    if port.fact_params.is_empty() {
+        return Ok(facts);
+    }
+    let instance = spec.split_once('.').map_or(spec, |(m, _)| m);
+    let empty = Value::Null;
+    let entry = config
+        .get("modules")
+        .and_then(Value::as_array)
+        .and_then(|ms| {
+            ms.iter()
+                .find(|m| m.get("name").and_then(Value::as_str) == Some(instance))
+        })
+        .unwrap_or(&empty);
+    for (fact, param) in &port.fact_params {
+        match param_of(entry, param)? {
+            BoundParam::Value(v) => {
+                facts.insert(fact.clone(), vec![v.to_string()]);
+            }
+            BoundParam::NotAnInteger => {
+                return Err(Error::Config(format!(
+                    "`{spec}`: fact `{fact}` is bound to param `{param}`, which module \
+                     `{instance}` does not declare as an integer param (u8, u16 or u32)"
+                )))
+            }
+            BoundParam::NoSchema => {}
+        }
+    }
+    Ok(facts)
+}
+
 /// Compare the stream facts both ends of each edge declare, and refuse fan-in
-/// onto an encoded input port.
+/// onto a record-stream input port.
 ///
-/// `[ports.facts]` is the build-time half of an encoded stream's description
-/// (the runtime half is the stream's own `STREAM` record). For every fact both
-/// ports declare, the producer's terms must fit the consumer's: a set is a
-/// subset (everything the producer may send, the consumer takes), an exact
-/// number is equal, a ceiling is not exceeded. A fact only one end declares is
-/// unconstrained on that edge — the honest reading of an undeclared fact —
-/// except a fact in `UNDECLARED_IS_NONE`, which a consumer that declares
-/// nothing takes none of: a requester whose `request_out` declares an
-/// exchange `binding` is refused against a provider whose `request_in` does
-/// not speak it.
+/// `[ports.facts]` is the build-time half of a stream's description (the
+/// runtime half is the stream's own records). For every fact both ports
+/// declare, the producer's terms must fit the consumer's: a set is a subset
+/// (everything the producer may send, the consumer takes), an exact number
+/// is equal, a ceiling is not exceeded, a floor is met. A fact only one end
+/// declares is unconstrained on that edge — the honest reading of an
+/// undeclared fact — except a fact in `UNDECLARED_IS_NONE`, which a consumer
+/// that declares nothing takes none of: a requester whose `request_out`
+/// declares an exchange `binding` is refused against a provider whose
+/// `request_in` does not speak it.
 ///
-/// Fan-in onto an encoded input is refused outright. An encoded stream is a
-/// sequence of records a reader reassembles across reads; a merge interleaves
-/// two producers' bytes, and no reader can recover a record boundary from
-/// that. Exchange requests are whole records each, so their fan-in stands.
+/// A fact that is the subject of a cross-fact rule
+/// (`vocabulary::CROSS_FACT_RULES`) is judged by that rule in place of its
+/// own row, on every edge of the rule's capability, whether or not the
+/// producer declares it.
+///
+/// A fact bound to a param takes that instance's value through `param_of`.
+///
+/// Fan-in onto a record-stream input is refused outright. Such a stream is
+/// a sequence of records a reader reassembles across reads; a merge
+/// interleaves two producers' bytes, and no reader can recover a record
+/// boundary from that. Exchange requests are whole records each, so their
+/// fan-in stands.
 ///
 /// FAILS OPEN on a module whose manifest could not be resolved, like
 /// [`validate_port_capabilities`] and for the same reason.
-pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>) -> Result<()> {
+pub fn validate_port_facts(
+    config: &Value,
+    manifests: &HashMap<String, Manifest>,
+    param_of: BoundParamOf<'_>,
+) -> Result<()> {
     use fluxor_contracts::vocabulary::{
-        fact_rule, facts_for, surface_capability, FactRule, PORT_SCOPED_CAPABILITIES,
-        UNDECLARED_IS_NONE,
+        banding_admits, cross_fact_rule, fact_rule, facts_for, surface_capability, FactRule,
+        BANDING, CROSS_FACT_RULES, PORT_SCOPED_CAPABILITIES, UNDECLARED_IS_NONE,
     };
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
@@ -2435,6 +2587,7 @@ pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>
             .and_then(|ct| surface_capability(ct))
             .filter(|c| PORT_SCOPED_CAPABILITIES.contains(c))
     };
+    let number = |v: Option<&Vec<String>>| -> Option<u32> { v?.first()?.parse::<u32>().ok() };
 
     let mut producers_into: HashMap<&str, Vec<&str>> = HashMap::new();
     for entry in wiring {
@@ -2453,11 +2606,26 @@ pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>
         if capability != "exchange.request" {
             producers_into.entry(to).or_default().push(from);
         }
+        let out_facts = instance_port_facts(config, from, &out_port, param_of)?;
+        let in_facts = instance_port_facts(config, to, &in_port, param_of)?;
 
         let schema = facts_for(capability).unwrap_or(&[]);
         let none: Vec<String> = Vec::new();
-        for (fact, sent) in &out_port.facts {
-            let taken = match in_port.facts.get(fact) {
+        for (fact, sent) in &out_facts {
+            if cross_fact_rule(capability, fact).is_some() {
+                continue;
+            }
+            // A cross-fact rule's gate at 0 on the consumer hands the edge
+            // to that rule: `frame_bytes = 0` is a consumer that retains no
+            // frame, not one whose frames are at most 0 bytes.
+            if CROSS_FACT_RULES
+                .iter()
+                .any(|r| r.capability == capability && r.gate == fact)
+                && number(in_facts.get(fact)) == Some(0)
+            {
+                continue;
+            }
+            let taken = match in_facts.get(fact) {
                 Some(taken) => taken,
                 None if UNDECLARED_IS_NONE.contains(&(capability, fact.as_str())) => &none,
                 None => continue,
@@ -2493,25 +2661,50 @@ pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>
                     }
                 }
                 FactRule::Ceiling => {
-                    let n = |v: &[String]| v.first().and_then(|x| x.parse::<u32>().ok());
-                    if let (Some(s), Some(t)) = (n(sent), n(taken)) {
+                    if let (Some(s), Some(t)) = (number(Some(sent)), number(Some(taken))) {
                         if s > t {
                             return refuse(format!(
-                                "the producer sends up to {s} bytes but the consumer takes {t}"
+                                "the producer goes up to {s} but the consumer takes at most {t}"
+                            ));
+                        }
+                    }
+                }
+                FactRule::Floor => {
+                    if let (Some(s), Some(t)) = (number(Some(sent)), number(Some(taken))) {
+                        if t > s {
+                            return refuse(format!(
+                                "the consumer needs at least {t} but the producer sustains {s}"
                             ));
                         }
                     }
                 }
             }
         }
+        for rule in CROSS_FACT_RULES.iter().filter(|r| r.capability == capability) {
+            let gate = number(in_facts.get(rule.gate));
+            let sent = number(out_facts.get(rule.fact));
+            let taken = number(in_facts.get(rule.fact));
+            let show = |v: Option<u32>| v.map_or_else(|| "undeclared".to_string(), |n| n.to_string());
+            if *rule == BANDING && !banding_admits(gate, sent, taken) {
+                return Err(Error::Config(format!(
+                    "`{from}` -> `{to}`: the consumer retains no frame (`{gate_name}` = 0), so \
+                     the producer must send bands no taller than the consumer's \
+                     ({capability} fact `{fact}`: producer declares {}, consumer declares {})",
+                    show(sent),
+                    show(taken),
+                    gate_name = rule.gate,
+                    fact = rule.fact,
+                )));
+            }
+        }
     }
     for (to, froms) in producers_into {
         if froms.len() > 1 {
             return Err(Error::Config(format!(
-                "`{to}` is an encoded-media input fed by {} producers ({}). An encoded \
-                 stream is a record sequence, and merging two interleaves their bytes \
-                 past any reader's ability to find a record boundary. Give each \
-                 producer its own consumer.",
+                "`{to}` is a record-stream input fed by {} producers ({}). A record \
+                 stream is read as a sequence of records, and merging two interleaves \
+                 their bytes past any reader's ability to find a record boundary. Give \
+                 each producer its own consumer.",
                 froms.len(),
                 froms.join(", "),
             )));

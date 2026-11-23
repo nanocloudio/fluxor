@@ -569,8 +569,7 @@ static mut FLUXOR_RP_GATE_CB: [Cb; CORES] = [const {
 }; CORES];
 
 fn core_id() -> usize {
-    // SAFETY: SIO CPUID, a read-only register present on both dies.
-    (unsafe { core::ptr::read_volatile(0xD000_0000 as *const u32) } as usize) & 1
+    chip::core_id()
 }
 
 /// Whether a gated module is running on this core — the step guard's alarm
@@ -590,12 +589,21 @@ pub fn force_out() {
     unsafe { w(reg::ICSR, 1 << 28) };
 }
 
-/// One-time setup: SVC and PendSV at the lowest priority, so every device
-/// interrupt still preempts the trap path; the configurable faults enabled
-/// where they exist, so a module's MemManage or stack-limit fault is not
-/// escalated.
+/// One-time setup on the boot core: its own system control block
+/// ([`init_core`]), the MPU checked against the target's facts, and every
+/// peripheral made privileged-only.
 pub fn init() {
-    // SAFETY: privileged SCS writes at boot.
+    init_core();
+    let _ = mpu_matches_facts();
+    gate_lock_peripherals();
+}
+
+/// The setup each core does for itself, its system control block being its
+/// own: SVC and PendSV at the lowest priority, so every device interrupt
+/// still preempts the trap path; the configurable faults enabled where they
+/// exist, so a module's MemManage or stack-limit fault is not escalated.
+pub fn init_core() {
+    // SAFETY: privileged SCS writes, on the core they configure.
     unsafe {
         let v = r(reg::SHPR2) & 0x00FF_FFFF;
         w(reg::SHPR2, v | 0xFF00_0000);
@@ -609,8 +617,6 @@ pub fn init() {
             w(reg::MPU_MAIR0, 0x0000_0444);
         }
     }
-    let _ = mpu_matches_facts();
-    gate_lock_peripherals();
 }
 
 // ── Entry ───────────────────────────────────────────────────────────

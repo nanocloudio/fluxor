@@ -341,6 +341,22 @@ provider_alarms = []
 foreign_instance = "TIMER"
 foreign_alarms = [0]
 
+# Which core runs each execution domain: every domain on core 0's one loop.
+# The second Cortex-M0+ runs nothing; ARMv6-M has no exclusive accesses to
+# build a cross-core lock from.
+[smp]
+cores = 1
+domain_cores = [0, 0, 0, 0]
+
+# What the hardware counters a module reads through the `counters` contract
+# count: the facts of the target capabilities `counter.cycles` and
+# `counter.icache`. ARMv6-M has no cycle counter, so cycles are the 1 MHz
+# system timer scaled to the system clock; the instruction-cache figures are
+# the XIP cache's hit and access counters, one pair for the node.
+[counters]
+cycles = "system"
+icache = "node"
+
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module
 # requires a contract that neither the kernel (`channel`, `timer`, `event`,

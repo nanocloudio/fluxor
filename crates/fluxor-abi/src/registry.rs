@@ -12,7 +12,7 @@ pub const MAX_CONTRACTS: usize = 64;
 /// ORed onto an opcode: dispatch to the provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x10000;
 /// Contract ids the registry assigns.
-pub const CONTRACTS_ASSIGNED: usize = 45;
+pub const CONTRACTS_ASSIGNED: usize = 46;
 
 /// Op-level grants (`grants = [..]` in a manifest): the bits of the
 /// second grant word. A contract's own grant is its id's bit in the first.
@@ -601,6 +601,9 @@ pub mod platform_dma_fd {
     pub const RESTART: u32 = 0x1f87;
     pub const FREE: u32 = 0x1f88;
     pub const QUEUE: u32 = 0x1f89;
+    pub const LIST_START: u32 = 0x1f8a;
+    pub const LIST_ARM: u32 = 0x1f8b;
+    pub const LIST_STATUS: u32 = 0x1f8c;
 }
 
 pub mod reconfigure {
@@ -765,6 +768,12 @@ pub mod image_decode {
     pub const CLOSE: u32 = 0x2c02;
 }
 
+pub mod counters {
+    pub const ID: u16 = 0x002d;
+    pub const DESCRIBE: u32 = 0x2d00;
+    pub const READ: u32 = 0x2d01;
+}
+
 /// The contract a manifest names (`requires_contract`, `provides`).
 pub fn contract_of_name(name: &str) -> Option<u16> {
     match name {
@@ -852,6 +861,7 @@ pub fn contract_id(name: &str) -> Option<u16> {
         "storage.block" => Some(0x002a),
         "net_tx_drain" => Some(0x002b),
         "image_decode" => Some(0x002c),
+        "counters" => Some(0x002d),
         _ => None,
     }
 }
@@ -904,6 +914,7 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
         0x002a => Some("storage.block"),
         0x002b => Some("net_tx_drain"),
         0x002c => Some("image_decode"),
+        0x002d => Some("counters"),
         _ => None,
     }
 }
@@ -994,6 +1005,7 @@ pub fn op_routes_to_kernel(op: u32) -> bool {
             | 0x25
             | 0x27
             | 0x29
+            | 0x2d
     ) && !matches!(op, 0x00fe)
 }
 
@@ -1554,6 +1566,9 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x1f87 => Some(OpGrant::Contract(0x001f)),
         0x1f88 => Some(OpGrant::Contract(0x001f)),
         0x1f89 => Some(OpGrant::Contract(0x001f)),
+        0x1f8a => Some(OpGrant::Contract(0x001f)),
+        0x1f8b => Some(OpGrant::Contract(0x001f)),
+        0x1f8c => Some(OpGrant::Contract(0x001f)),
         0x2020 => Some(OpGrant::Grant(grant::RECONFIGURE_OTA)),
         0x2021 => Some(OpGrant::Grant(grant::RECONFIGURE_OTA)),
         0x2022 => Some(OpGrant::Grant(grant::RECONFIGURE_OWNER)),
@@ -1664,6 +1679,8 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x2c00 => Some(OpGrant::Contract(0x002c)),
         0x2c01 => Some(OpGrant::Contract(0x002c)),
         0x2c02 => Some(OpGrant::Contract(0x002c)),
+        0x2d00 => Some(OpGrant::Contract(0x002d)),
+        0x2d01 => Some(OpGrant::Contract(0x002d)),
         _ => None,
     }
 }
@@ -1717,6 +1734,7 @@ pub fn contract_grant(id: u16) -> Option<OpGrant> {
         0x002a => Some(OpGrant::Contract(0x002a)),
         0x002b => Some(OpGrant::Contract(0x002b)),
         0x002c => Some(OpGrant::Contract(0x002c)),
+        0x002d => Some(OpGrant::Contract(0x002d)),
         _ => None,
     }
 }
@@ -1792,7 +1810,7 @@ pub mod gate {
             0x002a => Some(OpRule {
                 handle: HandleUse::Global,
                 arg: Dir::Out,
-                arg_max: 20,
+                arg_max: 24,
                 data: Dir::None,
                 data_max: Bound::Bytes(0),
                 closes: false,
@@ -4509,6 +4527,36 @@ pub mod gate {
                 addr_answer: false,
                 signals: false,
             }),
+            0x1f8a => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f8b => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f8c => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
             0x2020 => Some(OpRule {
                 handle: HandleUse::Global,
                 arg: Dir::In,
@@ -5596,6 +5644,26 @@ pub mod gate {
                 data: Dir::None,
                 data_max: Bound::Bytes(0),
                 closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2d00 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2d01 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
                 addr_answer: false,
                 signals: false,
             }),

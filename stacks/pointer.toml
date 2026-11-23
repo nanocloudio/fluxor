@@ -22,10 +22,10 @@ match = { family = "wasm" }
 modules = [{ name = "pointer", type = "wasm_browser_pointer" }]
 wiring = []
 
-# ── Linux host: libinput / evdev pointer device
+# ── Linux host: an evdev pointer device
 [[variant]]
 match = { family = "linux" }
-modules = [{ name = "pointer", type = "linux_input_pointer" }]
+modules = [{ name = "pointer", type = "linux_pointer" }]
 wiring = []
 
 # ── BCM2712 with touchscreen: i2c / spi capacitive controller.

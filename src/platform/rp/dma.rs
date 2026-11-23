@@ -35,11 +35,24 @@ pub mod addr {
     /// `AL1_CTRL` — the same control register without the trigger side
     /// effect, for reading or editing a live channel's configuration.
     pub const AL1_CTRL: usize = 0x10;
+    /// `AL1_READ_ADDR`, `AL1_WRITE_ADDR` and `AL1_TRANS_COUNT_TRIG`: with
+    /// [`AL1_CTRL`], the four registers one channel loads into another from
+    /// a control block, the last of them starting it.
+    pub const AL1_READ_ADDR: usize = 0x14;
+    pub const AL1_WRITE_ADDR: usize = 0x18;
+    pub const AL1_TRANS_COUNT_TRIG: usize = 0x1c;
     /// `AL3_TRANS_COUNT`, paired with [`AL3_READ_ADDR_TRIG`].
     pub const AL3_TRANS_COUNT: usize = 0x38;
     /// `AL3_READ_ADDR_TRIG` — writing it re-triggers the channel, so it must
     /// be written last.
     pub const AL3_READ_ADDR_TRIG: usize = 0x3c;
+
+    /// `INTR`: every channel's raw interrupt flag, cleared by writing a one.
+    pub const INTR: usize = 0x400;
+    /// `INTE0`/`INTE1`: the channels whose interrupt raises `DMA_IRQ_0` or
+    /// `DMA_IRQ_1`; `INTS0`/`INTS1`: the flags among them that are set.
+    pub const INTE: [usize; 2] = [0x404, 0x414];
+    pub const INTS: [usize; 2] = [0x40c, 0x41c];
 
     /// Address of a channel register at `reg` within the block.
     #[inline]
@@ -59,6 +72,18 @@ pub mod addr {
         channel_reg(base, ch, CTRL_TRIG)
     }
 }
+
+/// `TREQ_SEL` of a channel no peripheral paces: it runs as fast as the bus
+/// lets it.
+pub const TREQ_PERMANENT: u8 = 0x3f;
+
+/// The NVIC lines of `DMA_IRQ_0` and `DMA_IRQ_1` (RP2040 datasheet §2.3.2;
+/// RP2350 datasheet §3.2). The kernel takes the first on core 0 and the
+/// second on a second core, for the scan lists.
+#[cfg(feature = "chip-rp2040")]
+pub const IRQ_LINES: [u16; 2] = [11, 12];
+#[cfg(not(feature = "chip-rp2040"))]
+pub const IRQ_LINES: [u16; 2] = [10, 11];
 
 /// `STREAM_CTR` within the XIP control block — the count of words the XIP
 /// stream engine has still to deliver. Same offset on both chips; the *base*
@@ -227,6 +252,41 @@ impl CtrlTrig {
             DMA_CTRL_CHAIN_TO_LSB,
             DMA_CTRL_CHAIN_TO_WIDTH,
             ch as u32,
+        ))
+    }
+
+    /// Wrap the write address every `1 << log2_bytes` bytes, so a channel
+    /// that loads the same registers each time it is triggered starts from
+    /// the first of them again.
+    #[must_use]
+    pub const fn ring_write(self, log2_bytes: u32) -> Self {
+        use crate::platform::chip::{
+            DMA_CTRL_RING_SEL_LSB, DMA_CTRL_RING_SEL_WIDTH, DMA_CTRL_RING_SIZE_LSB,
+            DMA_CTRL_RING_SIZE_WIDTH,
+        };
+        let v = crate::platform::rp_regs::set_field(
+            self.0,
+            DMA_CTRL_RING_SIZE_LSB,
+            DMA_CTRL_RING_SIZE_WIDTH,
+            log2_bytes,
+        );
+        Self(crate::platform::rp_regs::set_field(
+            v,
+            DMA_CTRL_RING_SEL_LSB,
+            DMA_CTRL_RING_SEL_WIDTH,
+            1,
+        ))
+    }
+
+    /// Whether the channel keeps its completion interrupt to itself.
+    #[must_use]
+    pub const fn irq_quiet(self, on: bool) -> Self {
+        use crate::platform::chip::{DMA_CTRL_IRQ_QUIET_LSB, DMA_CTRL_IRQ_QUIET_WIDTH};
+        Self(crate::platform::rp_regs::set_field(
+            self.0,
+            DMA_CTRL_IRQ_QUIET_LSB,
+            DMA_CTRL_IRQ_QUIET_WIDTH,
+            on as u32,
         ))
     }
 

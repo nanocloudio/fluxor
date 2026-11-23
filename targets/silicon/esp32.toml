@@ -44,6 +44,10 @@ flash_size = "0x400000"
 ram_base = "0x3ffb0000"
 ram_size = "0x50000"
 
+# What the hardware counters a module reads through the `counters` contract
+# count. No kernel runs here, so none.
+[counters]
+
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module
 # requires a contract that neither the kernel (`channel`, `timer`, `event`,

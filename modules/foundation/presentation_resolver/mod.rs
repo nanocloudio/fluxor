@@ -96,9 +96,11 @@ struct State {
     chrome_capacity: u16,
     content_capacity: u16,
 
-    // Most-recent traits record (resolution is a pure function of the latest
-    // surface state; a burst coalesces to this).
+    // Most-recent traits record the contract admits (resolution is a pure
+    // function of the latest surface state; a burst coalesces to this).
     latest: [u8; st::EVENT_SIZE],
+    // Records the contract refused.
+    refused: u32,
 
     // Encoded layout awaiting (or mid-) delivery — the layout channel is
     // all-or-nothing, so a refused write is retried next step rather than lost.
@@ -459,6 +461,7 @@ pub unsafe extern "C" fn module_new(
         s.chrome_capacity = 0;
         s.content_capacity = 8;
         s.latest = [0; st::EVENT_SIZE];
+        s.refused = 0;
         s.out = [0; OUT_BUF];
         s.out_len = 0;
         s.pending = false;
@@ -508,9 +511,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 if nread < st::EVENT_SIZE as i32 {
                     break;
                 }
-                if rec[0] == st::MSG_TRAITS {
+                if st::decode(&rec).is_some() {
                     have = true;
                     s.latest = rec; // keep last (coalesce)
+                } else {
+                    s.refused = s.refused.wrapping_add(1);
                 }
             }
             if have {
@@ -526,20 +531,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 /// Decode the latest traits record + policy into a Surface, resolve, encode the
 /// layout into `s.out`.
 fn resolve_and_stage(s: &mut State) {
-    let rec = s.latest;
+    // `latest` only ever holds a record `decode` admitted.
+    let Some(traits) = st::decode(&s.latest) else {
+        return;
+    };
     let surf = Surface {
-        size_class_w: rec[2],
-        modalities: (rec[8] as u16) | ((rec[9] as u16) << 8),
-        display_count: rec[21],
+        size_class_w: traits.size_class_w,
+        modalities: traits.modalities,
+        display_count: traits.display_count,
         chrome_region: s.chrome_region,
         physical_buttons: s.physical_buttons,
         chrome_capacity: s.chrome_capacity,
         content_capacity: s.content_capacity,
     };
-    let epoch = (rec[16] as u32)
-        | ((rec[17] as u32) << 8)
-        | ((rec[18] as u32) << 16)
-        | ((rec[19] as u32) << 24);
+    let epoch = traits.epoch;
     let r = resolve(s, &surf);
     let (buf, len) = encode_layout(s, &r, epoch);
     s.out[..len].copy_from_slice(&buf[..len]);

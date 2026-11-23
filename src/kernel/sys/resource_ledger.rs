@@ -575,11 +575,23 @@ fn resident_demand(config: &crate::kernel::boot::config::Config) -> (usize, usiz
     (usize::from(workloads.count()), modules, edges)
 }
 
-/// Edges of the node graph that cross execution domains: their modules sit in
-/// different domains, or the edge is marked cross-core. A kernel with domains
-/// on their own cores bridges each with a consumer-side channel of its own
-/// beside the producer's (`domains::cross::bridge_edges`). A tee or merge takes the domain of the
-/// module it fans on, so fanning adds no crossing.
+/// The cross-core edges of the config last planned ([`plan`]).
+#[cfg(feature = "smp")]
+static CROSSINGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many edges of the config last planned cross cores: one bridge ring
+/// each.
+#[cfg(feature = "smp")]
+pub fn crossings() -> usize {
+    CROSSINGS.load(core::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Edges of the node graph that cross cores: their modules sit in domains
+/// the target runs on different cores, or the edge is marked cross-core. A
+/// kernel with domains on their own cores bridges each with a consumer-side
+/// channel of its own beside the producer's (`domains::cross::bridge_edges`).
+/// A tee or merge takes the domain of the module it fans on, so fanning adds
+/// no crossing.
 #[cfg(feature = "smp")]
 fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
     use crate::kernel::boot::config::EdgeClass;
@@ -591,7 +603,16 @@ fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
         .iter()
         .take(config.edge_count as usize)
         .flatten()
-        .filter(|e| e.edge_class == EdgeClass::CrossCore || domain(e.from_id) != domain(e.to_id))
+        .filter(|e| {
+            e.edge_class == EdgeClass::CrossCore
+                || match (domain(e.from_id), domain(e.to_id)) {
+                    (Some(from), Some(to)) => crate::kernel::exec::domains::crosses_cores(
+                        usize::from(from),
+                        usize::from(to),
+                    ),
+                    (from, to) => from != to,
+                }
+        })
         .count()
 }
 
@@ -606,7 +627,11 @@ pub fn plan(config: &crate::kernel::boot::config::Config) {
     let (workloads, wl_modules, wl_edges) = resident_demand(config);
     let module_slots = modules + fans + wl_modules + wl_edges;
     #[cfg(feature = "smp")]
-    let channels = edges + fans + 2 * wl_edges + cross_domain_edges(config);
+    let crossings = cross_domain_edges(config);
+    #[cfg(feature = "smp")]
+    CROSSINGS.store(crossings as u32, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "smp")]
+    let channels = edges + fans + 2 * wl_edges + crossings;
     #[cfg(not(feature = "smp"))]
     let channels = edges + fans + 2 * wl_edges;
     set_derived(res::POOL_MODULE_SLOTS, module_slots as u32);

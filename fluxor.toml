@@ -106,7 +106,23 @@ limit_register_coverage = "fail"
 # runtime: a reserved port refuses it at admission, an unreserved one grants
 # its UDP lease, a table name answers from the graph and any other is
 # delegated to a host resolver, and removing the workload frees the port.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/workload_package_e2e.sh", "tests/host/program_section.sh", "tests/host/state_budget_paths.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/transport_continuity_rst_in.sh", "tests/host/transport_continuity_rst_out.sh", "tests/host/transport_continuity_timewait.sh", "tests/host/transport_continuity_timers.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh", "tests/host/cli_out_drain.sh", "tests/host/agent_remote.sh", "examples/dns_server/linux_e2e.sh"]
+# `tests/host/linux_drawn_ui_e2e.sh` runs drawn-UI graphs under `fluxor-linux`
+# with no display: a draw list rasterised a band at a time and presented
+# whole, a menu over a moving picture, a pointer press reaching a drawn
+# button, and the host's device pixel ratio.
+# `tests/host/wasm_raster_mirror_e2e.sh` and
+# `tests/host/wasm_a11y_fixture_e2e.sh` build the wasm kernel, build a graph
+# of browser-host modules into a bundle and run it under `node` against the
+# host shims: a region raster crossing a kernel channel to the canvas and
+# the accessibility mirror; and drawn controls with their accessibility tree
+# and their input. `tests/host/wasm_draw_vectors_e2e.sh` runs every
+# draw-list conformance vector through the wasm rasteriser module under
+# `node`, in both pixel formats, against the digests the vectors state.
+# `tests/host/raster_vectors_cortex_m.sh` builds the reference rasteriser as
+# Cortex-M object code for each RP target and runs every vector under
+# `qemu-system-arm`. Each of these fails, not skips, without its engine
+# (`node`, QEMU): a script that exits 0 without running reads as a pass.
+scripts = ["tools/ci/deps_budget.sh", "tests/host/workload_package_e2e.sh", "tests/host/program_section.sh", "tests/host/state_budget_paths.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/transport_continuity_rst_in.sh", "tests/host/transport_continuity_rst_out.sh", "tests/host/transport_continuity_timewait.sh", "tests/host/transport_continuity_timers.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh", "tests/host/cli_out_drain.sh", "tests/host/agent_remote.sh", "examples/dns_server/linux_e2e.sh", "tests/host/linux_drawn_ui_e2e.sh", "tests/host/wasm_raster_mirror_e2e.sh", "tests/host/wasm_a11y_fixture_e2e.sh", "tests/host/wasm_draw_vectors_e2e.sh", "tests/host/raster_vectors_cortex_m.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal
@@ -141,6 +157,12 @@ itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""
 
 [[ci.lints.exemption]]
 crate = "fluxor-rt"
+reason = """A crate every module links: the tree is also published and staged in other projects, where there is \
+no fluxor workspace to inherit from, so it states the workspace's lint tables \
+itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""
+
+[[ci.lints.exemption]]
+crate = "fluxor-contracts"
 reason = """A crate every module links: the tree is also published and staged in other projects, where there is \
 no fluxor workspace to inherit from, so it states the workspace's lint tables \
 itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""

@@ -102,7 +102,7 @@ mod playback_backend {
     }
 }
 
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 
 use fluxor::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
 

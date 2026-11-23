@@ -2,16 +2,15 @@
 //! that emits its incoming binary messages on the output channel as a
 //! `VideoRaster` byte stream.
 //!
-//! This is the "thin viewer" half of the split-deployment image
-//! pipeline: an upstream component (e.g. a Pi 5 running
-//! `host_image_codec → ws_stream → http`) decodes images and pushes
-//! RGB565 frames over `/ws`; the browser hosts this module, which
-//! pulls the bytes via the existing `host_ws_*` shim and forwards
-//! them to `wasm_browser_canvas` for paint. The same canvas module
-//! is wired in the pure-wasm graph behind `wasm_browser_image_codec`,
-//! so swapping decoder location is purely a graph-wiring concern —
-//! the canvas, the wire shape, and the user-visible behaviour are
-//! identical between deployments.
+//! This is the "thin viewer" half of a split-deployment image pipeline: an
+//! upstream node decodes images and pushes raster records over `/ws`; the
+//! browser hosts this module, which pulls the bytes through the `host_ws_*`
+//! shim and forwards them to `wasm_browser_canvas`. It relays bytes and
+//! reads none of them: the remote producer writes each record's region
+//! header (`abi::contracts::video_raster`) and the consumer checks it. The
+//! same canvas module is wired in the pure-wasm graph behind
+//! `wasm_browser_image_codec`, so where the decoder runs is a graph-wiring
+//! choice.
 //!
 //! State: heap-allocated on the module's own heap; its arena state
 //! holds the `*mut WsSourceState` pointer.
@@ -37,8 +36,8 @@ extern "C" {
     /// into `buf`. Returns the number of bytes written, 0 if the queue
     /// is empty, or negative on error / EOF. Large messages may be
     /// returned across multiple calls; this module is byte-stream
-    /// oriented and lets the downstream consumer (canvas) accumulate
-    /// `width * height * 2` bytes per frame from arbitrary chunks.
+    /// oriented, and the downstream consumer reassembles each record
+    /// from arbitrary chunks by the length its header states.
     fn host_ws_recv(handle: i32, buf: *mut u8, len: usize) -> i32;
 }
 

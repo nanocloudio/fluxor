@@ -1,17 +1,18 @@
 # linux_display
 
-Linux-only native display sink. Consumes RGB565 frames (row-major,
-`width × height × 2` bytes per frame) on its `pixels` input and either
-writes them as PPM files, blits them through a host window, or
-discards them.
+Linux-only native display sink with frame memory. Consumes `VideoRaster`
+records on its `pixels` input and either writes each presented frame as a
+PPM file, shows it in a host window, or discards it. In window mode it is
+also the window's input source: pointer, key and text records leave on its
+`pointer`, `keys` and `text` outputs.
 
 ## Modes
 
 | Mode     | Behaviour                                                                  | Build                       |
 |----------|----------------------------------------------------------------------------|-----------------------------|
-| `file`   | write each frame to `<path>` with `%04d` substituted from a counter        | always                      |
-| `null`   | accumulate and discard — useful for performance / backpressure tests       | always                      |
-| `window` | open a winit + softbuffer window and blit each frame                       | `--features host-window`    |
+| `file`   | write each presented frame to `<path>` with `%04d` substituted from a counter | always                   |
+| `null`   | take the stream and present nothing: for performance and backpressure tests | always                     |
+| `window` | open a host window, show each frame, and send the window's input           | `--features host-window`    |
 
 Build interactive support:
 
@@ -33,10 +34,13 @@ Configured via `[[params]]` in [manifest.toml](manifest.toml):
 |----------|------|------------------------------------------|---------------------------------------------------------------|
 | `mode`   | enum | `file` (or stack default)                | `file`, `null`, or `window`                                   |
 | `path`   | str  | `./target/host-display/frame_%04d.ppm`   | PPM path template (used in `file` mode)                       |
-| `width`  | u32  | 480 (range 1..=4096)                     | frame width in pixels                                         |
-| `height` | u32  | 480 (range 1..=4096)                     | frame height in pixels                                        |
-| `scale`  | u32  | 1 (range 1..=16)                         | integer pixel scale for `window` mode                         |
-| `header` | u32  | 0 (range 0..=1)                          | 1: each frame carries an `SRF1` header (magic, width, height, format) and the sink takes its geometry from the stream, not from `width`/`height` |
+| `width`  | u32  | 480 (range 1..=4096)                     | the window's first width, in surface pixels                   |
+| `height` | u32  | 480 (range 1..=4096)                     | the window's first height, in surface pixels                  |
+| `scale`  | u32  | 1 (range 1..=16)                         | window pixels per surface pixel, each way, in `window` mode   |
+
+The stream states its surface: `width` and `height` size the window until
+the first frame arrives, and the window then takes the extent of the
+surface in the stream.
 
 ```yaml
 modules:
@@ -59,12 +63,65 @@ When wired through the `display` platform stack
 instance is named `display` and its params come from
 `platform.display.*` in the YAML.
 
-## Pixel format
+## The stream
 
-The sink consumes RGB565, row-major. Each frame is exactly
-`width × height × 2` bytes. The PPM is written as P6 binary RGB888 —
-RGB565 is expanded per-pixel.
+Every record on `pixels` is a 20-byte region header and that region's
+pixels (`abi::contracts::video_raster`): the surface's extent, the pixel
+format (RGB565 or RGBA8), a rectangle on the surface and two flags. The
+display takes surfaces up to 4096 x 4096.
 
-Producers that emit row chunks are accumulated in a scratch buffer
-until a full frame's worth has arrived. Producers that emit more than
-one frame's worth in a single message are split at frame boundaries.
+- A frame is one or more regions; the one flagged last ends it. The display
+  holds the picture and presents at that region, so a frame of several
+  regions appears whole: file mode writes one PPM a frame, never a partial
+  one.
+- A damage frame changes only its regions; the rest of the picture stays. A
+  frame without the damage flag tiles the whole surface top to bottom.
+- A record the contract refuses (a damaged header, a region outside its
+  surface, a broken tiling, a surface past 4096 on an axis) is counted and
+  logged, its frame is abandoned, the picture stays as last presented, and
+  the stream is scanned forward for the next header of the surface in use.
+- The alpha of an RGBA8 region is not kept: nothing lies behind the picture.
+
+The PPM is written as P6 binary RGB888.
+
+## Window input
+
+In `window` mode the display sends what the window reports. Positions and
+pixel wheel deltas are in surface pixels: window pixels divided by `scale`.
+
+| Port      | Content type    | Records |
+|-----------|-----------------|---------|
+| `pointer` | `PointerEvents` | move, down, up, enter and leave for the mouse (pointer 0) and for touch contacts; wheel records, a line scroll in 1/120 detent and a smooth scroll in eighths of a surface pixel, positive toward the end and the right |
+| `keys`    | `KeyEvents`     | key down and up with modifiers; `key_code` the logical key, `scan_code` the evdev code |
+| `text`    | `TextEvents`    | text a key press typed, and an input method's composition and result |
+
+A key record is flagged `KEY_TEXT` only when that key press sent a COMMIT
+on `text`: text with no control character while neither Ctrl nor Meta is
+held. Backspace, Enter, arrows and shortcuts arrive unflagged and are the
+application's to act on. While an input method is composing, keys send no
+record.
+
+Records wait in three bounded queues of 64. A record a full channel
+refuses is offered again on the next step; a queue that is itself full
+drops its oldest record.
+
+### Input method
+
+Wire the application's `AccessibilityTree` output to the optional `tree`
+input and the window allows its input method while the tree's focused node
+is editable, placed at that node's bounds, and turns it off otherwise.
+Without `tree`, text is what key presses type.
+
+```yaml
+wiring:
+  - from: app.pixels
+    to:   display.pixels
+  - from: app.tree
+    to:   display.tree
+  - from: display.pointer
+    to:   app.pointer
+  - from: display.keys
+    to:   app.keys
+  - from: display.text
+    to:   app.text
+```

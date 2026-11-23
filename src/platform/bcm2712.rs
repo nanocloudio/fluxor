@@ -776,6 +776,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Split every edge whose endpoints live in different domains into a
     // producer-side and a consumer-side channel joined by an SPSC ring.
+    domains::install(&PLATFORM);
+    // The performance monitors where they are the kernel's to read (a
+    // board whose firmware enters at EL2); elsewhere no source, and the
+    // contract answers the system clock.
+    if fluxor::arch::aarch64::counters::monitors_present() {
+        fluxor::kernel::sys::counters::install(&COUNTERS);
+    }
     if let Err(msg) = cross::bridge_edges() {
         // Boot posture: a reservation shortfall halts — rebinding a consumer
         // to a handle no pump fills would strand every byte the producer
@@ -790,7 +797,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Instantiate + activate the compiled graph (shared with live rebuild).
-    let total_mods = match domains::instantiate(staged) {
+    let total_mods = match domains::instantiate(staged, &PLATFORM) {
         Ok(n) => n,
         Err(why) => {
             // Fail closed at boot. Running a graph whose modules did not all
@@ -864,20 +871,38 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
 /// What this platform does around the shared domain loop.
 static PLATFORM: domains::Platform = domains::Platform {
+    core_id: fluxor::arch::aarch64::smp::core_id,
+    signal: fluxor::arch::aarch64::smp::signal,
+    wait_event: fluxor::arch::aarch64::smp::wait_event,
+    wait_interrupt: fluxor::arch::aarch64::smp::wait_interrupt,
+    park: fluxor::arch::aarch64::smp::park,
+    counter: fluxor::arch::aarch64::smp::counter,
+    us_to_ticks: fluxor::arch::aarch64::smp::us_to_ticks,
+    interrupts: fluxor::arch::aarch64::smp::interrupts,
+    set_tick: fluxor::arch::aarch64::smp::set_tick,
     has_core: bcm_has_core,
     after_pass: bcm_after_pass,
     after_step: bcm_after_step,
 };
 
-/// Domain `n` runs on core `n`, once that core has come up.
+/// The `counters` contract's source: each core's own performance monitors.
+static COUNTERS: fluxor::kernel::sys::counters::Source = fluxor::kernel::sys::counters::Source {
+    cycles_clock: fluxor::abi::contracts::counters::CLOCK_CORE,
+    icache_scope: fluxor::abi::contracts::counters::SCOPE_CORE,
+    cycles_hz: fluxor::arch::aarch64::counters::monitors_hz,
+    read: fluxor::arch::aarch64::counters::monitors_read,
+};
+
+/// A domain has a core once the core the target maps it to has come up.
 fn bcm_has_core(domain_id: usize) -> bool {
-    u8::try_from(domain_id).is_ok_and(multicore::is_core_started)
+    u8::try_from(domains::domain_core(domain_id)).is_ok_and(multicore::is_core_started)
 }
 
 /// After each pass: core 0 drains the log to the UART; the `tick` loops
 /// report the die temperature; domain 0 reports the cross-domain bridges
-/// when the graph has more than one domain.
-fn bcm_after_pass(domain_id: usize, core_id: usize, mode: ExecMode) {
+/// when the graph has more than one domain; every domain reports its
+/// heartbeat and domain 0 serves a pending rebuild.
+fn bcm_after_pass(domain_id: usize, core_id: usize, mode: ExecMode, passes: u32) {
     if core_id == 0 {
         debug_drain_poll_core0();
     }
@@ -887,6 +912,7 @@ fn bcm_after_pass(domain_id: usize, core_id: usize, mode: ExecMode) {
     if mode == ExecMode::Tick && domain_id == 0 && domains::domains_needed() > 1 && xdom_due() {
         report_cross_domain();
     }
+    domains::primary_upkeep(domain_id, passes, &PLATFORM);
 }
 
 /// Owner roots' background jobs (making, charging, removing a workload's
@@ -972,7 +998,7 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"\r\n");
     log::info!("[core{core_id}] started, domain={domain_id}");
 
-    let ticks = domains::seed_core_tick(domain_id);
+    let ticks = domains::seed_core_tick(domain_id, &PLATFORM);
     // SAFETY: once, before the domain loop starts; the GIC CPU interface and
     // the generic timer are this core's own.
     unsafe {

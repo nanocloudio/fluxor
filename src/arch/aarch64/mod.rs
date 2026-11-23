@@ -14,10 +14,12 @@
 //! `platform/uefi.rs` from the machine's ACPI tables.
 
 pub mod boot_mmu;
+pub mod counters;
 pub mod cpu;
 pub mod exception;
 pub mod gic;
 pub mod isolation;
 pub mod mmio;
 pub mod psci;
+pub mod smp;
 pub mod timer;

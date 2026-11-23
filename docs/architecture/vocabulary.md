@@ -12,18 +12,18 @@ the replacement for each one in the way.
 | **target** | A build descriptor: the silicon, board or host class (`targets/silicon/`, `targets/boards/`, `targets/host/`) a build is made for. Graph `target:` names one. | A target resolves to one runtime and one module ABI ([runtimes_and_abis.md](runtimes_and_abis.md)). A target is never the running machine: that is a node. |
 | **node** | A running Fluxor instance: one kernel on one machine (a board, a cloud instance, a Linux host process, a browser tab), the unit an orchestrator manages. | A node is built for one target, runs one node graph and the workloads its owners place on it, and is reached through its node agent. |
 | **node agent** | A node's control endpoint: the end of the [agent protocol](agent_protocol.md) a controller talks to. | One per node. It commits workloads into the node's store; the kernel runs them. |
-| **core** | A processor core of the node's machine. | On the SMP targets (bcm2712, uefi) domain d runs on core d; on RP, Linux and wasm every domain runs on one thread ([concurrency.md](concurrency.md)). |
+| **core** | A processor core of the node's machine. | A target maps each domain index to a core (`domain_cores`): on bcm2712 and uefi domain d runs on core d; on RP2350 domain 1 runs on core 1 and domains 0, 2 and 3 on core 0; on RP2040, Linux and wasm every domain runs on core 0's one thread ([concurrency.md](concurrency.md)). |
 | **host** | Never bare. A **Linux host** is the machine a Linux node runs on; a **host class** is a target under `targets/host/` (uefi, wasm, Linux); the **host-process backend** runs a workload as a Linux process; the **build host** is the machine running `fluxor build`. | |
 
 ## Execution
 
 | Term | Definition | Relations |
 |---|---|---|
-| **domain** | An execution domain: one core (on SMP) and one exec mode, fixed at boot. A graph declares up to `MAX_DOMAINS` (4), indexed 0..3. | A node runs its domains; every module instance runs in exactly one domain. A domain's index is its core. |
+| **domain** | An execution domain: one exec mode, run on the core its target maps the domain's index to, fixed at boot. A graph declares up to `MAX_DOMAINS` (4), indexed 0..3. | A node runs its domains; every module instance runs in exactly one domain. A domain runs on the core its target maps its index to. |
 | **exec mode** | How a domain runs its modules: `tick` or `poll` (the cooperative family, full syscall surface), or `timer` or `irq` (the interrupt family, bridge-only, admitting only `interrupt_safe` modules). Encoded as `ExecMode` (`Tick` 0, `Poll` 1, `Timer` 2, `Irq` 3). | One per domain ([scheduler.md](scheduler.md#execution-modes)). Cadence belongs to the domain: `tick_us` for `tick`, `rate_hz` for `timer`. |
 | **pre-pass** | A module attribute (`pre_pass = true`): the module runs at the start of every tick pass of its domain, before the exec order. | Legal only in a `tick` domain. Not an exec mode. |
-| **domain loop** | The loop that drives a domain: on SMP one per core, elsewhere one loop that runs every domain in index order. | A domain loop runs passes. |
-| **pass** | One iteration of a domain loop over its domain: a tick pass or a wake pass. | A pass steps module instances; budgets, wakes and fault windows are per pass. |
+| **domain loop** | The loop that drives the domains of one core: one per core that runs a domain, passing over that core's domains in index order. | A domain loop runs passes. |
+| **pass** | One iteration of a domain loop over one of its domains: a tick pass or a wake pass. | A pass steps module instances; budgets, wakes and fault windows are per pass. |
 
 ## Code
 
@@ -67,6 +67,22 @@ form a build or a run compiles.
 
 A stack ([Code](#code)) is a composition a graph includes, not an artefact a
 node admits.
+
+## Pictures and input
+
+| Term | Definition | Relations |
+|---|---|---|
+| **surface** | The whole picture one display sink presents: a canvas, a window, a panel. A `VideoRaster` stream states its surface's extent and format in every record. | A consumer with frame memory holds one surface. A change of extent or format at a frame's start is a new surface. |
+| **surface pixel** | A pixel of the raster a surface presents. Pointer positions, pixel wheel deltas and accessibility bounds are in surface pixels, whatever size a page or a window shows the raster at. | A producer of the raster and a consumer of input from the same surface share this space with no conversion. |
+| **logical pixel** | The unit a surface's viewport is stated in (`viewport_w_px`, `viewport_h_px`; a CSS pixel in a browser). Size classes and layout key on logical pixels. | Related to surface pixels by the device pixel ratio. |
+| **device pixel ratio** | Surface pixels per logical pixel, carried as `dpr_eighths` in a `SurfaceTraits` record (8 = 1x). A producer renders at `viewport x dpr_eighths / 8` for its raster to be presented 1:1. | Reported by the surface's authority; 0 means unreported ([input_capability_surface.md](input_capability_surface.md)). |
+| **region** | One `VideoRaster` record: a rectangle of a surface and its pixels, behind the contract's header. | A frame is one or more regions. |
+| **frame** | The regions up to and including the one flagged last. A consumer with frame memory presents at the last region, so a frame appears whole. | A **damage frame** changes only its regions and the rest of the surface keeps its picture; a **tiling frame** covers the surface top to bottom in full-width regions. |
+| **band** | A full-width run of rows: a region of a tiling frame, and the unit a rasteriser draws and a panel driver scans out. | `band_rows` is a `video.draw` fact ([av_capability_surface.md](av_capability_surface.md)). |
+| **draw list** | A `VideoDraw` stream: resources, then frames of drawing records (rectangles, borders, pixmaps, glyph runs, clips) a consumer rasterises. | Produced by an application that draws its own interface; consumed by a rasteriser (`draw_raster`) or a driver that scans out bands. |
+| **detent** | One notch of a wheel. Wheel records count 1/120 of a detent, the unit of high-resolution wheels. | How far a detent scrolls is the consumer's own metric. |
+| **composition** | An input method's text in progress. Its **preedit** is the text shown while it is composed, carried in `COMPOSE` records and never inserted; what the composition produced arrives as a `COMMIT`. | `TextEvents` ([input_capability_surface.md](input_capability_surface.md)). |
+| **accessibility tree** | The controls an application draws, published as nodes with roles, states, bounds, names and values (`AccessibilityTree`). | A platform's **mirror** presents the tree to assistive technology (in a browser, as page elements over the canvas) and reports what was done to it as `AccessibilityActions`. |
 
 ## Retired words
 

@@ -83,6 +83,23 @@ isolated_slots = 2
 # NOTE: no [memory] here — the memory map is a board/emulator fact, declared in
 # the board overlay (see the header). BCM2712 silicon does not fix RAM origin.
 
+# Which core runs each execution domain: domain d on core d.
+[smp]
+cores = 4
+domain_cores = [0, 1, 2, 3]
+
+# What the hardware counters a module reads through the `counters` contract
+# count: the facts of the target capabilities `counter.cycles` and
+# `counter.icache`. Both are each core's own performance monitors: the cycle
+# counter, and the L1 instruction-cache access and refill events. A core
+# reads them when it entered the kernel at EL2, as the Pi 5's firmware hands
+# every core over: the kernel leaves the monitors untrapped on its way down
+# to EL1. A machine that enters at EL1 states its own counters in its board
+# file.
+[counters]
+cycles = "core"
+icache = "core"
+
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module
 # requires a contract that neither the kernel (`channel`, `timer`, `event`,

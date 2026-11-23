@@ -1,46 +1,268 @@
 # Displays
 
-A display pipeline is ordinary graph wiring: producer modules emit pixel
-data on a channel, and a panel driver module scans it out to the hardware.
-Touch input, where the panel has it, is a separate input plane handled by
-its own driver module. This guide describes both, using the in-tree panel
-drivers as the reference.
+A display is ordinary graph wiring: a producer sends a draw list or pixels
+on a channel, and a panel driver shows them. Touch, where the panel has it,
+is a separate input plane with its own driver. This guide describes both,
+with the in-tree panel drivers as the reference.
 
 Source: `modules/drivers/st7701s/`, `modules/drivers/gt911/`,
-`modules/foundation/panel_surface_traits/`.
+`modules/foundation/draw_raster/`, `modules/foundation/panel_surface_traits/`,
+`crates/fluxor-sdk/src/video/raster/`.
 
 ## Pipeline shape
 
 ```text
-image/source -> decode/format -> panel driver -> panel
-touch driver -> gesture/UI modules
+application ──VideoDraw──▶ panel driver ──▶ panel
+picture     ──VideoRaster─▶ panel driver (a surface the draw list places)
+
+touch driver ──▶ gesture / UI modules
 ```
 
-The panel driver is a paced sink: it owns the display refresh timeline. In
-the capability model it declares `video.raster`, `video.scanout`,
-`display.scanout` and `presentation.clock`, so a display group that
-contains one panel driver has its presentation clock without further
-configuration. Upstream decode or format stages normalise content into the
-driver's input contract; the driver consumes `VideoRaster` records on its
-`pixels` input port.
+An application that draws its own interface sends a draw list
+(`VideoDraw`: rectangles, rounded rectangles, borders, pixmaps, glyph runs;
+see [av_capability_surface.md](../architecture/av_capability_surface.md)).
+A panel driver that rasterises the list itself needs no framebuffer: it
+keeps the last committed frame's records and draws them again every
+refresh. A picture another producer draws (a decoded image, a video frame)
+arrives as `VideoRaster` on its own edge, and a `SURFACE` record of the draw
+list places it.
+
+The panel driver owns the refresh timeline. It declares `video.draw`,
+`video.raster`, `video.scanout`, `display.scanout` and `presentation.clock`,
+so a display group with one panel driver has its presentation clock with
+nothing more configured.
+
+On a target whose display takes pixels (`linux_display`,
+`wasm_browser_canvas`), `draw_raster` stands between the two: the same
+rasteriser as a module, a draw list in and region rasters out. A draw list
+gives the same pixels through either.
 
 ## The ST7701S panel driver
 
-`st7701s` drives ST7701S-based RGB parallel panels on rp2350 boards. It is
-board-agnostic: pin assignments and PIO block selection come from module
-parameters, so one driver supports different board layouts without code
-changes.
+`st7701s` drives an ST7701S RGB-parallel panel from an RP2350.
 
-Bring-up runs a reset pulse, writes the panel's register initialisation
-sequence over bit-banged 9-bit SPI, then configures four PIO state
-machines across two PIO blocks (hsync/vsync on the sync PIO, data-enable
-and RGB on the data PIO) and starts DMA-fed scan-out. Frame timing is
-generated entirely by the PIO hardware; the CPU only feeds pixel data into
-the RGB state machine's FIFO. The backlight is enabled once the first
-frame has loaded, so the panel never shows uninitialised memory.
+| Port | Content type | |
+|---|---|---|
+| `draw` | `VideoDraw` | The draw list. The last committed frame is retained and drawn again every refresh. Every frame's damage is the whole surface. |
+| `surface0` | `VideoRaster` | A raster a `SURFACE` record places, held whole at its own resolution. With no `draw` edge the driver shows it scaled to the panel. |
 
-Geometry is parameterised (`width`, `height`, both defaulting to 480); the
-register initialisation sequence itself is compiled into the driver.
+### Bands and the ring
+
+The driver draws a refresh a band at a time: `band_rows` rows (default 16)
+into one scratch band of three bytes a pixel, converted to RGB565 into a
+slot of a ring of `ring_rows / band_rows` slots (default three). A DMA scan
+list (`platform_dma_fd` `LIST_START`) sends one entry a band to the PIO
+state machine that puts pixels on the pins: from a ring slot when the
+driver armed the entry in time, and as one fill colour when it did not.
+Four PIO state machines make HSYNC, VSYNC, DE and the pixel clock and never
+stop. No software sits in the panel's timing.
+
+A band can be armed until the scan is two entries short of it: the entry
+being sent and the one after it are the scan's. The driver draws ahead of
+the scan by up to the ring, and a slot is free again once its band has been
+sent.
+
+A new frame takes effect whole, at the first band of the first refresh
+drawn after its `COMMIT`; a refresh never shows parts of two frames. Until
+a frame has committed the panel is black.
+
+### Refresh rate
+
+`refresh_mhz` (default 60000) is the graph's choice. The driver reads the
+system clock and sets the sync divider, in steps of 1/256, to the nearest
+rate; a frame of `width × height` active pixels is
+`(2 × width + 61) × (height + 29)` sync cycles. It refuses to construct at
+a rate whose pixel clock is above `pclk_max_khz` (default 18000) or an
+eighth of the system clock, which is what the pixel state machine needs.
+
+For 480 × 480 on a 150 MHz system clock:
+
+| `refresh_mhz` | Achieved | Divider | Pixel clock | 16-row band | Budget, system cycles a pixel |
+|---|---|---|---|---|---|
+| 60000 | 59.98 Hz | 4 + 208/256 | 15.6 MHz | 524 µs | 10.9 |
+| 45000 | 45.00 Hz | 6 + 106/256 | 11.7 MHz | 699 µs | 14.5 |
+| 40000 | 40.01 Hz | 7 + 55/256 | 10.4 MHz | 786 µs | 16.3 |
+
+The budget is the whole of one core over a refresh, for everything a pixel
+costs: walking the records, coverage, compositing and the RGB565
+conversion.
+
+### A band that is not drawn in time
+
+A band whose entry is still fill when the scan loads it is an underrun.
+The panel shows `underrun_rgb565` (default black) on those rows for that
+refresh, the `underruns` counter moves, and nothing else happens: sync, the
+porches and the pixel clock do not move, and an underrun is never a fault.
+
+The driver does not chase the scan. When the scan catches it, it resumes at
+the first band it can still finish (two past the one being sent, and one
+further for each band period a band has been costing), and the bands
+between go out as fill. So a frame that costs more than the budget shows a
+share of its bands every refresh, in step with the scan, instead of
+falling a refresh behind.
+
+Two things blank bands that the driver drew in time:
+
+- **The start.** The list starts on its first entry with the second next,
+  so the first two bands of the first refresh are fill. The driver's
+  `underruns` leaves those two out.
+- **A flash write.** The kernel holds interrupts for a flash erase or
+  program, so it first returns every armed entry of every list to fill:
+  the panel shows fill for the length of the write instead of a slot a
+  refresh old. Afterwards the driver arms bands as before and the picture
+  is whole within one refresh. The bands a write blanked are counted in
+  `underruns`; while a write lasts longer than a refresh, the scan's
+  position, and with it `refreshes`, `underruns` and the measured rate,
+  stand still for the whole refreshes that pass.
+
+### Heavy frames
+
+What a frame costs depends on what it draws. Counted on a Cortex-M33 model
+for a 480 × 480 surface, drawing and conversion together, in instructions
+per surface pixel:
+
+| Frame | Instructions a pixel |
+|---|---|
+| Black, or one opaque background | 4.4 to 4.8 |
+| A background, a rounded rectangle and a line of glyphs | 6.6 |
+| 32 opaque rounded rectangles | 12.7 |
+| A translucent fill of the whole surface | 17.8 |
+| A background, 32 rounded rectangles, 32 borders and 400 glyphs | 30.6 |
+| 1,800 a8 glyphs | 32.7 |
+| A document of 721 records | 41.4 |
+
+A cycle is not an instruction: allow about one and a half cycles for each,
+more for code running from flash with a cold cache. By that measure the
+first two rows are inside the 40 Hz budget; a panel of cards and text is
+not, on one core, and shows part of its bands each refresh.
+
+Read it from the telemetry, or from the status line `status_s` turns on:
+
+```text
+[st7701s] measured_mhz=40006 refreshes=400 underruns=0 late_frames=0 render_us_per_band=… band_us=786
+```
+
+| Counter | Meaning |
+|---|---|
+| `refresh_mhz` | The rate the sync divider gives (telemetry). `measured_mhz` in the status line is the rate the scan ran at since the last line, from bands sent. |
+| `refreshes` | Refreshes scanned. |
+| `underruns` | Bands that went out as fill after the driver could have armed them. |
+| `late_frames` | Committed frames that waited more than one refresh to show. |
+| `render_us_per_band` | The mean time the driver spent on a band over the last refresh, drawing and conversion. |
+
+- `render_us_per_band` below `band_us` with `underruns` still: the content
+  fits. The ratio is the share of its core the panel takes.
+- `render_us_per_band` above `band_us`: the content does not fit. About
+  `band_us / render_us_per_band` of the bands show each refresh and
+  `underruns` rises by the rest, `refreshes × bands × (1 − share)`.
+- `underruns` rising in bursts with `render_us_per_band` below `band_us`:
+  something else held the driver's core for longer than the ring covers
+  (about `ring_rows / band_rows − 2` band periods), or a flash write ran.
+
+To fit a frame: lower `refresh_mhz`, give the driver a core to itself,
+draw fewer translucent and glyph-dense pixels, or keep text in glyph packs
+the node image holds (`pack0` to `pack3`), which cost no resource memory
+and no transfer.
+
+### Memory
+
+One heap block, sized by the params (`heap_per_param` in the manifest), and
+the instance state:
+
+| Part | Size | Default (480 × 480) |
+|---|---|---|
+| Ring | `ring_rows` × 960 | 46,080 |
+| Scratch band | `band_rows` × 1,440 | 23,040 |
+| Retained frames (two) | `frame_bytes` × 2 | 16,384 |
+| Defined resources | `resource_bytes` | 16,384 |
+| Read buffer | `record_bytes` | 1,024 |
+| `surface0` (two buffers) | `surface_bytes` × 2 | 0 |
+| State | | about 6,400 |
+| **Total** | | **about 109,400** |
+
+The ring and scratch factors are for a row of 480 pixels, the widest the
+driver takes. The smallest useful instance, bands of 8 rows with a ring of
+24, two 4 KiB frames and every resource a `RES_REF`, takes 43,776 bytes of
+heap. The kernel keeps one table of 64 list entries for every scan list of
+the node: a panel's bands (`height / band_rows`, at least three) must fit
+what the table has free, or the scan fails to start and the log says so.
+
+A frame larger than `frame_bytes`, more defined resource bytes than
+`resource_bytes`, or a record larger than `record_bytes` is a stream fault:
+the driver logs it with the byte offset, keeps showing the retained frame,
+and skips to the next `STREAM`.
+
+### Pins
+
+The PIO programs fix the shape of a layout; the params place it:
+
+- 16 data pins in a row from `data0_pin`, one RGB565 pixel a pixel clock;
+- `de_pin`, `vsync_pin`, `hsync_pin`, `pclk_pin` in a row, in that order;
+- all 20 inside GPIO 0-31, or all inside GPIO 16-47: the driver sets the
+  PIO blocks' GPIO base from them;
+- `cs_pin`, `sck_pin`, `sda_pin` (the 9-bit register SPI), `rst_pin` and
+  `bl_pin` (active low; 255 for no backlight pin) anywhere;
+- `pio_sync` and `pio_data`: two different PIO blocks.
+
+Anything else is refused at construction with the reason.
+
+| | Waveshare RP2350-Touch-LCD-4 (the defaults) | A 30-pin RP2350A board with a wireless chip |
+|---|---|---|
+| Data | 24-39 | 2-17 |
+| DE, VSYNC, HSYNC, PCLK | 20, 21, 22, 23 | 18, 19, 20, 21 |
+| Register SPI: CS, SCK, SDA | 18, 2, 3 | 22, 26, 27 |
+| Reset | 19 | 28 |
+| Backlight | 40 | none (255) |
+| GPIO base | 16 | 0 |
+
+The backlight comes on when the scan starts. `mirror_x` (default 1)
+reverses the panel's source scan direction.
+
+### Placement and edges
+
+Give the driver a `poll` domain on a core of its own (domain 1 on RP2350):
+it then draws without regard to a tick.
+
+```yaml
+execution:
+  domains:
+    - name: main
+    - name: scan
+      exec: poll
+
+modules:
+  - name: app
+    domain: main
+  - name: st7701s
+    domain: scan
+    params:
+      refresh_mhz: 40000
+
+wiring:
+  - from: app.draw
+    to: st7701s.draw
+```
+
+In a `tick` domain the tick must be shorter than the scan takes over
+`ring_rows − band_rows` rows (1,048 µs at the 60 Hz defaults), and the
+domain's other modules must leave the core the time a refresh costs; on a
+shared core that means a lower `refresh_mhz`.
+
+The `draw` edge needs nothing stated: the port asks for the `transaction`
+rate class, since a frame is a few kilobytes that arrive when the picture
+changes. An edge into `surface0` on an RP target must state its class:
+`VideoRaster` edges are `video` class unless told otherwise, and RP buffer
+arenas host no `video`-class ring.
+
+```yaml
+wiring:
+  - from: decoder.pixels
+    to: st7701s.surface0
+    rate: transaction
+```
+
+Set `surface_bytes` to the largest surface the input will carry, in its own
+format (a 240 × 240 RGB565 picture: 115,200); the driver keeps two.
 
 ## Touch: the GT911 driver
 
@@ -67,14 +289,19 @@ buttons.
 
 ## Design guidance
 
+- Send a draw list where the content is drawn (interfaces, text, charts)
+  and a raster where it is a picture; a draw list costs kilobytes where a
+  framebuffer costs hundreds.
 - Keep coordinate transform policy (rotation, mirroring, axis mapping)
   explicit in configuration rather than implicit in a consumer.
-- Keep transport and backlight concerns inside the panel driver; upstream
-  stages deal only in pixel formats.
-- Prefer region updates over full-frame copies where the content allows.
+- Keep transport and backlight concerns inside the panel driver.
+- Choose the refresh rate for the content: a rate the frame fits shows
+  every band; a higher one shows fill.
 
 ## Related documentation
 
+- [../architecture/av_capability_surface.md](../architecture/av_capability_surface.md) — the draw list and raster contracts, and their facts
 - [../architecture/pipeline.md](../architecture/pipeline.md) — pipeline and channel model
+- [../architecture/concurrency.md](../architecture/concurrency.md) — domains and cores
 - [input_gestures.md](input_gestures.md) — turning input events into commands
 - module READMEs under `modules/drivers/st7701s/` and `modules/drivers/gt911/`

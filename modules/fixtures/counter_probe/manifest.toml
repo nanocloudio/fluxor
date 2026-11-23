@@ -1,0 +1,50 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "uefi", "linux"]
+# The cycle and instruction-cache counters are read through the `counters`
+# contract, whose grant is the contract's own.
+grants = ["counters"]
+
+# Fixture for the `counters` contract. Once, `delay` milliseconds after it
+# starts, it asks what the target's counters are and what one read costs it:
+#   [counter_probe] present=<mask> clock=<core|system> scope=<none|core|node>
+#   hz=<rate> cost=<cycles one read costs>
+# Then every `period_ms` it runs a fixed loop once to warm it, reads the
+# counters, runs the loop `iterations` times more (`turns` turns each: one
+# subtract and one branch a turn on Arm), reads them again, and reports
+#   [counter_probe] n=<report> turns=<turns run> cycles=<cycles, less the
+#   read's own> hit=<cache hits> access=<cache accesses> permille=<hits per
+#   thousand accesses> want=<cycles expected> ok=<1 or 0>
+# `want` is `cycles_per_turn` times the turns, and `ok` is 1 when the cycles
+# are within 5 % of it; with `cycles_per_turn: 0` nothing is expected and
+# `ok` is 1 when the cycle counter moved. The counts cover everything that
+# ran on the core in the region, interrupts included, and with scope `node`
+# every other reader of the cache.
+#
+# Each report also goes out on `samples` as one `MeasurementStream` record
+# whose block is three `u32`: the cycles, the cache hits and the cache
+# accesses of the region. A refused call is `[counter_probe] refused`.
+timer_class = "wall_clock"
+
+capabilities = ["measurement.stream"]
+
+[capability_facts."measurement.stream"]
+encoding            = "u32le"
+channels            = 3
+samples_per_channel = 1
+period_ms           = 1000
+max_payload         = 28
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[[ports]]
+name = "samples"
+direction = "output"
+content_type = "MeasurementStream"
+# The 16-byte header and three 32-bit samples.
+max_record = 28
+buffer_size = 256
+
+[observability]
+exempt = "counters fixture; its '[counter_probe]' lines and its sample records are the observable, consumed by the rig scenarios' rules"

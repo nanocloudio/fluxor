@@ -9,6 +9,13 @@ hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
 #   [prog] slot=0 size=<n> kind=<hex> format=<hex8> read=<sha8> inplace=<sha8|none>
 #   [prog] none                     (no program in slot 0)
 #
+# With `blob` set to an asset (`blob: ${asset:<name>}`) it then opens the
+# value with `fluxor_rt::asset` and logs what the target handed it:
+#
+#   [asset] slot=<n> size=<n> addr=<hex8> inplace=<sha8|none> read=<sha8>
+#   [asset] fs len=<n>              (a path or a bundle URL: the fs contract's)
+#   [asset] error=-<errno>          (no program in the slot the value names)
+#
 # With `poke: 1` it then reads the first byte it is not granted: the end of
 # its program region under an MPU, the end of the region's last page under
 # a page table. An isolated module must fault there, so `[prog] poked`
@@ -16,6 +23,10 @@ hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
 # the start, for a board whose log reaches the bench only once its network
 # is up.
 timer_class = "agnostic"
+
+[[params]]
+name = "blob"
+asset = true
 
 [observability]
 exempt = "fixture whose evidence is its one log line"

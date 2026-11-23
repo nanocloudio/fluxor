@@ -6,16 +6,23 @@ builtin = true
 # the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Linux Surface Traits authority — the Linux implementation of the runtime
+# Linux Surface Traits authority: the Linux implementation of the runtime
 # environment plane, publishing the same wire shape as the bare-metal panel
-# and browser authorities. Emits 24-byte
-# `input::surface_traits::MSG_TRAITS` records on the output port: a baseline at
-# startup, then one per change. Orientation / size class derive from the
-# configured width/height; input modalities are scanned from
-# /proc/bus/input/devices and re-scanned periodically so USB device hot-plug
-# bumps the epoch. Window-resize propagation, audio config, and gamepad count
-# are deferred (see the module header). A consumer wired to this output adapts
-# to the surface; an unwired graph is unaffected.
+# and browser authorities. Writes 24-byte
+# `input::surface_traits::MSG_TRAITS` records on `events`: a baseline at
+# startup, then one per change. The viewport is the `linux_display`
+# window's surface when one is open, else the configured width and height;
+# orientation and size class derive from it. Input modalities and the
+# gamepad count are scanned from /proc/bus/input/devices and scanned again
+# periodically, so a device plugged in or out moves the epoch. Audio
+# channels and rate are the `linux_audio` sink's when the graph has one.
+#
+# `dpr_eighths` is 8: `linux_display` takes a raster of the viewport's own
+# extent and magnifies it by its integer `scale` itself, so a surface pixel
+# is a logical pixel whatever the screen's density.
+#
+# A consumer wired to this output adapts to the surface; an unwired graph is
+# unaffected.
 
 [[ports]]
 name = "events"

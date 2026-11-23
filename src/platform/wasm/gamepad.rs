@@ -1,32 +1,29 @@
 //! `wasm_browser_gamepad` native module: gamepad input source backed by
-//! the W3C Gamepad API. The host shim polls
-//! `navigator.getGamepads()` each requestAnimationFrame and pushes
-//! per-slot state into a per-handle event queue; this module drains
-//! that queue into the configured output channel.
+//! the W3C Gamepad API. The host polls `navigator.getGamepads()` each
+//! animation frame and queues a record when a slot changes; this module
+//! drains that queue into the output channel.
 //!
-//! Wire shape on `gamepad.events`:
-//!   `crates/fluxor-abi/src/contracts/input/gamepad.rs::MSG_STATE` /
-//!   `MSG_CONNECTION` — 16-byte records.
+//! Wire shape on `gamepad.events`: `abi::contracts::input::gamepad`
+//! `MSG_STATE` / `MSG_CONNECTION` records.
 //!
-//! Host shim contract: `host_gamepad_pop(buf, len)` returns one
-//! 16-byte event record per call, or 0 when the queue is empty.
+//! Host shim contract: `host_gamepad_pop(buf, len)` writes one record per
+//! call and returns its length, or 0 when the queue is empty.
 
+use crate::abi::contracts::input::gamepad;
 use crate::abi::platform::native::wasm::wasm_browser_gamepad as tags;
 use crate::kernel::exec::scheduler;
 use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
-use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_gamepad_pop(buf: *mut u8, len: usize) -> i32;
 }
 
-const EVENT_RECORD: usize = 16;
-
 #[repr(C)]
 pub(crate) struct GamepadState {
     pub out_chan: i32,
-    pub buf: [u8; EVENT_RECORD],
+    /// The record in hand; `relay_records` holds one the channel refused.
+    pub buf: [u8; gamepad::EVENT_SIZE],
 }
 
 unsafe fn alloc_state(out_chan: i32) -> *mut GamepadState {
@@ -40,7 +37,7 @@ unsafe fn alloc_state(out_chan: i32) -> *mut GamepadState {
         raw,
         GamepadState {
             out_chan,
-            buf: [0u8; EVENT_RECORD],
+            buf: [0u8; gamepad::EVENT_SIZE],
         },
     );
     raw
@@ -63,17 +60,12 @@ unsafe extern "C" fn gamepad_step(state: *mut u8) -> i32 {
             return 0;
         }
 
-        loop {
-            let n = host_gamepad_pop(st.buf.as_mut_ptr(), st.buf.len());
-            if n <= 0 {
-                break;
-            }
-            let n = n as usize;
-            let written = channel::channel_write(st.out_chan, st.buf.as_ptr(), n.min(st.buf.len()));
-            if written <= 0 {
-                break;
-            }
-        }
+        super::relay_records(st.out_chan, &mut st.buf, host_gamepad_pop, |b| {
+            matches!(
+                gamepad::decode(b),
+                Some(gamepad::Event::State { .. } | gamepad::Event::Connection { .. })
+            )
+        });
         0
     }
 }

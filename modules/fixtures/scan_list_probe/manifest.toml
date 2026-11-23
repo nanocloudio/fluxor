@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040"]
+# A raw claim on the UART whose transmit FIFO is the list's sink.
+grants = ["rp_raw"]
+
+# Fixture for the DMA scan list. It claims a UART, sets it transmitting at
+# `baud` with nothing attached to its pin, and runs a scan list of
+# `entries` entries of 256 bytes into its transmit FIFO, so the FIFO's own
+# pace is the list's clock: `baud` / 10 bits / 256 entries a second. Each
+# step it reads the list's status and arms the entries two and three ahead
+# of the scan from a ring of four spans, as a band renderer does. About once
+# a second it reports
+#   [scan_list] pos=<entries sent> late=<entries sent as fill since the last
+#   report> armed=<arms made> busy=<arms refused> hz=<entries a second>
+#   want=<the rate the baud sets> ok=<1 when hz is within 2 % of want>
+# and a failure to start is `[scan_list] start rc=<errno> at=<step>`.
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[[resources]]
+requires_contract = "platform_dma_fd"
+access = "write"
+
+[observability]
+exempt = "scan-list fixture; its '[scan_list]' lines are the observable, consumed by the rig scenario's rules"

@@ -18,6 +18,7 @@
 //       onLog: (level, msg) => console.log(...), // optional
 //       onPanic: (msg) => stopLoop(),            // optional
 //       onCanvasFrame: (w, h) => {},             // optional
+//       onAccessibility: (m) => mirror.handle(m), // required for the mirror
 //       canvasContainer: stage,                   // required for canvas
 //       inputQueue: keyboardQueue,                // required for input
 //     });
@@ -511,6 +512,1582 @@ registerProcessor('pcm-ring', PcmRing);
     create(name, ctx) { const f = this._factories.get(name); return f ? f(ctx) : null; },
   };
 
+
+  // ── Page-captured input queues ────────────────────────────────────
+  //
+  // Input is captured where the DOM is — the page — into one
+  // `__fluxor_<class>_queue` global per input class, and drained where the
+  // kernel steps by the matching `host_<class>_pop` import. When the kernel
+  // steps in a Worker those are two different globals, so the page moves
+  // every class across in one message: `postInputBatch` on the page,
+  // `putInputQueues` in the Worker. A class listed here crosses; nothing
+  // else needs to know the list.
+  //
+  // Each class has a cap. A graph need not hold the module that drains a
+  // class, and a queue nothing drains must not grow with every pointer
+  // move: past its cap a queue loses its oldest records, on whichever side
+  // it sits.
+  const INPUT_QUEUE_CAPS = {
+    keyboard: 1024,
+    pointer: 1024,
+    button: 256,
+    gamepad: 256,
+    action: 256,
+    surface_traits: 64,
+    text: 1024,
+    accessibility_action: 256,
+  };
+  const INPUT_QUEUE_CLASSES = Object.keys(INPUT_QUEUE_CAPS);
+  // The cap of the `wasm_browser_dom_input` queue, which the page owns.
+  const DOM_INPUT_QUEUE_CAP = 1024;
+
+  function inputQueueOf(win, cls) {
+    const key = '__fluxor_' + cls + '_queue';
+    return win[key] || (win[key] = []);
+  }
+
+  // Drop the oldest records of `queue` past `cap`.
+  function capQueue(queue, cap) {
+    if (queue.length > cap) queue.splice(0, queue.length - cap);
+  }
+
+  // Append one record to a class queue, within the class's cap. Every
+  // producer on the page pushes through here.
+  function pushInput(win, cls, rec) {
+    const queue = inputQueueOf(win, cls);
+    queue.push(rec);
+    capQueue(queue, INPUT_QUEUE_CAPS[cls]);
+  }
+
+  // Empty every non-empty class queue into `{ class: records[] }`, or null
+  // when nothing is waiting.
+  function takeInputQueues(win) {
+    let batch = null;
+    for (const cls of INPUT_QUEUE_CLASSES) {
+      const q = win['__fluxor_' + cls + '_queue'];
+      if (q && q.length) (batch || (batch = {}))[cls] = q.splice(0);
+    }
+    return batch;
+  }
+
+  // Append a batch from `takeInputQueues` to this side's class queues, in
+  // the order it was captured, each within its cap.
+  function putInputQueues(win, batch) {
+    if (!batch) return;
+    for (const cls of INPUT_QUEUE_CLASSES) {
+      const recs = batch[cls];
+      if (!recs || !recs.length) continue;
+      const queue = inputQueueOf(win, cls);
+      for (const rec of recs) queue.push(rec);
+      capQueue(queue, INPUT_QUEUE_CAPS[cls]);
+    }
+  }
+
+  // Append the page's `wasm_browser_dom_input` records to the Worker's own
+  // queue for that module, within its cap.
+  function putDomInput(queue, recs) {
+    if (!recs || !recs.length) return;
+    for (const rec of recs) queue.push(rec);
+    capQueue(queue, DOM_INPUT_QUEUE_CAP);
+  }
+
+  // Page side of the Worker bridge: post whatever the page has captured
+  // since the last call — the `wasm_browser_dom_input` queue the page owns
+  // (`domQueue`) and every class queue — as one `input` message. Returns
+  // whether a message was posted.
+  function postInputBatch(win, domQueue, post) {
+    const dom = domQueue && domQueue.length ? domQueue.splice(0) : null;
+    const queues = takeInputQueues(win);
+    if (!dom && !queues) return false;
+    post({ type: 'input', dom, queues });
+    return true;
+  }
+
+  // ── Gamepad API producer (wasm_browser_gamepad) ───────────────────
+  //
+  // Polls `navigator.getGamepads()` once per animation frame and pushes
+  // `input::gamepad` records into `__fluxor_gamepad_queue` when a pad
+  // changes: on attach a MSG_CONNECTION then a MSG_STATE, on any button
+  // or axis change a MSG_STATE, on detach a MSG_CONNECTION then a
+  // released MSG_STATE (connected = 0, nothing held) so a consumer that
+  // reads only state snapshots lets go of what was held. Browser indices
+  // at or past the contract's MAX_GAMEPADS are not reported. Runs on the
+  // page — a Worker has no Gamepad API — in both main-thread and Worker
+  // mode.
+  //
+  // SLOTS. The contract has MAX_GAMEPADS slots and two producers fill
+  // them: this poller, and the pads a presentation overlay draws on the
+  // page (`makeHostSinks`, browser_overlay_runtime.js). One table,
+  // `__fluxor_gamepad_slots`, says who holds each slot, so the two never
+  // answer on the same one. A drawn pad holds the slot its shell declares
+  // (`'virtual'`); a pad the browser reports takes the slot of its own
+  // `Gamepad.index` when nobody holds it, else the lowest free one
+  // (`'physical:<index>'`), and moves when a drawn pad claims the slot it
+  // had.
+  const GAMEPAD_SLOTS = 4;        // input::gamepad::MAX_GAMEPADS
+  const GAMEPAD_BUTTONS = 16;     // MSG_STATE.button_bits width
+  const GAMEPAD_MSG_STATE = 0x01;
+  const GAMEPAD_MSG_CONNECTION = 0x02;
+
+  function gamepadSlots(win) {
+    return win.__fluxor_gamepad_slots
+      || (win.__fluxor_gamepad_slots = new Array(GAMEPAD_SLOTS).fill(null));
+  }
+
+  function gamepadAxis(v) {
+    v = Number(v);
+    if (!(v === v)) return 0;
+    if (v > 1) v = 1; else if (v < -1) v = -1;
+    return Math.round(v * 32767);
+  }
+
+  // USB ids from `Gamepad.id`, which carries them as
+  // "… (… Vendor: 045e Product: 028e)" or "045e-028e-…" depending on the
+  // browser; 0/0 when it carries neither.
+  function gamepadUsbIds(id) {
+    const s = String(id || '');
+    const m = /Vendor:\s*([0-9a-f]{4})\s+Product:\s*([0-9a-f]{4})/i.exec(s)
+      || /^([0-9a-f]{4})-([0-9a-f]{4})-/i.exec(s);
+    return m
+      ? { vendorId: parseInt(m[1], 16), productId: parseInt(m[2], 16) }
+      : { vendorId: 0, productId: 0 };
+  }
+
+  function gamepadSnapshot(g) {
+    let bits = 0;
+    const buttons = g.buttons || [];
+    for (let i = 0; i < GAMEPAD_BUTTONS && i < buttons.length; i++) {
+      const b = buttons[i];
+      if (b && (b.pressed || b.value > 0.5)) bits |= 1 << i;
+    }
+    const axes = g.axes || [];
+    return {
+      buttonBits: bits,
+      axisLx: gamepadAxis(axes[0]), axisLy: gamepadAxis(axes[1]),
+      axisRx: gamepadAxis(axes[2]), axisRy: gamepadAxis(axes[3]),
+    };
+  }
+
+  // `opts.noAutoWire` leaves the animation-frame loop off so a caller can
+  // drive `poll()` itself. Returns `{ poll, stop }`; `poll()` answers the
+  // number of records it pushed.
+  function installGamepadPoller(win, opts) {
+    opts = opts || {};
+    const nav = win.navigator;
+    const slots = gamepadSlots(win);
+    const held = new Map(); // browser index → { slot, tag, state }
+
+    function connection(slot, connected, st) {
+      return { kind: GAMEPAD_MSG_CONNECTION, gamepadId: slot, connected,
+               mapping: st.mapping, vendorId: st.vendorId, productId: st.productId };
+    }
+    function state(slot, connected, st) {
+      return { kind: GAMEPAD_MSG_STATE, gamepadId: slot, connected, buttonBits: st.buttonBits,
+               axisLx: st.axisLx, axisLy: st.axisLy, axisRx: st.axisRx, axisRy: st.axisRy };
+    }
+    const RELEASED = { buttonBits: 0, axisLx: 0, axisLy: 0, axisRx: 0, axisRy: 0 };
+
+    function poll() {
+      let pads = null;
+      // getGamepads throws where a permissions policy blocks the API.
+      try { pads = nav && nav.getGamepads ? nav.getGamepads() : null; } catch (e) { pads = null; }
+      const present = new Map();
+      if (pads) {
+        for (let i = 0; i < pads.length; i++) {
+          const g = pads[i];
+          if (g && g.connected && g.index >= 0 && g.index < GAMEPAD_SLOTS) present.set(g.index, g);
+        }
+      }
+      const out = []; // { slot, recs }, pushed in slot order
+
+      // Pads that went away, and pads whose slot a drawn pad now holds:
+      // the drawn pad answers there, so nothing more is said on it.
+      for (const [index, ent] of held) {
+        const owned = slots[ent.slot] === ent.tag;
+        if (present.has(index) && owned) continue;
+        held.delete(index);
+        if (!owned) continue;
+        slots[ent.slot] = null;
+        out.push({ slot: ent.slot,
+                   recs: [connection(ent.slot, 0, ent.state), state(ent.slot, 0, RELEASED)] });
+      }
+
+      for (const index of Array.from(present.keys()).sort((a, b) => a - b)) {
+        const g = present.get(index);
+        let ent = held.get(index);
+        const now = gamepadSnapshot(g);
+        if (!ent) {
+          const slot = slots[index] === null ? index : slots.indexOf(null);
+          if (slot < 0) continue; // every slot is held
+          const ids = gamepadUsbIds(g.id);
+          now.mapping = g.mapping === 'standard' ? 0 : 1; // MAPPING_STANDARD : MAPPING_LEGACY
+          now.vendorId = ids.vendorId;
+          now.productId = ids.productId;
+          ent = { slot, tag: 'physical:' + index, state: now };
+          slots[slot] = ent.tag;
+          held.set(index, ent);
+          out.push({ slot, recs: [connection(slot, 1, now), state(slot, 1, now)] });
+          continue;
+        }
+        const was = ent.state;
+        now.mapping = was.mapping;
+        now.vendorId = was.vendorId;
+        now.productId = was.productId;
+        if (now.buttonBits === was.buttonBits
+          && now.axisLx === was.axisLx && now.axisLy === was.axisLy
+          && now.axisRx === was.axisRx && now.axisRy === was.axisRy) continue;
+        ent.state = now;
+        out.push({ slot: ent.slot, recs: [state(ent.slot, 1, now)] });
+      }
+
+      out.sort((a, b) => a.slot - b.slot);
+      let pushed = 0;
+      for (const o of out) {
+        for (const rec of o.recs) { pushInput(win, 'gamepad', rec); pushed++; }
+      }
+      return pushed;
+    }
+
+    let running = false;
+    let handle = 0;
+    if (!opts.noAutoWire && nav && nav.getGamepads && typeof win.requestAnimationFrame === 'function') {
+      running = true;
+      const frame = () => {
+        if (!running) return;
+        poll();
+        handle = win.requestAnimationFrame(frame);
+      };
+      handle = win.requestAnimationFrame(frame);
+    }
+    function stop() {
+      running = false;
+      if (handle && typeof win.cancelAnimationFrame === 'function') win.cancelAnimationFrame(handle);
+      handle = 0;
+    }
+    return { poll, stop };
+  }
+
+  // ── Surface geometry ──────────────────────────────────────────────
+  //
+  // SURFACE PIXELS are the pixels of the raster presented on a surface,
+  // whatever size the page lays its canvas out at. Pointer positions,
+  // pixel wheel deltas and accessibility bounds are all in them.
+  // `surfaceGeometry` answers the canvas of a surface element, where the
+  // page shows it, the raster's extent, and the surface pixels per CSS
+  // pixel on each axis: the one mapping the pointer listeners, the wheel
+  // producer and the accessibility mirror share. A surface with no canvas
+  // is the canonical 960 x 540.
+  //
+  // The raster's extent is the canvas's own `width` x `height`, except for
+  // a canvas whose control was transferred to a Worker: its attributes
+  // stay as they were when it left, so the page records the extent the
+  // kernel last presented there (`noteSurfaceExtent`, from the Worker's
+  // `canvas-frame` message) and that is used instead.
+  const surfaceExtents = new WeakMap();
+  function noteSurfaceExtent(canvas, width, height) {
+    if (canvas && width > 0 && height > 0) surfaceExtents.set(canvas, { width, height });
+  }
+  function surfaceGeometry(el) {
+    const isCanvas = el && el.tagName && String(el.tagName).toUpperCase() === 'CANVAS';
+    const canvas = isCanvas ? el : (el && el.querySelector ? el.querySelector('canvas') : null);
+    const target = canvas || el;
+    const rect = target.getBoundingClientRect();
+    const noted = canvas ? surfaceExtents.get(canvas) : null;
+    const width = (noted && noted.width) || (canvas && canvas.width) || 960;
+    const height = (noted && noted.height) || (canvas && canvas.height) || 540;
+    return {
+      canvas, rect, width, height,
+      sx: width / (rect.width || width),
+      sy: height / (rect.height || height),
+    };
+  }
+  // A page position in surface pixels.
+  function surfacePoint(el, clientX, clientY) {
+    const g = surfaceGeometry(el);
+    return {
+      x: Math.round((clientX - g.rect.left) * g.sx),
+      y: Math.round((clientY - g.rect.top) * g.sy),
+    };
+  }
+
+  // ── Keyboard producer (wasm_browser_keyboard, wasm_browser_dom_input) ──
+  //
+  // Key records for `__fluxor_keyboard_queue`:
+  //   { kind, modifiers, flags, keyCode, scanCode }
+  //
+  // KEYS AND TEXT, NEVER TWICE. A key whose effect arrived on `TextEvents`
+  // (an insert, a deletion, a paste the mirror's text field translated)
+  // carries KEY_TEXT, so the application does not apply it a second time.
+  // The browser dispatches the `beforeinput` a key causes inside the
+  // keydown's own task, after the keydown listeners, so each key record is
+  // posted one task later: by then the mirror has said (`noteText`) whether
+  // it translated that key's `beforeinput`.
+  //
+  // A keydown the input method owns (`isComposing`, or keyCode 229)
+  // produces no key record. Held keys are reported once: the browser's
+  // autorepeat is not forwarded.
+  //
+  // DEFAULTS. Outside the mirror the page keeps Enter, Shift, Space and
+  // the arrows from scrolling or activating page chrome. In a mirror text
+  // field those must type, so there the caret and focus keys are stopped
+  // instead (arrows, Home, End, PageUp, PageDown, Tab, Ctrl/Meta+A): they
+  // reach the application as plain keys and come back as an echoed
+  // selection. A mirrored range stops the same keys, and any mirror
+  // element stops Tab, which the application handles.
+  const KEY_KIND_DOWN = 1;        // key::KIND_DOWN
+  const KEY_KIND_UP = 2;          // key::KIND_UP
+  const KEY_FLAG_TEXT = 0x02;     // key::KEY_TEXT
+  const KEYCODE_TAB = 9;
+  const KEYCODE_A = 65;
+  const KEYCODE_IME = 229;
+  const KEYS_PAGE_DEFAULT = [13, 16, 32, 37, 38, 39, 40];
+  const KEYS_CARET_AND_FOCUS = [9, 33, 34, 35, 36, 37, 38, 39, 40];
+  const MIRROR_ATTR = 'data-fluxor-mirror'; // 'node' | 'edit' | 'range'
+
+  // What kind of mirror element `target` is or sits in; null outside the
+  // mirror.
+  function mirrorKindOf(target) {
+    for (let el = target; el; el = el.parentNode) {
+      const kind = el.getAttribute ? el.getAttribute(MIRROR_ATTR) : null;
+      if (kind) return kind;
+    }
+    return null;
+  }
+
+  function keyModifiers(e) {
+    return (e.shiftKey ? 0x01 : 0) | (e.ctrlKey ? 0x02 : 0)
+      | (e.altKey ? 0x04 : 0) | (e.metaKey ? 0x08 : 0);
+  }
+
+  // `opts.target` is where the listeners go (the window by default).
+  // `opts.onKey(keyCode, down)` sees every record as it is queued (the
+  // page feeds its `wasm_browser_dom_input` queue from it). `opts.defer`
+  // replaces the one-task post, for a caller that drives tasks itself.
+  // Returns `{ key, noteText, stop }`: `key(code, down)` queues a key that
+  // has no DOM event (an on-screen control); `noteText()` is the mirror
+  // saying it translated the `beforeinput` of the key in flight.
+  function installKeyboard(win, opts) {
+    opts = opts || {};
+    const target = opts.target || win;
+    const onKey = opts.onKey || null;
+    let defer = opts.defer || null;
+    let channel = null;
+    if (!defer && typeof win.MessageChannel === 'function') {
+      const tasks = [];
+      channel = new win.MessageChannel();
+      channel.port1.onmessage = () => { const task = tasks.shift(); if (task) task(); };
+      defer = (task) => { tasks.push(task); channel.port2.postMessage(0); };
+    }
+    if (!defer) defer = (task) => win.setTimeout(task, 0);
+
+    const held = new Set();
+    let inFlight = null; // the keydown record whose task may still raise a beforeinput
+
+    function emit(rec) {
+      pushInput(win, 'keyboard', rec);
+      if (onKey) onKey(rec.keyCode, rec.kind === KEY_KIND_DOWN);
+    }
+    function post(rec) {
+      defer(() => {
+        if (inFlight === rec) inFlight = null;
+        emit(rec);
+      });
+    }
+    function record(kind, code, modifiers) {
+      return { kind, modifiers, flags: 0, keyCode: code & 0x7fff, scanCode: 0 };
+    }
+
+    function onDown(e) {
+      const code = e.keyCode || e.which;
+      if (!code) return;
+      if (e.isComposing || code === KEYCODE_IME) return;
+      const kind = mirrorKindOf(e.target);
+      let stop;
+      if (kind === 'edit') {
+        stop = KEYS_CARET_AND_FOCUS.includes(code) || ((e.ctrlKey || e.metaKey) && code === KEYCODE_A);
+      } else if (kind === 'range') {
+        stop = KEYS_CARET_AND_FOCUS.includes(code);
+      } else {
+        stop = KEYS_PAGE_DEFAULT.includes(code) || (kind === 'node' && code === KEYCODE_TAB);
+      }
+      if (stop) e.preventDefault();
+      if (held.has(code)) return;
+      held.add(code);
+      const rec = record(KEY_KIND_DOWN, code, keyModifiers(e));
+      inFlight = rec;
+      post(rec);
+    }
+    function onUp(e) {
+      const code = e.keyCode || e.which;
+      if (!code || !held.has(code)) return;
+      held.delete(code);
+      post(record(KEY_KIND_UP, code, keyModifiers(e)));
+    }
+
+    target.addEventListener('keydown', onDown);
+    target.addEventListener('keyup', onUp);
+    return {
+      key(code, down) { emit(record(down ? KEY_KIND_DOWN : KEY_KIND_UP, code, 0)); },
+      noteText() { if (inFlight) inFlight.flags |= KEY_FLAG_TEXT; },
+      stop() {
+        target.removeEventListener('keydown', onDown);
+        target.removeEventListener('keyup', onUp);
+        if (channel) { channel.port1.onmessage = null; channel.port1.close(); channel.port2.close(); }
+      },
+    };
+  }
+
+  // ── Wheel producer (wasm_browser_pointer) ─────────────────────────
+  //
+  // A `wheel` listener on a display surface, not passive so it can keep
+  // the page from scrolling under the surface. Wheel records join the
+  // pointer queue as KIND_WHEEL:
+  //   { pointerId, kind: 8, buttons, modifiers, pressure: 0, x, y,
+  //     wheelUnit, dx, dy }
+  //
+  //   deltaMode 0 (CSS pixels)  WHEEL_PIXELS, eighths of a surface pixel:
+  //                             delta x surface pixels per CSS pixel x 8
+  //   deltaMode 1 (lines)       WHEEL_DETENTS, 1/120 detent: 40 a line
+  //                             (three lines a detent)
+  //   deltaMode 2 (pages)       WHEEL_PIXELS: a page is the surface's
+  //                             height down and its width across
+  //
+  // Signs are the W3C `WheelEvent`'s. At most one record per unit goes out
+  // per animation frame, the frame's deltas summed and the last position
+  // carried; a sum past what one record holds goes out as further records,
+  // never clamped. A wheel event with Ctrl held is the browser's zoom (and
+  // a trackpad pinch): it is neither forwarded nor stopped, and reaches
+  // the application as a change of device pixel ratio.
+  const POINTER_KIND_WHEEL = 8;       // pointer::KIND_WHEEL
+  const WHEEL_PIXELS = 0;             // pointer::WHEEL_PIXELS
+  const WHEEL_DETENTS = 1;            // pointer::WHEEL_DETENTS
+  const WHEEL_UNITS_PER_PIXEL = 8;    // pointer::WHEEL_UNITS_PER_PIXEL
+  const WHEEL_UNITS_PER_DETENT = 120; // pointer::WHEEL_UNITS_PER_DETENT
+  const WHEEL_LINES_PER_DETENT = 3;
+  const WHEEL_DELTA_MAX = 32767;      // one record's delta is an i16
+
+  // `opts.coords(ev)` replaces the mapping of an event to surface pixels
+  // (`surfacePoint`); `opts.raf` replaces requestAnimationFrame.
+  // Returns `{ flush, stop }`.
+  function installWheel(win, el, opts) {
+    opts = opts || {};
+    const coords = opts.coords || ((ev) => surfacePoint(el, ev.clientX, ev.clientY));
+    const raf = opts.raf
+      || (win.requestAnimationFrame ? (cb) => win.requestAnimationFrame(cb) : (cb) => win.setTimeout(cb, 16));
+    const sums = [null, null]; // per wheel unit: { dx, dy, x, y, buttons, modifiers }
+    let scheduled = false;
+    let mouseId = 1; // the mouse's pointer id, learned from its pointer events
+
+    function flush() {
+      scheduled = false;
+      for (let unit = 0; unit < sums.length; unit++) {
+        const s = sums[unit];
+        if (!s) continue;
+        // Whole units go out; the fraction waits for the next event.
+        let dx = Math.trunc(s.dx);
+        let dy = Math.trunc(s.dy);
+        s.dx -= dx;
+        s.dy -= dy;
+        while (dx !== 0 || dy !== 0) {
+          const cx = Math.max(-WHEEL_DELTA_MAX, Math.min(WHEEL_DELTA_MAX, dx));
+          const cy = Math.max(-WHEEL_DELTA_MAX, Math.min(WHEEL_DELTA_MAX, dy));
+          pushInput(win, 'pointer', {
+            pointerId: mouseId, kind: POINTER_KIND_WHEEL, buttons: s.buttons,
+            modifiers: s.modifiers, pressure: 0, x: s.x, y: s.y,
+            wheelUnit: unit, dx: cx, dy: cy,
+          });
+          dx -= cx;
+          dy -= cy;
+        }
+        if (s.dx === 0 && s.dy === 0) sums[unit] = null;
+      }
+    }
+
+    function onWheel(e) {
+      if (e.ctrlKey) return;
+      e.preventDefault();
+      const g = surfaceGeometry(el);
+      let unit = WHEEL_PIXELS;
+      let dx = e.deltaX || 0;
+      let dy = e.deltaY || 0;
+      if (e.deltaMode === 1) {
+        unit = WHEEL_DETENTS;
+        dx *= WHEEL_UNITS_PER_DETENT / WHEEL_LINES_PER_DETENT;
+        dy *= WHEEL_UNITS_PER_DETENT / WHEEL_LINES_PER_DETENT;
+      } else if (e.deltaMode === 2) {
+        dx *= g.width * WHEEL_UNITS_PER_PIXEL;
+        dy *= g.height * WHEEL_UNITS_PER_PIXEL;
+      } else {
+        dx *= g.sx * WHEEL_UNITS_PER_PIXEL;
+        dy *= g.sy * WHEEL_UNITS_PER_PIXEL;
+      }
+      const at = coords(e);
+      const s = sums[unit] || (sums[unit] = { dx: 0, dy: 0 });
+      s.dx += dx;
+      s.dy += dy;
+      s.x = at.x;
+      s.y = at.y;
+      s.buttons = e.buttons & 0xFF;
+      s.modifiers = keyModifiers(e);
+      if (!scheduled) { scheduled = true; raf(flush); }
+    }
+    function onPointer(e) {
+      if (e.pointerType === 'mouse') mouseId = e.pointerId & 0xFF;
+    }
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('pointermove', onPointer);
+    el.addEventListener('pointerdown', onPointer);
+    return {
+      flush,
+      stop() {
+        el.removeEventListener('wheel', onWheel);
+        el.removeEventListener('pointermove', onPointer);
+        el.removeEventListener('pointerdown', onPointer);
+      },
+    };
+  }
+
+  // ── Accessibility mirror (wasm_browser_accessibility) ─────────────
+  //
+  // An application that draws its own controls into a raster publishes an
+  // accessibility tree; this mirrors it into the page so assistive
+  // technology reaches the drawn controls as ordinary DOM: one transparent
+  // element per node, laid over the canvas at the node's bounds, carrying
+  // the node's ARIA role, states, name and description.
+  //
+  // The mirror lives where the DOM is, the page. The native module checks
+  // every batch in the kernel (which may step in a Worker) and hands over
+  // only checked batches, as the bytes of their tree records; `applyBatch`
+  // carries one out in a single synchronous pass, so the page never shows
+  // part of a batch.
+  //
+  // ELEMENTS. A node is a `<div>` with its role, never a native button or
+  // link: a native button turns Enter and Space into a click, which would
+  // activate a control a second time beside the key record, and a link
+  // carries no URL. An editable node is an `<input>` or `<textarea>`, so an
+  // input method opens beside it and a phone raises its keyboard on a tap;
+  // a slider or spinbutton is a native range or number input, which is
+  // what some screen readers adjust. Nothing is `opacity: 0` or
+  // `visibility: hidden`, which assistive technology may skip: elements
+  // are transparent, and the application draws its own focus ring.
+  //
+  // CONTENT. Application strings are data. They reach the page through
+  // `textContent`, `value` and `setAttribute` with attribute names from the
+  // fixed tables below, never as markup and never as a URL.
+  //
+  // SECRETS. A secret node carries no value. Its element is a password
+  // field filled with one bullet per scalar of the value's stated length,
+  // so offsets and deletion work and the secret is never in the page.
+  //
+  // TEXT. A mirror text field is controlled: the application owns its
+  // value and selection, and the element changes only by echo of the
+  // application's tree, except while an input method is composing. Each
+  // `beforeinput` is stopped and translated into text edits for the
+  // application; a composition is reported as it runs and its text
+  // committed at its end. With no tree wired (`open('text')`) the mirror is
+  // one text field over the surface whose edits name no node.
+  //
+  // What the mirror raises goes to two input queues the native module
+  // drains: `accessibility_action` ({ msg, id, arg }) and `text`
+  // ({ kind, flags, target, a, b, text: Uint8Array of UTF-8 }).
+
+  // Roles, by wire byte: `vocabulary::ACCESS_ROLES`, each the ARIA role of
+  // the same name.
+  const A11Y_ROLES = [
+    'generic', 'button', 'checkbox', 'radio', 'radiogroup', 'switch', 'slider',
+    'spinbutton', 'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'link',
+    'heading', 'paragraph', 'list', 'listitem', 'img', 'group', 'region', 'dialog',
+    'alertdialog', 'alert', 'status', 'menu', 'menubar', 'menuitem',
+    'menuitemcheckbox', 'menuitemradio', 'tab', 'tablist', 'tabpanel', 'progressbar',
+    'meter', 'toolbar', 'separator', 'scrollbar', 'table', 'row', 'cell',
+    'columnheader', 'rowheader', 'grid', 'gridcell', 'tree', 'treeitem',
+  ];
+  // Roles ARIA forbids an author to name: their text is their content.
+  const A11Y_ROLES_NAMED_BY_CONTENT = ['generic', 'paragraph'];
+  // Roles that carry `aria-checked`, and roles that carry `aria-selected`
+  // whether or not they are selected.
+  const A11Y_ROLES_CHECKABLE = [
+    'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem',
+  ];
+  const A11Y_ROLES_SELECTABLE = [
+    'option', 'tab', 'row', 'gridcell', 'columnheader', 'rowheader', 'treeitem',
+  ];
+
+  const A11Y_HEADER = 4;                    // accessibility::HEADER
+  const A11Y_NODE_FIXED = 60;               // accessibility::NODE_FIXED
+  const A11Y_MSG_TREE = 0x01;               // accessibility::MSG_TREE
+  const A11Y_MSG_NODE = 0x02;               // accessibility::MSG_NODE
+  const A11Y_MSG_REMOVE = 0x03;             // accessibility::MSG_REMOVE
+  const A11Y_MSG_FOCUS = 0x04;              // accessibility::MSG_FOCUS
+  const A11Y_MSG_ANNOUNCE = 0x05;           // accessibility::MSG_ANNOUNCE
+  const A11Y_MSG_APPLY = 0x06;              // accessibility::MSG_APPLY
+  const A11Y_NO_NODE = 0xFFFFFFFF;          // accessibility::NO_NODE
+  const A11Y_OFF_ID = 0;                    // accessibility::OFF_ID
+  const A11Y_OFF_PARENT = 4;                // accessibility::OFF_PARENT
+  const A11Y_OFF_ORDER = 8;                 // accessibility::OFF_ORDER
+  const A11Y_OFF_ROLE = 10;                 // accessibility::OFF_ROLE
+  const A11Y_OFF_LIVE = 11;                 // accessibility::OFF_LIVE
+  const A11Y_OFF_STATES = 12;               // accessibility::OFF_STATES
+  const A11Y_OFF_BOUNDS = 16;               // accessibility::OFF_BOUNDS
+  const A11Y_OFF_VALUE_MIN = 32;            // accessibility::OFF_VALUE_MIN
+  const A11Y_OFF_VALUE_MAX = 36;            // accessibility::OFF_VALUE_MAX
+  const A11Y_OFF_VALUE_NOW = 40;            // accessibility::OFF_VALUE_NOW
+  const A11Y_OFF_SEL_ANCHOR = 44;           // accessibility::OFF_SEL_ANCHOR
+  const A11Y_OFF_SEL_FOCUS = 48;            // accessibility::OFF_SEL_FOCUS
+  const A11Y_OFF_NAME_LEN = 52;             // accessibility::OFF_NAME_LEN
+  const A11Y_OFF_VALUE_LEN = 54;            // accessibility::OFF_VALUE_LEN
+  const A11Y_OFF_DESC_LEN = 56;             // accessibility::OFF_DESC_LEN
+  const A11Y_LIVE_POLITE = 1;               // accessibility::LIVE_POLITE
+  const A11Y_LIVE_ASSERTIVE = 2;            // accessibility::LIVE_ASSERTIVE
+  const A11Y_STATE_FOCUSABLE = 1 << 0;      // accessibility::STATE_FOCUSABLE
+  const A11Y_STATE_DISABLED = 1 << 1;       // accessibility::STATE_DISABLED
+  const A11Y_STATE_CHECKED = 1 << 2;        // accessibility::STATE_CHECKED
+  const A11Y_STATE_MIXED = 1 << 3;          // accessibility::STATE_MIXED
+  const A11Y_STATE_PRESSED = 1 << 4;        // accessibility::STATE_PRESSED
+  const A11Y_STATE_EXPANDED = 1 << 5;       // accessibility::STATE_EXPANDED
+  const A11Y_STATE_COLLAPSIBLE = 1 << 6;    // accessibility::STATE_COLLAPSIBLE
+  const A11Y_STATE_SELECTED = 1 << 7;       // accessibility::STATE_SELECTED
+  const A11Y_STATE_READONLY = 1 << 8;       // accessibility::STATE_READONLY
+  const A11Y_STATE_REQUIRED = 1 << 9;       // accessibility::STATE_REQUIRED
+  const A11Y_STATE_INVALID = 1 << 10;       // accessibility::STATE_INVALID
+  const A11Y_STATE_MULTILINE = 1 << 11;     // accessibility::STATE_MULTILINE
+  const A11Y_STATE_BUSY = 1 << 12;          // accessibility::STATE_BUSY
+  const A11Y_STATE_MODAL = 1 << 13;         // accessibility::STATE_MODAL
+  const A11Y_STATE_SECRET = 1 << 14;        // accessibility::STATE_SECRET
+  const A11Y_STATE_EDITABLE = 1 << 15;      // accessibility::STATE_EDITABLE
+  const A11Y_STATE_MULTISELECTABLE = 1 << 16; // accessibility::STATE_MULTISELECTABLE
+  const A11Y_STATE_RANGE = 1 << 17;         // accessibility::STATE_RANGE
+  const A11Y_STATE_SELECTION = 1 << 18;     // accessibility::STATE_SELECTION
+  const A11Y_ACTION_SIZE = 12;              // accessibility::ACTION_SIZE
+  const A11Y_ACTION_LEN = 8;                // accessibility::ACTION_LEN
+  const A11Y_OFF_ACTION_LEN = 2;            // accessibility::OFF_ACTION_LEN
+  const A11Y_OFF_ACTION_ID = 4;             // accessibility::OFF_ACTION_ID
+  const A11Y_OFF_ACTION_ARG = 8;            // accessibility::OFF_ACTION_ARG
+  const A11Y_ACTION_ACTIVATE = 0x01;        // accessibility::ACTION_ACTIVATE
+  const A11Y_ACTION_FOCUS = 0x02;           // accessibility::ACTION_FOCUS
+  const A11Y_ACTION_SET_VALUE = 0x03;       // accessibility::ACTION_SET_VALUE
+  const TEXT_MSG_COMMIT = 0x01;             // text::MSG_COMMIT
+  const TEXT_MSG_COMPOSE = 0x02;            // text::MSG_COMPOSE
+  const TEXT_MSG_DELETE = 0x03;             // text::MSG_DELETE
+  const TEXT_MSG_SELECT = 0x04;             // text::MSG_SELECT
+  const TEXT_COMMIT_CONTINUES = 0x01;       // text::COMMIT_CONTINUES
+  const TEXT_COMPOSE_START = 0x01;          // text::COMPOSE_START
+  const TEXT_COMPOSE_END = 0x02;            // text::COMPOSE_END
+  const TEXT_NO_TARGET = 0xFFFFFFFF;        // text::NO_TARGET
+  const TEXT_MAX = 1024;                    // text::TEXT_MAX
+
+  // State bits that are one boolean ARIA attribute on any role: present as
+  // "true" when the bit is set, absent when it is clear.
+  const A11Y_STATE_ATTRIBUTES = [
+    [A11Y_STATE_DISABLED, 'aria-disabled'],
+    [A11Y_STATE_PRESSED, 'aria-pressed'],
+    [A11Y_STATE_READONLY, 'aria-readonly'],
+    [A11Y_STATE_REQUIRED, 'aria-required'],
+    [A11Y_STATE_INVALID, 'aria-invalid'],
+    [A11Y_STATE_BUSY, 'aria-busy'],
+    [A11Y_STATE_MODAL, 'aria-modal'],
+    [A11Y_STATE_MULTISELECTABLE, 'aria-multiselectable'],
+  ];
+
+  // `beforeinput` types the mirror translates into an insert. Deletions
+  // are every type that starts with "delete". The types an input method
+  // raises while and just after composing are in neither set: a
+  // composition is reported from its composition events alone, and
+  // translating them too would commit its text twice.
+  const A11Y_INSERT_INPUTS = [
+    'insertText', 'insertReplacementText', 'insertFromPaste', 'insertFromDrop',
+    'insertFromYank', 'insertLineBreak', 'insertParagraph',
+  ];
+  const A11Y_COMPOSITION_INPUTS = [
+    'insertCompositionText', 'deleteCompositionText', 'insertFromComposition',
+    'deleteByComposition',
+  ];
+
+  const A11Y_STYLE_ID = 'fluxor-a11y-style';
+  const A11Y_CSS = [
+    '[data-fluxor-a11y]{position:absolute;overflow:hidden;pointer-events:none;margin:0;padding:0;border:0;background:transparent;color:transparent}',
+    '[data-fluxor-a11y] *{position:absolute;box-sizing:border-box;margin:0;padding:0;border:0;border-radius:0;background:transparent;color:transparent;outline:none;caret-color:transparent;font:inherit;overflow:visible;resize:none;pointer-events:none;-webkit-appearance:none;appearance:none}',
+    '[data-fluxor-a11y] input,[data-fluxor-a11y] textarea{pointer-events:auto}',
+    '[data-fluxor-a11y] [data-fluxor-a11y-field]{left:0;top:0;width:100%;height:100%;pointer-events:none}',
+    '[data-fluxor-a11y] [data-fluxor-a11y-live]{left:0;top:0;width:1px;height:1px;overflow:hidden}',
+    '[data-fluxor-a11y] ::selection{background:transparent;color:transparent}',
+  ].join('\n');
+
+  function a11yIsLowSurrogate(c) { return c >= 0xDC00 && c <= 0xDFFF; }
+  function a11yPairAt(str, i) {
+    const c = str.charCodeAt(i);
+    return c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length && a11yIsLowSurrogate(str.charCodeAt(i + 1));
+  }
+
+  // Offsets on the wire count Unicode scalar values; the DOM counts UTF-16
+  // code units. These convert an offset into `str` one way and the other.
+  function a11yScalarsBefore(str, utf16) {
+    let n = 0;
+    for (let i = 0; i < utf16 && i < str.length; n++) i += a11yPairAt(str, i) ? 2 : 1;
+    return n;
+  }
+  function a11yUtf16At(str, scalars) {
+    let i = 0;
+    for (let n = 0; n < scalars && i < str.length; n++) i += a11yPairAt(str, i) ? 2 : 1;
+    return i;
+  }
+
+  // `bytes` (UTF-8) in pieces of at most `max` bytes, each ending on a
+  // scalar boundary.
+  function a11yUtf8Pieces(bytes, max) {
+    const out = [];
+    let at = 0;
+    while (at < bytes.length) {
+      let end = Math.min(bytes.length, at + max);
+      while (end > at && end < bytes.length && (bytes[end] & 0xC0) === 0x80) end--;
+      if (end === at) end = Math.min(bytes.length, at + max);
+      out.push(bytes.slice(at, end));
+      at = end;
+    }
+    return out;
+  }
+
+  // Where the unit a deletion removes ends, from `at` in `value`, one way
+  // or the other: a grapheme cluster (`'grapheme'`), a word (`'word'`) or
+  // the rest of the line (`'line'`).
+  function a11yDeletionEdge(win, value, at, unit, forward) {
+    if (unit === 'line') {
+      if (forward) {
+        const nl = value.indexOf('\n', at);
+        return nl < 0 ? value.length : (nl === at ? at + 1 : nl);
+      }
+      const nl = value.lastIndexOf('\n', at - 1);
+      return nl < 0 ? 0 : (nl === at - 1 ? nl : nl + 1);
+    }
+    const Segmenter = win.Intl && win.Intl.Segmenter;
+    if (Segmenter) {
+      const cuts = [0];
+      for (const seg of new Segmenter(undefined, { granularity: unit }).segment(value)) {
+        const end = seg.index + seg.segment.length;
+        // A word deletion takes the spaces between the caret and the word
+        // with it: what is not a word joins the word before it when
+        // deleting backward, and the word after it when deleting forward.
+        if (unit === 'word' && seg.isWordLike === false) {
+          if (forward) continue;
+          if (cuts.length > 1) { cuts[cuts.length - 1] = end; continue; }
+        }
+        cuts.push(end);
+      }
+      if (forward) {
+        for (const c of cuts) if (c > at) return c;
+        return value.length;
+      }
+      for (let i = cuts.length - 1; i >= 0; i--) if (cuts[i] < at) return cuts[i];
+      return 0;
+    }
+    // No segmenter: a scalar for a grapheme, a run of non-spaces (and the
+    // spaces before the caret) for a word.
+    if (unit === 'grapheme') {
+      if (forward) return Math.min(value.length, at + (a11yPairAt(value, at) ? 2 : 1));
+      return Math.max(0, at - (at >= 2 && a11yPairAt(value, at - 2) ? 2 : 1));
+    }
+    let i = at;
+    const space = (k) => /\s/.test(value.charAt(k));
+    if (forward) {
+      while (i < value.length && space(i)) i++;
+      while (i < value.length && !space(i)) i++;
+    } else {
+      while (i > 0 && space(i - 1)) i--;
+      while (i > 0 && !space(i - 1)) i--;
+    }
+    return i;
+  }
+
+  // `opts.surface` is the display surface element the mirror goes into
+  // (the element pointer positions are measured on). `opts.noteText()` is
+  // called when a `beforeinput` was translated, so the keyboard producer
+  // flags the key that caused it. `opts.log(text)` takes diagnostics.
+  // Returns `{ open, applyBatch, handle, layout, close, root }`.
+  function createAccessibilityMirror(win, opts) {
+    opts = opts || {};
+    const doc = win.document;
+    const surface = opts.surface;
+    const noteText = opts.noteText || (() => {});
+    const log = opts.log || (() => {});
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder('utf-8');
+    const serial = (win.__fluxor_a11y_serial = (win.__fluxor_a11y_serial || 0) + 1);
+
+    const nodes = new Map();      // id → node
+    let focusId = A11Y_NO_NODE;   // the application's focus
+    let root = null;
+    let treeBox = null;           // holds the root nodes' elements
+    let descBox = null;           // holds description texts, hidden
+    let live = null;              // { 1: polite region, 2: assertive region }
+    let field = null;             // the text-only field
+    let mode = null;              // 'tree' | 'text'
+    let quiet = 0;                // > 0 while the mirror itself moves focus or the DOM
+    let composing = null;         // { edit, start16, preedit, hlA, hlB }
+    let sawBeforeInput = false;
+    let restoreOnInput = false;
+
+    function action(msg, id, arg) {
+      pushInput(win, 'accessibility_action', { msg, id: id >>> 0, arg: arg | 0 });
+    }
+    function edit(kind, flags, target, a, b, text) {
+      pushInput(win, 'text', {
+        kind, flags, target: target >>> 0, a: a >>> 0, b: b >>> 0, text: text || new Uint8Array(0),
+      });
+    }
+
+    function ensureRoot() {
+      if (root) return;
+      if (doc.getElementById && doc.head && !doc.getElementById(A11Y_STYLE_ID)) {
+        const style = doc.createElement('style');
+        style.id = A11Y_STYLE_ID;
+        style.textContent = A11Y_CSS;
+        doc.head.appendChild(style);
+      }
+      root = doc.createElement('div');
+      root.setAttribute('data-fluxor-a11y', '');
+      // Page translation must not rewrite the application's strings.
+      root.setAttribute('translate', 'no');
+      treeBox = doc.createElement('div');
+      descBox = doc.createElement('div');
+      descBox.setAttribute('hidden', '');
+      live = {};
+      for (const [level, name] of [[A11Y_LIVE_POLITE, 'polite'], [A11Y_LIVE_ASSERTIVE, 'assertive']]) {
+        const region = doc.createElement('div');
+        region.setAttribute('data-fluxor-a11y-live', name);
+        region.setAttribute('aria-live', name);
+        live[level] = region;
+      }
+      root.appendChild(treeBox);
+      root.appendChild(descBox);
+      root.appendChild(live[A11Y_LIVE_POLITE]);
+      root.appendChild(live[A11Y_LIVE_ASSERTIVE]);
+      // The mirror is positioned over the canvas, inside the surface.
+      const pos = win.getComputedStyle ? win.getComputedStyle(surface).position : '';
+      if (pos === 'static' || pos === '') surface.style.position = 'relative';
+      surface.appendChild(root);
+
+      root.addEventListener('click', onClick);
+      root.addEventListener('focusin', onFocusIn);
+      root.addEventListener('focusout', onFocusOut);
+      root.addEventListener('beforeinput', onBeforeInput);
+      root.addEventListener('input', onInput);
+      root.addEventListener('compositionstart', onCompositionStart);
+      root.addEventListener('compositionupdate', onCompositionUpdate);
+      root.addEventListener('compositionend', onCompositionEnd);
+      doc.addEventListener('selectionchange', onSelectionChange);
+    }
+
+    // ── Elements ────────────────────────────────────────────────────
+
+    function roleOf(n) { return A11Y_ROLES[n.role] || 'generic'; }
+    function has(n, bit) { return (n.states & bit) !== 0; }
+
+    // What element a node is: 'div', an edit field ('text', 'password',
+    // 'textarea') or a native range ('range', 'number').
+    function shapeOf(n) {
+      if (has(n, A11Y_STATE_EDITABLE)) {
+        if (has(n, A11Y_STATE_SECRET)) return 'password';
+        return has(n, A11Y_STATE_MULTILINE) ? 'textarea' : 'text';
+      }
+      const role = roleOf(n);
+      if (role === 'slider') return 'range';
+      if (role === 'spinbutton') return 'number';
+      return 'div';
+    }
+    function isEdit(n) { return n.shape === 'text' || n.shape === 'password' || n.shape === 'textarea'; }
+    function isRange(n) { return n.shape === 'range' || n.shape === 'number'; }
+
+    function build(n) {
+      const shape = shapeOf(n);
+      let el;
+      if (shape === 'div') {
+        el = doc.createElement('div');
+        el.setAttribute(MIRROR_ATTR, 'node');
+      } else if (shape === 'textarea') {
+        el = doc.createElement('textarea');
+        el.setAttribute(MIRROR_ATTR, 'edit');
+      } else {
+        el = doc.createElement('input');
+        el.setAttribute('type', shape);
+        el.setAttribute(MIRROR_ATTR, shape === 'range' || shape === 'number' ? 'range' : 'edit');
+      }
+      el.setAttribute('data-fluxor-node', String(n.id));
+      n.shape = shape;
+      n.el = el;
+      n.label = null;
+      n.lastA = -1;
+      n.lastF = -1;
+    }
+
+    function setAttr(el, name, value) {
+      if (value === null) {
+        if (el.hasAttribute(name)) el.removeAttribute(name);
+      } else if (el.getAttribute(name) !== value) {
+        el.setAttribute(name, value);
+      }
+    }
+
+    // The value a mirror field holds for its node: the node's value, or
+    // for a secret one bullet per scalar of the length it states.
+    function fieldValue(n) {
+      if (has(n, A11Y_STATE_SECRET)) return '•'.repeat(Math.max(0, Math.min(n.valueNow, 65535)));
+      return n.value;
+    }
+    // The node's selection in the field's own (UTF-16) offsets: the one the
+    // application states, else the caret at the end of the value.
+    function fieldSelection(n) {
+      const value = fieldValue(n);
+      if (!has(n, A11Y_STATE_SELECTION)) return [value.length, value.length];
+      return [a11yUtf16At(value, n.selAnchor), a11yUtf16At(value, n.selFocus)];
+    }
+
+    function applySelection(n) {
+      const [a, f] = fieldSelection(n);
+      n.lastA = a;
+      n.lastF = f;
+      const el = n.el;
+      if (doc.activeElement !== el || !el.setSelectionRange) return;
+      const start = Math.min(a, f);
+      const end = Math.max(a, f);
+      const dir = f < a ? 'backward' : 'forward';
+      if (el.selectionStart !== start || el.selectionEnd !== end
+        || (start !== end && el.selectionDirection !== dir)) {
+        el.setSelectionRange(start, end, dir);
+      }
+    }
+
+    // Bring a field to what the application says it holds. Deferred while
+    // an input method composes in it: an echo must not break a composition.
+    function restore(n) {
+      if (composing && composing.edit.node === n) return;
+      const want = fieldValue(n);
+      if (n.el.value !== want) n.el.value = want;
+      applySelection(n);
+    }
+
+    function sync(n) {
+      const el = n.el;
+      const role = roleOf(n);
+      if (n.shape === 'div') setAttr(el, 'role', role === 'generic' ? null : role);
+      else if (isEdit(n)) setAttr(el, 'role', role === 'textbox' ? null : role);
+
+      // Name: content for the roles ARIA forbids naming, a label otherwise.
+      const byContent = n.shape === 'div' && A11Y_ROLES_NAMED_BY_CONTENT.includes(role);
+      if (byContent && n.name) {
+        if (!n.label) {
+          n.label = doc.createTextNode('');
+          el.insertBefore(n.label, el.firstChild);
+        }
+        if (n.label.textContent !== n.name) n.label.textContent = n.name;
+      } else if (n.label) {
+        el.removeChild(n.label);
+        n.label = null;
+      }
+      setAttr(el, 'aria-label', !byContent && n.name ? n.name : null);
+
+      // Description: a hidden text the element points at.
+      if (n.description) {
+        if (!n.desc) {
+          n.desc = doc.createElement('span');
+          n.desc.id = 'fluxor-a11y-' + serial + '-' + n.id;
+          descBox.appendChild(n.desc);
+        }
+        if (n.desc.textContent !== n.description) n.desc.textContent = n.description;
+        setAttr(el, 'aria-describedby', n.desc.id);
+      } else {
+        if (n.desc) { descBox.removeChild(n.desc); n.desc = null; }
+        setAttr(el, 'aria-describedby', null);
+      }
+
+      for (const [bit, name] of A11Y_STATE_ATTRIBUTES) setAttr(el, name, has(n, bit) ? 'true' : null);
+      setAttr(el, 'aria-checked', A11Y_ROLES_CHECKABLE.includes(role)
+        ? (has(n, A11Y_STATE_MIXED) ? 'mixed' : (has(n, A11Y_STATE_CHECKED) ? 'true' : 'false'))
+        : null);
+      setAttr(el, 'aria-selected', has(n, A11Y_STATE_SELECTED) ? 'true'
+        : (A11Y_ROLES_SELECTABLE.includes(role) ? 'false' : null));
+      setAttr(el, 'aria-expanded', has(n, A11Y_STATE_EXPANDED) ? 'true'
+        : (has(n, A11Y_STATE_COLLAPSIBLE) ? 'false' : null));
+      setAttr(el, 'aria-multiline', n.shape === 'div' && has(n, A11Y_STATE_MULTILINE) ? 'true' : null);
+      setAttr(el, 'aria-level', role === 'heading' && n.valueNow >= 1 && n.valueNow <= 6
+        ? String(n.valueNow) : null);
+      setAttr(el, 'aria-live', n.live === A11Y_LIVE_POLITE ? 'polite'
+        : (n.live === A11Y_LIVE_ASSERTIVE ? 'assertive' : null));
+
+      const range = has(n, A11Y_STATE_RANGE);
+      if (isRange(n)) {
+        setAttr(el, 'min', range ? String(n.valueMin) : null);
+        setAttr(el, 'max', range ? String(n.valueMax) : null);
+        const now = String(n.valueNow);
+        if (el.value !== now) el.value = now;
+        setAttr(el, 'aria-valuetext', n.value ? n.value : null);
+      } else if (!isEdit(n)) {
+        setAttr(el, 'aria-valuemin', range ? String(n.valueMin) : null);
+        setAttr(el, 'aria-valuemax', range ? String(n.valueMax) : null);
+        setAttr(el, 'aria-valuenow', range ? String(n.valueNow) : null);
+        setAttr(el, 'aria-valuetext', range && n.value ? n.value : null);
+      }
+      if (isEdit(n) || isRange(n)) {
+        const fixed = has(n, A11Y_STATE_READONLY) || has(n, A11Y_STATE_DISABLED);
+        setAttr(el, 'readonly', fixed ? '' : null);
+      }
+      if (isEdit(n)) restore(n);
+    }
+
+    // Where a node's element goes: inside the element of its nearest
+    // ancestor that can hold children (a field holds none), else the tree
+    // box. Answers that ancestor, or null.
+    function holderOf(n) {
+      let guard = nodes.size;
+      for (let p = nodes.get(n.parent); p && guard-- > 0; p = nodes.get(p.parent)) {
+        if (p.shape === 'div') return p;
+      }
+      return null;
+    }
+
+    function place(g) {
+      const kx = 1 / g.sx;
+      const ky = 1 / g.sy;
+      for (const n of nodes.values()) {
+        const holder = holderOf(n);
+        const ox = holder ? holder.x : 0;
+        const oy = holder ? holder.y : 0;
+        const st = n.el.style;
+        st.left = ((n.x - ox) / 64 * kx) + 'px';
+        st.top = ((n.y - oy) / 64 * ky) + 'px';
+        st.width = (Math.max(0, n.w) / 64 * kx) + 'px';
+        st.height = (Math.max(0, n.h) / 64 * ky) + 'px';
+      }
+    }
+
+    // Lay the mirror over the canvas as the page shows it now. CSS bounds
+    // are node bounds / 64 x CSS pixels per surface pixel: the inverse of
+    // the pointer mapping.
+    function layout() {
+      if (!root) return;
+      const g = surfaceGeometry(surface);
+      const outer = surface.getBoundingClientRect();
+      root.style.left = (g.rect.left - outer.left) + 'px';
+      root.style.top = (g.rect.top - outer.top) + 'px';
+      root.style.width = g.rect.width + 'px';
+      root.style.height = g.rect.height + 'px';
+      place(g);
+    }
+
+    // Put every element where the tree says: under its holder, among its
+    // siblings by `order` then id. Only elements out of place move, since
+    // moving a focused element drops its focus.
+    function arrange() {
+      const groups = new Map(); // holder element → nodes
+      for (const n of nodes.values()) {
+        const holder = holderOf(n);
+        const box = holder ? holder.el : treeBox;
+        let list = groups.get(box);
+        if (!list) groups.set(box, list = []);
+        list.push(n);
+      }
+      for (const [box, list] of groups) {
+        list.sort((p, q) => (p.order - q.order) || (p.id - q.id));
+        let at = 0;
+        for (const n of list) {
+          const here = box.children[at] || null;
+          if (here !== n.el) box.insertBefore(n.el, here);
+          at++;
+        }
+      }
+    }
+
+    function drop(n) {
+      if (n.el.parentNode) n.el.parentNode.removeChild(n.el);
+      if (n.desc) descBox.removeChild(n.desc);
+      if (composing && composing.edit.node === n) composing = null;
+      nodes.delete(n.id);
+    }
+
+    // Roving tabindex: the application's focus is the one tab stop, so Tab
+    // from page chrome enters the mirror there; with nothing focused the
+    // first focusable node is.
+    function firstFocusable(box) {
+      for (const el of Array.from(box.children)) {
+        const id = el.getAttribute('data-fluxor-node');
+        const n = id === null ? null : nodes.get(Number(id));
+        if (!n) continue;
+        if (has(n, A11Y_STATE_FOCUSABLE)) return n;
+        const below = n.shape === 'div' ? firstFocusable(el) : null;
+        if (below) return below;
+      }
+      return null;
+    }
+    function tabStops() {
+      const stop = nodes.get(focusId) || firstFocusable(treeBox);
+      for (const n of nodes.values()) {
+        const want = n === stop ? '0' : (has(n, A11Y_STATE_FOCUSABLE) ? '-1' : null);
+        setAttr(n.el, 'tabindex', want);
+      }
+    }
+
+    // Move DOM focus to the application's focus, but only from inside the
+    // mirror or from the page body: the application never takes focus away
+    // from page chrome.
+    function applyFocus() {
+      const active = doc.activeElement || null;
+      const inside = !!(active && root.contains(active));
+      if (!inside && active && active !== doc.body) return;
+      const n = nodes.get(focusId);
+      quiet++;
+      try {
+        if (n) {
+          if (active !== n.el) n.el.focus({ preventScroll: true });
+        } else if (inside) {
+          active.blur();
+        }
+      } finally { quiet--; }
+    }
+
+    // ── Batches ─────────────────────────────────────────────────────
+
+    function parseNode(dv, at, len) {
+      if (len < A11Y_NODE_FIXED) return null;
+      const u16 = (o) => dv.getUint16(at + o, true);
+      const nameLen = u16(A11Y_OFF_NAME_LEN);
+      const valueLen = u16(A11Y_OFF_VALUE_LEN);
+      const descLen = u16(A11Y_OFF_DESC_LEN);
+      if (A11Y_NODE_FIXED + nameLen + valueLen + descLen !== len) return null;
+      const bytes = new Uint8Array(dv.buffer, dv.byteOffset + at + A11Y_NODE_FIXED, len - A11Y_NODE_FIXED);
+      const str = (from, n) => decoder.decode(bytes.subarray(from, from + n));
+      return {
+        id: dv.getUint32(at + A11Y_OFF_ID, true),
+        parent: dv.getUint32(at + A11Y_OFF_PARENT, true),
+        order: u16(A11Y_OFF_ORDER),
+        role: dv.getUint8(at + A11Y_OFF_ROLE),
+        live: dv.getUint8(at + A11Y_OFF_LIVE),
+        states: dv.getUint32(at + A11Y_OFF_STATES, true),
+        x: dv.getInt32(at + A11Y_OFF_BOUNDS, true),
+        y: dv.getInt32(at + A11Y_OFF_BOUNDS + 4, true),
+        w: dv.getInt32(at + A11Y_OFF_BOUNDS + 8, true),
+        h: dv.getInt32(at + A11Y_OFF_BOUNDS + 12, true),
+        valueMin: dv.getInt32(at + A11Y_OFF_VALUE_MIN, true),
+        valueMax: dv.getInt32(at + A11Y_OFF_VALUE_MAX, true),
+        valueNow: dv.getInt32(at + A11Y_OFF_VALUE_NOW, true),
+        selAnchor: dv.getUint32(at + A11Y_OFF_SEL_ANCHOR, true),
+        selFocus: dv.getUint32(at + A11Y_OFF_SEL_FOCUS, true),
+        name: str(0, nameLen),
+        value: str(nameLen, valueLen),
+        description: str(nameLen + valueLen, descLen),
+      };
+    }
+
+    // The records of one checked batch, or null when the bytes are not
+    // whole records (nothing is applied then).
+    function parseBatch(bytes) {
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const ops = [];
+      let at = 0;
+      while (at < bytes.length) {
+        if (bytes.length - at < A11Y_HEADER) return null;
+        const msg = dv.getUint8(at);
+        const len = dv.getUint16(at + 2, true);
+        const body = at + A11Y_HEADER;
+        if (body + len > bytes.length) return null;
+        if (msg === A11Y_MSG_TREE) {
+          ops.push({ msg });
+        } else if (msg === A11Y_MSG_NODE) {
+          const node = parseNode(dv, body, len);
+          if (!node) return null;
+          ops.push({ msg, node });
+        } else if (msg === A11Y_MSG_REMOVE || msg === A11Y_MSG_FOCUS || msg === A11Y_MSG_APPLY) {
+          if (len !== 4) return null;
+          ops.push({ msg, id: dv.getUint32(body, true) });
+        } else if (msg === A11Y_MSG_ANNOUNCE) {
+          if (len < 4) return null;
+          ops.push({
+            msg, level: dv.getUint8(body),
+            text: decoder.decode(bytes.subarray(body + 4, body + len)),
+          });
+        } else {
+          return null;
+        }
+        at = body + len;
+      }
+      return ops;
+    }
+
+    function announce(level, text) {
+      const region = live[level];
+      if (!region) return;
+      // The same text twice in a row is still two announcements.
+      region.textContent = region.textContent === text ? text + ' ' : text;
+    }
+
+    // Carry out one checked batch as a single change to the page.
+    function applyBatch(bytes) {
+      const ops = parseBatch(bytes);
+      if (!ops) { log('[accessibility] a batch that is not whole tree records was not applied'); return false; }
+      ensureRoot();
+      let stale = null;        // after TREE: the nodes the batch has not restated
+      let focusMoved = false;
+      // The node holding DOM focus, to give it back if the batch moves or
+      // replaces its element.
+      let refocus = nodeOf(doc.activeElement);
+      const said = [];
+      quiet++;
+      try {
+        for (const op of ops) {
+          if (op.msg === A11Y_MSG_TREE) {
+            stale = new Set(nodes.keys());
+          } else if (op.msg === A11Y_MSG_NODE) {
+            const next = op.node;
+            if (stale) stale.delete(next.id);
+            let n = nodes.get(next.id);
+            if (!n) {
+              n = { id: next.id, desc: null };
+              nodes.set(n.id, n);
+              Object.assign(n, next);
+              build(n);
+            } else {
+              Object.assign(n, next);
+              if (shapeOf(n) !== n.shape) {
+                // Another kind of element takes the node's place; its
+                // children join it when the tree is arranged.
+                const old = n.el;
+                const hadFocus = doc.activeElement === old;
+                build(n);
+                if (old.parentNode) old.parentNode.replaceChild(n.el, old);
+                if (hadFocus) refocus = n;
+              }
+            }
+          } else if (op.msg === A11Y_MSG_REMOVE) {
+            const doomed = [];
+            const under = new Set([op.id]);
+            // Parents may follow children in the map: sweep until no node
+            // joins the subtree.
+            for (let grew = true; grew;) {
+              grew = false;
+              for (const n of nodes.values()) {
+                if (!under.has(n.id) && under.has(n.parent)) { under.add(n.id); grew = true; }
+              }
+            }
+            for (const id of under) { const n = nodes.get(id); if (n) doomed.push(n); }
+            for (const n of doomed) drop(n);
+          } else if (op.msg === A11Y_MSG_FOCUS) {
+            focusId = op.id;
+            focusMoved = true;
+          } else if (op.msg === A11Y_MSG_ANNOUNCE) {
+            said.push(op);
+          }
+        }
+        if (stale) for (const id of stale) { const n = nodes.get(id); if (n) drop(n); }
+        arrange();
+        for (const n of nodes.values()) sync(n);
+        tabStops();
+        layout();
+        if (focusMoved) applyFocus();
+        else if (refocus && nodes.get(refocus.id) === refocus && doc.activeElement !== refocus.el) {
+          refocus.el.focus({ preventScroll: true });
+        }
+        for (const s of said) announce(s.level, s.text);
+      } finally { quiet--; }
+      return true;
+    }
+
+    // ── What assistive technology and pointers do ───────────────────
+
+    function nodeOf(target) {
+      for (let el = target; el && el !== root; el = el.parentNode) {
+        const id = el.getAttribute ? el.getAttribute('data-fluxor-node') : null;
+        if (id !== null && id !== undefined) return nodes.get(Number(id)) || null;
+      }
+      return null;
+    }
+
+    function onClick(e) {
+      // A click here is the mirror's business, not the surface's.
+      e.stopPropagation();
+      const n = nodeOf(e.target);
+      if (!n || n.shape !== 'div' || has(n, A11Y_STATE_DISABLED)) return;
+      action(A11Y_ACTION_ACTIVATE, n.id, 0);
+    }
+
+    function onFocusIn(e) {
+      const n = nodeOf(e.target);
+      if (!n) return;
+      if (isEdit(n)) applySelection(n);
+      if (quiet || n.id === focusId) return;
+      action(A11Y_ACTION_FOCUS, n.id, 0);
+    }
+
+    function onFocusOut(e) {
+      if (quiet || mode !== 'tree') return;
+      const to = e.relatedTarget;
+      if (to && root.contains(to)) return;
+      action(A11Y_ACTION_FOCUS, A11Y_NO_NODE, 0);
+    }
+
+    // ── Text ────────────────────────────────────────────────────────
+
+    // The field an event belongs to: `{ el, node, target, measured }`.
+    // `measured` is false for the text-only field, whose content the
+    // mirror does not know: its edits carry no offsets.
+    function editOf(target) {
+      if (field && target === field) return { el: field, node: null, target: TEXT_NO_TARGET, measured: false };
+      const n = nodeOf(target);
+      if (!n || !isEdit(n)) return null;
+      return { el: n.el, node: n, target: n.id, measured: true };
+    }
+    function valueOf(ed) { return ed.node ? fieldValue(ed.node) : ''; }
+    function selectionOf(ed) { return ed.node ? fieldSelection(ed.node) : [0, 0]; }
+    function locked(ed) {
+      return !!ed.node && (has(ed.node, A11Y_STATE_READONLY) || has(ed.node, A11Y_STATE_DISABLED));
+    }
+    function restoreEdit(ed) {
+      if (ed.node) restore(ed.node);
+      else if (ed.el.value !== '') ed.el.value = '';
+    }
+
+    function commit(ed, str) {
+      const pieces = a11yUtf8Pieces(encoder.encode(str), TEXT_MAX);
+      pieces.forEach((piece, i) => {
+        edit(TEXT_MSG_COMMIT, i + 1 < pieces.length ? TEXT_COMMIT_CONTINUES : 0, ed.target, 0, 0, piece);
+      });
+    }
+    // Tell the application where the selection is, when it is not where
+    // the application last put it.
+    function select(ed, a16, f16) {
+      if (!ed.measured) return;
+      const [ma, mf] = selectionOf(ed);
+      if (a16 === ma && f16 === mf) return;
+      const value = valueOf(ed);
+      edit(TEXT_MSG_SELECT, 0, ed.target, a11yScalarsBefore(value, a16), a11yScalarsBefore(value, f16));
+      if (ed.node) { ed.node.lastA = a16; ed.node.lastF = f16; }
+    }
+    function elementSelection(el) {
+      const start = el.selectionStart || 0;
+      const end = el.selectionEnd == null ? start : el.selectionEnd;
+      return el.selectionDirection === 'backward' ? [end, start] : [start, end];
+    }
+
+    function onBeforeInput(e) {
+      const ed = editOf(e.target);
+      if (!ed) return;
+      sawBeforeInput = true;
+      const type = e.inputType || '';
+      if (composing || e.isComposing || A11Y_COMPOSITION_INPUTS.includes(type)) return;
+      const inserts = A11Y_INSERT_INPUTS.includes(type);
+      const deletes = type.indexOf('delete') === 0;
+      if (!inserts && !deletes) {
+        // Undo, redo and formatting are the application's: the key reaches
+        // it as a plain key.
+        e.preventDefault();
+        return;
+      }
+      // Stopped when it can be; a change the browser makes anyway is
+      // undone at the `input` that follows.
+      if (e.cancelable) e.preventDefault(); else restoreOnInput = true;
+      if (locked(ed)) return;
+
+      const [a16, f16] = elementSelection(ed.el);
+      const start = Math.min(a16, f16);
+      const end = Math.max(a16, f16);
+      if (inserts) {
+        let str = e.data;
+        if (type === 'insertLineBreak' || type === 'insertParagraph') str = '\n';
+        if (str == null && e.dataTransfer) str = e.dataTransfer.getData('text/plain');
+        if (!str) return;
+        select(ed, a16, f16);
+        commit(ed, str);
+        noteText();
+        return;
+      }
+      const forward = /Forward$/.test(type);
+      const backward = /Backward$/.test(type);
+      if (!ed.measured) {
+        // No value to measure: one scalar either way.
+        if (forward || backward) {
+          edit(TEXT_MSG_DELETE, 0, ed.target, backward ? 1 : 0, forward ? 1 : 0);
+          noteText();
+        }
+        return;
+      }
+      if (start !== end) {
+        select(ed, a16, f16);
+        edit(TEXT_MSG_DELETE, 0, ed.target, 0, 0);
+        noteText();
+        return;
+      }
+      // A caret: how far the deletion reaches is the browser's rule for
+      // the input type, measured on the value the application gave.
+      const value = valueOf(ed);
+      const unit = /Word/.test(type) ? 'word' : (/Line/.test(type) ? 'line' : 'grapheme');
+      const whole = type === 'deleteEntireSoftLine';
+      const from = backward || whole ? a11yDeletionEdge(win, value, start, unit, false) : start;
+      const to = forward || whole ? a11yDeletionEdge(win, value, start, unit, true) : start;
+      let before = a11yScalarsBefore(value.slice(from, start), start - from);
+      let after = a11yScalarsBefore(value.slice(start, to), to - start);
+      if (before === 0 && after === 0) {
+        // Nothing there on the value the mirror holds, which may be an
+        // echo behind what the user has typed: one scalar, and the
+        // application, which holds the text, deletes it or does nothing.
+        if (whole) return;
+        before = backward ? 1 : 0;
+        after = forward ? 1 : 0;
+      }
+      select(ed, start, start);
+      edit(TEXT_MSG_DELETE, 0, ed.target, before, after);
+      noteText();
+    }
+
+    function onInput(e) {
+      const n = nodeOf(e.target);
+      if (n && isRange(n)) {
+        // Assistive technology adjusted a native range: the application
+        // decides, and its echo sets the element.
+        const asked = Math.round(Number(n.el.value));
+        if (!has(n, A11Y_STATE_READONLY) && !has(n, A11Y_STATE_DISABLED)
+          && asked === asked && asked !== n.valueNow) {
+          action(A11Y_ACTION_SET_VALUE, n.id, asked);
+        }
+        n.el.value = String(n.valueNow);
+        return;
+      }
+      const ed = editOf(e.target);
+      if (!ed) return;
+      if (composing) {
+        if (composing.edit.el === ed.el) composeHighlight();
+        return;
+      }
+      const translated = sawBeforeInput;
+      sawBeforeInput = false;
+      restoreOnInput = false;
+      if (!translated && !locked(ed)) {
+        // The element changed with no `beforeinput` (autofill): the whole
+        // value is replaced by what it now holds.
+        const now = ed.el.value;
+        const old = valueOf(ed);
+        if (now !== old) {
+          if (ed.measured) select(ed, 0, old.length);
+          if (now) commit(ed, now);
+          else if (ed.measured) edit(TEXT_MSG_DELETE, 0, ed.target, 0, 0);
+        }
+      }
+      restoreEdit(ed);
+    }
+
+    function compose(flags, preedit, hlA, hlB) {
+      let bytes = encoder.encode(preedit);
+      if (bytes.length > TEXT_MAX) {
+        // A preedit is display only: it is cut at a scalar boundary and
+        // the highlight kept inside it.
+        bytes = a11yUtf8Pieces(bytes, TEXT_MAX)[0];
+        const kept = a11yScalarsBefore(decoder.decode(bytes), Infinity);
+        hlA = Math.min(hlA, kept);
+        hlB = Math.min(hlB, kept);
+      }
+      edit(TEXT_MSG_COMPOSE, flags, composing.edit.target, hlA, hlB, bytes);
+      composing.hlA = hlA;
+      composing.hlB = hlB;
+    }
+
+    // The input method's highlighted range, as the element's selection
+    // inside the preedit; sent when it is not what the last record said.
+    function composeHighlight() {
+      const c = composing;
+      const len = c.preedit.length;
+      const clamp = (v) => Math.max(0, Math.min(len, v - c.start16));
+      const lo = clamp(c.edit.el.selectionStart || 0);
+      const hi = clamp(c.edit.el.selectionEnd == null ? lo + c.start16 : c.edit.el.selectionEnd);
+      const hlA = a11yScalarsBefore(c.preedit, Math.min(lo, hi));
+      const hlB = a11yScalarsBefore(c.preedit, Math.max(lo, hi));
+      if (hlA !== c.hlA || hlB !== c.hlB) compose(0, c.preedit, hlA, hlB);
+    }
+
+    function onCompositionStart(e) {
+      const ed = editOf(e.target);
+      if (!ed || locked(ed)) return;
+      const [a16, f16] = elementSelection(ed.el);
+      select(ed, a16, f16);
+      composing = { edit: ed, start16: Math.min(a16, f16), preedit: '', hlA: 0, hlB: 0 };
+      compose(TEXT_COMPOSE_START, '', 0, 0);
+    }
+
+    function onCompositionUpdate(e) {
+      if (!composing) return;
+      composing.preedit = e.data || '';
+      // The caret sits at the end until the element says otherwise.
+      const end = a11yScalarsBefore(composing.preedit, Infinity);
+      compose(0, composing.preedit, end, end);
+    }
+
+    function onCompositionEnd(e) {
+      if (!composing) return;
+      const ed = composing.edit;
+      compose(TEXT_COMPOSE_END, '', 0, 0);
+      composing = null;
+      // The composition's own `beforeinput`s are behind it: an `input`
+      // from here on is judged by the `beforeinput` that precedes it.
+      sawBeforeInput = false;
+      if (e.data) commit(ed, e.data);
+      // The element ran ahead of the application while composing.
+      restoreEdit(ed);
+    }
+
+    function onSelectionChange() {
+      if (composing || !root) return;
+      const ed = editOf(doc.activeElement);
+      if (!ed || !ed.node) return;
+      const [a16, f16] = elementSelection(ed.el);
+      // The mirror's own echo, or a selection already reported.
+      if (a16 === ed.node.lastA && f16 === ed.node.lastF) return;
+      select(ed, a16, f16);
+      ed.node.lastA = a16;
+      ed.node.lastF = f16;
+    }
+
+    // ── Modes ───────────────────────────────────────────────────────
+
+    function onSurfacePointerDown() {
+      if (field && doc.activeElement !== field) field.focus({ preventScroll: true });
+    }
+
+    // `'tree'`: mirror the application's tree. `'text'`: no tree is wired;
+    // keep one text field over the surface, focused by the first tap on
+    // it, whose edits name no node.
+    function open(next) {
+      ensureRoot();
+      mode = next;
+      if (next === 'text' && !field) {
+        field = doc.createElement('textarea');
+        field.setAttribute(MIRROR_ATTR, 'edit');
+        field.setAttribute('data-fluxor-a11y-field', '');
+        field.setAttribute('aria-label', 'Text input');
+        root.appendChild(field);
+        surface.addEventListener('pointerdown', onSurfacePointerDown);
+      }
+      layout();
+    }
+
+    // A message from the native module, as it crosses from a Worker:
+    // `{ open: 'tree' | 'text' }` or `{ bytes: Uint8Array }`.
+    function handle(m) {
+      if (m.open) open(m.open);
+      if (m.bytes) applyBatch(m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array(m.bytes));
+    }
+
+    function close() {
+      if (!root) return;
+      doc.removeEventListener('selectionchange', onSelectionChange);
+      surface.removeEventListener('pointerdown', onSurfacePointerDown);
+      if (root.parentNode) root.parentNode.removeChild(root);
+      root = null;
+      field = null;
+      nodes.clear();
+    }
+
+    return {
+      open, applyBatch, handle, layout, close,
+      get root() { return root; },
+    };
+  }
+  // ── End of the accessibility mirror ───────────────────────────────
 
   function buildHostImports(opts) {
     const o = opts || {};
@@ -1442,13 +3019,16 @@ registerProcessor('pcm-ring', PcmRing);
     // installed by the shell) can push records into them.
     //
     //   wasm_browser_keyboard  ←  __fluxor_keyboard_queue
-    //                              { kind, modifiers, repeat, keyCode, scanCode }
+    //                              { kind, modifiers, flags, keyCode, scanCode }
     //   wasm_browser_pointer   ←  __fluxor_pointer_queue
     //                              { pointerId, kind, buttons, modifiers,
-    //                                pressure, x, y }
+    //                                pressure, x, y } and, on a wheel
+    //                              record, { wheelUnit, dx, dy }
     //   wasm_browser_gamepad   ←  __fluxor_gamepad_queue
-    //                              { kind: 0x01|0x02, gamepadId, connected,
+    //                              MSG_STATE      { kind: 0x01, gamepadId, connected,
     //                                buttonBits, axisLx, axisLy, axisRx, axisRy }
+    //                              MSG_CONNECTION { kind: 0x02, gamepadId, connected,
+    //                                mapping, vendorId, productId }
 
     const keyboardQueue = window.__fluxor_keyboard_queue
       || (window.__fluxor_keyboard_queue = []);
@@ -1460,7 +3040,7 @@ registerProcessor('pcm-ring', PcmRing);
         view.setUint8(0, 0x01);                  // MSG_EVENT
         view.setUint8(1, ev.kind & 0xFF);        // KIND_DOWN / KIND_UP
         view.setUint8(2, ev.modifiers & 0xFF);
-        view.setUint8(3, ev.repeat ? 1 : 0);
+        view.setUint8(3, (ev.flags | 0) & 0x03); // KEY_REPEAT | KEY_TEXT
         view.setUint16(4, ev.keyCode & 0xFFFF, true);
         view.setUint16(6, (ev.scanCode || 0) & 0xFFFF, true);
         return 8;
@@ -1479,11 +3059,14 @@ registerProcessor('pcm-ring', PcmRing);
         view.setUint8(2, ev.kind & 0xFF);
         view.setUint8(3, ev.buttons & 0xFF);
         view.setUint8(4, ev.modifiers & 0xFF);
-        view.setUint8(5, 0);
+        // The wheel fields are zero on every kind but KIND_WHEEL.
+        const wheel = (ev.kind & 0xFF) === POINTER_KIND_WHEEL;
+        view.setUint8(5, wheel ? ev.wheelUnit & 0xFF : 0);
         view.setUint16(6, ev.pressure & 0xFFFF, true);
         view.setInt16(8,  ev.x | 0, true);
         view.setInt16(10, ev.y | 0, true);
-        view.setUint32(12, 0, true);
+        view.setInt16(12, wheel ? ev.dx | 0 : 0, true);
+        view.setInt16(14, wheel ? ev.dy | 0 : 0, true);
         return 16;
       },
     };
@@ -1518,6 +3101,14 @@ registerProcessor('pcm-ring', PcmRing);
         view.setUint16(2, 0, true);
         view.setUint8(4, ev.gamepadId & 0xFF);
         view.setUint8(5, ev.connected ? 1 : 0);
+        if ((ev.kind & 0xFF) === GAMEPAD_MSG_CONNECTION) {
+          view.setUint8(6, ev.mapping & 0xFF);   // MAPPING_STANDARD | MAPPING_LEGACY
+          view.setUint8(7, 0);
+          view.setUint16(8, ev.vendorId & 0xFFFF, true);
+          view.setUint16(10, ev.productId & 0xFFFF, true);
+          view.setUint32(12, 0, true);
+          return 16;
+        }
         view.setUint16(6, ev.buttonBits & 0xFFFF, true);
         view.setInt16(8,  ev.axisLx | 0, true);
         view.setInt16(10, ev.axisLy | 0, true);
@@ -1548,10 +3139,13 @@ registerProcessor('pcm-ring', PcmRing);
 
     // SURFACE TRAITS authority — wasm_browser_surface_traits. The browser
     // runtime publisher (installSurfaceTraits in browser_overlay_runtime.js)
-    // coalesces resize / visualViewport / pointer-class / gamepad / audio
-    // changes to at most one record per animation frame and pushes:
+    // coalesces resize / visualViewport / device-pixel-ratio / pointer-class
+    // / gamepad / audio changes to at most one record per animation frame
+    // and pushes:
     //   { orientation, sizeClassW, sizeClassH, viewportW, viewportH,
-    //     modalities, gamepadCount, audioChannels, audioRateHz, epoch }
+    //     modalities, gamepadCount, audioChannels, audioRateHz, epoch, dpr8 }
+    // `dpr8` is `dpr_eighths`: surface pixels per logical pixel in eighths,
+    // 1..=255 when reported.
     // `host_surface_traits_pop` serialises it to the 24-byte MSG_TRAITS
     // record (input::surface_traits.rs). authority = 0 (browser).
     const surfaceTraitsQueue = window.__fluxor_surface_traits_queue
@@ -1574,9 +3168,74 @@ registerProcessor('pcm-ring', PcmRing);
         view.setUint32(16, (ev.epoch >>> 0), true);
         view.setUint8(20, 0);                            // AUTHORITY_BROWSER
         view.setUint8(21, (ev.displayCount == null ? 1 : ev.displayCount) & 0xFF); // a browser always has a display
-        view.setUint8(22, (ev.dpr8 || 0) & 0xFF);        // pad[0] = devicePixelRatio ×8 (DPR-aware raster)
+        view.setUint8(22, (ev.dpr8 || 0) & 0xFF);        // dpr_eighths; 0 = unreported
         view.setUint8(23, 0);
         return 24;
+      },
+    };
+
+    // ── Accessibility mirror bridge (wasm_browser_accessibility) ─────
+    //
+    // The native module checks tree batches where the kernel steps; the
+    // mirror is on the page. `onAccessibility(message)` carries what the
+    // module says to the mirror — `{ type: 'a11y', open: 'tree' | 'text' }`
+    // once, then `{ type: 'a11y', bytes }` per applied batch — and is a
+    // direct call on the page and a `postMessage` from a Worker. What the
+    // mirror raises comes back through the `accessibility_action` and
+    // `text` input queues.
+    const onAccessibility = o.onAccessibility || (() => {});
+    let a11yStaged = [];
+    const a11yActionQueue = inputQueueOf(window, 'accessibility_action');
+    const a11yTextQueue = inputQueueOf(window, 'text');
+    // A text edit as `src/platform/wasm/accessibility.rs` reads it:
+    //   [0] kind  [1] flags  [2..4] text_len  [4..8] target
+    //   [8..12] a  [12..16] b  [16..] text
+    const A11Y_EDIT_TEXT = 16;
+    const accessibilityShim = {
+      host_a11y_open: (treeWired) => {
+        onAccessibility({ type: 'a11y', open: treeWired ? 'tree' : 'text' });
+      },
+      host_a11y_stage: (ptr, len) => { a11yStaged.push(kview(ptr, len).slice()); },
+      host_a11y_commit: (apply) => {
+        const parts = a11yStaged;
+        a11yStaged = [];
+        if (!apply || parts.length === 0) return;
+        let total = 0;
+        for (const part of parts) total += part.length;
+        const bytes = new Uint8Array(total);
+        let at = 0;
+        for (const part of parts) { bytes.set(part, at); at += part.length; }
+        onAccessibility({ type: 'a11y', bytes });
+      },
+      host_a11y_action_pop: (bufPtr, bufLen) => {
+        if (a11yActionQueue.length === 0 || bufLen < A11Y_ACTION_SIZE) return 0;
+        const ev = a11yActionQueue.shift();
+        const view = new DataView(getKernel().exports.memory.buffer, bufPtr, A11Y_ACTION_SIZE);
+        view.setUint8(0, ev.msg & 0xFF);          // ACTION_*
+        view.setUint8(1, 0);
+        view.setUint16(A11Y_OFF_ACTION_LEN, A11Y_ACTION_LEN, true);
+        view.setUint32(A11Y_OFF_ACTION_ID, ev.id >>> 0, true);
+        view.setInt32(A11Y_OFF_ACTION_ARG, ev.arg | 0, true);
+        return A11Y_ACTION_SIZE;
+      },
+      host_a11y_text_pop: (bufPtr, bufLen) => {
+        while (a11yTextQueue.length > 0) {
+          const ev = a11yTextQueue.shift();
+          const text = ev.text || new Uint8Array(0);
+          const need = A11Y_EDIT_TEXT + text.length;
+          // An edit the module has no room for can never be taken.
+          if (need > bufLen) continue;
+          const view = new DataView(getKernel().exports.memory.buffer, bufPtr, need);
+          view.setUint8(0, ev.kind & 0xFF);
+          view.setUint8(1, ev.flags & 0xFF);
+          view.setUint16(2, text.length, true);
+          view.setUint32(4, ev.target >>> 0, true);
+          view.setUint32(8, ev.a >>> 0, true);
+          view.setUint32(12, ev.b >>> 0, true);
+          kview(bufPtr + A11Y_EDIT_TEXT, text.length).set(text);
+          return need;
+        }
+        return 0;
       },
     };
 
@@ -1909,22 +3568,40 @@ registerProcessor('pcm-ring', PcmRing);
     // when to PRESENT) — no page rAF present loop.
 
     // ── Canvas sink (wasm_browser_canvas) ────────────────────────────
+    //
+    // The canvas is the surface's extent in surface pixels. On the page it
+    // is an element mounted in `canvasContainer`; in a Worker it is the
+    // OffscreenCanvas the page transferred.
     let canvasEl = null;
     let canvasCtx = null;
-    let canvasImage = null;
+    // Regions of the frame in progress, staged until its last one.
+    let canvasStaged = [];
+    // RGBA scratch for a frame that is one region: painted at once, so it
+    // needs no copy of its own and the buffer is kept from frame to frame.
+    let canvasScratch = new Uint8ClampedArray(0);
     function ensureCanvas(w, h) {
-      if (canvasEl && canvasEl.width === w && canvasEl.height === h) return;
-      canvasEl = document.createElement('canvas');
-      canvasEl.width = w; canvasEl.height = h;
-      canvasEl.style.maxWidth = '100%';
-      canvasEl.style.height = 'auto';
-      if (canvasContainer) {
-        canvasContainer.replaceChildren(canvasEl);
+      if (canvasEl && canvasEl.width === w && canvasEl.height === h) return canvasCtx;
+      if (offscreenSurface) {
+        canvasEl = offscreenSurface;
+        canvasEl.width = w; canvasEl.height = h;
       } else {
-        document.body.appendChild(canvasEl);
+        canvasEl = document.createElement('canvas');
+        canvasEl.width = w; canvasEl.height = h;
+        canvasEl.style.maxWidth = '100%';
+        canvasEl.style.height = 'auto';
+        if (canvasContainer) {
+          // The surface's other children (the accessibility mirror among
+          // them) stay; only a canvas of another extent is replaced.
+          const old = canvasContainer.querySelector ? canvasContainer.querySelector('canvas') : null;
+          if (old && old.parentNode === canvasContainer) canvasContainer.replaceChild(canvasEl, old);
+          else canvasContainer.insertBefore(canvasEl, canvasContainer.firstChild || null);
+        } else {
+          document.body.appendChild(canvasEl);
+        }
       }
       canvasCtx = canvasEl.getContext('2d');
-      canvasImage = canvasCtx.createImageData(w, h);
+      if (!canvasCtx) onLog(3, '[canvas] the surface has no 2D context: it already presents another way');
+      return canvasCtx;
     }
 
     // ── DOM scrollback terminal (wasm_browser_terminal) ──────────────
@@ -1959,20 +3636,35 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
+    const CANVAS_PRESENT_FIRST = 1; // src/platform/wasm/canvas.rs PRESENT_FIRST
+    const CANVAS_PRESENT_LAST = 2;  // src/platform/wasm/canvas.rs PRESENT_LAST
     const canvasShim = {
-      // `format`: 0 = RGB565-LE (two bytes per pixel, what every producer
-      // predating the field emits), 1 = RGBA8888-LE (`r | g<<8 | b<<16`,
-      // alpha ignored). A producer whose source is already 8 bits per channel
-      // sends the second: narrowing to RGB565 on the way to a canvas that
-      // immediately widens it again throws away three bits for nothing.
-      // `format` is the SRF1 `fmt` byte from `src/platform/wasm/canvas.rs`:
-      // 0 = RGB565 little-endian, 1 = RGBA8888 in byte order. Anything else
-      // reads as RGB565, matching the Rust side's default.
-      host_canvas_present: (ptr, len, width, height, format) => {
-        ensureCanvas(width, height);
-        const src = kview(ptr, len);
-        const dst = canvasImage.data;
+      // One region of a frame: `width` x `height` pixels at (`x`, `y`) of a
+      // `surfaceW` x `surfaceH` surface. The kernel has read and checked the
+      // region's header; what arrives here is pixels and a rectangle.
+      // `format` is the raster format's position: 0 = RGB565 little-endian
+      // (two bytes per pixel), 1 = RGBA8 in R, G, B, A byte order (the alpha
+      // byte is carried and ignored: the canvas is opaque).
+      //
+      // Regions are staged and painted together at the frame's last one, so
+      // a frame of several regions appears whole. A region that opens a
+      // frame drops what was staged for a frame that never completed. A
+      // surface of another extent takes effect when its first frame is
+      // shown; until then the canvas keeps its picture.
+      host_canvas_present: (ptr, len, width, height, format, x, y, surfaceW, surfaceH, flags) => {
+        if (flags & CANVAS_PRESENT_FIRST) canvasStaged = [];
+        const bpp = format === 1 ? 4 : 2;
         const pixels = width * height;
+        if (pixels === 0 || pixels * bpp !== len) return;
+        const src = kview(ptr, len);
+        const whole = (flags & CANVAS_PRESENT_FIRST) && (flags & CANVAS_PRESENT_LAST);
+        let dst;
+        if (whole) {
+          if (canvasScratch.length < pixels * 4) canvasScratch = new Uint8ClampedArray(pixels * 4);
+          dst = canvasScratch.length === pixels * 4 ? canvasScratch : canvasScratch.subarray(0, pixels * 4);
+        } else {
+          dst = new Uint8ClampedArray(pixels * 4);
+        }
         if (format === 1) {
           for (let i = 0; i < pixels; i++) {
             const o = i * 4;
@@ -1983,15 +3675,21 @@ registerProcessor('pcm-ring', PcmRing);
             const lo = src[i * 2];
             const hi = src[i * 2 + 1];
             const v = (hi << 8) | lo;
-            const r = ((v >> 11) & 0x1F) * 255 / 31;
-            const g = ((v >> 5) & 0x3F) * 255 / 63;
-            const b = (v & 0x1F) * 255 / 31;
             const o = i * 4;
-            dst[o] = r; dst[o + 1] = g; dst[o + 2] = b; dst[o + 3] = 255;
+            dst[o] = ((v >> 11) & 0x1F) * 255 / 31;
+            dst[o + 1] = ((v >> 5) & 0x3F) * 255 / 63;
+            dst[o + 2] = (v & 0x1F) * 255 / 31;
+            dst[o + 3] = 255;
           }
         }
-        canvasCtx.putImageData(canvasImage, 0, 0);
-        onCanvasFrame(width, height);
+        canvasStaged.push({ data: dst, width, height, x, y });
+        if (!(flags & CANVAS_PRESENT_LAST)) return;
+        const staged = canvasStaged;
+        canvasStaged = [];
+        const ctx = ensureCanvas(surfaceW, surfaceH);
+        if (!ctx) return;
+        for (const r of staged) ctx.putImageData(new ImageData(r.data, r.width, r.height), r.x, r.y);
+        onCanvasFrame(surfaceW, surfaceH);
       },
     };
 
@@ -2037,7 +3735,8 @@ registerProcessor('pcm-ring', PcmRing);
     // getDisplayMedia is the browser's only display-capture API, so capture is
     // JS; everything downstream is the graph. We ask lazily on the first pull —
     // a share dialog at boot is a dialog with no context — draw each frame to an
-    // offscreen canvas, and hand the wasm side an SRF1 RGB565 frame.
+    // offscreen canvas, and hand the wasm side its pixels and their extent;
+    // the kernel writes the raster header.
     //
     // The person stopping the share is reported once, as ENDED, and the stream
     // is not restarted. Re-calling getDisplayMedia would re-open the picker; a
@@ -2078,41 +3777,42 @@ registerProcessor('pcm-ring', PcmRing);
         });
     }
     const displayCaptureShim = {
-      host_display_frame: (bufPtr, bufLen) => {
+      // Writes one frame as RGB565 little-endian pixels, rows top to bottom,
+      // into `bufLen` bytes at `bufPtr`, and the frame's width and height as
+      // two u32s at `extentPtr`. Returns the pixel bytes written, 0 when no
+      // frame is ready, or DISPLAY_ENDED.
+      host_display_frame: (bufPtr, bufLen, extentPtr) => {
         if (!dispState) { startDisplayCapture(); return 0; }
         const st = dispState;
         if (st.ended) return DISPLAY_ENDED;
         if (!st.ready || !st.video.videoWidth) return 0;
-        // The shared surface's own geometry, capped by what the graph sized its
-        // buffer for. The SRF1 header says which it turned out to be, so a
-        // consumer never has to guess.
-        const room = Math.max(0, (bufLen - 10) >> 1);
+        // The shared surface's own extent, scaled down to the room the graph
+        // sized its buffer for and no larger than a raster surface can be.
+        const room = Math.max(0, bufLen >> 1);
         let w = st.video.videoWidth;
         let h = st.video.videoHeight;
-        if (w * h > room) {
-          const scale = Math.sqrt(room / (w * h));
-          w = Math.max(1, Math.floor(w * scale));
-          h = Math.max(1, Math.floor(h * scale));
+        const fit = Math.min(1, Math.sqrt(room / (w * h)), 65535 / w, 65535 / h);
+        if (fit < 1) {
+          w = Math.max(1, Math.floor(w * fit));
+          h = Math.max(1, Math.floor(h * fit));
         }
-        if (w * h === 0 || 10 + w * h * 2 > bufLen) return 0;
+        if (w * h === 0 || w * h * 2 > bufLen) return 0;
         if (st.canvas.width !== w || st.canvas.height !== h) {
           st.canvas.width = w; st.canvas.height = h;
         }
         st.ctx.drawImage(st.video, 0, 0, w, h);
         const px = st.ctx.getImageData(0, 0, w, h).data;
-        const out = kview(bufPtr, 10 + w * h * 2);
-        out[0] = 0x53; out[1] = 0x52; out[2] = 0x46; out[3] = 0x31; // "SRF1"
-        out[4] = w & 0xFF; out[5] = (w >> 8) & 0xFF;
-        out[6] = h & 0xFF; out[7] = (h >> 8) & 0xFF;
-        out[8] = 1; // FMT_RGB565 (sector/modules/common/sector_raster.rs)
-        out[9] = 0;
-        for (let i = 0, p = 10; i < w * h; i++, p += 2) {
+        const out = kview(bufPtr, w * h * 2);
+        for (let i = 0, p = 0; i < w * h; i++, p += 2) {
           const o = i * 4;
           const v = ((px[o] >> 3) << 11) | ((px[o + 1] >> 2) << 5) | (px[o + 2] >> 3);
           out[p] = v & 0xFF;
           out[p + 1] = (v >> 8) & 0xFF;
         }
-        return 10 + w * h * 2;
+        const extent = new DataView(getKernel().exports.memory.buffer, extentPtr, 8);
+        extent.setUint32(0, w, true);
+        extent.setUint32(4, h, true);
+        return w * h * 2;
       },
     };
 
@@ -3782,6 +5482,7 @@ registerProcessor('pcm-ring', PcmRing);
         gamepadShim,
         actionShim,
         surfaceTraitsShim,
+        accessibilityShim,
         wsShim,
         httpShim,
         wsLinkShim,
@@ -3867,4 +5568,15 @@ registerProcessor('pcm-ring', PcmRing);
   window.fluxor.buildHostImports = buildHostImports;
   window.fluxor.parseAssetBank = parseAssetBank;
   window.fluxor.createAudioScheduler = createAudioScheduler; // shared by the Worker bridge
+  window.fluxor.installGamepadPoller = installGamepadPoller;
+  window.fluxor.pushInput = pushInput;                       // every page-side producer
+  window.fluxor.postInputBatch = postInputBatch;             // page → Worker
+  window.fluxor.putInputQueues = putInputQueues;             // Worker side of the same
+  window.fluxor.putDomInput = putDomInput;
+  window.fluxor.surfaceGeometry = surfaceGeometry;
+  window.fluxor.surfacePoint = surfacePoint;
+  window.fluxor.noteSurfaceExtent = noteSurfaceExtent;
+  window.fluxor.installKeyboard = installKeyboard;
+  window.fluxor.installWheel = installWheel;
+  window.fluxor.createAccessibilityMirror = createAccessibilityMirror;
 })();

@@ -42,7 +42,9 @@ fn find_node_image(
                     let held = |off: u32, len: u32| {
                         uf2::extract_region(memory, addr + off, len as usize).is_some()
                     };
-                    if held(h.modules_offset, h.modules_size) && held(h.config_offset, h.config_size) {
+                    if held(h.modules_offset, h.modules_size)
+                        && held(h.config_offset, h.config_size)
+                    {
                         return Ok((addr, h));
                     }
                 }
@@ -135,8 +137,12 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
             "Node image: header at 0x{image_addr:08x}, epoch {}, {}",
             header.epoch,
             if fluxor_abi::wire::node_image::signature(
-                &uf2::extract_region(&memory, image_addr, fluxor_abi::wire::node_image::HEADER_SIZE)
-                    .unwrap_or_default()
+                &uf2::extract_region(
+                    &memory,
+                    image_addr,
+                    fluxor_abi::wire::node_image::HEADER_SIZE
+                )
+                .unwrap_or_default()
             )
             .is_some()
             {
@@ -145,8 +151,14 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 "unsigned"
             }
         );
-        println!("  Modules: 0x{modules_addr:08x} ({} bytes)", header.modules_size);
-        println!("  Config:  0x{config_addr:08x} ({} bytes)", header.config_size);
+        println!(
+            "  Modules: 0x{modules_addr:08x} ({} bytes)",
+            header.modules_size
+        );
+        println!(
+            "  Config:  0x{config_addr:08x} ({} bytes)",
+            header.config_size
+        );
 
         // Check config magic
         if let Some(header_data) = uf2::extract_region(&memory, config_addr, 4) {
@@ -191,8 +203,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                         let fmod_offset =
                             u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
                         let fmod_size =
-                            u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
-                                as usize;
+                            u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
 
                         let fmod_addr = modules_addr + fmod_offset;
                         if let Some(fmod_header) =
@@ -236,11 +247,9 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                 let manifest_addr = fmod_addr + manifest_offset as u32;
 
                                 if manifest_size > 0 {
-                                    if let Some(manifest_data) = uf2::extract_region(
-                                        &memory,
-                                        manifest_addr,
-                                        manifest_size,
-                                    ) {
+                                    if let Some(manifest_data) =
+                                        uf2::extract_region(&memory, manifest_addr, manifest_size)
+                                    {
                                         match manifest::Manifest::from_bytes(&manifest_data) {
                                             Ok(m) => println!("{}", m.display()),
                                             Err(e) => println!("      manifest: error: {e}"),
@@ -473,8 +482,9 @@ fn generate_config_bytes(
 /// Refuse a module whose code is over the loader's ceiling for the target.
 ///
 /// The loader refuses it at boot ("code too large"), which on a board is a
-/// graph that never starts, found after a flash. The ceiling is the silicon's
-/// `module_code_kb`; a target that states none is not checked.
+/// graph that never starts, found after a flash. The ceiling is the kernel's
+/// `MAX_MODULE_CODE_SIZE` for the target
+/// (`TargetDescriptor::module_code_kb`); a target with no kernel has none.
 fn check_code_ceiling(
     modules: &[modules::ModuleInfo],
     target: &crate::target::TargetDescriptor,
@@ -492,11 +502,11 @@ fn check_code_ceiling(
         return Ok(());
     }
     Err(error::Error::Config(format!(
-        "{} over {}'s module code ceiling of {} B (module_code_kb in targets/silicon/{}.toml): the loader would refuse it at boot",
+        "{} over {}'s module code ceiling of {} B (the loader's `MAX_MODULE_CODE_SIZE`): the \
+         loader would refuse it at boot",
         over.join(", "),
         target.id,
         ceiling,
-        target.id
     )))
 }
 
@@ -550,6 +560,11 @@ fn check_state_budget(
         target.buffer_arena_kb.map(|kb| kb as u64 * 1024),
         config.get("capacity"),
     );
+    // An edge between cores takes its bridge ring out of the pool the RP
+    // arenas share, before they are placed.
+    let crossings = crate::config::core_crossings(config_data, &target.smp)?;
+    let bridged = crate::capacity::crossing_arena_charge(target.runtime(), crossings);
+    let arena = arena.saturating_sub(bridged);
     let mut total = 0u64;
     let mut unknown: Vec<&str> = Vec::new();
     let mut rows: Vec<(String, u64)> = Vec::new();
@@ -605,7 +620,9 @@ fn check_state_budget(
         };
         let state = m.manifest.state_bytes_64 as u64 * 64;
         let heap = crate::config::heap_cap_offset(params)
-            .map(|at| u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]]))
+            .map(|at| {
+                u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]])
+            })
             .unwrap_or(m.manifest.arena_bytes) as u64;
         let gated = levels.get(&m.name).copied().unwrap_or(default).is_gated();
         if gated && state != 0 && iso_arena.is_some() {
@@ -706,6 +723,11 @@ fn check_state_budget(
         } else {
             ""
         };
+        let by = if bridged > 0 {
+            format!("{by} (less {bridged} B for its {crossings} edge(s) between cores)")
+        } else {
+            by.to_string()
+        };
         let remedy = if crate::capacity::kernel_places_arenas(target.runtime()) {
             format!(
                 "give the state arena more: `capacity: {{ state_arena }}`, or state_arena_kb \
@@ -754,8 +776,8 @@ impl KernelCarves<'_> {
             .iter()
             .find(|&&(h, _)| h == hash)
             .map(|&(_, bytes)| state_carve(bytes as u64))?;
-        let seat = crate::capacity::kernel_native_seat(self.runtime, hash, params)
-            .map_or(0, state_carve);
+        let seat =
+            crate::capacity::kernel_native_seat(self.runtime, hash, params).map_or(0, state_carve);
         Some(state + seat)
     }
 
@@ -916,7 +938,10 @@ fn check_aarch64_payload_window(config_addr: u32, config: &[u8], firmware_end: u
 /// its own; the kernel stack is shared one module at a time, so the DEEPEST
 /// module on it — a maximum, not a sum — must fit what the kernel leaves
 /// (`TargetDescriptor::module_stack_limit`). A module with no figure is
-/// refused on a target without an MMU, where nothing traps an overrun.
+/// refused on a target without an MMU, where nothing traps an overrun. A
+/// module in a domain a core other than 0 runs, and not gated, steps on that
+/// core's stack and must also fit what it leaves
+/// (`TargetDescriptor::secondary_stack_limit`).
 fn check_stack_budget(
     modules: &[modules::ModuleInfo],
     config: &serde_json::Value,
@@ -938,6 +963,32 @@ fn check_stack_budget(
             limit,
             what,
         ));
+    }
+    // A module a core other than 0 steps runs on that core's stack, unless
+    // it is gated, when it steps on the stack in its own region.
+    if let Some((limit, what)) = target.secondary_stack_limit() {
+        for (ty, entry) in crate::protection::module_entries(config) {
+            let domain = crate::config::resolve_domain_id(entry, config)?;
+            if target.smp.domain_core(domain) == 0 {
+                continue;
+            }
+            let level = crate::protection::resolve(entry, config, &target.isolation.levels)
+                .map_or(crate::protection::Level::Privileged, |r| r.provided);
+            if level != crate::protection::Level::Privileged {
+                continue;
+            }
+            if let Some(m) = modules.iter().find(|m| m.name == ty) {
+                let row = (
+                    m.name.as_str(),
+                    m.manifest.stack_bytes_64 as u64 * 64,
+                    limit,
+                    what,
+                );
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
+            }
+        }
     }
     if rows.is_empty() {
         return Ok(());
@@ -982,6 +1033,153 @@ fn check_stack_budget(
             over.join(", "),
             target.id,
         )));
+    }
+    Ok(())
+}
+
+/// Every address the program section of the module table `modules_data` may
+/// sit at on a flash target: in the image at `image_addr` where the build
+/// places one (a firmware image carries its node image after the kernel),
+/// and in each of the board's two graph slots, where an update writes it.
+/// Empty for a table with no programs and for a target with no XIP flash.
+fn program_section_placements(
+    target: &crate::target::TargetDescriptor,
+    modules_data: &[u8],
+    config_data: &[u8],
+    image_addr: Option<u64>,
+) -> Result<Vec<(&'static str, u64)>> {
+    let at = crate::modules::TABLE_PROGRAMS_AT;
+    let section_at = modules_data
+        .get(at..at + 4)
+        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(layout) = target.graph_flash().filter(|_| section_at != 0) else {
+        return Ok(Vec::new());
+    };
+    let mut bases = Vec::new();
+    if let Some(addr) = image_addr {
+        bases.push(("after the kernel image", addr));
+    }
+    if layout.slot_size != 0 {
+        bases.push(("graph slot A", u64::from(XIP_BASE + layout.slot_a)));
+        bases.push(("graph slot B", u64::from(XIP_BASE + layout.slot_b)));
+    }
+    bases
+        .into_iter()
+        .map(|(place, base)| {
+            let header = crate::node_image::header(base, modules_data, config_data, 0)?;
+            Ok((
+                place,
+                base + u64::from(header.modules_offset) + u64::from(section_at),
+            ))
+        })
+        .collect()
+}
+
+/// The refusal of a node image of `len` bytes that does not fit `limit`: a
+/// graph slot of `board`, or the staging ceiling of a target with no flash
+/// slots. It names the image's three largest programs, which is where an
+/// asset too large for the board shows.
+fn image_overflow_refusal(
+    len: usize,
+    limit: usize,
+    board: Option<&str>,
+    programs: &[crate::modules::ProgramBlob],
+) -> String {
+    let held = if programs.is_empty() {
+        String::new()
+    } else {
+        format!(" Its largest programs: {}.", largest_programs(programs))
+    };
+    match board {
+        Some(board) => format!(
+            "Node image ({len} bytes) does not fit a graph slot of {board} ({limit} bytes).{held} \
+             Reduce its modules, config or programs."
+        ),
+        None => format!(
+            "Node image ({len} bytes) exceeds the size ceiling ({limit} bytes).{held} Reduce \
+             its modules, config or programs."
+        ),
+    }
+}
+
+/// The three largest programs of `programs`, as a refusal names them.
+fn largest_programs(programs: &[crate::modules::ProgramBlob]) -> String {
+    let mut by_size: Vec<&crate::modules::ProgramBlob> = programs.iter().collect();
+    by_size.sort_by_key(|p| std::cmp::Reverse(p.bytes.len()));
+    by_size
+        .iter()
+        .take(3)
+        .map(|p| {
+            format!(
+                "'{}' of module '{}' ({} B)",
+                p.label,
+                p.owner,
+                p.bytes.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuse an isolated instance whose programs the target's MPU cannot grant.
+///
+/// An isolated module reads its programs in place through one read-only MPU
+/// region over its owner region of the program section. PMSAv8 draws any
+/// 32-byte-granular span; PMSAv7 needs a power-of-two region aligned to its
+/// size, and a region it cannot draw exactly fails the instance's load at
+/// boot. `sections` names every address the program section may sit at (a
+/// placement and the section's first byte there); each isolated owner's
+/// region is planned at each.
+fn check_program_regions(
+    programs: &[crate::modules::ProgramBlob],
+    config: &serde_json::Value,
+    target: &crate::target::TargetDescriptor,
+    sections: &[(&str, u64)],
+) -> Result<()> {
+    use fluxor_contracts::isolation::RegionModel;
+    let Some(model @ RegionModel::Pmsav7 { .. }) = target.isolation.planner_model() else {
+        return Ok(());
+    };
+    let empty = Vec::new();
+    let entries = config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+    for region in crate::modules::program_regions(programs)? {
+        let Some(entry) = entries
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(region.owner.as_str()))
+        else {
+            continue;
+        };
+        let level = crate::protection::resolve(entry, config, &target.isolation.levels)
+            .map_or(crate::protection::Level::Privileged, |r| r.provided);
+        if level != crate::protection::Level::Isolated {
+            continue;
+        }
+        let bases: Vec<(&str, u64)> = sections
+            .iter()
+            .map(|&(place, at)| (place, at + region.offset as u64))
+            .collect();
+        if let Some(why) =
+            crate::protection::program_region_refusal(region.len as u64, &bases, model)
+        {
+            let held: Vec<&str> = programs
+                .iter()
+                .filter(|p| p.owner == region.owner)
+                .map(|p| p.label.as_str())
+                .collect();
+            return Err(Error::Config(format!(
+                "module '{}' is isolated and owns {} B of programs ({}), which {} grants as \
+                 one MPU region: {why}. Run it `protection: contained` (it then reads all of \
+                 flash), give it a smaller asset, or build for a target whose MPU draws any \
+                 span (rp2350).",
+                region.owner,
+                region.len,
+                held.join(", "),
+                target.id,
+            )));
+        }
     }
     Ok(())
 }
@@ -1318,15 +1516,21 @@ fn cmd_combine(
     // it, and the module table and config where `node_image::place` puts
     // them from there.
     let image_addr = firmware_max_addr.div_ceil(256) * 256;
-    let header = crate::node_image::header(
-        u64::from(image_addr),
-        &modules_data,
-        &config_data,
-        0,
-    )?;
+    let header = crate::node_image::header(u64::from(image_addr), &modules_data, &config_data, 0)?;
     let modules_addr = image_addr + header.modules_offset;
     let config_addr = image_addr + header.config_offset;
     let image_end = u64::from(image_addr) + header.end();
+    check_program_regions(
+        &programs,
+        &config,
+        &target_desc,
+        &program_section_placements(
+            &target_desc,
+            &modules_data,
+            &config_data,
+            Some(u64::from(image_addr)),
+        )?,
+    )?;
 
     // A RAM-loaded aarch64 image carries its node image below `.bss`: past
     // that boundary `_start` zeroes it before the kernel reads it.
@@ -1674,23 +1878,28 @@ pub fn cmd_workload_image(
         abi,
         project_root: project_root.as_path(),
     };
+    // The graph's `module_search_paths` reach its workload's modules as they
+    // reach a node graph's.
+    let search_paths = crate::config::extract_module_search_paths(&config, config_path);
+    let extra_dirs: Vec<&Path> = search_paths.iter().map(|p| p.as_path()).collect();
     let (workloads, env_binds) = crate::schema::with_env_binds(|| {
-        crate::config::build_workloads(&only, loc, &[], &target_desc.id)
+        crate::config::build_workloads(&only, loc, &extra_dirs, &target_desc.id)
     });
     let workloads = workloads?;
-    let graph = crate::add_subgraph::encode_workload(&workloads[0]).map_err(error::Error::Config)?;
+    let graph =
+        crate::add_subgraph::encode_workload(&workloads[0]).map_err(error::Error::Config)?;
     let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
     let mut modules = parse_modules_from_config_multi(
         &only,
         &module_root,
-        &[],
+        &extra_dirs,
         store_fb.as_deref().map(|f| f as _),
     )?;
     crate::modules::add_fan_modules(
         &mut modules,
         &workloads[0].graph.fan_types(),
         &module_root,
-        &[],
+        &extra_dirs,
         store_fb.as_deref().map(|f| f as _),
     )?;
     if modules.is_empty() {
@@ -1864,12 +2073,23 @@ fn cmd_node_image(
     let mut out = crate::node_image::compose(&modules_data, &config_data, epoch, seed.as_ref())?;
     let header = crate::node_image::read(&out, "the node image")?;
     let (modules_offset, config_offset) = (header.modules_offset, header.config_offset);
+    let programs = crate::modules::collect_programs(&config)?;
     if out.len() > image_size {
-        return Err(error::Error::Config(format!(
-            "Node image ({} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config.",
-            out.len()
+        return Err(error::Error::Config(image_overflow_refusal(
+            out.len(),
+            image_size,
+            flash_slot
+                .is_some()
+                .then(|| target_desc.board_id.as_deref().unwrap_or(&target_desc.id)),
+            &programs,
         )));
     }
+    check_program_regions(
+        &programs,
+        &config,
+        &target_desc,
+        &program_section_placements(&target_desc, &modules_data, &config_data, None)?,
+    )?;
     // A flash image ends on a whole page, which is what `graph_slot`
     // programs.
     if flash_slot.is_some() {
@@ -1906,7 +2126,10 @@ fn cmd_node_image(
 
 #[cfg(test)]
 mod state_budget_tests {
-    use super::check_state_budget;
+    use super::{
+        check_program_regions, check_stack_budget, check_state_budget, image_overflow_refusal,
+        program_section_placements,
+    };
     use crate::manifest::Manifest;
     use crate::modules::ModuleInfo;
     use serde_json::json;
@@ -2009,13 +2232,261 @@ mod state_budget_tests {
         let mods = [module("a", default / 2 + 1024)];
         check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
             .expect("one instance fits");
-        check_state_budget(&mods, &json!({}), &image(&[("a", &[]), ("a", &[])]), &target)
-            .expect_err("two instances do not");
+        check_state_budget(
+            &mods,
+            &json!({}),
+            &image(&[("a", &[]), ("a", &[])]),
+            &target,
+        )
+        .expect_err("two instances do not");
     }
 
     fn linux() -> crate::target::TargetDescriptor {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         crate::target::load_target("linux", &root).expect("linux target")
+    }
+
+    fn program(owner: &str, label: &str, len: usize) -> crate::modules::ProgramBlob {
+        crate::modules::ProgramBlob {
+            type_hash: crate::hash::fnv1a_hash(owner.as_bytes()),
+            ordinal: 0,
+            slot: 0,
+            kind: crate::hash::fnv1a_hash(label.as_bytes()),
+            format: [0; 32],
+            bytes: vec![0x5A; len],
+            owner: owner.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    /// Where the program section of a table holding `programs` sits in each
+    /// graph slot of `target`.
+    fn slot_placements(
+        target: &crate::target::TargetDescriptor,
+        programs: &[crate::modules::ProgramBlob],
+    ) -> Vec<(&'static str, u64)> {
+        let table = crate::modules::build_module_table_with_programs(&[], programs).unwrap();
+        let config = image(&[("probe", &[])]);
+        let places = program_section_placements(target, &table, &config, None).unwrap();
+        assert_eq!(
+            places.iter().map(|p| p.0).collect::<Vec<_>>(),
+            ["graph slot A", "graph slot B"]
+        );
+        places
+    }
+
+    /// An isolated instance reads its programs through one MPU region,
+    /// which PMSAv7 draws only as a power of two aligned to its size: a
+    /// 100 KiB asset is refused on RP2040 at build, where the load would
+    /// fail at boot. Contained, the module reads all of flash.
+    #[test]
+    fn an_isolated_rp2040_instance_with_an_asset_the_mpu_cannot_draw_is_refused() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let pico = crate::target::load_target("pico", &root).expect("pico target");
+        let programs = [program("probe", "probe.gpk", 100 * 1024)];
+        let graph =
+            |protection: &str| json!({"modules": [{"name": "probe", "protection": protection}]});
+        let places = slot_placements(&pico, &programs);
+        let e = check_program_regions(&programs, &graph("isolated"), &pico, &places)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("module 'probe' is isolated")
+                && e.contains("102400 B of programs (probe.gpk)")
+                && e.contains("graph slot")
+                && e.contains("protection: contained")
+                && e.contains("smaller asset")
+                && e.contains("rp2350"),
+            "{e}"
+        );
+        check_program_regions(&programs, &graph("contained"), &pico, &places)
+            .expect("a contained module reads all of flash");
+        // A region the MPU draws exactly is granted: 4 KiB on a page.
+        let small = [program("probe", "probe.gpk", 4096)];
+        check_program_regions(
+            &small,
+            &graph("isolated"),
+            &pico,
+            &slot_placements(&pico, &small),
+        )
+        .expect("a 4 KiB region on a 4 KiB boundary");
+        // PMSAv8 draws any 32-byte-granular span.
+        let pico2w = pico2w();
+        check_program_regions(
+            &programs,
+            &graph("isolated"),
+            &pico2w,
+            &slot_placements(&pico2w, &programs),
+        )
+        .expect("rp2350 draws the span");
+    }
+
+    /// A node image past its graph slot names the slot, the image and its
+    /// three largest programs.
+    #[test]
+    fn a_slot_overflow_names_the_largest_programs() {
+        let programs = [
+            program("menu", "icons.gpk", 40_000),
+            program("emu", "game.rom", 900_000),
+            program("view", "fonts.gpk", 120_000),
+            program("view2", "page.doc", 9_000),
+        ];
+        let e = image_overflow_refusal(1_300_000, 1_171_456, Some("pico2w"), &programs);
+        assert!(
+            e.contains("1300000 bytes")
+                && e.contains("graph slot of pico2w (1171456 bytes)")
+                && e.contains(
+                    "'game.rom' of module 'emu' (900000 B), 'fonts.gpk' of module 'view' \
+                     (120000 B), 'icons.gpk' of module 'menu' (40000 B)"
+                )
+                && !e.contains("page.doc"),
+            "{e}"
+        );
+        let e = image_overflow_refusal(10, 5, None, &[]);
+        assert!(
+            e.contains("size ceiling (5 bytes)") && !e.contains("largest"),
+            "{e}"
+        );
+    }
+
+    /// A built config of two modules, `a` in domain 0 and `b` in `domain`,
+    /// joined by one edge.
+    fn bridged_image(domain: u8) -> Vec<u8> {
+        use fluxor_contracts::boot_config::{encode, BootConfigSpec, DomainRecord};
+        use fluxor_contracts::graph::{EdgeRecord, Endpoint, GraphSpec, ModuleRecord};
+        let modules = [
+            ModuleRecord {
+                name_hash: crate::hash::fnv1a_hash(b"a"),
+                ..ModuleRecord::default()
+            },
+            ModuleRecord {
+                name_hash: crate::hash::fnv1a_hash(b"b"),
+                domain,
+                ..ModuleRecord::default()
+            },
+        ];
+        let edges = [EdgeRecord {
+            from: Endpoint::New(0),
+            to: Endpoint::New(1),
+            ..EdgeRecord::default()
+        }];
+        let domains = vec![DomainRecord::default(); usize::from(domain) + 1];
+        encode(&BootConfigSpec {
+            graph: GraphSpec {
+                order: &[0, 1],
+                modules: &modules,
+                edges: &edges,
+                ..GraphSpec::default()
+            },
+            domains: &domains,
+            ..BootConfigSpec::default()
+        })
+        .expect("encodes")
+    }
+
+    /// An edge between core 0 and core 1 takes its bridge ring from the pool
+    /// the RP arenas share, so the state arena a graph is admitted against
+    /// is that much smaller. An edge between two domains of core 0, and any
+    /// edge on RP2040, takes nothing.
+    #[test]
+    fn an_edge_between_rp2350_cores_shrinks_the_state_arena() {
+        let target = pico2w();
+        let default = target.state_arena_kb.expect("an RP arena") as u64 * 1024;
+        let ring = crate::capacity::RP_CORE_CROSSING_BYTES;
+        assert_eq!(
+            crate::config::core_crossings(&bridged_image(1), &target.smp).unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::config::core_crossings(&bridged_image(2), &target.smp).unwrap(),
+            0
+        );
+        // State that fits the whole arena with 8 KiB to spare, but not the
+        // arena less one ring.
+        let mods = [module("a", default - 8 * 1024), module("b", 64)];
+        check_state_budget(&mods, &json!({}), &bridged_image(2), &target)
+            .expect("domains 0 and 2 share core 0");
+        let e = check_state_budget(&mods, &json!({}), &bridged_image(1), &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("arena is {} B", default - ring))
+                && e.contains(&format!("less {ring} B for its 1 edge(s) between cores")),
+            "{e}"
+        );
+        let small = [module("a", default - ring - 8 * 1024), module("b", 64)];
+        check_state_budget(&small, &json!({}), &bridged_image(1), &target)
+            .expect("fits beside the ring");
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let pico = crate::target::load_target("pico", &root).expect("pico target");
+        assert_eq!(
+            crate::config::core_crossings(&bridged_image(1), &pico.smp).unwrap(),
+            0
+        );
+        // The Pi 5 bridges the edge, from tables its kernel sizes apart.
+        let pi5 = crate::target::load_target("pi5", &root).expect("pi5 target");
+        assert_eq!(
+            crate::config::core_crossings(&bridged_image(1), &pi5.smp).unwrap(),
+            1
+        );
+        assert_eq!(crate::capacity::crossing_arena_charge(pi5.runtime(), 1), 0);
+    }
+
+    fn module_with_stack(name: &str, stack: u64) -> ModuleInfo {
+        let mut m = module(name, 64);
+        m.manifest.stack_bytes_64 = (stack / 64) as _;
+        m
+    }
+
+    /// A module core 1 steps ungated runs on core 1's stack, which leaves
+    /// it the stack less the kernel's reserve on RP2350; gated, it steps on
+    /// the stack in its own region. A domain core 0 runs, and a target with
+    /// one core, hold it to the kernel stack only.
+    #[test]
+    fn a_module_on_a_secondary_core_fits_that_cores_stack() {
+        let target = pico2w();
+        let (size_kb, reserve_kb) = target.smp.secondary_stack_kb.expect("core 1's stack");
+        let limit = u64::from(size_kb - reserve_kb) * 1024;
+        assert_eq!(
+            target.secondary_stack_limit().map(|(bytes, _)| bytes),
+            Some(limit)
+        );
+        let over = limit + 1024;
+        let deep = [module_with_stack("deep", over)];
+        let shallow = [module_with_stack("deep", limit - 1024)];
+        let graph = |domain: &str, protection: Option<&str>| {
+            let mut m = json!({"name": "deep", "domain": domain});
+            if let Some(p) = protection {
+                m["protection"] = json!(p);
+            }
+            json!({
+                "execution": {"domains": [{"name": "main"}, {"name": "second"}, {"name": "third"}]},
+                "modules": [m],
+            })
+        };
+        let e = check_stack_budget(&deep, &graph("second", None), &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("deep")
+                && e.contains(&format!("{over} B"))
+                && e.contains("secondary core")
+                && e.contains(&format!("{limit} B")),
+            "{e}"
+        );
+        check_stack_budget(&shallow, &graph("second", None), &target).expect("fits core 1's stack");
+        check_stack_budget(&deep, &graph("second", Some("contained")), &target)
+            .expect("a gated module steps on its own region's stack");
+        check_stack_budget(&deep, &graph("main", None), &target).expect("core 0's stack");
+        check_stack_budget(&deep, &graph("third", None), &target)
+            .expect("domain 2 shares core 0's loop");
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let pico = crate::target::load_target("pico", &root).expect("pico target");
+        assert_eq!(pico.secondary_stack_limit(), None);
+        check_stack_budget(&deep, &graph("second", None), &pico)
+            .expect("RP2040 steps every domain on core 0");
     }
 
     fn wasm() -> crate::target::TargetDescriptor {
@@ -2049,7 +2520,10 @@ mod state_budget_tests {
         let e = check_state_budget(&mods, &cfg, &graph, &target)
             .unwrap_err()
             .to_string();
-        assert!(e.contains(&format!("needs {need} B")) && e.contains("over by 1 B"), "{e}");
+        assert!(
+            e.contains(&format!("needs {need} B")) && e.contains("over by 1 B"),
+            "{e}"
+        );
     }
 
     /// A type that is neither a module of the image nor one of the target's
@@ -2058,9 +2532,14 @@ mod state_budget_tests {
     fn an_unknown_native_is_refused() {
         let target = linux();
         let cfg = json!({"modules": [{"name": "no_such_native"}]});
-        let e = check_state_budget(&[module("a", 64)], &cfg, &image(&[("a", &[]), ("no_such_native", &[])]), &target)
-            .unwrap_err()
-            .to_string();
+        let e = check_state_budget(
+            &[module("a", 64)],
+            &cfg,
+            &image(&[("a", &[]), ("no_such_native", &[])]),
+            &target,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("`no_such_native`"), "{e}");
     }
 
@@ -2126,9 +2605,14 @@ mod state_budget_tests {
             &crate::config::HeapPlan::default(),
         )
         .expect("heap tags");
-        assert!(params.windows(3).any(|w| w == [0xEE, 1, 1]), "marked 0xEE: {params:x?}");
+        assert!(
+            params.windows(3).any(|w| w == [0xEE, 1, 1]),
+            "marked 0xEE: {params:x?}"
+        );
         let cap: u32 = 64 + 2 * 387_224;
-        assert!(params.windows(6).any(|w| w[..2] == [0xEF, 4] && w[2..] == cap.to_le_bytes()));
+        assert!(params
+            .windows(6)
+            .any(|w| w[..2] == [0xEF, 4] && w[2..] == cap.to_le_bytes()));
         let mods = [ModuleInfo {
             name: "tc".into(),
             name_hash: crate::hash::fnv1a_hash(b"tc"),
@@ -2162,7 +2646,9 @@ mod state_budget_tests {
         // memory, so the host's carve is all it takes from the arena.
         let mods = [module_with_heap("a", 4096, 8192), module("z", 0)];
         // width 320 (tag 10), height 200 (tag 11).
-        let wh: &[u8] = &[0xFE, 0x01, 10, 0, 10, 2, 0x40, 0x01, 11, 2, 0xC8, 0x00, 0xFF, 0x00];
+        let wh: &[u8] = &[
+            0xFE, 0x01, 10, 0, 10, 2, 0x40, 0x01, 11, 2, 0xC8, 0x00, 0xFF, 0x00,
+        ];
         let graph = image(&[("a", &[]), ("z", &[]), ("wasm_browser_canvas", wh)]);
         let [base, per_pixel, ..] = canvas::HEAP_SEAT;
         let seat = base + per_pixel * 320 * 200;
@@ -2200,7 +2686,10 @@ mod state_budget_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("isolated-module arena"), "{e}");
-        assert_eq!(crate::capacity::iso_carve(4096) + crate::capacity::iso_carve(8192), 8192 + 12288);
+        assert_eq!(
+            crate::capacity::iso_carve(4096) + crate::capacity::iso_carve(8192),
+            8192 + 12288
+        );
     }
 
     /// RP commits a heap whole at instantiation, so the cap is charged beside
@@ -2214,7 +2703,9 @@ mod state_budget_tests {
         let mods = [module_with_heap("a", state, 32 * 1024)];
         check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
             .expect_err("the declared heap does not fit beside the state");
-        let small_cap: &[u8] = &[0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x20, 0x00, 0x00, 0xFF, 0x00];
+        let small_cap: &[u8] = &[
+            0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x20, 0x00, 0x00, 0xFF, 0x00,
+        ];
         check_state_budget(&mods, &json!({}), &image(&[("a", small_cap)]), &target)
             .expect("an 8 KiB instance cap fits");
     }

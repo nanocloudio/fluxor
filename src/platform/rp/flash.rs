@@ -420,12 +420,13 @@ pub mod store {
         let (Some(rom), Some(erase)) = (bootrom::FlashRom::resolve(), bootrom::erase_fn()) else {
             return crate::kernel::sys::errno::ENOSYS;
         };
-        // SAFETY: offset alignment + writable-region check above; with_flash_op
-        // disables IRQs and detaches XIP across the ROM-bootloader call.
+        // SAFETY: offset alignment + writable-region check above;
+        // `with_xip_detached` masks interrupts, parks the other core and
+        // quiesces flash readers across the ROM-bootloader call.
         unsafe {
-            match with_flash_op(|| flash_erase_sector(&rom, erase, offset)) {
+            match with_xip_detached(true, || flash_erase_sector(&rom, erase, offset)) {
                 Ok(()) => 0,
-                Err(()) => crate::kernel::sys::errno::ERROR,
+                Err(e) => e,
             }
         }
     }
@@ -441,12 +442,15 @@ pub mod store {
         else {
             return crate::kernel::sys::errno::ENOSYS;
         };
-        // SAFETY: writable-region check above; with_flash_op disables IRQs
-        // and detaches XIP. `page` holds exactly PAGE_SIZE readable bytes.
+        // SAFETY: writable-region check above; `with_xip_detached` masks
+        // interrupts, parks the other core and quiesces flash readers.
+        // `page` holds exactly PAGE_SIZE readable bytes.
         unsafe {
-            match with_flash_op(|| flash_program_page(&rom, program, offset, page.as_ptr())) {
+            match with_xip_detached(true, || {
+                flash_program_page(&rom, program, offset, page.as_ptr())
+            }) {
                 Ok(()) => 0,
-                Err(()) => crate::kernel::sys::errno::ERROR,
+                Err(e) => e,
             }
         }
     }
@@ -455,29 +459,116 @@ pub mod store {
     // Flash hardware operations (ROM bootloader calls)
     // ============================================================================
 
-    /// Execute a flash operation within a critical section with DMA safety.
+    /// Run `op`, which takes the QSPI pads or leaves execute-in-place mode,
+    /// with nothing left that could fetch from flash meanwhile. Every such
+    /// path goes through here: sector erase, page program and the BOOTSEL
+    /// sideband read.
     ///
-    /// Acquires exclusive flash access, disables interrupts, waits for all
-    /// DMA channels reading from flash to complete, then runs the operation.
-    unsafe fn with_flash_op<F: FnOnce()>(op: F) -> Result<(), ()> {
+    /// In order, with interrupts masked throughout: the other core is parked
+    /// in RAM between two of its module steps; every DMA channel reading from
+    /// flash is waited out; `op` runs; the other core is released. The time
+    /// all of it took is the kernel's, not the stepping module's, so this
+    /// core's step deadline moves past it instead of firing the moment
+    /// interrupts return.
+    ///
+    /// Refused, with nothing detached: `ENOTSUP` on a core other than 0
+    /// (only core 0 detaches XIP); `EBUSY` when the other core did not reach
+    /// a park point within its step's deadline, or a DMA channel reading
+    /// flash did not finish within the quiesce limit. Each bound is a
+    /// refusal the caller sees, never a wait without end.
+    ///
+    /// `flushes_cache` says `op` empties the execute-in-place cache (an
+    /// erase or a program does; the BOOTSEL read does not): the code both
+    /// cores run next is then fetched from flash again, and each core's
+    /// steps are allowed that refill once on top of their deadlines.
+    ///
+    /// # Safety
+    /// `op` and everything it calls lie in RAM and restore XIP before
+    /// returning.
+    pub(super) unsafe fn with_xip_detached<R>(
+        flushes_cache: bool,
+        op: impl FnOnce() -> R,
+    ) -> Result<R, i32> {
+        let mut op = Some(op);
+        let mut answer = None;
+        // SAFETY: the caller's contract, passed on; `op` runs at most once.
+        unsafe {
+            detached(flushes_cache, &mut || {
+                answer = op.take().map(|run| run());
+            })
+        }?;
+        answer.ok_or(crate::kernel::sys::errno::EBUSY)
+    }
+
+    /// [`with_xip_detached`] for an operation that answers nothing: the one
+    /// body every caller shares.
+    ///
+    /// # Safety
+    /// As [`with_xip_detached`].
+    #[inline(never)]
+    unsafe fn detached(flushes_cache: bool, op: &mut dyn FnMut()) -> Result<(), i32> {
+        use crate::kernel::sys::errno;
         use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
 
-        crate::arch::cortex_m::interrupt_free(|| {
-            if !quiesce_flash_readers(QUIESCE_LIMIT) {
-                // Refuse rather than erase underneath a live read. The
-                // wait is bounded so a stuck channel is reported here rather
-                // than presenting as a hang.
-                return Err(());
-            }
-            // The op stalls the whole chip, so its time is the kernel's,
-            // not the stepping module's: the step guard's deadline moves
-            // past it rather than firing the moment interrupts return.
+        #[cfg(feature = "smp")]
+        if crate::platform::chip::core_id() != 0 {
+            return Err(errno::ENOTSUP);
+        }
+        let outcome = crate::arch::cortex_m::interrupt_free(|| {
             let started = crate::platform::rp_timer::alarm::now_raw_lo();
-            op();
+            #[cfg(feature = "smp")]
+            let parked = match crate::platform::rp_core1::park_for_xip_detach() {
+                Ok(parked) => parked,
+                Err(_) => return Err(Refusal::OtherCore),
+            };
+            // Refuse rather than detach underneath a live read. The wait is
+            // bounded so a stuck channel is reported here rather than
+            // presenting as a hang.
+            let r = if quiesce_flash_readers(QUIESCE_LIMIT) {
+                // An erase or a program holds interrupts for longer than a
+                // DMA scan list may take to come round: its armed entries
+                // go back to fill first, so none is sent twice. The lists
+                // read RAM, so nothing above waited on them.
+                if flushes_cache {
+                    crate::platform::rp_providers::dma_lists_disarm_all();
+                }
+                op();
+                Ok(())
+            } else {
+                Err(Refusal::DmaReader)
+            };
+            #[cfg(feature = "smp")]
+            if parked {
+                crate::platform::rp_core1::release_after_xip_detach();
+            }
             let took = crate::platform::rp_timer::alarm::now_raw_lo().wrapping_sub(started);
             crate::platform::rp_step_guard::rp_step_guard_defer(took);
-            Ok(())
+            if r.is_ok() && flushes_cache {
+                crate::platform::rp_step_guard::xip_cache_flushed();
+            }
+            r
+        });
+        outcome.map_err(|why| {
+            match why {
+                #[cfg(feature = "smp")]
+                Refusal::OtherCore => log::warn!(
+                    "[flash] core 1 did not park within its step deadline; XIP detach refused"
+                ),
+                Refusal::DmaReader => {
+                    log::warn!("[flash] a DMA channel is still reading flash; XIP detach refused")
+                }
+            }
+            errno::EBUSY
         })
+    }
+
+    /// Why [`with_xip_detached`] detached nothing.
+    enum Refusal {
+        /// The other core did not park in time.
+        #[cfg(feature = "smp")]
+        OtherCore,
+        /// A DMA channel reading flash did not finish in time.
+        DmaReader,
     }
 
     /// Copy boot2 into a RAM buffer and return a callable function pointer.
@@ -499,7 +590,7 @@ pub mod store {
     /// Erase one 4KB sector at the given flash offset.
     ///
     /// # Safety
-    /// Must be called within `with_flash_op` (interrupts disabled, DMA idle).
+    /// Must be called within `with_xip_detached`.
     #[inline(never)]
     #[link_section = ".data.ram_func"]
     unsafe fn flash_erase_sector(rom: &bootrom::FlashRom, erase: bootrom::EraseFn, offset: u32) {
@@ -532,7 +623,7 @@ pub mod store {
     /// `data` must point to exactly 256 bytes in SRAM.
     ///
     /// # Safety
-    /// Must be called within `with_flash_op` (interrupts disabled, DMA idle).
+    /// Must be called within `with_xip_detached`.
     #[inline(never)]
     #[link_section = ".data.ram_func"]
     unsafe fn flash_program_page(
@@ -574,9 +665,10 @@ pub mod xip_lock {
     //! Provides exclusive access to named critical resources (e.g., FLASH_XIP)
     //! and sideband operations that require exclusive resource access.
     //!
-    //! The resource lock is a lightweight CAS-based mechanism. On the single-core
+    //! The resource lock is a lightweight CAS-based mechanism. Under the
     //! cooperative scheduler, contention only arises when a module holds a lock
-    //! across step() boundaries (which is discouraged for FLASH_XIP).
+    //! across step() boundaries (which is discouraged for FLASH_XIP), or when
+    //! modules on two cores ask at once.
     //!
     //! Flash sideband operations (e.g., BOOTSEL button read) use an atomic
     //! lock-read-unlock pattern: acquire FLASH_XIP, perform the operation with
@@ -723,35 +815,21 @@ pub mod xip_lock {
 
     /// Read the BOOTSEL button state.
     ///
-    /// Temporarily disconnects flash and samples the QSPI SS pad as a GPIO input.
-    /// Must run entirely from RAM with interrupts disabled.
+    /// Temporarily disconnects flash and samples the QSPI SS pad as a GPIO
+    /// input, from RAM, through `store::with_xip_detached`.
     ///
-    /// Returns 0 (not pressed) or 1 (pressed).
+    /// Returns 0 (not pressed) or 1 (pressed), or the errno of a refused
+    /// detach: a read that never ran samples nothing.
     fn read_bootsel() -> i32 {
         use crate::platform::chip;
-        use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
 
-        let mut sio_hi_sample: u32 = 0;
-        let mut quiesced = false;
-
-        crate::arch::cortex_m::interrupt_free(|| {
-            if !quiesce_flash_readers(QUIESCE_LIMIT) {
-                return;
-            }
-            quiesced = true;
-
-            // SAFETY: called inside interrupt-free, IO-quiesced critical
-            // section; the RAM-resident routine briefly detaches flash to
-            // read the QSPI SS pad.
-            let (_status, sio) = unsafe { read_bootsel_io_qspi() };
-            sio_hi_sample = sio;
-        });
-
-        // A read that never ran samples nothing; reporting "not pressed" is
-        // the safe answer, since the alternative is a spurious BOOTSEL entry.
-        if !quiesced {
-            return 0;
-        }
+        // SAFETY: the RAM-resident routine briefly releases the flash chip
+        // select to read the QSPI SS pad and restores it before returning.
+        let sio_hi_sample =
+            match unsafe { super::store::with_xip_detached(false, || read_bootsel_io_qspi().1) } {
+                Ok(sample) => sample,
+                Err(e) => return e,
+            };
 
         // BOOTSEL is active-low: pressed when the QSPI SS bit is LOW.
         if (sio_hi_sample >> chip::BOOTSEL_QSPI_SS_BIT) & 1 == 0 {

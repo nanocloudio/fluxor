@@ -25,7 +25,12 @@ bundle.
   `host_audio_play`, `host_canvas_present`, `host_input_pop`,
   `host_ws_*`, `host_image_decode_*`, `host_instantiate_module` and
   the child-module syscall bridge). Every kernel-side extern fn has a
-  matching shim entry; a missing one fails CI.
+  matching shim entry; a missing one fails CI. It also holds what the
+  page itself runs for the kernel's input and accessibility modules,
+  so both are loadable (and tested) outside a browser page: the input
+  queues and their caps, the gamepad poller, the keyboard and wheel
+  producers, and the accessibility mirror with its text field
+  (`docs/architecture/wasm_browser_host.md` §4.8, §4.9).
 
 - **`endpoint_runtime.js`** — generic reusable browser-endpoint
   runtime (exposes `window.BrowserSurface`) described

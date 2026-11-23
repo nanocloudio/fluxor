@@ -150,6 +150,70 @@ If LEDs are not tied to the audio sample clock, they will still have their own o
 
 ---
 
+## 10) Measuring a region: cycle and cache counters
+
+Stream time says when something should happen. To learn what a piece of a
+module's own code costs, read the target's counters around it through the
+`counters` contract (`fluxor_rt::counters`). A module that reads them
+declares `grants = ["counters"]`: an instruction-cache count that covers the
+whole node moves with every other owner's code, so the read is granted, not
+free.
+
+```rust
+let what = counters::describe(sys)?;      // once: which counters, which clock
+let cost = counters::calibrate(sys)?;     // once: cycles one read costs this module
+let before = counters::read(sys)?;
+hot_loop();
+let after = counters::read(sys)?;
+let ran = counters::elapsed(&before, &after);
+let cycles = ran.cycles.saturating_sub(cost);
+```
+
+What the numbers mean is the target's, and `describe` says it:
+
+| Target | Cycle count | Instruction-cache counts |
+|---|---|---|
+| rp2350 | the calling core's own cycle counter, at the system clock | the execute-in-place cache's hits and accesses, one pair for both cores and every flash-reading transfer (`node`) |
+| rp2040 | the 1 MHz timer (`system`): microseconds, not core cycles | the execute-in-place cache's, for the node |
+| bcm2712 | the calling core's cycle counter | the calling core's L1 instruction-cache accesses and hits (`core`); on a machine that enters the kernel below EL2, the system clock and no cache count |
+| uefi, linux, wasm | a system clock (`system`), at the rate `describe` reports | none |
+
+A target states the same in its `[counters]` table, as the facts of the
+target capabilities `counter.cycles` (`clock = "core" | "system"`) and
+`counter.icache` (`scope = "core" | "node"`). A module that cannot work
+without one requires it and is refused at build for a target that lacks it;
+a module that only reports takes what `describe` answers. A counter the
+target lacks reads zero with its `present` bit clear.
+
+Rules for a measurement that means something:
+
+- **Every count wraps at 32 bits.** Subtract two readings with `elapsed`,
+  and keep a region shorter than one wrap: 28 s of cycles at 150 MHz.
+- **Subtract the read.** A read is a kernel call and costs cycles of its
+  own, more through the gateway when the module is gated. `calibrate`
+  measures it the way this module pays it.
+- **Warm the region first.** Run the loop once before the first reading, so
+  the figure is the loop's steady cost and not the cache filling.
+- **Measure many iterations between two readings**, a thousand or more, not
+  one iteration a thousand times: the cost of the readings then disappears
+  into the total.
+- **The counts are the core's, not the module's.** Everything that ran on
+  the core between the readings is in them: interrupts, and kernel work.
+  With scope `node` the cache counts also include the other core and
+  flash-reading transfers. No attribution to a module is claimed; measure in
+  the graph the module will run in, since the other modules' code competes
+  for the cache there as it will in use.
+- **A hit rate is hits over accesses of the same region.** On an
+  execute-in-place target a hot loop that outgrows the cache shows here
+  first: the loop runs several times slower than the same code running
+  from cache.
+
+A module that publishes what it measured emits it as measurement records
+(content type `MeasurementStream`, capability `measurement.stream` with the
+block's shape in its facts), so any measurement consumer takes it unchanged.
+
+---
+
 ## Checklist for new modules
 
 - Does the module operate in stream frames, not wall-clock ms?

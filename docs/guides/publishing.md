@@ -45,7 +45,7 @@ project index (`fluxor/meta`) lists:
 | Artefact | Content | Tag |
 |---|---|---|
 | Module crate source trees | canonical tars of `crates/fluxor-abi/**`, `crates/fluxor-sdk/**` and `crates/fluxor-rt/**`, unprefixed; `fluxor sync` extracts each to `target/fluxor/<name>/`, where `fluxor modules build` compiles it to the rlib every module links | `fluxor/src/fluxor-abi:<ver>`, `fluxor/src/fluxor-sdk:<ver>`, `fluxor/src/fluxor-rt:<ver>` |
-| Contracts source tree | canonical tar of `contracts/src/**` mapped under a `src/` path prefix | `fluxor/src/fluxor-contracts:<ver>` |
+| Contracts crate | canonical tar of `contracts/Cargo.toml` and `contracts/src/**`; `fluxor sync` extracts it to `target/fluxor/fluxor-contracts/`, where the module build compiles it and a cargo project depends on it by path | `fluxor/src/fluxor-contracts:<ver>` |
 | fmod palette | compiled `.fmod` + manifest for every module this repo owns (every layer under `modules/`), per declared module ABI shelf | `<abi>/<name>:<ver>` |
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
 | Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
@@ -303,6 +303,22 @@ make build && make publish  # fluxor build, then fluxor publish
   resolved digests through, so the change is visible as an ordinary
   lockfile diff. An artefact fluxor publishes for the first time
   arrives with `fluxor update`.
+- **A member's working tree is not read.** A consumer computes the ABI
+  epoch from its CLI and resolves stacks, target descriptors and the
+  manifests of the native modules Fluxor's runtimes carry from the
+  `fluxor-catalog` source it syncs (`target/fluxor/fluxor-catalog/`), so
+  an edit in progress in Fluxor's checkout reaches no consumer. A module
+  of another project resolves from that project's pins; no project reads
+  a checkout of a project it does not depend on. To build
+  against Fluxor work not yet published, name the checkout under
+  `live_trees` in `~/.fluxor/workspace.toml`
+  (`live_trees = ["/path/to/fluxor"]`); the epoch and the catalog then
+  come from that tree, and a tree that does not parse is reported by
+  name.
+- **Board kernel images are runtimes.** Fluxor publishes each board's
+  `firmware.elf` and `firmware.bin` it has built; sync writes them to
+  `target/<board>/`, where a firmware-image build and a rig scenario read
+  them, so a consumer needs no Fluxor checkout to build for a board.
 - **Pinned checkouts** stay on their digests until they run
   `fluxor update`, which also pins every stack and workload package the project
   references by name.

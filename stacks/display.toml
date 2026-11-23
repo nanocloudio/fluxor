@@ -1,9 +1,19 @@
-# Display stack — provides a `display` sink that consumes RGB565 frames.
+# Display stack — provides a `display` sink.
 #
-# Logical name: `display`. Apps wire `<producer>.pixels -> display.pixels`
-# without naming a concrete driver. The stack picks the implementation
-# from board / family / driver so the same graph runs on hardware and
-# on the Linux host.
+# Logical name: `display`. Apps wire to it without naming a concrete
+# driver; the stack picks the implementation from board / family / driver.
+#
+# What a graph wires depends on what the sink holds:
+#
+# - A sink with a framebuffer (the Linux window, the browser canvas) takes
+#   rasters: `<producer>.pixels -> display.pixels`. A draw list reaches it
+#   through `draw_raster` (`<producer>.draw -> raster.draw`,
+#   `raster.pixels -> display.pixels`).
+# - The ST7701S panel has no framebuffer: it retains a draw list and draws
+#   it again every refresh. `<producer>.draw -> display.draw`. A raster is
+#   placed by the draw list's SURFACE records, or shown scaled when no
+#   draw list is wired, through `display.surface0`; the graph gives
+#   `surface_bytes`, the largest surface it sends.
 
 [stack]
 name = "display"
@@ -12,7 +22,12 @@ name = "display"
 [[variant]]
 match = { board = "waveshare-lcd4" }
 modules = [
-  { name = "display", type = "st7701s" },
+  { name = "display", type = "st7701s",
+    params = {
+      refresh_mhz   = "user:refresh_mhz|60000",
+      surface_bytes = "user:surface_bytes|0",
+    },
+  },
 ]
 wiring = []
 

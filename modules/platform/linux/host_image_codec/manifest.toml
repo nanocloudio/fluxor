@@ -12,11 +12,16 @@ direction = "input"
 content_type = "OctetStream"
 required = true
 
+# One record a decoded picture: the region header of a whole-surface frame
+# (`abi::contracts::video_raster`), then `width` x `height` RGB565 pixels.
 [[ports]]
 name = "pixels"
 direction = "output"
 content_type = "VideoRaster"
 required = true
+[ports.facts]
+formats = ["rgb565"]
+regions = ["bands"]
 
 [[params]]
 name = "width"

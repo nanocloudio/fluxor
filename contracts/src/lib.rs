@@ -20,6 +20,7 @@ extern crate alloc;
 
 pub mod boot;
 pub mod boot_config;
+pub mod core_map;
 pub mod graph;
 pub mod isolation;
 #[cfg(feature = "alloc")]
@@ -214,6 +215,21 @@ pub const CONTENT_TYPES: &[&str] = &[
     // composer refusing a 3-channel producer wired to a 1-channel consumer at
     // build time is the check that can actually act.
     "MeasurementStream",
+    // Text and composition records — what a platform's text machinery did
+    // for an application that draws its own text fields: committed text, an
+    // input method's preedit, deletions and selection moves, per
+    // `crates/fluxor-abi/src/contracts/input/text.rs`. Keys stay on
+    // `KeyEvents`; a key whose effect arrived here is flagged there.
+    "TextEvents",
+    // The accessibility tree of an application that draws its own controls —
+    // node upserts, removals, focus and announcements in batches a mirror
+    // applies atomically, per `crates/fluxor-abi/src/contracts/accessibility.rs`.
+    // Flows from the application to a platform mirror.
+    "AccessibilityTree",
+    // What assistive technology did to a mirrored control — activate, focus,
+    // set a value — and a mirror's request for the whole tree: fixed 12-byte
+    // records flowing from the mirror back to the application.
+    "AccessibilityActions",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -354,6 +370,11 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     // buffer sizing that follows from `Control` would stall it. A producer with
     // an unusual cadence still declares `rate:` on the edge.
     Bulk, // MeasurementStream
+    // Typing cadence: a record per edit, a paste as a run of 1 KiB records.
+    Control, // TextEvents
+    // A batch per change to the drawn controls; a full tree only on resync.
+    Control, // AccessibilityTree
+    Control, // AccessibilityActions
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
@@ -448,6 +469,12 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     // whole — a torn frame would present as a sequence gap AND corrupt data,
     // and the two are not distinguishable after the fact.
     Framed, // MeasurementStream
+    // Streamed, like `GpuCommand`: every record declares its own length and
+    // the decoder carries a partial one. A tree node with a long value is
+    // larger than a small ring.
+    Streamed, // TextEvents
+    Streamed, // AccessibilityTree
+    Streamed, // AccessibilityActions
 ];
 
 const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());

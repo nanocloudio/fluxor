@@ -233,6 +233,11 @@ pub struct ProgramBlob {
     /// The digest the producer names its format by, or zeros.
     pub format: [u8; 32],
     pub bytes: Vec<u8>,
+    /// The module instance that owns it, as the graph names it.
+    pub owner: String,
+    /// What the graph calls it: its `kind:` (an asset's name) where it has
+    /// one, else its file.
+    pub label: String,
 }
 
 /// The programs a graph's modules own, in graph order.
@@ -286,8 +291,15 @@ pub fn collect_programs(config: &serde_json::Value) -> Result<Vec<ProgramBlob>> 
             )));
         };
         if list.len() > 256 {
+            let over = &list[256];
+            let label = over
+                .get("kind")
+                .or_else(|| over.get("file"))
+                .and_then(|v| v.as_str())
+                .or_else(|| over.as_str())
+                .unwrap_or("?");
             return Err(Error::Config(format!(
-                "module '{name}': more than 256 programs"
+                "module '{name}': more than 256 programs: '{label}' is program 257"
             )));
         }
         for (slot, spec) in list.into_iter().enumerate() {
@@ -326,9 +338,11 @@ pub fn collect_programs(config: &serde_json::Value) -> Result<Vec<ProgramBlob>> 
                 type_hash: fnv1a_hash(ty.as_bytes()),
                 ordinal,
                 slot: slot as u8,
-                kind: kind.map_or(0, |k| fnv1a_hash(k.as_bytes())),
+                kind: kind.as_deref().map_or(0, |k| fnv1a_hash(k.as_bytes())),
                 format,
                 bytes,
+                owner: name.to_string(),
+                label: kind.unwrap_or_else(|| path.clone()),
             });
         }
     }
@@ -349,18 +363,23 @@ fn parse_format_digest(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// The program section for `programs`, laid out as `kernel_abi::program`
-/// documents: the entries in owner order, each owner's programs together in
-/// a region that starts on a 4 KiB boundary and is a whole number of 32-byte
-/// granules, each program on a 32-byte boundary, and the section a whole
-/// number of 4 KiB pages. The kernel refuses a section that is not laid out
-/// this way. Empty when there are no programs.
-pub fn build_program_section(programs: &[ProgramBlob]) -> Result<Vec<u8>> {
-    if programs.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Where a section's programs lie.
+struct ProgramLayout {
+    /// Indices into the programs, in owner order.
+    order: Vec<usize>,
+    /// Per program: its offset, and its owner's region offset and length.
+    placed: Vec<(usize, usize, usize)>,
+    /// The section's length.
+    total: usize,
+}
+
+/// Lay `programs` out as [`build_program_section`] documents.
+fn place_programs(programs: &[ProgramBlob]) -> Result<ProgramLayout> {
     if programs.len() > 255 {
-        return Err(Error::Config("more than 255 programs in one graph".into()));
+        return Err(Error::Config(format!(
+            "more than 255 programs in one graph: '{}' of module '{}' is program {}",
+            programs[255].label, programs[255].owner, 256
+        )));
     }
     // Entries in owner order, so an owner's programs are contiguous.
     let mut order: Vec<usize> = (0..programs.len()).collect();
@@ -393,6 +412,60 @@ pub fn build_program_section(programs: &[ProgramBlob]) -> Result<Vec<u8>> {
     if total > u32::MAX as usize {
         return Err(Error::Config("program section larger than 4 GiB".into()));
     }
+    Ok(ProgramLayout {
+        order,
+        placed,
+        total,
+    })
+}
+
+/// One owner's region of a program section: the span an isolated instance
+/// is granted over its programs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramRegion {
+    /// The owning module instance, as the graph names it.
+    pub owner: String,
+    /// The region's offset from the section's start, and its length.
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// Each owner's region in the section [`build_program_section`] packs for
+/// `programs`, in section order.
+pub fn program_regions(programs: &[ProgramBlob]) -> Result<Vec<ProgramRegion>> {
+    if programs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let layout = place_programs(programs)?;
+    let mut out: Vec<ProgramRegion> = Vec::new();
+    for &i in &layout.order {
+        let (_, offset, len) = layout.placed[i];
+        if out.last().is_none_or(|r| r.offset != offset) {
+            out.push(ProgramRegion {
+                owner: programs[i].owner.clone(),
+                offset,
+                len,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The program section for `programs`, laid out as `kernel_abi::program`
+/// documents: the entries in owner order, each owner's programs together in
+/// a region that starts on a 4 KiB boundary and is a whole number of 32-byte
+/// granules, each program on a 32-byte boundary, and the section a whole
+/// number of 4 KiB pages. The kernel refuses a section that is not laid out
+/// this way. Empty when there are no programs.
+pub fn build_program_section(programs: &[ProgramBlob]) -> Result<Vec<u8>> {
+    if programs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ProgramLayout {
+        order,
+        placed,
+        total,
+    } = place_programs(programs)?;
     let mut out = vec![0u8; total];
     out[0..4].copy_from_slice(&pg::SECTION_MAGIC.to_le_bytes());
     out[4] = pg::SECTION_VERSION;
@@ -2325,6 +2398,8 @@ content_type = "NetProto"
             kind: 7,
             format: [slot; 32],
             bytes: bytes.to_vec(),
+            owner: format!("{type_hash:x}.{ordinal}"),
+            label: format!("program {slot}"),
         }
     }
 

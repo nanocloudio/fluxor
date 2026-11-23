@@ -739,26 +739,36 @@ const AUTHORITY_UNPARSABLE: u8 = 1;
 const AUTHORITY_V6: u8 = 2;
 const AUTHORITY_NAME_TOO_LONG: u8 = 3;
 
+/// The target an instance dials when its `authority` names none:
+/// `127.0.0.1:4443`.
+fn default_authority(s: &mut QuicState) {
+    let dflt = b"127.0.0.1:4443";
+    s.authority[..dflt.len()].copy_from_slice(dflt);
+    s.authority_len = dflt.len() as u8;
+    s.peer_name_len = 0;
+    s.peer_v4 = [127, 0, 0, 1];
+    s.peer_port = DEFAULT_PEER_PORT;
+    s.authority_refused = AUTHORITY_OK;
+}
+
 /// Take the `authority` parameter: parse `host[:port]`, and keep the
-/// target by kind. An empty value is the default `127.0.0.1:4443`. A
-/// value that does not parse, names a v6 literal, or carries a name longer
-/// than the instance holds is recorded for `module_new` to refuse.
+/// target by kind. An empty value, like an absent one, is the default
+/// ([`default_authority`]). A value that does not parse, names a v6
+/// literal, or carries a name longer than the instance holds is recorded
+/// for `module_new` to refuse.
 ///
 /// # Safety
 /// `d` is valid for `len` reads.
 unsafe fn parse_authority(s: &mut QuicState, d: *const u8, len: usize) {
+    if len == 0 || d.is_null() {
+        default_authority(s);
+        return;
+    }
     s.authority_len = 0;
     s.peer_name_len = 0;
     s.peer_v4 = [0; 4];
     s.peer_port = DEFAULT_PEER_PORT;
     s.authority_refused = AUTHORITY_OK;
-    if len == 0 || d.is_null() {
-        let dflt = b"127.0.0.1:4443";
-        s.authority[..dflt.len()].copy_from_slice(dflt);
-        s.authority_len = dflt.len() as u8;
-        s.peer_v4 = [127, 0, 0, 1];
-        return;
-    }
     if len > MAX_AUTHORITY {
         s.authority_refused = AUTHORITY_NAME_TOO_LONG;
         return;
@@ -905,6 +915,8 @@ pub unsafe extern "C" fn module_new(
         i += 1;
     }
 
+    // An instance whose params name no authority dials the default.
+    default_authority(s);
     set_defaults(s);
     if params_len >= 4 {
         let p = core::slice::from_raw_parts(params, params_len);

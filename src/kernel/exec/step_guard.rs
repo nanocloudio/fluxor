@@ -140,6 +140,37 @@ impl FaultStats {
     }
 }
 
+/// What a module's own core has left for the primary to do to it. A core
+/// other than the primary does not finalize, restart or terminate a module
+/// itself: that work changes tables every domain reads and runs through
+/// provider release hooks of any depth, so it is the primary's, taken with
+/// the other cores parked. The module is not stepped while one is posted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PostedFault {
+    /// Nothing is posted.
+    None = 0,
+    /// The step ran past its deadline.
+    Timeout = 1,
+    /// A protection fault.
+    Protection = 2,
+    /// The step returned the error in `posted_rc`.
+    Error = 3,
+    /// As `Error`, from a burst re-step.
+    ErrorInBurst = 4,
+    /// As `Error`, from the pipeline-refill hook.
+    ErrorInRefill = 5,
+    /// As `Error`, from the post-tick-flush hook.
+    ErrorInFlush = 6,
+    /// The module finished.
+    Done = 7,
+    /// As `Done`, from a burst re-step.
+    DoneInBurst = 8,
+    /// The module is `Faulted`: its policy is due a look (the quarantine,
+    /// then the restart or the termination once its backoff has passed).
+    Advance = 9,
+}
+
 /// Per-module fault bookkeeping (stored in SchedulerState).
 #[derive(Clone, Copy)]
 pub struct ModuleFaultInfo {
@@ -183,6 +214,10 @@ pub struct ModuleFaultInfo {
     /// pairs (TLS handshake + transport, codec pair-stream) where
     /// one half's failure invalidates the other.
     pub quarantine_partner: ModuleId,
+    /// What the module's core has left for the primary, and the error code
+    /// that goes with it.
+    pub posted: PostedFault,
+    pub posted_rc: i32,
 }
 
 impl Default for ModuleFaultInfo {
@@ -207,7 +242,29 @@ impl ModuleFaultInfo {
             step_deadline_us: 0,
             step_deadline_burst_us: 0,
             quarantine_partner: NO_MODULE,
+            posted: PostedFault::None,
+            posted_rc: 0,
         }
+    }
+
+    /// Leave `what` for the primary, unless something is already posted:
+    /// the first outcome stands until the primary has taken it. Returns
+    /// whether it was recorded.
+    pub fn post(&mut self, what: PostedFault, rc: i32) -> bool {
+        if self.posted != PostedFault::None {
+            return false;
+        }
+        self.posted = what;
+        self.posted_rc = rc;
+        true
+    }
+
+    /// Take what is posted, leaving nothing.
+    pub fn take_posted(&mut self) -> (PostedFault, i32) {
+        let taken = (self.posted, self.posted_rc);
+        self.posted = PostedFault::None;
+        self.posted_rc = 0;
+        taken
     }
 
     /// Get the effective step deadline in microseconds.
@@ -332,6 +389,46 @@ static MPU_FAULT_PENDING: [AtomicBool; MAX_STEP_GUARD_CORES] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
 ];
+
+/// Per-core time, in microseconds, the kernel held the core for inside the
+/// step it is running: time that is not the module's (a masked flash
+/// operation, a park for another core's). Cleared when a step starts; the
+/// scheduler takes it out of the time it records for the step.
+static EXCLUDED_US: [portable_atomic::AtomicU32; MAX_STEP_GUARD_CORES] =
+    [const { portable_atomic::AtomicU32::new(0) }; MAX_STEP_GUARD_CORES];
+
+/// A step starts on this core: nothing is excluded from it yet.
+#[inline]
+pub fn begin_step() {
+    EXCLUDED_US[cur_core()].store(0, Ordering::Relaxed);
+}
+
+/// The kernel held this core for `us` microseconds inside the running step.
+/// Called by the platform, on the core, where it moves the step's deadline
+/// past the same time.
+#[inline]
+pub fn exclude(us: u32) {
+    let slot = &EXCLUDED_US[cur_core()];
+    slot.store(
+        slot.load(Ordering::Relaxed).saturating_add(us),
+        Ordering::Relaxed,
+    );
+}
+
+/// The time excluded from the step running on this core, since
+/// [`begin_step`].
+#[inline]
+pub fn excluded_us() -> u32 {
+    EXCLUDED_US[cur_core()].load(Ordering::Relaxed)
+}
+
+/// `elapsed_us` of wall clock, less the part of `excluded_us` that fell
+/// inside it: what a step that took `elapsed_us` is charged when the kernel
+/// held its core for `excluded_us` of that.
+#[inline]
+pub const fn charged(elapsed_us: u64, excluded_us: u32) -> u64 {
+    elapsed_us.saturating_sub(excluded_us as u64)
+}
 
 #[inline(always)]
 fn cur_core() -> usize {

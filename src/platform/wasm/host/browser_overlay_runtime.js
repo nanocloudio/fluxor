@@ -163,23 +163,44 @@
   // ── Full-WASM host sinks: emit normalized records into the kernel
   //    host queues drained by host_shims.js (`__fluxor_*_queue`).
   //    Semantic actions also fire the optional `__fluxor_action` hook.
+  //
+  //    GAMEPAD SLOTS. A drawn pad answers on the slot its shell declares
+  //    (`player`). The pads the browser reports are queued by the poller
+  //    in host_shims.js; `__fluxor_gamepad_slots` says who holds each of
+  //    the contract's slots, so the two never share one: a drawn pad marks
+  //    its slot `'virtual'` and the poller keeps its pads off it. A pad
+  //    declared past the contract's slots reports nothing.
+  //
+  //    A queue the graph holds no module for is never drained, so each
+  //    push keeps its queue within HOST_QUEUE_CAP, oldest records first
+  //    out.
+  const HOST_GAMEPAD_SLOTS = 4;   // input::gamepad::MAX_GAMEPADS
+  const HOST_QUEUE_CAP = 256;
   function makeHostSinks(win) {
     win = win || root;
     const gpQ = win.__fluxor_gamepad_queue || (win.__fluxor_gamepad_queue = []);
     const kbQ = win.__fluxor_keyboard_queue || (win.__fluxor_keyboard_queue = []);
     const acQ = win.__fluxor_action_queue || (win.__fluxor_action_queue = []);
+    const slots = win.__fluxor_gamepad_slots
+      || (win.__fluxor_gamepad_slots = new Array(HOST_GAMEPAD_SLOTS).fill(null));
+    const push = (queue, rec) => {
+      queue.push(rec);
+      if (queue.length > HOST_QUEUE_CAP) queue.splice(0, queue.length - HOST_QUEUE_CAP);
+    };
     return makeSinks((r) => {
       if (r.class === 'gamepad') {
-        gpQ.push({ kind: 0x01, gamepadId: r.id, connected: 1, buttonBits: r.buttonBits,
+        if (!(r.id >= 0 && r.id < HOST_GAMEPAD_SLOTS)) return;
+        slots[r.id] = 'virtual';
+        push(gpQ, { kind: 0x01, gamepadId: r.id, connected: 1, buttonBits: r.buttonBits,
           axisLx: r.axisLx, axisLy: r.axisLy, axisRx: r.axisRx, axisRy: r.axisRy });
       } else if (r.class === 'key') {
-        kbQ.push({ kind: r.down ? 0x01 : 0x02, modifiers: 0, repeat: 0,
+        push(kbQ, { kind: r.down ? 0x01 : 0x02, modifiers: 0, flags: 0,
           keyCode: r.keyCode, scanCode: 0 });
       } else if (r.class === 'action') {
         // The kernel action queue carries an f32; non-numeric param
         // values (e.g. select option ids) coerce to 0 there but reach
         // the app-level hook intact.
-        acQ.push({ hash: r.hash, value: typeof r.value === 'number' ? r.value : 0 });
+        push(acQ, { hash: r.hash, value: typeof r.value === 'number' ? r.value : 0 });
         if (typeof win.__fluxor_action === 'function') win.__fluxor_action(r.actionId, r.value);
       }
     });
@@ -1118,10 +1139,10 @@
       const audioHz = v ? (v.audioRateHz >>> 0)
         : ((w.__fluxor_audio_traits && w.__fluxor_audio_traits.rateHz) >>> 0);
       const physBtns = v ? !!v.physicalButtons : false;
-      // Device pixel ratio — drives the shell's device-pixel supersampling so
-      // text/art render crisp on hi-DPI screens instead of a CSS upscale. The
-      // viewport stays in CSS px (so size-class/layout are unaffected); only the
-      // raster resolution follows DPR.
+      // Device pixel ratio: how many surface pixels a producer renders per
+      // logical pixel for its raster to be presented 1:1. The viewport stays
+      // in logical (CSS) pixels, so size class and layout are unaffected;
+      // only the raster's resolution follows it.
       const dpr = v
         ? (v.dpr || 1)
         : ((typeof w.devicePixelRatio === 'number' && w.devicePixelRatio > 0) ? w.devicePixelRatio : 1);
@@ -1142,7 +1163,10 @@
       if (p.pads > 0) modalities |= ST.MOD_GAMEPAD;
       if (p.physBtns) modalities |= ST.MOD_PHYSICAL_BUTTONS;
 
-      const dpr8 = Math.max(0, Math.min(255, Math.round((p.dpr || 1) * 8)));
+      // `dpr_eighths`: the nearest eighth, halves up, within 1..=255. A
+      // reported ratio is never 0, which means unreported: a page zoomed
+      // far out still reports its smallest step.
+      const dpr8 = Math.max(1, Math.min(255, Math.floor((p.dpr || 1) * 8 + 0.5)));
       const key = [orientation, scW, scH, p.vw, p.vh, modalities, p.pads,
         p.audioCh, p.audioHz, dpr8].join(',');
       if (key === lastKey) return false;
@@ -1188,7 +1212,29 @@
         w.addEventListener(evt, onChange);
         listeners.push([evt, w]);
       }
-      stop = () => { for (const [evt, tgt] of listeners) tgt.removeEventListener(evt, onChange); };
+      // A window moved to a screen of another density, or a page zoom,
+      // changes the device pixel ratio without a `resize`. A media query
+      // for the ratio in force stops matching when it changes; it names one
+      // ratio, so it is armed again for the new one each time it fires.
+      let dprQuery = null;
+      const onDpr = () => { armDpr(); schedule(); };
+      const disarmDpr = () => {
+        if (dprQuery && dprQuery.removeEventListener) dprQuery.removeEventListener('change', onDpr);
+        dprQuery = null;
+      };
+      function armDpr() {
+        disarmDpr();
+        if (!w.matchMedia || !(w.devicePixelRatio > 0)) return;
+        const query = w.matchMedia('(resolution: ' + w.devicePixelRatio + 'dppx)');
+        if (!query || !query.addEventListener) return;
+        query.addEventListener('change', onDpr);
+        dprQuery = query;
+      }
+      armDpr();
+      stop = () => {
+        for (const [evt, tgt] of listeners) tgt.removeEventListener(evt, onChange);
+        disarmDpr();
+      };
     }
 
     // Startup baseline so a freshly-wired consumer has a record immediately.
@@ -1196,14 +1242,16 @@
     return { recompute, schedule, stop, _sizeClassFor: sizeClassFor };
   }
 
-  // Map a page-space pointer position into a surface's LOGICAL pixel space —
-  // the raster a module renders + hit-tests in. When a canvas is mounted (any
+  // Map a page-space pointer position into SURFACE pixels: the pixels of the
+  // raster a module renders + hit-tests in. When a canvas is mounted (any
   // raster-rendering module, e.g. content_controls), that is the canvas's own
-  // rect + intrinsic width/height, so a 240×80 content panel yields panel-local
+  // rect + raster width/height, so a 240×80 content panel yields panel-local
   // coords and a 960×540 display yields 960×540. Canvas-less surfaces (the
   // gamepad overlay, hit-tested against the canonical 960×540 region table) use
-  // the element rect + a 960×540 fallback. Used by runtime.html's pointer
-  // listeners; exported so it can be unit-tested without a live browser.
+  // the element rect + a 960×540 fallback. This is the mapping for a page
+  // that carries this file without host_shims.js; the full-wasm host maps
+  // with `fluxor.surfacePoint` there, which also knows the extent of a
+  // canvas a Worker presents into.
   function surfaceLocalCoords(el, clientX, clientY) {
     const isCanvas = el && el.tagName && el.tagName.toUpperCase() === 'CANVAS';
     const canvas = isCanvas

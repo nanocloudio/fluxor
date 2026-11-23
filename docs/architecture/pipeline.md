@@ -193,8 +193,9 @@ Source: `src/kernel/exec/scheduler/pass.rs`, `src/platform/rp.rs`,
 
 Every target's loop drives the one pass engine; [scheduler.md](scheduler.md#passes)
 describes the passes and [events.md](events.md#scheduler-wake-integration)
-the loop around them. A single-core loop (RP, Linux, wasm) runs a tick
-pass over every domain, then a wake pass for what the tick latched, then
+the loop around them. A loop over every domain of its core (RP core 0,
+Linux, wasm) runs a tick pass over each, then a wake pass for what the tick
+latched, then
 sleeps until the pass's deadline or a wake, then runs a wake pass again; a
 domain loop on its own core (bcm2712, uefi) does the same for its one
 domain.

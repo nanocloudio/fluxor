@@ -61,6 +61,11 @@ mod surface_traits;
 #[path = "wasm/surface_traits_probe.rs"]
 mod surface_traits_probe;
 
+// The mirror of a drawn UI: checks `AccessibilityTree` batches, hands the
+// page the checked ones, and emits `AccessibilityActions` and `TextEvents`.
+#[path = "wasm/accessibility.rs"]
+mod accessibility;
+
 // Browser-side BUTTON capability driver — wasm equivalent of
 // `flash_rp` (rp BOOTSEL) and `modules/foundation/button` (rp GPIO).
 // Emits one-byte transitions (`input::button` raw contract) drained
@@ -157,6 +162,45 @@ fn tlv_u32(value: &[u8]) -> u32 {
     let n = value.len().min(4);
     buf[..n].copy_from_slice(&value[..n]);
     u32::from_le_bytes(buf)
+}
+
+/// Move fixed-size input records from a host queue to `chan`: pop one with
+/// `pop`, check it with `admit`, write it, repeat until the queue is empty
+/// or the channel refuses a record. A refused record stays in `held` and is
+/// written first on the next call, so a full channel delays input and never
+/// loses it (a lost key-up is a stuck key). A record `admit` refuses is
+/// dropped: it is not one the contract allows on the edge.
+///
+/// `held[0]` is the record's message type, which no contract allocates as
+/// zero: zero there means nothing is held.
+///
+/// # Safety
+/// `pop` is a host import that writes at most the `len` bytes it is given.
+unsafe fn relay_records<const N: usize>(
+    chan: i32,
+    held: &mut [u8; N],
+    pop: unsafe extern "C" fn(*mut u8, usize) -> i32,
+    admit: fn(&[u8; N]) -> bool,
+) {
+    loop {
+        if held[0] == 0 {
+            // SAFETY: the caller's contract; `held` is N writable bytes.
+            let n = unsafe { pop(held.as_mut_ptr(), N) };
+            if n <= 0 {
+                return;
+            }
+            if n as usize != N || !admit(held) {
+                held[0] = 0;
+                continue;
+            }
+        }
+        // SAFETY: `held` is N readable bytes.
+        let written = unsafe { crate::kernel::ipc::channel::channel_write(chan, held.as_ptr(), N) };
+        if written <= 0 {
+            return;
+        }
+        held[0] = 0;
+    }
 }
 
 // ── Host imports ─────────────────────────────────────────────────────
@@ -355,6 +399,10 @@ static NATIVE_MODULES: &[(u32, &NativeVtable)] = &[
     (
         crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe::NAME_HASH,
         &surface_traits_probe::WASM_BROWSER_SURFACE_TRAITS_PROBE,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_accessibility::NAME_HASH,
+        &accessibility::WASM_BROWSER_ACCESSIBILITY,
     ),
     (
         crate::abi::platform::native::wasm::wasm_browser_button::NAME_HASH,

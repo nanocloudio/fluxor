@@ -92,11 +92,13 @@ const STANDARD_MODULE_SUBDIRS: &[&str] = crate::manifest::MODULE_LAYERS;
 /// Build the prioritized list of module search roots. Order:
 ///   1. `<project_root>/<standard subdirs>` — user's overrides
 ///      first so a local module shadows the bundled one.
-///   2. `<install_root>/<standard subdirs>` — bundled fallback
-///      when the install root differs from the project root.
-///   3. `<workspace member>/<standard subdirs>` — sibling checkouts,
-///      last so they never shadow an in-tree module. Dev-only; see
-///      `workspace::member_roots`.
+///   2. `<install_root>/<standard subdirs>` — Fluxor's modules, from
+///      the synced catalog or a `live_trees` checkout, when the install
+///      root differs from the project root.
+///
+/// A module of another project resolves from that project's pins, never
+/// from a checkout of it: a project the graph does not depend on is never
+/// read.
 ///
 /// Returns absolute paths in priority order. Non-existent entries
 /// are kept (the manifest loader skips them) so a missing
@@ -117,17 +119,6 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    // Sibling checkouts last, so an in-tree module always wins a name clash.
-    // See `workspace::member_roots` for why this is a dev convenience and not
-    // a resolution path anything shippable may rely on.
-    for member in crate::workspace::member_roots(&project) {
-        for sub in STANDARD_MODULE_SUBDIRS {
-            let p = member.join(sub);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
     dirs
 }
 
@@ -142,8 +133,7 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
 ///      ordered*: an entry earlier in the list shadows a later one.
 ///   2. **`standard_module_dirs()`** — the bundled subtree layout
 ///      (`modules/drivers`, `modules/foundation`, ...) under the
-///      project root, then the install root, then any workspace
-///      member checkout.
+///      project root, then the install root.
 ///
 /// Returns the first hit (`<dir>/<type_name>` whose directory
 /// exists). Centralising the lookup keeps the manifest loader
@@ -195,11 +185,75 @@ fn warn_manifest_once(path: &std::path::Path, message: &str) {
     }
 }
 
-fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
-    warn_manifest_once(
-        path,
-        &format!("manifest at {} failed to parse: {}", path.display(), err),
-    );
+/// How a module type's manifest resolved.
+pub(crate) enum TypeManifest {
+    /// Found, pinned or on the search paths, and accepted.
+    Found(Box<Manifest>),
+    /// Found but rejected: the refusal names the module, where its manifest
+    /// was found and the rule it broke.
+    Rejected(String),
+    /// Found nowhere.
+    Absent,
+}
+
+/// The manifest of module type `type_name`, in `variant` when one is named,
+/// resolved the one way every graph resolves one — a node graph's modules, a
+/// workload's modules and the fans the composer inserts alike: its pin in
+/// `fluxor.lock` (`pins`), authoritative when present, else its
+/// `manifest.toml` on `extra_dirs` and the standard module directories.
+/// `name` labels the refusal.
+pub(crate) fn type_manifest(
+    name: &str,
+    type_name: &str,
+    variant: Option<&str>,
+    extra_dirs: &[&std::path::Path],
+    target_abi: Option<&str>,
+    pins: Option<&crate::store_cli::BoxedManifestResolver>,
+) -> TypeManifest {
+    // The rule a manifest broke, without the error kind's prefix: the
+    // refusal already says where the manifest was found.
+    let cause = |e: Error| match e {
+        Error::Module(why) | Error::Config(why) => why,
+        other => other.to_string(),
+    };
+    let accept = |toml: &str| -> std::result::Result<Manifest, String> {
+        let mut m = Manifest::from_toml_str_for_target(toml, target_abi).map_err(cause)?;
+        if let Some(v) = variant {
+            m.apply_variant(v).map_err(cause)?;
+        }
+        Ok(m)
+    };
+    let label = module_label(name, type_name);
+    match pins.map_or(crate::modules::ManifestPin::NotPinned, |p| p(type_name)) {
+        crate::modules::ManifestPin::Resolved(toml) => match accept(&toml) {
+            Ok(m) => TypeManifest::Found(Box::new(m)),
+            Err(why) => TypeManifest::Rejected(format!(
+                "{label} is pinned in fluxor.lock but its pinned manifest is rejected: {why}"
+            )),
+        },
+        crate::modules::ManifestPin::Failed(why) => TypeManifest::Rejected(format!(
+            "{label} is pinned in fluxor.lock but its manifest could not be resolved from \
+             the OCI store: {why}"
+        )),
+        crate::modules::ManifestPin::NotPinned => {
+            let Some(path) = resolve_module_root(type_name, extra_dirs)
+                .map(|root| root.join("manifest.toml"))
+                .filter(|p| p.exists())
+            else {
+                return TypeManifest::Absent;
+            };
+            match std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read it: {e}"))
+                .and_then(|toml| accept(&toml))
+            {
+                Ok(m) => TypeManifest::Found(Box::new(m)),
+                Err(why) => TypeManifest::Rejected(format!(
+                    "{label} was found at {} but its manifest is rejected: {why}",
+                    path.display()
+                )),
+            }
+        }
+    }
 }
 
 pub fn load_module_manifests_with_extra(
@@ -258,177 +312,107 @@ pub fn load_module_manifests_with_extra_for_target(
         crate::store_cli::lock_store_manifest_resolver(project_root, target_abi, None);
 
     for module in list {
-        let name = match module["name"].as_str() {
-            Some(n) => n,
-            None => continue,
+        let Some(name) = module["name"].as_str() else {
+            continue;
         };
         let type_name = module["type"].as_str().unwrap_or(name);
-
-        if let Some(resolver) = &store_manifests {
-            match resolver(type_name) {
-                crate::modules::ManifestPin::Resolved(toml) => {
-                    match Manifest::from_toml_str_for_target(&toml, target_abi) {
-                        Ok(mut m) => {
-                            if let Some(variant) = module["variant"].as_str() {
-                                if let Err(e) = m.apply_variant(variant) {
-                                    warn_manifest_once(
-                                        std::path::Path::new(&format!("oci://{type_name}")),
-                                        &format!(
-                                            "module '{name}' (pinned artifact): {e}; its \
-                                             manifest is omitted from wiring validation"
-                                        ),
-                                    );
-                                    continue;
-                                }
-                            }
-                            manifests.insert(name.to_string(), m);
-                        }
-                        Err(e) => warn_manifest_parse_error_once(
-                            std::path::Path::new(&format!("oci://{type_name}")),
-                            &e,
-                        ),
-                    }
-                    // Pinned is authoritative — never fall through to disk.
-                    continue;
-                }
-                // This loader is infallible by construction, so it can only
-                // warn; enforcement lives in
-                // `assert_pinned_manifests_resolvable`, which every strict
-                // path (validate / config-gen / image build) calls before
-                // loading. Reaching this arm therefore means an advisory
-                // caller, where aborting would be wrong.
-                crate::modules::ManifestPin::Failed(why) => {
-                    warn_manifest_once(
-                        std::path::Path::new(&format!("oci://{type_name}")),
-                        &format!(
-                            "module '{name}' is pinned in fluxor.lock but its manifest \
-                             could not be resolved from the store: {why}"
-                        ),
-                    );
-                    continue;
-                }
-                crate::modules::ManifestPin::NotPinned => {}
+        // This loader cannot fail: a rejected manifest is warned and omitted
+        // here, and refused by `assert_module_manifests_resolvable`, which
+        // every strict path (validate / config-gen / image build) calls first.
+        match type_manifest(
+            name,
+            type_name,
+            module["variant"].as_str(),
+            extra_dirs,
+            target_abi,
+            store_manifests.as_ref(),
+        ) {
+            TypeManifest::Found(m) => {
+                manifests.insert(name.to_string(), *m);
             }
-        }
-
-        // `resolve_module_root` walks `extra_dirs` first (the
-        // YAML-declared `module_search_paths:` order), then the
-        // standard bundled subdirs. An explicit YAML entry
-        // shadowing a bundled module of the same type:name was
-        // documented to win — searching standard first violated
-        // that and could load the wrong `manifest.toml` for
-        // interrupt-mode admission.
-        let Some(root) = resolve_module_root(type_name, extra_dirs) else {
-            continue;
-        };
-        let manifest_path = root.join("manifest.toml");
-        if !manifest_path.exists() {
-            continue;
-        }
-        match Manifest::from_toml_for_target(&manifest_path, target_abi) {
-            Ok(mut m) => {
-                // Variant-selected node: the
-                // manifest wiring validates against is the VARIANT's —
-                // omitted ports absent, so a YAML that wires a dropped
-                // port fails loudly at config build (`resolve_port_spec`
-                // finds no such port) instead of at runtime. An unknown
-                // variant name only WARNS here (this loader is
-                // infallible by design — see the NOTE below on
-                // omission); the hard failure comes at fmod resolution
-                // (`parse_modules_from_config_multi`), which names the
-                // missing `<type>-<variant>.fmod` artifact.
-                if let Some(variant) = module["variant"].as_str() {
-                    if let Err(e) = m.apply_variant(variant) {
-                        warn_manifest_once(
-                            &manifest_path,
-                            &format!(
-                                "module '{name}' (manifest {}): {e}; its manifest is \
-                                 omitted from wiring validation",
-                                manifest_path.display()
-                            ),
-                        );
-                        continue;
-                    }
-                }
-                manifests.insert(name.to_string(), m);
+            TypeManifest::Rejected(why) => {
+                warn_manifest_once(std::path::Path::new(&why), &why);
             }
-            Err(e) => {
-                // Don't silently swallow the parse error — a
-                // malformed manifest looks identical to a missing
-                // one downstream ("no manifest found") and the
-                // user has no idea why. Surface the path + error.
-                // NOTE: a malformed manifest is OMITTED from the
-                // map, which is indistinguishable from "no manifest"
-                // to map lookups — so a gate that must NOT fail open
-                // on a malformed manifest (e.g. the adaptive
-                // timer-class gate in `validate_adaptive_tick`) has
-                // to re-check manifest-file existence itself and
-                // reject; it cannot rely on the omission alone.
-                // Dedup'd across the process so re-entry from
-                // multiple validators doesn't spam the same path.
-                warn_manifest_parse_error_once(&manifest_path, &e);
-            }
+            TypeManifest::Absent => {}
         }
     }
     manifests
 }
 
-/// Enforcement half of the pinned-manifest path: a module pinned in
+/// Enforcement half of manifest loading: every module whose manifest is
+/// found must be one the graph can be checked against. A module pinned in
 /// `fluxor.lock` whose `manifest.toml` cannot be resolved and parsed from
 /// the store (corrupt/missing blob, non-UTF-8 payload, unreadable store,
 /// unreadable lockfile, ambiguous multi-target pin, malformed TOML, unknown
-/// variant) is a HARD error naming the module, the pin and the cause. The
-/// pin exists precisely to enforce that port surface, so a strict caller
-/// must refuse rather than let the module drop out of wiring validation and
-/// pass a graph nothing checked.
+/// variant), and a module whose `manifest.toml` is found on the search
+/// paths but rejected (it does not parse or validate, or its variant is
+/// unknown), are HARD errors naming the module, where its manifest was
+/// found and the cause. A strict caller refuses rather than let the module
+/// drop out of wiring validation, where it would read as a module with no
+/// manifest at all.
 ///
 /// Separate from `load_module_manifests_*` on purpose: that loader returns a
 /// map and cannot fail, so it warns and omits — right for advisory callers,
-/// wrong for `fluxor build --check` / config generation / image build, which call
-/// this first. `project_root` is config-anchored (see the loader's note); a
-/// project with no pins resolves no resolver and this is a no-op.
-pub fn assert_pinned_manifests_resolvable(
+/// wrong for `fluxor build --check` / config generation / image build, which
+/// call this first. `project_root` is config-anchored (see the loader's
+/// note). A module found nowhere is left to the checks that name it.
+pub fn assert_module_manifests_resolvable(
     modules_config: &Value,
+    extra_dirs: &[&std::path::Path],
     target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
+    let refusals = module_manifest_refusals(modules_config, extra_dirs, target, project_root);
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Config(refusals.join("\n")))
+    }
+}
+
+/// Every module in `modules_config` whose manifest is found but rejected,
+/// each as the refusal that names it, where its manifest was found and the
+/// cause. What [`assert_module_manifests_resolvable`] refuses a graph for,
+/// and what `fluxor inspect` lists.
+pub fn module_manifest_refusals(
+    modules_config: &Value,
+    extra_dirs: &[&std::path::Path],
+    target: Option<&str>,
+    project_root: &std::path::Path,
+) -> Vec<String> {
     let module_abi = target_module_abi(target, project_root);
     let target_abi = module_abi.as_deref();
+    let mut refusals = Vec::new();
     let Some(list) = modules_config.as_array() else {
-        return Ok(());
+        return refusals;
     };
-    let Some(resolver) =
-        crate::store_cli::lock_store_manifest_resolver(project_root, target_abi, None)
-    else {
-        return Ok(());
-    };
+    let pins = crate::store_cli::lock_store_manifest_resolver(project_root, target_abi, None);
     for module in list {
         let Some(name) = module["name"].as_str() else {
             continue;
         };
         let type_name = module["type"].as_str().unwrap_or(name);
-        let why = match resolver(type_name) {
-            crate::modules::ManifestPin::NotPinned => continue,
-            crate::modules::ManifestPin::Failed(why) => why,
-            crate::modules::ManifestPin::Resolved(toml) => {
-                match Manifest::from_toml_str_for_target(&toml, target_abi) {
-                    Ok(mut m) => match module["variant"].as_str() {
-                        Some(variant) => match m.apply_variant(variant) {
-                            Ok(()) => continue,
-                            Err(e) => format!("{e}"),
-                        },
-                        None => continue,
-                    },
-                    Err(e) => format!("{e}"),
-                }
-            }
-        };
-        return Err(Error::Config(format!(
-            "module '{name}' is pinned in fluxor.lock but its manifest could not be \
-             resolved from the OCI store: {why}"
-        )));
+        if let TypeManifest::Rejected(why) = type_manifest(
+            name,
+            type_name,
+            module["variant"].as_str(),
+            extra_dirs,
+            target_abi,
+            pins.as_ref(),
+        ) {
+            refusals.push(why);
+        }
     }
-    Ok(())
+    refusals
+}
+
+/// `module 'name'`, with its type when the two differ.
+fn module_label(name: &str, type_name: &str) -> String {
+    if name == type_name {
+        format!("module '{name}'")
+    } else {
+        format!("module '{name}' (type '{type_name}')")
+    }
 }
 
 /// Resolve a port spec using named ports from the module manifest.
@@ -466,6 +450,20 @@ fn resolve_port_spec<'a>(
     // Run a Levenshtein lookup against the declared module-name
     // list first — typo'd name is the single most common cause.
     let manifest = manifests.get(module_name).ok_or_else(|| {
+        if declared_names.iter().any(|n| n == module_name) {
+            // Declared, so not a typo of the name: its manifest was found
+            // nowhere (a rejected manifest is refused before wiring is read).
+            return format!(
+                "module '{module_name}' is declared but no manifest was found for it \
+                 (needed to resolve port name '{port_part}'). Common causes:\n\
+                 \x20\x20- the module's `type:` field is misspelled or refers to a module \
+                 that doesn't exist;\n\
+                 \x20\x20- the project / install roots don't include the module's source \
+                 tree (run `fluxor inspect` to see the search paths in use);\n\
+                 \x20\x20- the module is a native module whose feature isn't compiled into \
+                 this `fluxor` binary."
+            );
+        }
         let typo_hint = crate::target::closest_match(module_name, declared_names, 3)
             .map(|s| format!("Did you mean '{s}'? "))
             .unwrap_or_default();

@@ -9,6 +9,7 @@
 use super::*;
 use crate::kernel::exec::interrupt::{self, IsrOutcome};
 use crate::kernel::exec::irq;
+use crate::kernel::exec::step_guard::PostedFault;
 use portable_atomic::{AtomicU32, Ordering};
 
 /// What went wrong with a module's step.
@@ -20,6 +21,31 @@ pub(crate) enum FaultKind {
     Error(i32),
     /// A protection fault: an EL0 abort, or a broken stack fence.
     Protection,
+}
+
+/// Where in a pass a module's fault was taken: what its log line says after
+/// the error code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultSite {
+    /// The module's step.
+    Step,
+    /// A burst re-step.
+    Burst,
+    /// The pipeline-refill hook.
+    Refill,
+    /// The post-tick-flush hook.
+    Flush,
+}
+
+impl FaultSite {
+    fn suffix(self) -> &'static str {
+        match self {
+            FaultSite::Step => "",
+            FaultSite::Burst => " (burst)",
+            FaultSite::Refill => " (pipeline-refill)",
+            FaultSite::Flush => " (post-tick-flush)",
+        }
+    }
 }
 
 impl FaultKind {
@@ -67,18 +93,170 @@ fn detect_caused_by(sched: &SchedulerState, module_idx: usize, now_ms: u64) -> M
     best
 }
 
-/// Take a fault on `module_idx`: record it (counters, `MON_FAULT`, the fault
-/// ring), then apply its policy. `Tolerate` records a timeout and nothing
-/// more: a step stalled behind a device flush is late work, not a runaway. A
-/// module that may restart moves to `Faulted` with its backoff; any other is
-/// terminated and finalized. Then the quarantine pairing.
+/// Whether `domain`'s own core leaves a module's fault work to the primary:
+/// every domain a core other than 0 runs. Finalizing, restarting and
+/// terminating a module change tables every domain reads and run through
+/// provider release hooks, so they are done on the primary, with the other
+/// cores parked ([`apply_posted`]); a kernel with one core does them where
+/// the fault is taken.
+#[inline]
+fn posts_to_primary(domain: usize) -> bool {
+    #[cfg(all(feature = "smp", target_os = "none"))]
+    {
+        crate::kernel::exec::domains::domain_core(domain) != 0
+    }
+    #[cfg(not(all(feature = "smp", target_os = "none")))]
+    {
+        let _ = domain;
+        false
+    }
+}
+
+/// Set once a module has something posted; the primary's pass looks only
+/// then.
+static ANY_POSTED: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+
+/// Leave `what` on `module_idx` for the primary.
+fn post(sched: &mut SchedulerState, module_idx: usize, what: PostedFault, rc: i32) {
+    if sched.fault_info[module_idx].post(what, rc) {
+        ANY_POSTED.store(true, Ordering::Release);
+        crate::kernel::sys::hal::wake_scheduler();
+    }
+}
+
+/// The primary domain's half of the fault work of modules on other cores:
+/// with every other core parked, do to each module what its core posted.
+/// One relaxed load when nothing is posted.
+pub(crate) fn apply_posted(sched: &mut SchedulerState, modules: &mut [ModuleSlot]) {
+    if !ANY_POSTED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let parked = crate::kernel::sys::hal::smp_quiesce_peers();
+    let count = sched.active_module_count;
+    let mut active = (0..count).filter(|&i| !sched.finished[i]).count();
+    for idx in 0..count {
+        let (what, rc) = sched.fault_info[idx].take_posted();
+        if what == PostedFault::None || sched.finished[idx] {
+            continue;
+        }
+        // One of three things, each called from one place.
+        let fault = |kind, site| Some((kind, site));
+        let as_fault = match what {
+            PostedFault::Timeout => fault(FaultKind::Timeout, FaultSite::Step),
+            PostedFault::Protection => fault(FaultKind::Protection, FaultSite::Step),
+            PostedFault::Error => fault(FaultKind::Error(rc), FaultSite::Step),
+            PostedFault::ErrorInBurst => fault(FaultKind::Error(rc), FaultSite::Burst),
+            PostedFault::ErrorInRefill => fault(FaultKind::Error(rc), FaultSite::Refill),
+            PostedFault::ErrorInFlush => fault(FaultKind::Error(rc), FaultSite::Flush),
+            PostedFault::None
+            | PostedFault::Done
+            | PostedFault::DoneInBurst
+            | PostedFault::Advance => None,
+        };
+        if let Some((kind, site)) = as_fault {
+            fault_now(sched, modules, idx, kind, &mut active, site);
+        } else if what == PostedFault::Advance {
+            let _ = advance_now(sched, modules, idx, &mut active);
+        } else {
+            finish(modules, idx, what == PostedFault::DoneInBurst);
+        }
+        // An interrupt-mode module is not stepped by a pass: its domain's
+        // pass drives a `Faulted` one's backoff, and its line goes once it
+        // has ended.
+        let domain = sched.domain_id[idx] as usize;
+        if domain < MAX_DOMAINS && sched.domains[domain].exec_mode.is_interrupt() {
+            if sched.fault_info[idx].state == FaultState::Faulted {
+                ISR_FAULTED_DOMAINS.fetch_or(1 << domain, Ordering::Relaxed);
+            }
+            if sched.finished[idx] {
+                if let Some(irq) = super::module_irq(idx) {
+                    retire_line(irq);
+                }
+            }
+        }
+    }
+    if parked {
+        crate::kernel::sys::hal::smp_release_peers();
+    }
+}
+
+/// A module's step returned `Done`: finalize it, or leave that to the
+/// primary when the module's core is not the primary.
+pub(crate) fn done(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot],
+    module_idx: usize,
+    active_count: &mut usize,
+    in_burst: bool,
+) {
+    if posts_to_primary(sched.domain_id[module_idx] as usize) {
+        let what = if in_burst {
+            PostedFault::DoneInBurst
+        } else {
+            PostedFault::Done
+        };
+        post(sched, module_idx, what, 0);
+        return;
+    }
+    finish(modules, module_idx, in_burst);
+    *active_count -= 1;
+}
+
+/// Finalize a module whose step returned `Done`.
+#[inline(never)]
+fn finish(modules: &mut [ModuleSlot], module_idx: usize, in_burst: bool) {
+    let site = if in_burst {
+        FaultSite::Burst
+    } else {
+        FaultSite::Step
+    };
+    finalize_module(
+        module_idx,
+        None,
+        modules[module_idx].type_name(),
+        site.suffix(),
+    );
+}
+
+/// Take a fault on `module_idx`: on the primary's core at once
+/// ([`fault_now`]); on any other, posted for the primary.
+#[inline(never)]
 pub(crate) fn fault(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot],
     module_idx: usize,
     kind: FaultKind,
     active_count: &mut usize,
-    context: &str,
+    site: FaultSite,
+) {
+    if posts_to_primary(sched.domain_id[module_idx] as usize) {
+        let (what, rc) = match (kind, site) {
+            (FaultKind::Timeout, _) => (PostedFault::Timeout, 0),
+            (FaultKind::Protection, _) => (PostedFault::Protection, 0),
+            (FaultKind::Error(rc), FaultSite::Step) => (PostedFault::Error, rc),
+            (FaultKind::Error(rc), FaultSite::Burst) => (PostedFault::ErrorInBurst, rc),
+            (FaultKind::Error(rc), FaultSite::Refill) => (PostedFault::ErrorInRefill, rc),
+            (FaultKind::Error(rc), FaultSite::Flush) => (PostedFault::ErrorInFlush, rc),
+        };
+        post(sched, module_idx, what, rc);
+        return;
+    }
+    fault_now(sched, modules, module_idx, kind, active_count, site);
+}
+
+/// Take a fault on `module_idx`: record it (counters, `MON_FAULT`, the fault
+/// ring), then apply its policy. `Tolerate` records a timeout and nothing
+/// more: a step stalled behind a device flush is late work, not a runaway. A
+/// module that may restart moves to `Faulted` with its backoff; any other is
+/// terminated and finalized. Then the quarantine pairing.
+#[inline(never)]
+fn fault_now(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot],
+    module_idx: usize,
+    kind: FaultKind,
+    active_count: &mut usize,
+    site: FaultSite,
 ) {
     let now_ms = crate::kernel::sys::hal::now_millis();
     let domain = sched.domain_id[module_idx] as usize;
@@ -122,12 +300,46 @@ pub(crate) fn fault(
         let suffix = match kind {
             FaultKind::Timeout => " (timeout terminated)",
             FaultKind::Protection => " (mpu terminated)",
-            FaultKind::Error(_) => context,
+            FaultKind::Error(_) => site.suffix(),
         };
         finalize_module(module_idx, Some(kind.rc()), name, suffix);
         *active_count -= 1;
     }
     apply_quarantine(sched, modules, module_idx, active_count);
+}
+
+/// Whether `module_idx` must not step, running its policy if it is
+/// `Faulted`: on the primary's core at once ([`advance_now`]); on any other
+/// the policy is posted for the primary. A module with anything posted does
+/// not step until the primary has taken it.
+pub(crate) fn advance(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot],
+    module_idx: usize,
+    active_count: &mut usize,
+) -> bool {
+    if posts_to_primary(sched.domain_id[module_idx] as usize) {
+        if sched.fault_info[module_idx].posted != PostedFault::None {
+            return true;
+        }
+        return match sched.fault_info[module_idx].state {
+            FaultState::Running => false,
+            FaultState::Terminated | FaultState::Recovering => true,
+            FaultState::Faulted => {
+                // Posted once the backoff has passed, so the primary parks
+                // the other cores for the restart or the termination and
+                // not on every pass of the wait. The quarantine pairing was
+                // applied when the fault was taken, and is again when the
+                // partner faults.
+                let now_ms = crate::kernel::sys::hal::now_millis();
+                if now_ms >= sched.fault_info[module_idx].restart_not_before_ms {
+                    post(sched, module_idx, PostedFault::Advance, 0);
+                }
+                true
+            }
+        };
+    }
+    advance_now(sched, modules, module_idx, active_count)
 }
 
 /// Run a `Faulted` module's policy: quarantine first (a co-faulted partner
@@ -136,7 +348,7 @@ pub(crate) fn fault(
 /// Returns `true` when the module is not `Running` and so must not step.
 /// Runs ahead of the period and readiness gates: those govern normal
 /// stepping, not recovery.
-pub(crate) fn advance(
+fn advance_now(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot],
     module_idx: usize,
@@ -458,15 +670,26 @@ pub(crate) fn drain_isr_faults(
             continue;
         }
         match f.outcome {
-            IsrOutcome::Done => {
-                finalize_module(idx, None, modules[idx].type_name(), "");
-                *active_count -= 1;
-            }
+            IsrOutcome::Done => done(sched, modules, idx, active_count, false),
             IsrOutcome::Error(rc) => {
-                fault(sched, modules, idx, FaultKind::Error(rc), active_count, "");
+                fault(
+                    sched,
+                    modules,
+                    idx,
+                    FaultKind::Error(rc),
+                    active_count,
+                    FaultSite::Step,
+                );
             }
             IsrOutcome::Overrun => {
-                fault(sched, modules, idx, FaultKind::Timeout, active_count, "");
+                fault(
+                    sched,
+                    modules,
+                    idx,
+                    FaultKind::Timeout,
+                    active_count,
+                    FaultSite::Step,
+                );
             }
         }
         if sched.fault_info[idx].state == FaultState::Faulted {

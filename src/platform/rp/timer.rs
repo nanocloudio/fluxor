@@ -251,10 +251,41 @@ fn start_monotonic_tick() {
     }
 }
 
-/// RP2040 feeds its single TIMER from the watchdog tick, which the clock
-/// bring-up already enables.
+/// Start the tick of core 1's timer instance, at the same microsecond as the
+/// monotonic one. Called once on core 0, before core 1 is launched: the
+/// instance does not count, and no alarm on it fires, until its tick runs.
+#[cfg(all(feature = "rp", feature = "smp"))]
+pub fn start_secondary_tick() {
+    use crate::platform::chip::TICKS_BASE;
+    use crate::platform::rp_regs::write32;
+
+    // The TICKS block's generators are 0x0c apart, {ctrl, cycles, count}:
+    // PROC0, PROC1, TIMER0 at 0x18, TIMER1 at 0x24.
+    const TIMER0_CTRL: usize = 0x18;
+    const TIMER0_CYCLES: usize = 0x1c;
+    const TICK_ENABLE: u32 = 1 << 0;
+    const _: () = assert!(
+        crate::platform::chip::SECONDARY_TIMER_BASE == 0x400B_0000,
+        "the secondary timer is not TIMER0, whose tick generator this starts"
+    );
+
+    let cycles = crate::platform::chip::XOSC_HZ / 1_000_000;
+    let base = TICKS_BASE as usize;
+    // SAFETY: TICKS_BASE is generated from the silicon TOML and the offsets
+    // are this block's own; written once, before the instance has a user.
+    // Cycles before enable: the divider is latched when the tick starts.
+    unsafe {
+        write32(base + TIMER0_CYCLES, cycles);
+        write32(base + TIMER0_CTRL, TICK_ENABLE);
+    }
+}
+
+/// RP2040 feeds its single TIMER from the watchdog's tick; the timer does
+/// not count until that tick runs.
 #[cfg(all(feature = "rp", feature = "chip-rp2040"))]
-fn start_monotonic_tick() {}
+fn start_monotonic_tick() {
+    crate::platform::rp_watchdog::start_tick();
+}
 
 /// Start the monotonic timer and enable the scheduler alarm's NVIC line.
 /// Call once at boot, before anything reads the clock or sleeps.
@@ -323,71 +354,144 @@ pub mod alarm {
 
     use super::addr;
 
-    #[inline]
-    fn base() -> usize {
-        MONOTONIC_BASE as usize
+    /// The alarms of one timer instance.
+    ///
+    /// Each instance counts from its own tick, so two instances agree on
+    /// rate and on nothing else: a deadline armed here is relative to this
+    /// instance's own counter ([`Alarms::set_target_from_now`]), or an
+    /// absolute value of it.
+    #[derive(Clone, Copy)]
+    pub struct Alarms {
+        base: usize,
     }
 
-    /// Current low word of the counter.
+    /// The monotonic instance: core 0's alarms, and the clock every core
+    /// reads.
+    pub const MONOTONIC: Alarms = Alarms {
+        base: MONOTONIC_BASE as usize,
+    };
+
+    /// Core 1's instance, whose alarm lines are enabled in core 1's NVIC
+    /// alone.
+    #[cfg(feature = "smp")]
+    pub const SECONDARY: Alarms = Alarms {
+        base: crate::platform::chip::SECONDARY_TIMER_BASE as usize,
+    };
+
+    impl Alarms {
+        /// Current low word of the counter.
+        #[inline]
+        pub fn now_lo(self) -> u32 {
+            // SAFETY: generated base plus this block's own offset.
+            unsafe { read32(addr::TIMELR + self.base) }
+        }
+
+        /// Current low word of the raw counter, the value alarms compare
+        /// against.
+        #[inline]
+        pub fn now_raw_lo(self) -> u32 {
+            // SAFETY: generated base plus this block's own offset.
+            unsafe { read32(addr::TIMERAWL + self.base) }
+        }
+
+        /// The target an alarm holds.
+        #[inline]
+        pub fn target(self, idx: u8) -> u32 {
+            // SAFETY: plain RW alarm compare register.
+            unsafe { read32(addr::alarm(self.base, idx)) }
+        }
+
+        /// Enable or disable one alarm's interrupt, leaving the others
+        /// alone.
+        #[inline]
+        pub fn set_enabled(self, idx: u8, on: bool) {
+            let bit = addr::alarm_bit(idx);
+            // SAFETY: INTE is a plain RW register with the RP atomic aliases.
+            unsafe {
+                if on {
+                    set_bits(self.base + TIMER_INTE_OFFSET as usize, bit);
+                } else {
+                    clear_bits(self.base + TIMER_INTE_OFFSET as usize, bit);
+                }
+            };
+        }
+
+        /// Whether one alarm's interrupt is enabled.
+        #[inline]
+        pub fn is_enabled(self, idx: u8) -> bool {
+            // SAFETY: INTE is a plain RW register.
+            unsafe { read32(self.base + TIMER_INTE_OFFSET as usize) & addr::alarm_bit(idx) != 0 }
+        }
+
+        /// Acknowledge one alarm's pending interrupt.
+        #[inline]
+        pub fn ack(self, idx: u8) {
+            // SAFETY: INTR is write-one-to-clear: write only this alarm's bit.
+            unsafe { clear_w1c(self.base + TIMER_INTR_OFFSET as usize, addr::alarm_bit(idx)) };
+        }
+
+        /// Arm an alarm at an absolute counter value, without enabling it.
+        ///
+        /// Separate from [`Alarms::set_target_from_now`] because the
+        /// scheduler computes its deadline against the 64-bit clock and then
+        /// truncates: adding a delta here would re-read the counter and
+        /// drift by however long that computation took.
+        #[inline]
+        pub fn set_target(self, idx: u8, value: u32) {
+            // SAFETY: plain RW alarm compare register.
+            unsafe { write32(addr::alarm(self.base, idx), value) };
+        }
+
+        /// Arm an alarm for `delta_us` from now, without enabling it.
+        #[inline]
+        pub fn set_target_from_now(self, idx: u8, delta_us: u32) -> u32 {
+            let target = self.now_lo().wrapping_add(delta_us);
+            // SAFETY: plain RW alarm compare register.
+            unsafe { write32(addr::alarm(self.base, idx), target) };
+            target
+        }
+    }
+
+    /// Current low word of the monotonic counter.
     #[inline]
     pub fn now_lo() -> u32 {
-        // SAFETY: generated base plus this block's own offset.
-        unsafe { read32(addr::TIMELR + base()) }
+        MONOTONIC.now_lo()
     }
 
-    /// Current low word of the raw counter, the value alarms compare against.
+    /// Current low word of the raw monotonic counter.
     #[inline]
     pub fn now_raw_lo() -> u32 {
-        // SAFETY: generated base plus this block's own offset.
-        unsafe { read32(addr::TIMERAWL + base()) }
+        MONOTONIC.now_raw_lo()
     }
 
-    /// The target an alarm holds.
+    /// The target a monotonic alarm holds.
     #[inline]
     pub fn target(idx: u8) -> u32 {
-        // SAFETY: plain RW alarm compare register.
-        unsafe { read32(addr::alarm(base(), idx)) }
+        MONOTONIC.target(idx)
     }
 
-    /// Enable or disable one alarm's interrupt, leaving the others alone.
+    /// Enable or disable one monotonic alarm's interrupt.
     #[inline]
     pub fn set_enabled(idx: u8, on: bool) {
-        let bit = addr::alarm_bit(idx);
-        // SAFETY: INTE is a plain RW register with the RP atomic aliases.
-        unsafe {
-            if on {
-                set_bits(base() + TIMER_INTE_OFFSET as usize, bit);
-            } else {
-                clear_bits(base() + TIMER_INTE_OFFSET as usize, bit);
-            }
-        };
+        MONOTONIC.set_enabled(idx, on);
     }
 
-    /// Acknowledge one alarm's pending interrupt.
+    /// Acknowledge one monotonic alarm's pending interrupt.
     #[inline]
     pub fn ack(idx: u8) {
-        // SAFETY: INTR is write-one-to-clear — write only this alarm's bit.
-        unsafe { clear_w1c(base() + TIMER_INTR_OFFSET as usize, addr::alarm_bit(idx)) };
+        MONOTONIC.ack(idx);
     }
 
-    /// Arm an alarm at an absolute counter value, without enabling it.
-    ///
-    /// Separate from [`set_target_from_now`] because the scheduler computes
-    /// its deadline against the 64-bit clock and then truncates: adding a
-    /// delta here would re-read the counter and drift by however long that
-    /// computation took.
+    /// Arm a monotonic alarm at an absolute counter value, without enabling
+    /// it.
     #[inline]
     pub fn set_target(idx: u8, value: u32) {
-        // SAFETY: plain RW alarm compare register.
-        unsafe { write32(addr::alarm(base(), idx), value) };
+        MONOTONIC.set_target(idx, value);
     }
 
-    /// Arm an alarm for `delta_us` from now, without enabling it.
+    /// Arm a monotonic alarm for `delta_us` from now, without enabling it.
     #[inline]
     pub fn set_target_from_now(idx: u8, delta_us: u32) -> u32 {
-        let target = now_lo().wrapping_add(delta_us);
-        // SAFETY: plain RW alarm compare register.
-        unsafe { write32(addr::alarm(base(), idx), target) };
-        target
+        MONOTONIC.set_target_from_now(idx, delta_us)
     }
 }

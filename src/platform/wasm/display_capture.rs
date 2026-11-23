@@ -1,21 +1,15 @@
 //! `wasm_browser_display_capture` native module: frames of a surface the user chose
 //! to share. Pulls the newest frame from the host shim's `getDisplayMedia`
-//! capture loop and forwards it on the output channel as an `SRF1`-headered
-//! RGB565-LE raster — the format `linux_display`, `st7701s`, and
-//! `wasm_browser_canvas` all already consume.
+//! capture loop and forwards it on the output channel as a `VideoRaster`
+//! record: one region header (`abi::contracts::video_raster`) covering the
+//! whole surface, then its RGB565 pixels.
 //!
-//! Wire shape on `capture.pixels`: one self-describing frame per capture,
-//! `[magic "SRF1"][w:u16 LE][h:u16 LE][fmt:u8][flags:u8][rgb565 w*h*2]`. A
-//! frame larger than the channel buffer is written across steps (position kept
-//! in state), and a new frame is pulled only once the previous one is fully
-//! drained, so a consumer sees whole frames back-to-back with natural
-//! back-pressure and never a half-frame followed by a fresh header.
-//!
-//! Host shim contract: `host_display_frame(buf, len)` writes one framed raster
-//! into kernel memory and returns its total byte length, 0 when no frame is
-//! ready (the share dialog is still open, or permission is pending), or a
-//! negative — `ENDED` once the person stopped sharing, and nothing else that
-//! this leaf keeps waiting on.
+//! The shim hands over pixels and their extent; the header is written here.
+//! The shared surface's extent is the person's choice and may change between
+//! frames, which the header of each frame states. A frame is written to the
+//! channel in pieces across steps (position kept in state), and a new frame
+//! is pulled only once the previous one is fully written, so a consumer sees
+//! whole frames back to back with natural back-pressure.
 //!
 //! **Stopping is final here.** When the shim reports `ENDED` this leaf latches
 //! and never pulls again. Re-asking would re-open the browser's share dialog —
@@ -24,6 +18,7 @@
 //! under the person's control. A new capture is a new module instance, which
 //! means a new decision.
 
+use crate::abi::contracts::video_raster::{self, Header};
 use crate::abi::platform::native::wasm::wasm_browser_display_capture as tags;
 use crate::kernel::exec::scheduler;
 use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
@@ -31,20 +26,17 @@ use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
 extern "C" {
-    /// Fill `buf` (kernel pointer) with one `SRF1` RGB565 frame of the shared
-    /// surface. Returns the total length written, 0 if no frame is available
-    /// yet, or a negative to end the capture — `ENDED` when the person ended
-    /// it, any other when the shim cannot serve one at all. The shim starts
-    /// `getDisplayMedia` lazily on the first call, and never writes more than
-    /// `len` bytes: it scales the shared surface down to the room it is given
-    /// and says so in the header.
-    fn host_display_frame(buf: *mut u8, len: usize) -> i32;
+    /// Fill `buf` (kernel pointer, `len` bytes of room) with one frame of the
+    /// shared surface as RGB565 little-endian pixels, rows top to bottom,
+    /// and write the frame's width and height to `extent` (two `u32`s).
+    /// Returns the pixel bytes written, 0 if no frame is available yet, or a
+    /// negative to end the capture — `ENDED` when the person ended it, any
+    /// other when the shim cannot serve one at all. The shim starts
+    /// `getDisplayMedia` lazily on the first call, and never writes more
+    /// than `len` bytes: it scales the shared surface down to the room it is
+    /// given and reports the extent it produced.
+    fn host_display_frame(buf: *mut u8, len: usize, extent: *mut u32) -> i32;
 }
-
-/// Self-describing frame header: `magic(4) + w(2) + h(2) + format(1) + flags(1)`.
-/// Matches `sector/modules/common/sector_raster.rs` and `linux_display`'s
-/// `header` mode.
-const SRF1_HDR_LEN: usize = 10;
 
 /// The shim's "the person stopped sharing" return.
 ///
@@ -54,15 +46,26 @@ const SRF1_HDR_LEN: usize = 10;
 /// outside that set ends the capture rather than being waited on.
 const ENDED: i32 = -2;
 
-/// Bytes one frame at `width` x `height` occupies: the self-describing header
-/// plus RGB565 pixels.
+/// The format this source produces.
+const FORMAT: u8 = video_raster::FORMAT_RGB565;
+const PIXEL: usize = match video_raster::bytes_per_pixel(FORMAT) {
+    Some(n) => n,
+    None => panic!("the capture format is a raster format"),
+};
+
+/// The most one channel write carries. A write lands whole or not at all,
+/// so a frame goes out in pieces a ring of the default size takes.
+const WRITE_CHUNK_BYTES: usize = 1024;
+
+/// Bytes one frame at `width` x `height` occupies: the region header plus
+/// its pixels.
 ///
 /// One expression, because the heap seat is asserted against it and
 /// [`alloc_state`] allocates from it. Two copies that disagree would size the
 /// arena below the allocation, which surfaces as a module that faults on its
 /// first step rather than as anything that names the real cause.
 const fn frame_bytes(width: u16, height: u16) -> usize {
-    SRF1_HDR_LEN + (width as usize) * (height as usize) * 2
+    video_raster::HEADER + (width as usize) * (height as usize) * PIXEL
 }
 
 #[repr(C)]
@@ -76,29 +79,19 @@ pub(crate) struct DisplayCaptureState {
     pub pos: u32,
     /// Set once the capture ended. Never cleared: see the module docs.
     pub ended: bool,
-    /// Whether the `SRF1` header is forwarded. When it is not, the header the
-    /// shim writes is skipped rather than not written: the shim always
-    /// describes the frame, and this leaf decides whether the consumer is one
-    /// that reads the description.
-    pub header: bool,
 }
 
-/// Heap footprint, the manifest's `HEAP_SEAT`: the State struct plus one full
-/// frame at the configured backing geometry. Sized from the params because
-/// the buffer *is* the bound on what a stream-supplied header may claim.
+/// Heap footprint, the manifest's `HEAP_SEAT`: the instance plus one full
+/// frame at the configured backing extent. Sized from the params because
+/// the buffer *is* the bound on the surface the shim may hand over.
 const SEAT: [u32; 6] = crate::abi::platform::native::wasm::wasm_browser_display_capture::HEAP_SEAT;
 const _: () = assert!(
-    SEAT[0] as usize >= core::mem::size_of::<DisplayCaptureState>() + frame_bytes(0, 0) + 256
+    SEAT[0] as usize >= super::heap_for::<DisplayCaptureState>() + 32 + frame_bytes(0, 0)
         && SEAT[1] as usize == frame_bytes(1, 1) - frame_bytes(0, 0),
-    "the declared heap seat holds the state and one frame"
+    "the declared heap seat holds the instance and one frame"
 );
 
-unsafe fn alloc_state(
-    out_chan: i32,
-    width: u16,
-    height: u16,
-    header: bool,
-) -> *mut DisplayCaptureState {
+unsafe fn alloc_state(out_chan: i32, width: u16, height: u16) -> *mut DisplayCaptureState {
     let table = syscalls::get_syscall_table();
     let raw = (table.heap_alloc)(core::mem::size_of::<DisplayCaptureState>() as u32)
         as *mut DisplayCaptureState;
@@ -123,10 +116,20 @@ unsafe fn alloc_state(
             len: 0,
             pos: 0,
             ended: false,
-            header,
         },
     );
     raw
+}
+
+/// The header of a whole-surface frame of `pixel_bytes` bytes at the extent
+/// the shim reported, or `None` when the two do not describe one frame the
+/// contract admits.
+fn frame_header(extent: [u32; 2], pixel_bytes: usize) -> Option<Header> {
+    let w = u16::try_from(extent[0]).ok()?;
+    let h = u16::try_from(extent[1]).ok()?;
+    let header = Header::whole(w, h, FORMAT);
+    header.validate().ok()?;
+    (header.pixel_len() == pixel_bytes as u64).then_some(header)
 }
 
 /// # Safety
@@ -153,7 +156,15 @@ unsafe extern "C" fn display_capture_step(state: *mut u8) -> i32 {
                 if st.ended {
                     break;
                 }
-                let n = host_display_frame(st.buf_ptr, st.buf_cap as usize);
+                st.len = 0;
+                st.pos = 0;
+                let room = st.buf_cap as usize - video_raster::HEADER;
+                let mut extent = [0u32; 2];
+                let n = host_display_frame(
+                    st.buf_ptr.add(video_raster::HEADER),
+                    room,
+                    extent.as_mut_ptr(),
+                );
                 if n == 0 {
                     break; // no frame ready
                 }
@@ -169,18 +180,31 @@ unsafe extern "C" fn display_capture_step(state: *mut u8) -> i32 {
                     st.ended = true;
                     break;
                 }
-                st.len = (n as usize).min(st.buf_cap as usize) as u32;
-                if st.len as usize <= SRF1_HDR_LEN {
-                    // A frame that is header and nothing else describes no
-                    // pixels; dropping it is better than writing a header a
-                    // consumer would then wait behind.
-                    st.len = 0;
+                let pixel_bytes = n as usize;
+                let header = if pixel_bytes <= room {
+                    frame_header(extent, pixel_bytes)
+                } else {
+                    None
+                };
+                let head = core::slice::from_raw_parts_mut(st.buf_ptr, video_raster::HEADER);
+                let Some(_) = header.and_then(|h| h.write(head)) else {
+                    // Pixels that do not make the frame their extent names
+                    // describe nothing a consumer could present.
+                    log::warn!(
+                        "[display-capture] dropped a {pixel_bytes}-byte frame reported as {}x{}",
+                        extent[0],
+                        extent[1]
+                    );
                     break;
-                }
-                st.pos = if st.header { 0 } else { SRF1_HDR_LEN as u32 };
+                };
+                st.len = (video_raster::HEADER + pixel_bytes) as u32;
             }
             let remaining = (st.len - st.pos) as usize;
-            let w = channel::channel_write(st.out_chan, st.buf_ptr.add(st.pos as usize), remaining);
+            let w = channel::channel_write(
+                st.out_chan,
+                st.buf_ptr.add(st.pos as usize),
+                remaining.min(WRITE_CHUNK_BYTES),
+            );
             if w <= 0 {
                 break; // channel full — try again next step (back-pressure)
             }
@@ -203,11 +227,9 @@ pub static WASM_BROWSER_DISPLAY_CAPTURE: NativeVtable = super::heap_native(
 unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     let mut width = 0u16;
     let mut height = 0u16;
-    let mut header = true;
     super::walk_tlv(init.params, |tag, value| match tag {
         tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
         tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
-        tags::TAG_HEADER => header = super::tlv_u32(value) != 0,
         _ => {}
     });
     let out_chan = scheduler::module_port(init.slot, tags::PORT_PIXELS);
@@ -219,7 +241,7 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
             init.slot,
             &crate::abi::platform::native::wasm::wasm_browser_display_capture::HEAP_SEAT,
             init.params,
-            || alloc_state(out_chan, width, height, header).cast(),
+            || alloc_state(out_chan, width, height).cast(),
         )
     }
 }

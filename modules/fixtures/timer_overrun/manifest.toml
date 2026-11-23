@@ -1,0 +1,15 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "linux"]
+
+# Fixture for the interrupt-mode cycle budget: each step spins well past the
+# 2,000 cycles a step stepped from the module timer is allowed, so the
+# kernel's measurement of the step latches an overrun. `interrupt_safe`
+# attests that the step makes no call at all. The observable is the kernel's
+# `[guard]` line naming the module.
+interrupt_safe = true
+
+# It keeps no time of its own.
+timer_class = "agnostic"
+
+[observability]
+exempt = "timer-domain fixture; it makes no call, and the kernel's '[guard]' line for it is the observable"

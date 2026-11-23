@@ -371,6 +371,44 @@ As a backstop for an ELF linked by any other route, packing refuses a linked
 module holding an allocated section the image does not carry (anything but
 `.text`, `.rodata`, `.data`, `.param_schema` — a `.got` above all).
 
+#### Image size
+
+`crates/fluxor-rt/module.ld` links a module's `.text`, `.rodata`, `.data` and
+`.param_schema` into one region of 512 KiB (524288 bytes), on every PIC ABI:
+`thumbv6m`, `thumbv8m` and `aarch64` share the script. Code and read-only
+data draw on the same 512 KiB, so the room for tables is what the module's
+code, and the SDK code it links, leave: a module with 30 KiB of code has
+about 480 KiB for `.rodata`.
+
+The region is a statement that modules are small, not an addressing limit
+of any target. An image that fits links on every ABI whatever its mix of
+code and data; one that does not is refused by `fluxor modules build`,
+which names the module, its size against the region, and where data of
+that size goes:
+
+```text
+module 'glyph_atlas': its image (code and constant data) is 530056 B, 5768 B past the 512 KiB (524288 B) module image region, the most one module may link. ...
+```
+
+A module directory that carries its own `module.ld` is linked with that
+script in place of the runtime's, and so with that script's region.
+
+Past the link, the loader refuses a module whose code segment (`.text` and
+`.rodata` as packed) is over `MAX_MODULE_CODE_SIZE` (`src/kernel/config.rs`):
+1 MiB, and 384 KiB on RP2040. `fluxor build` refuses the same module first,
+on every target with a kernel.
+
+Large data does not belong in the image. Every byte of it is linked into
+each build of the module, hashed at admission, and the same for every
+instance. A table, a model, a font or a compiled script that approaches the
+region goes in a **program** instead (see [Programs](#programs)): the graph
+names the file on the instance (`program:` / `programs:`), the packer places
+it page-aligned in the node image beside the modules, and the module asks
+`PROGRAM_INFO` where it is and reads it in place — no copy into module
+state, no share of the 512 KiB, and a different file per instance if the
+graph says so. Where `PROGRAM_INFO` answers address 0 (wasm), the module
+reads the same bytes through `PROGRAM_READ`.
+
 #### What a module cannot link
 
 A module links against the module runtime (`crates/fluxor-rt/src/intrinsics.rs`) and no
@@ -494,7 +532,7 @@ with the variables it holds (`-C llvm-args=-no-stack-coloring` separates
 slots that share storage). A value built by `new()` and assigned into state is
 staged on the stack first; assigning from a `const` copies it in place.
 
-A module links three crates, built once per module ABI by `fluxor modules
+A module links four crates, built once per module ABI by `fluxor modules
 build` and passed to every module compile with `--extern`:
 
 ```rust
@@ -506,6 +544,7 @@ use fluxor_abi as abi;
 use abi::SyscallTable;
 use fluxor_rt::*;
 use fluxor_sdk::crypto::sha256::*; // only what the module calls
+use fluxor_contracts::graph::{self, plan}; // a module that composes a graph
 ```
 
 - `fluxor_abi` is the ABI and nothing else: `kernel_abi` (core primitives),
@@ -524,10 +563,29 @@ use fluxor_sdk::crypto::sha256::*; // only what the module calls
   `fluxor_rt::wasm_entry!()` (the wasm entry glue, at the end of the root).
 - `fluxor_sdk` is library code: crypto, DNSSEC validation, the GPU device
   model and the cores more than one module runs.
+- `fluxor_contracts` is the vocabulary and the codecs the kernel and the
+  tools share: the composed-graph codec and composer (`graph`, `graph::plan`),
+  ring sizing, the params TLV, the state-arena carve rule. A module that
+  places a graph at run time (a live add, a workload CREATE) composes and
+  encodes it with these, so the bytes it sends are the bytes the kernel
+  admits by. It is built with its `alloc` feature off, since a module has
+  no global allocator: `graph::encode_into` over the module's own buffer
+  and the slice passes (`plan::fan_pass`, `plan::record_mailboxes`,
+  `plan::order`, `plan::rings`) are there; `graph::encode`, `plan::compose`
+  and `plan::plan`, which return vectors, are not.
+
+The contracts crate also serves the kernel and the tools, which format
+errors and look names up in tables of strings — data a position-independent
+module may not carry (see "Position-independent data"). So it is held to
+the module rules as each module links it: the build reads what the link
+kept of it (`--print-gc-sections`) and refuses a module that reaches a table
+of pointers there, naming the crate, where the other three crates are
+checked whole when they are built. Its stack is walked with the module's.
 
 No module mounts their source with `#[path]` or `include!`; the `sdk-mount`
-hygiene rule refuses it. A module elsewhere links the same crates, built
-from the trees `fluxor sync` stages under `target/fluxor/`.
+hygiene rule refuses it, for all four crates. A module elsewhere links the
+same crates, built from the trees `fluxor sync` stages under
+`target/fluxor/`.
 
 **Native modules** (`builtin = true` in their `manifest.toml`) are
 compiled directly into the kernel binary rather than shipped as
@@ -600,6 +658,25 @@ that fails. A module reads in place where the address is non-zero; a
 gated module that is isolated is granted its region read-only and never
 executable (see [module_isolation.md](module_isolation.md)), and reaches
 nothing else of the section.
+
+A graph asset is a program too. On a target whose node image carries
+programs, a module param whose value is `${asset:<name>}` makes the asset
+a program of that instance, after the ones the entry lists, and the param
+reads `program:<slot>` ([stacks.md](stacks.md), "Build-time assets"). The
+module marks such a param `asset = true` in its manifest and opens the
+value with `fluxor_rt::asset`:
+
+```rust
+match asset::open(sys, value)? {
+    Asset::InPlace(bytes) => { /* the program, where the kernel maps it */ }
+    Asset::Program(slot) => { /* no address: asset::read(sys, slot, offset, buf) */ }
+    Asset::Fs(path) => { /* a path or asset://<name>: the fs contract */ }
+}
+```
+
+`InPlace` bytes live as long as the node image, which outlives every
+module of it. `open` answers the kernel's `ENOENT` when the slot the value
+names holds no program, on which a module refuses to construct.
 
 ### Step Outcome Contract
 

@@ -98,10 +98,24 @@ pub mod rp_bootrom;
 /// the result decoding is host-testable; the register reads are `rp`-gated.
 #[path = "rp/clocks.rs"]
 pub mod rp_clocks;
+/// RP2350 core 1 as the core of an execution domain: its launch, its RAM
+/// park, its own interrupt lines and timer.
+#[cfg(all(feature = "rp", feature = "smp"))]
+#[path = "rp/core1.rs"]
+pub mod rp_core1;
+/// RP cycle and execute-in-place cache counters. Declared unconditionally so
+/// the cycle arithmetic is host-testable; the register access is `rp`-gated.
+#[path = "rp/counters.rs"]
+pub mod rp_counters;
 /// RP DMA channel registers. Declared unconditionally so the channel address
 /// arithmetic is host-testable; the register reads are `rp`-gated.
 #[path = "rp/dma.rs"]
 pub mod rp_dma;
+/// The RP DMA scan list: its control-block table, arming rules and position
+/// accounting. Declared unconditionally so a host test runs it against a
+/// model of the channels; the registers are in `rp_providers`.
+#[path = "rp/dma_list.rs"]
+pub mod rp_dma_list;
 /// RP entropy sources and their conditioning. Declared unconditionally so
 /// the register offsets and quality grades are host-testable.
 #[path = "rp/entropy.rs"]
@@ -144,6 +158,11 @@ pub mod rp_providers;
 /// unsafe and address-checked by their callers.
 #[path = "rp/regs.rs"]
 pub mod rp_regs;
+/// What a step on an RP core is charged: deadlines moved past time the
+/// kernel held the core, and the allowance for a cache refilled after a
+/// flash write. Declared unconditionally so the accounting is host-testable.
+#[path = "rp/step_charge.rs"]
+pub mod rp_step_charge;
 /// RP step-guard (watchdog-backed step budget).
 #[cfg(feature = "rp")]
 #[path = "rp/step_guard.rs"]
@@ -153,6 +172,10 @@ pub mod rp_step_guard;
 /// host-testable; the register reads inside are `rp`-gated.
 #[path = "rp/timer.rs"]
 pub mod rp_timer;
+/// RP timer ownership rules, which the build script applies to the silicon
+/// TOML. Declared unconditionally so a host test drives the same rules.
+#[path = "rp/timer_ledger.rs"]
+pub mod rp_timer_ledger;
 /// RP fallback UART console — the log path that survives a USB stack that
 /// will not enumerate.
 #[cfg(feature = "rp")]

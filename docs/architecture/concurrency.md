@@ -2,11 +2,14 @@
 
 The kernel ships on five platforms with different concurrency profiles.
 Every platform admits up to `MAX_DOMAINS` (4) execution domains; what
-differs is whether a domain gets a core of its own:
+differs is which core each domain runs on. A target maps each domain index
+to a core (`[smp] domain_cores` in its TOML), and one domain loop runs per
+core that has a domain:
 
 | Platform | Cores | Domains | Domain loop |
 |---|---|---|---|
-| RP2040 / RP2350 | 1 (effective) | up to 4, all on one thread | one synchronous loop on core 0 runs a pass of every domain in index order (`pass::tick_all`) |
+| RP2040 | 1 | up to 4, all on one thread | one loop on core 0 passes over every domain in index order |
+| RP2350 | 2 | up to 4: domain 1 on core 1, domains 0, 2, 3 on core 0 | one loop per core over its domains; core 1 parks whenever XIP is detached |
 | BCM2712 (Pi 5) | 4 | up to 4, domain d on core d | one bare-metal domain loop per core, each running its own domain's modules |
 | uefi | up to 4 used | up to 4, domain d on core d | as BCM2712: the boot core runs domain 0, secondary n runs domain n |
 | Linux | 1 (cooperative) | up to 4, all on one thread | the main thread of the process runs a pass of every domain in index order (`pass::tick_all`) |
@@ -40,7 +43,8 @@ written exclusively in that window need no synchronisation:
 After init these are read-only. The multi-core platforms (bcm2712, uefi)
 publish them to their secondaries with the release store `domains::release()`
 makes, which each secondary's acquire load pairs with before it reads them;
-RP, Linux and WASM have no secondary core to release. Writes during
+the RP2350 lets core 1 leave its wait in RAM after the same release; RP2040,
+Linux and WASM have no secondary core to release. Writes during
 reconfigure happen on core 0 with all secondaries parked, restoring
 boot-only semantics for the duration of the rebuild. The parsed config's
 module entries borrow their params from the resident config blob in place
@@ -173,6 +177,90 @@ Rule of thumb for new code: any state visible to PIC modules via
 syscall traffic is cross-core-shared by default; any state populated by
 `populate_static_state` / `prepare_graph` is boot-only; anything else,
 justify in a comment.
+
+## RP2350: two cores and one flash
+
+The RP2350 runs domain 1 on its second Cortex-M33 and domains 0, 2 and 3 on
+the first (`targets/silicon/rp2350.toml`, `[smp] domain_cores`). The kernel
+state the two cores share falls into the classes above; what the platform
+adds (`src/platform/rp/`) is classified here.
+
+**Each core's own.** The step guard's alarm, armed deadline and stray count
+(`rp/step_guard.rs`; core 0 on the monotonic timer instance, core 1 on its
+own instance); the armed, timed-out and protection-fault flags
+(`kernel/exec/step_guard.rs`, indexed by core); the gated-module control
+block and the MPU, which each core programs for the module it steps
+(`rp/protection.rs`); the stack fence and the measured entry depth
+(`rp/boot.rs`; core 1 steps on its own stack in SRAM8 and SRAM9); the
+module-timer alarm and the `timer` slots tagged with the core
+(`kernel/exec/timer.rs`); the NVIC. Each core's NVIC can be written by that
+core alone, so a line bound for core 1 is recorded in a line set
+(`rp/core1.rs`) that core 1 applies when it enters its loop, after every
+park and at a pass boundary where the set changed.
+
+**Shared under the cores' lock.** `portable_atomic`'s 64-bit atomics (the
+monotonic and ledger counters, the log and telemetry rings) go through the
+critical section (`arch/critical_section_impl.rs`), which masks the local
+core's interrupts and then takes one lock word with the exclusive accesses
+(`arch/core_lock.rs`); a nested section takes the lock once. The platform
+providers (`gpio`, `platform_dma`, `platform_dma_fd`, the raw register
+bridges) run each call inside the same section while core 1 runs a domain
+(`rp_providers::exclusive`). Every lock word and every atomic is a static in
+main SRAM, the only memory where the two cores' exclusive accesses are
+arbitrated.
+
+**Core 0 only.** USB, the console, the watchdog, flash, and every quiesce
+request. Core 0 feeds the watchdog only while core 1's heartbeat moves, core
+1 is parked for core 0, or core 1 runs no domain.
+
+**Bridged.** An edge between a domain on core 0 and one on core 1 is split
+into two channels joined by a lock-free ring (`domains/cross.rs`); an edge
+between two domains of core 0 is a plain channel, since one loop steps both
+ends.
+
+**XIP detach.** Both cores execute from flash. A sector erase, a page
+program and the BOOTSEL read take execute-in-place away, so every one of
+them goes through `with_xip_detached` (`rp/flash.rs`), on core 0 only: core
+1 parks between two of its module steps in a loop that lies in RAM and runs
+with its interrupts masked, records from inside that loop that it has
+parked, and returns only once core 0 has restored XIP. Core 0 waits no
+longer than the deadline of the step core 1 is in plus a millisecond, and
+answers `EBUSY` past it. Core 1 is started for the first graph that places a
+module on it, waits in the same RAM loop until that graph is released, and
+parks there for a structural quiesce. A flash op issued on core 1 answers
+`ENOTSUP`. The time a core is held for a detach (core 0 with its interrupts
+masked, core 1 parked) is not the stepping module's: its deadline moves past
+it and the scheduler leaves it out of the step's time. An erase or a program
+also empties the cache both cores fetch through, so each core's steps may
+run over their deadlines by one refill of that cache in the passes that
+follow (`rp/step_charge.rs`). Before an erase or a program every DMA scan
+list's armed entries return to fill.
+
+**Core 1's stack.** Core 1 steps on a stack of its own, 8 KiB
+(`[smp] secondary_stack` in the target file). A gated module runs on the
+stack in its private region; a module that is not gated runs on core 1's,
+and the composer admits it against the stack less `reserve_kb`, the kernel's
+own share under it: its frames where it calls the module, the deepest call
+the module can make back (through the provider table to a handler and the
+logger), and one interrupt on top. The firmware build measures that sum in
+the linked image (`tools/img/kernel_stack_bound.py`) and refuses an image
+that needs more than the reserve. Three kinds of call run frames deeper than
+core 1's whole stack (a signature check, the loader): the `reconfigure`
+contract, the signing root and the key vault answer `ENOTSUP` on core 1, as
+flash does.
+
+**Faults.** A module's fault on core 1 is taken by its policy like any
+other, and the work of the policy is core 0's: on every kernel that runs
+domains on more than one core, a core other than the primary posts a
+module's timeout, error, protection fault or completion on the module's own
+fault record and stops stepping it, and the primary's next pass finalizes,
+restarts or terminates it with the other cores parked
+(`scheduler/fault.rs`). A kernel fault or a panic on core 1 is the node's:
+core 1 gives up the lock between the cores, leaves what happened for core 0
+and waits in RAM; core 0 logs it, keeps it as the crash record the next boot
+reports, and resets the whole node through the bootrom. Whenever core 0
+itself stops running the graph (its own fault report, a halted graph, a
+reset) it first returns core 1 to the bootrom, so nothing runs beside it.
 
 ## Function-local statics
 

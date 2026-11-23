@@ -54,6 +54,15 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "input.gamepad",
     "input.virtual",
     "input.remote",
+    // The surface a `TextEvents` port carries, port-scoped: committed text
+    // and composition for an application that draws its own text fields. It
+    // carries no facts (the contract fixes the record limit); being
+    // port-scoped is what refuses two producers into one input.
+    "input.text",
+    // The surface an `AccessibilityTree` port carries, port-scoped: its
+    // `max_nodes` fact is the largest tree the producer publishes and the
+    // largest a mirror holds.
+    "accessibility.tree",
     // MIDI surface — paired with the `input::midi` contract and the
     // `MidiEvents` content type. Declared by the per-platform MIDI drivers
     // (Web MIDI on wasm, ALSA seq on linux, class-compliant USB-MIDI on
@@ -104,6 +113,16 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // bundle is missing still answers, by refusing every chain. It carries
     // no facts: a verifier either answers or it does not.
     "trust.system",
+    // A cycle counter a granted module reads through the `counters`
+    // contract. Provided by the TARGET; its `clock` fact says what a cycle
+    // is: `core`, the calling core's own clock, or `system`, a fixed-rate
+    // timer. A module that cannot work from a timer requires the capability
+    // with `clock = "core"`.
+    "counter.cycles",
+    // Instruction-cache hit and access counts read through the same
+    // contract. Provided by the TARGET; its `scope` fact says whose fetches
+    // the counts cover: the calling `core`'s, or the whole `node`'s.
+    "counter.icache",
     "replication.state_machine",
     // The ordered-ack terms of the exchange contract
     // (`crates/fluxor-abi/src/contracts/exchange.rs`): publish requests in order, each
@@ -522,6 +541,65 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
             ("max_payload", FACT_NUMERIC),
         ],
     ),
+    (
+        // The terms of a draw-list stream, declared on the PORT that carries
+        // it (`crates/fluxor-abi/src/contracts/video_draw.rs`). A producer
+        // states what it may send and the limits it stays within; a consumer
+        // states what it draws and holds.
+        "video.draw",
+        &[
+            ("ops", DRAW_OPS),
+            ("pixmap_formats", PIXMAP_FORMATS),
+            ("glyph_formats", GLYPH_FORMATS),
+            // Deepest SAVE nesting, and the most live rounded clips.
+            ("max_depth", FACT_NUMERIC),
+            ("max_resources", FACT_NUMERIC),
+            // Bytes of defined resources live at once.
+            ("resource_bytes", FACT_NUMERIC),
+            // The producer's largest frame, FRAME through COMMIT, against
+            // what the consumer retains. A consumer declaring 0 retains
+            // nothing.
+            ("frame_bytes", FACT_NUMERIC),
+            // The band height of a banded stream; compared by the banding
+            // rule (`BANDING`).
+            ("band_rows", FACT_NUMERIC),
+            // What a frame's damage may be. A consumer that replays retained
+            // records can only show what the last frame holds, so it
+            // declares `full` alone.
+            ("damage", &["full", "partial"]),
+            // Whether a frame must appear whole. A producer that needs it
+            // declares `yes`; a consumer that retains pixels or records
+            // declares both, one that retains nothing `no`.
+            ("atomic", &["yes", "no"]),
+            // Millihertz. A consumer's refresh rate; a producer that streams
+            // bands to a consumer retaining nothing states the band rate it
+            // sustains.
+            ("refresh_mhz", FACT_NUMERIC),
+            // Raster inputs a producer's SURFACE records name, against what
+            // the consumer has.
+            ("surfaces", FACT_NUMERIC),
+        ],
+    ),
+    (
+        // The terms of a raster stream, declared on the PORT. The stream's
+        // own region headers (`crates/fluxor-abi/src/contracts/video_raster.rs`)
+        // are the runtime truth; these are the build-time half.
+        "video.raster",
+        &[
+            ("formats", RASTER_FORMATS),
+            // Whether a frame's regions update a retained surface (`damage`)
+            // or tile the whole of it top to bottom (`bands`, which a whole
+            // frame in one region is).
+            ("regions", &["damage", "bands"]),
+            // The producer's largest surface against what the consumer
+            // accepts.
+            ("width", FACT_NUMERIC),
+            ("height", FACT_NUMERIC),
+        ],
+    ),
+    ("accessibility.tree", &[("max_nodes", FACT_NUMERIC)]),
+    ("counter.cycles", &[("clock", &["core", "system"])]),
+    ("counter.icache", &[("scope", &["core", "node"])]),
 ];
 
 // ── Encoded media vocabulary ───────────────────────────────────────────────
@@ -585,6 +663,130 @@ pub fn glyph_format_byte(format: &str) -> Option<u8> {
         .map(|i| i as u8)
 }
 
+// The raster and pixmap formats, and the draw operations. POSITIONAL, like
+// `CODECS`: an entry's index is the byte (or, for an operation, the bit) the
+// contract carries, and the contract's constants are pinned against these
+// tables. Appending is safe; reordering or removing is a wire break. The two
+// format tables are separate vocabularies in different orders: a raster
+// region's format byte is not a pixmap resource's.
+
+/// Every `VideoRaster` pixel format, in wire-byte order
+/// (`crates/fluxor-abi/src/contracts/video_raster.rs`, `FORMAT_*`).
+pub const RASTER_FORMATS: &[&str] = &["rgb565", "rgba8"];
+
+/// Every draw-list pixmap format, in wire-byte order
+/// (`crates/fluxor-abi/src/contracts/video_draw.rs`, `PIXMAP_*`).
+pub const PIXMAP_FORMATS: &[&str] = &["rgba8", "rgb565"];
+
+/// Every draw-list operation a consumer may omit, in bit order
+/// (`crates/fluxor-abi/src/contracts/video_draw.rs`, `OP_*`).
+pub const DRAW_OPS: &[&str] = &[
+    "fill_rect",
+    "fill_rrect",
+    "border",
+    "pixmap",
+    "glyphs",
+    "clip_rect",
+    "clip_rrect",
+    "translate",
+    "surface",
+    "res_ref",
+];
+
+/// The wire byte for a raster format, or `None` for a name outside
+/// [`RASTER_FORMATS`].
+pub fn raster_format_byte(format: &str) -> Option<u8> {
+    RASTER_FORMATS
+        .iter()
+        .position(|f| *f == format)
+        .map(|i| i as u8)
+}
+
+/// The wire byte for a pixmap format, or `None` for a name outside
+/// [`PIXMAP_FORMATS`].
+pub fn pixmap_format_byte(format: &str) -> Option<u8> {
+    PIXMAP_FORMATS
+        .iter()
+        .position(|f| *f == format)
+        .map(|i| i as u8)
+}
+
+/// The bit position of a draw operation, or `None` for a name outside
+/// [`DRAW_OPS`].
+pub fn draw_op_bit(op: &str) -> Option<u8> {
+    DRAW_OPS.iter().position(|o| *o == op).map(|i| i as u8)
+}
+
+// The accessibility roles. POSITIONAL: an entry's index is the `role` byte a
+// tree node carries (`crates/fluxor-abi/src/contracts/accessibility.rs`,
+// whose `ROLE_*` bytes are pinned against this table). Each is the ARIA 1.2
+// role of the same name, chosen so composite widgets have their required
+// children. Appending is safe; reordering or removing is a wire break.
+//
+// This table serves tools and a mirror's own copy. A module uses the
+// `ROLE_*` bytes, never the names: a table of string slices is a table of
+// absolute addresses, which position-independent module code cannot hold.
+
+/// Every accessibility role, in wire-byte order.
+pub const ACCESS_ROLES: &[&str] = &[
+    "generic",
+    "button",
+    "checkbox",
+    "radio",
+    "radiogroup",
+    "switch",
+    "slider",
+    "spinbutton",
+    "textbox",
+    "searchbox",
+    "combobox",
+    "listbox",
+    "option",
+    "link",
+    "heading",
+    "paragraph",
+    "list",
+    "listitem",
+    "img",
+    "group",
+    "region",
+    "dialog",
+    "alertdialog",
+    "alert",
+    "status",
+    "menu",
+    "menubar",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "tab",
+    "tablist",
+    "tabpanel",
+    "progressbar",
+    "meter",
+    "toolbar",
+    "separator",
+    "scrollbar",
+    "table",
+    "row",
+    "cell",
+    "columnheader",
+    "rowheader",
+    "grid",
+    "gridcell",
+    "tree",
+    "treeitem",
+];
+
+/// The wire byte for an accessibility role, or `None` for a name outside
+/// [`ACCESS_ROLES`].
+pub fn access_role_byte(role: &str) -> Option<u8> {
+    ACCESS_ROLES
+        .iter()
+        .position(|r| *r == role)
+        .map(|i| i as u8)
+}
+
 /// The wire byte for `codec`, or `None` for a name outside [`CODECS`].
 pub fn codec_byte(codec: &str) -> Option<u8> {
     CODECS.iter().position(|c| *c == codec).map(|i| i as u8)
@@ -603,8 +805,15 @@ pub fn packing_byte(packing: &str) -> Option<u8> {
 /// Capabilities whose facts describe the stream on ONE PORT rather than a
 /// service the module provides. Their facts are declared in `[ports.facts]`
 /// on the port and refused in the module-level `[capability_facts]` table.
-pub const PORT_SCOPED_CAPABILITIES: &[&str] =
-    &["audio.encoded", "video.encoded", "exchange.request"];
+pub const PORT_SCOPED_CAPABILITIES: &[&str] = &[
+    "audio.encoded",
+    "video.encoded",
+    "exchange.request",
+    "video.draw",
+    "video.raster",
+    "input.text",
+    "accessibility.tree",
+];
 
 /// Set-valued port facts a consumer that declares nothing takes NONE of,
 /// rather than being unconstrained: what a port does not say it speaks, it
@@ -624,6 +833,8 @@ pub fn surface_capability(content_type: &str) -> Option<&'static str> {
         ("VideoScanout", "video.scanout"),
         ("MediaMuxed", "media.muxed"),
         ("ExchangeRequest", "exchange.request"),
+        ("TextEvents", "input.text"),
+        ("AccessibilityTree", "accessibility.tree"),
     ];
     SURFACES
         .iter()
@@ -641,18 +852,97 @@ pub enum FactRule {
     Subset,
     /// A number both ends must agree on exactly (`clock_rate`, `channels`).
     Exact,
-    /// A size ceiling: the producer's value must not exceed the consumer's.
+    /// A ceiling: the producer's value must not exceed the consumer's
+    /// (`max_payload`, `width`).
     Ceiling,
+    /// A floor: the consumer's value must not exceed the producer's
+    /// (`refresh_mhz`: a consumer's rate against the rate a producer
+    /// sustains).
+    Floor,
 }
 
-/// The comparison rule for `fact`, given its admitted values.
+/// The rule of every numeric fact, by fact name. A name carries one rule on
+/// every capability that has it; the crate's vocabulary test holds that every
+/// numeric fact in [`CAPABILITY_FACTS`] has a row here and that every row
+/// names one.
+pub const NUMERIC_FACT_RULES: &[(&str, FactRule)] = &[
+    ("max_payload", FactRule::Ceiling),
+    ("clock_rate", FactRule::Exact),
+    ("channels", FactRule::Exact),
+    ("samples_per_channel", FactRule::Exact),
+    ("period_ms", FactRule::Exact),
+    ("max_depth", FactRule::Ceiling),
+    ("max_resources", FactRule::Ceiling),
+    ("resource_bytes", FactRule::Ceiling),
+    ("frame_bytes", FactRule::Ceiling),
+    // The subject of the banding rule ([`BANDING`]), which decides whether
+    // this ceiling is compared at all.
+    ("band_rows", FactRule::Ceiling),
+    ("refresh_mhz", FactRule::Floor),
+    ("surfaces", FactRule::Ceiling),
+    ("width", FactRule::Ceiling),
+    ("height", FactRule::Ceiling),
+    ("max_nodes", FactRule::Ceiling),
+];
+
+/// The comparison rule for `fact`, given its admitted values: `Subset` for
+/// an enumerated fact, its [`NUMERIC_FACT_RULES`] row for a numeric one.
 pub fn fact_rule(fact: &str, admitted: FactValues) -> FactRule {
     if admitted != FACT_NUMERIC {
-        FactRule::Subset
-    } else if fact == "max_payload" {
-        FactRule::Ceiling
-    } else {
-        FactRule::Exact
+        return FactRule::Subset;
+    }
+    NUMERIC_FACT_RULES
+        .iter()
+        .find(|(name, _)| *name == fact)
+        .map_or(FactRule::Exact, |(_, rule)| *rule)
+}
+
+/// A rule that reads two facts of one capability: whether `fact` is
+/// compared across an edge depends on the consumer's `gate` fact. Checked in
+/// place of `fact`'s own row in [`NUMERIC_FACT_RULES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossFactRule {
+    pub capability: &'static str,
+    pub fact: &'static str,
+    pub gate: &'static str,
+}
+
+/// The banding rule of `video.draw`: a consumer whose `frame_bytes` is 0
+/// retains neither pixels nor records, so the producer's stream must be
+/// banded (`band_rows` non-zero) in bands no taller than the consumer's. A
+/// consumer that retains bands for itself and takes any stream. Judged by
+/// [`banding_admits`].
+pub const BANDING: CrossFactRule = CrossFactRule {
+    capability: "video.draw",
+    fact: "band_rows",
+    gate: "frame_bytes",
+};
+
+/// Every cross-fact rule.
+pub const CROSS_FACT_RULES: &[CrossFactRule] = &[BANDING];
+
+/// The cross-fact rule whose subject is `fact` on `capability`, if any.
+pub fn cross_fact_rule(capability: &str, fact: &str) -> Option<&'static CrossFactRule> {
+    CROSS_FACT_RULES
+        .iter()
+        .find(|r| r.capability == capability && r.fact == fact)
+}
+
+/// Whether an edge passes [`BANDING`]. `None` is a fact that end does not
+/// declare. A consumer that declares no `frame_bytes`, or a non-zero one,
+/// takes any stream. One that declares 0 needs a producer that declares a
+/// non-zero `band_rows`, within the consumer's own when it declares one.
+pub fn banding_admits(
+    consumer_frame_bytes: Option<u32>,
+    producer_band_rows: Option<u32>,
+    consumer_band_rows: Option<u32>,
+) -> bool {
+    if consumer_frame_bytes != Some(0) {
+        return true;
+    }
+    match producer_band_rows {
+        None | Some(0) => false,
+        Some(rows) => consumer_band_rows.is_none_or(|ceiling| rows <= ceiling),
     }
 }
 
@@ -660,7 +950,12 @@ pub fn fact_rule(fact: &str, admitted: FactValues) -> FactRule {
 /// platform HAL that a manifest can require but nothing in a graph declares.
 /// Answered per target by the composer's target-facts table; a
 /// `[[requires_when]]` naming any other capability is a manifest error.
-pub const TARGET_CAPABILITIES: &[&str] = &["time.wall", "trust.system"];
+pub const TARGET_CAPABILITIES: &[&str] = &[
+    "time.wall",
+    "trust.system",
+    "counter.cycles",
+    "counter.icache",
+];
 
 /// Marker for a fact whose value is a `u32` rather than one of an
 /// enumerated set. Compared by identity of the empty slice's contents, so a

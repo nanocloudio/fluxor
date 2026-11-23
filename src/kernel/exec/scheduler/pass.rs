@@ -1,6 +1,7 @@
 //! The pass engine: one function steps a domain's modules for one tick, and
 //! the same function steps woken modules between ticks. Every platform loop
-//! calls [`run`] (a single-core loop through [`tick_all`] and [`wake_all`]),
+//! calls [`run`] (a loop over all of its core's domains through [`tick_all`]
+//! and [`wake_all`]),
 //! so a graph behaves the same whether it is the only resident graph or one
 //! of many, admitted at boot or live, on any target.
 //!
@@ -21,7 +22,7 @@
 //! A wake pass ([`PassKind::Wake`]) is step 5 for the woken modules alone,
 //! each once, with the domain's budget deferring what does not fit.
 use super::*;
-use fault::{self, FaultKind};
+use fault::{self, FaultKind, FaultSite};
 
 /// What a pass does: a full domain tick, or the woken modules in the mask.
 #[derive(Clone, Copy)]
@@ -63,16 +64,23 @@ pub fn take_domain_wakes(domain: usize) -> ModuleMask {
     crate::kernel::ipc::event::take_wake_in_mask(&mask)
 }
 
-/// A single-core loop's tick: [`run`] over every domain, in order. The
-/// result is `Done` only when every domain's is; the deadline is the
-/// soonest.
+/// The domains the calling core's loop passes over, a bit per domain: the
+/// ones the target maps to this core.
+fn this_core_domains() -> u8 {
+    crate::kernel::exec::domains::core_domains(crate::kernel::sys::hal::core_id())
+}
+
+/// The tick of a loop that passes over every domain of its core: [`run`]
+/// over each of the calling core's domains, in index order. The result is
+/// `Done` only when every domain's is; the deadline is the soonest.
 pub fn tick_all() -> PassResult {
     let mut out = PassResult {
         result: StepResult::Done,
         deadline_us: u32::MAX,
         burst: false,
     };
-    for d in 0..domain_count() {
+    let mine = this_core_domains();
+    for d in (0..domain_count()).filter(|&d| mine & (1 << d) != 0) {
         let r = run(d, PassKind::Tick);
         if r.result != StepResult::Done {
             out.result = r.result;
@@ -86,11 +94,13 @@ pub fn tick_all() -> PassResult {
     out
 }
 
-/// A single-core loop's wake drain: each domain's latched wakes, stepped by
-/// [`run`]. Returns whether any were taken.
+/// The wake drain of a loop that passes over every domain of its core: each
+/// of the calling core's domains' latched wakes, stepped by [`run`]. Returns
+/// whether any were taken.
 pub fn wake_all() -> bool {
     let mut any = false;
-    for d in 0..domain_count() {
+    let mine = this_core_domains();
+    for d in (0..domain_count()).filter(|&d| mine & (1 << d) != 0) {
         let woken = take_domain_wakes(d);
         if !woken.is_empty() {
             any = true;
@@ -140,8 +150,13 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
         sched.domains[domain]
             .pass_count
             .fetch_add(1, Ordering::Relaxed);
+        // This core's cache counters, read again before they stick or wrap,
+        // once a module on it has read them.
+        crate::kernel::sys::counters::housekeep();
         if domain == 0 {
-            // Lines whose `irq` module ended go on the primary.
+            // The fault work other cores left for the primary, then the
+            // lines whose `irq` module ended.
+            fault::apply_posted(sched, modules);
             fault::retire_isr_lines();
         }
         if sched.domains[domain].exec_mode.is_interrupt() {
@@ -158,7 +173,8 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
                 ..idle
             };
         }
-        if fault::enforce_drain_timeout(sched, modules, count) {
+        // The drain ceiling terminates every module: the primary's.
+        if domain == 0 && fault::enforce_drain_timeout(sched, modules, count) {
             return idle;
         }
     } else if sched.domains[domain].exec_mode.is_interrupt() {
@@ -767,9 +783,9 @@ fn run_pre_pass_hook(
     };
     let (timed_out, protection) = end_step_guard();
     let mut admitted = false;
-    let context = match hook {
-        PrePassHook::Refill => " (pipeline-refill)",
-        PrePassHook::Flush => " (post-tick-flush)",
+    let site = match hook {
+        PrePassHook::Refill => FaultSite::Refill,
+        PrePassHook::Flush => FaultSite::Flush,
     };
     if timed_out {
         fault::fault(
@@ -778,7 +794,7 @@ fn run_pre_pass_hook(
             module_idx,
             FaultKind::Timeout,
             active_count,
-            "",
+            FaultSite::Step,
         );
     } else if protection {
         fault::fault(
@@ -787,7 +803,7 @@ fn run_pre_pass_hook(
             module_idx,
             FaultKind::Protection,
             active_count,
-            "",
+            FaultSite::Step,
         );
     } else {
         match result {
@@ -798,7 +814,7 @@ fn run_pre_pass_hook(
                 module_idx,
                 FaultKind::Error(rc),
                 active_count,
-                context,
+                site,
             ),
         }
     }
@@ -1010,6 +1026,10 @@ pub(crate) fn step_one_module(
     if sched.finished[module_idx] {
         return;
     }
+    // Between steps, with no guard armed and no module mid-step, is where a
+    // core parks for a step quiesce.
+    #[cfg(all(feature = "smp", target_os = "none"))]
+    crate::kernel::exec::domains::step_boundary();
     // Interrupt-mode modules run from their timer or IRQ, never from a pass.
     let domain = sched.domain_id[module_idx] as usize;
     if domain < MAX_DOMAINS && sched.domains[domain].exec_mode.is_interrupt() {
@@ -1056,16 +1076,21 @@ pub(crate) fn step_one_module(
     }
 
     let deadline = sched.fault_info[module_idx].effective_deadline_us();
+    step_guard::begin_step();
     step_guard::arm(deadline);
     // The whole step's wall clock, burst re-steps included, is what the
-    // domain's budget is charged.
+    // domain's budget is charged, less the time the kernel held the core
+    // for inside it (a flash operation, a park for another core's).
     let module_t0 = crate::kernel::sys::hal::now_micros();
     crate::kernel::sys::hal::stack_fence_arm(m.stack_bytes());
     let outcome = as_module_step(|| m.step());
     note_stack_fence(module_idx);
     record_step_time(
         module_idx,
-        (crate::kernel::sys::hal::now_micros() - module_t0) as u32,
+        step_guard::charged(
+            crate::kernel::sys::hal::now_micros() - module_t0,
+            step_guard::excluded_us(),
+        ) as u32,
     );
 
     match outcome {
@@ -1079,7 +1104,7 @@ pub(crate) fn step_one_module(
                     module_idx,
                     FaultKind::Timeout,
                     active_count,
-                    "",
+                    FaultSite::Step,
                 );
             } else if protection {
                 fault::fault(
@@ -1088,7 +1113,7 @@ pub(crate) fn step_one_module(
                     module_idx,
                     FaultKind::Protection,
                     active_count,
-                    "",
+                    FaultSite::Step,
                 );
             }
         }
@@ -1101,7 +1126,7 @@ pub(crate) fn step_one_module(
                     module_idx,
                     FaultKind::Protection,
                     active_count,
-                    "",
+                    FaultSite::Step,
                 );
             } else if !sched.ready[module_idx] {
                 sched.ready[module_idx] = true;
@@ -1110,8 +1135,7 @@ pub(crate) fn step_one_module(
         }
         Ok(StepOutcome::Done) => {
             let _ = end_step_guard();
-            finalize_module(module_idx, None, modules[module_idx].type_name(), "");
-            *active_count -= 1;
+            fault::done(sched, modules, module_idx, active_count, false);
         }
         Ok(StepOutcome::Burst) => {
             step_burst(
@@ -1132,13 +1156,23 @@ pub(crate) fn step_one_module(
             } else {
                 FaultKind::Error(rc)
             };
-            fault::fault(sched, modules, module_idx, kind, active_count, "");
+            fault::fault(
+                sched,
+                modules,
+                module_idx,
+                kind,
+                active_count,
+                FaultSite::Step,
+            );
         }
     }
 
     set_current_module(MAX_MODULES);
 
-    let elapsed = crate::kernel::sys::hal::now_micros().wrapping_sub(module_t0);
+    let elapsed = step_guard::charged(
+        crate::kernel::sys::hal::now_micros().wrapping_sub(module_t0),
+        step_guard::excluded_us(),
+    );
     let Some(ds) = sched.domains.get_mut(domain) else {
         return;
     };
@@ -1189,6 +1223,12 @@ fn step_burst(
     // the closing guard check does not take a second fault.
     let mut ended = false;
     for _ in 0..MAX_BURST_STEPS {
+        // Between two re-steps no module is mid-step either: a core parks
+        // here for a step quiesce, so a bursting module does not hold the
+        // primary for the whole burst. The platform's park moves the burst
+        // deadline past the time parked.
+        #[cfg(all(feature = "smp", target_os = "none"))]
+        crate::kernel::exec::domains::step_boundary();
         if step_guard::is_timed_out() {
             step_guard::disarm();
             step_guard::check_and_clear_timeout();
@@ -1198,7 +1238,7 @@ fn step_burst(
                 module_idx,
                 FaultKind::Timeout,
                 active_count,
-                "",
+                FaultSite::Step,
             );
             ended = true;
             break;
@@ -1208,7 +1248,10 @@ fn step_burst(
         if let Some(ds) = sched.domains.get_mut(domain) {
             let limit = u64::from(ds.budget_limit_us);
             if limit > 0 {
-                let elapsed_now = crate::kernel::sys::hal::now_micros().wrapping_sub(module_t0);
+                let elapsed_now = step_guard::charged(
+                    crate::kernel::sys::hal::now_micros().wrapping_sub(module_t0),
+                    step_guard::excluded_us(),
+                );
                 if ds.budget_consumed_us.saturating_add(elapsed_now) > limit {
                     if let Some(sup) = ds.mon_throttle(MonLine::BurstAbort) {
                         log::warn!(
@@ -1230,11 +1273,15 @@ fn step_burst(
             break;
         };
         let t0 = crate::kernel::sys::hal::now_micros();
+        let excluded_before = step_guard::excluded_us();
         let outcome = as_module_step(|| m.step());
         note_stack_fence(module_idx);
         record_step_time(
             module_idx,
-            (crate::kernel::sys::hal::now_micros() - t0) as u32,
+            step_guard::charged(
+                crate::kernel::sys::hal::now_micros() - t0,
+                step_guard::excluded_us().saturating_sub(excluded_before),
+            ) as u32,
         );
         match outcome {
             Ok(StepOutcome::Burst) => continue,
@@ -1247,13 +1294,7 @@ fn step_burst(
                 break;
             }
             Ok(StepOutcome::Done) => {
-                finalize_module(
-                    module_idx,
-                    None,
-                    modules[module_idx].type_name(),
-                    " (burst)",
-                );
-                *active_count -= 1;
+                fault::done(sched, modules, module_idx, active_count, true);
                 ended = true;
                 break;
             }
@@ -1264,7 +1305,7 @@ fn step_burst(
                     module_idx,
                     FaultKind::Error(rc),
                     active_count,
-                    " (burst)",
+                    FaultSite::Burst,
                 );
                 ended = true;
                 break;
@@ -1282,7 +1323,7 @@ fn step_burst(
             module_idx,
             FaultKind::Timeout,
             active_count,
-            "",
+            FaultSite::Step,
         );
     } else if protection {
         fault::fault(
@@ -1291,7 +1332,7 @@ fn step_burst(
             module_idx,
             FaultKind::Protection,
             active_count,
-            "",
+            FaultSite::Step,
         );
     }
 }

@@ -202,8 +202,7 @@ wiring = []
 # pluggable export path. Every kind inserts the `otel` export engine + a
 # generic `transport_buffer` (the byte-egress stage), differing only in the
 # buffer's `transport` capability. `otel` drains the kernel telemetry ring (no
-# per-source wiring — emission is ring-based since
-# ring-based), batches records as `fxtl-compact`, and
+# per-source wiring: emission is ring-based), batches records as `fxtl-compact`, and
 # frames each batch onto its `export` port; `transport_buffer` forwards each
 # framed batch over the selected transport. `udp` (transport 0) sends each
 # batch as one datagram off the family's net module (needs a unicast `dst_ip`,

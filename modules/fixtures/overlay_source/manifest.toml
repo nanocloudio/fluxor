@@ -1,0 +1,49 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+timer_class = "agnostic"
+
+# A drawn menu over a moving picture, for a rasteriser's SURFACE path under
+# test: the two streams an application sends when it overlays its interface
+# on a picture another producer draws.
+#
+# `surface` carries the picture: a 256 x 192 RGB565 raster
+# (`abi::contracts::video_raster`), whole frames in bands of 8 rows, a
+# checkerboard with a bar that moves one step each frame. A frame is sent
+# every 32 steps.
+#
+# `draw` carries one static `VideoDraw` frame
+# (`abi::contracts::video_draw`) over a 256 x 192 surface: a SURFACE record
+# placing the consumer's raster input 0 across the whole surface, a
+# translucent rounded panel over it, and three menu rows, one highlighted.
+# Wire `surface` to that raster input and the consumer redraws the menu
+# over each picture as it arrives.
+
+[[ports]]
+name = "draw"
+direction = "output"
+content_type = "VideoDraw"
+required = true
+[ports.facts]
+ops = ["fill_rect", "fill_rrect", "surface"]
+max_depth = 0
+max_resources = 0
+resource_bytes = 0
+frame_bytes = 256
+damage = ["full"]
+atomic = ["no"]
+surfaces = 1
+
+[[ports]]
+name = "surface"
+index = 1
+direction = "output"
+content_type = "VideoRaster"
+required = false
+[ports.facts]
+formats = ["rgb565"]
+regions = ["bands"]
+width = 256
+height = 192
+
+[observability]
+exempt = "a fixture — the frames it sends are what there is to observe"

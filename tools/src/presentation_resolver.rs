@@ -119,6 +119,12 @@ pub struct Surface {
     /// Max controls a plane renders before overflow (host/profile policy).
     pub chrome_capacity: usize,
     pub content_capacity: usize,
+    /// Surface pixels per logical pixel the surface's authority reports, in
+    /// eighths (`input::surface_traits` `dpr_eighths`: 8 = 1x); 0 where the
+    /// ratio is known only at run time (a browser) or there is no display.
+    /// Placement keys on logical size classes, so it does not read this; a
+    /// renderer sizes what it draws by it.
+    pub dpr_eighths: u8,
 }
 
 impl Surface {
@@ -707,6 +713,50 @@ fn declared_buttons(panel: &Value) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
+/// `input::surface_traits::DPR_UNREPORTED`: the authority reports no ratio.
+pub const DPR_UNREPORTED: u8 = fluxor_abi::contracts::input::surface_traits::DPR_UNREPORTED;
+/// `input::surface_traits::DPR_1X`: one surface pixel per logical pixel.
+pub const DPR_1X: u8 = fluxor_abi::contracts::input::surface_traits::DPR_1X;
+
+/// The `dpr_eighths` a `panel_surface_traits` authority declares: its param,
+/// or 1x when it sets none. `Err` holds a value outside `1..=255`, which is
+/// no ratio a panel with a display can report (0 means unreported).
+fn panel_dpr_eighths(panel: &Value) -> std::result::Result<u8, u64> {
+    let set = panel
+        .get("dpr_eighths")
+        .or_else(|| panel.get("params").and_then(|p| p.get("dpr_eighths")));
+    match set {
+        None => Ok(DPR_1X),
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=255) => Ok(n as u8),
+            Some(n) => Err(n),
+            None => Err(0),
+        },
+    }
+}
+
+/// Why a config's panel authority declares a device pixel ratio it cannot
+/// report, or `None`: a `panel_surface_traits` module with a display whose
+/// `dpr_eighths` is not `1..=255`.
+pub fn panel_dpr_refusal(config: &Value) -> Option<String> {
+    let panel = find_authority(config, "panel_surface_traits")?;
+    let display_count = panel
+        .get("display_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    if display_count == 0 {
+        return None;
+    }
+    panel_dpr_eighths(panel).err().map(|_| {
+        let name = panel.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        format!(
+            "module `{name}` (panel_surface_traits): `dpr_eighths` is surface pixels per \
+             logical pixel in eighths, 1 to 255 (8 = 1x, 12 = 1.5x, 16 = 2x); 0 is what a \
+             panel with no display reports"
+        )
+    })
+}
+
 /// Derive the surface a config presents on. A `panel_surface_traits` authority
 /// names a bare-metal panel (including the screenless `display_count = 0` case);
 /// a `linux_surface_traits` authority names a Linux host — which, like the
@@ -745,6 +795,13 @@ pub fn surface_from_config(config: &Value) -> Surface {
             physical_buttons,
             chrome_capacity: 0,
             content_capacity: if display_count > 0 { 64 } else { 0 },
+            // The board declares its ratio with its viewport; a headless
+            // panel reports none.
+            dpr_eighths: if display_count > 0 {
+                panel_dpr_eighths(m).unwrap_or(DPR_UNREPORTED)
+            } else {
+                DPR_UNREPORTED
+            },
         }
     } else if let Some(m) = find_authority(config, "linux_surface_traits") {
         let display_count = m.get("display_count").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
@@ -759,6 +816,13 @@ pub fn surface_from_config(config: &Value) -> Surface {
             physical_buttons: 0,
             chrome_capacity: 0,
             content_capacity: if display_count > 0 { 64 } else { 0 },
+            // The Linux display takes a raster in logical pixels and
+            // magnifies it itself.
+            dpr_eighths: if display_count > 0 {
+                DPR_1X
+            } else {
+                DPR_UNREPORTED
+            },
         }
     } else {
         Surface {
@@ -769,6 +833,8 @@ pub fn surface_from_config(config: &Value) -> Surface {
             physical_buttons: 0,
             chrome_capacity: 64,
             content_capacity: 64,
+            // A browser reports its device pixel ratio at run time.
+            dpr_eighths: DPR_UNREPORTED,
         }
     };
 
@@ -908,15 +974,16 @@ pub fn content_controls_unrenderable(config: &Value) -> Option<(String, String)>
 }
 
 /// Lint a config's presentation shell against its surface. Returns one message
-/// per `essential` control that cannot be surfaced. Empty = clean (including
-/// configs with no shell / no controls).
+/// per `essential` control that cannot be surfaced, and one for a panel
+/// authority that declares a device pixel ratio it cannot report. Empty =
+/// clean (including configs with no shell / no controls).
 pub fn lint_config(config: &Value) -> Vec<String> {
     let controls = match config
         .pointer("/presentation/shell/controls")
         .and_then(|c| c.as_array())
     {
         Some(c) if !c.is_empty() => c,
-        _ => return Vec::new(),
+        _ => return panel_dpr_refusal(config).into_iter().collect(),
     };
     let intents: Vec<ControlIntent> = controls.iter().filter_map(intent_from_control).collect();
     let surface = surface_from_config(config);
@@ -934,6 +1001,8 @@ pub fn lint_config(config: &Value) -> Vec<String> {
             )
         })
         .collect();
+
+    msgs.extend(panel_dpr_refusal(config));
 
     // Physical-binding integrity. These are independent of plane placement: a
     // double-bound button or a binding to a non-existent button is a config

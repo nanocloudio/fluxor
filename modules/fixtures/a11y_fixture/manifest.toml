@@ -1,0 +1,88 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+timer_class = "agnostic"
+
+# A small application that draws its own controls: a text field, a button
+# and a secret field on a 240 x 128 surface, for a host's input and
+# accessibility path under test.
+#
+# `pixels` carries the picture as `VideoRaster` records
+# (`abi::contracts::video_raster`): whole frames in bands of 8 rows, RGB565.
+# Each field shows a bar as long as its text; the focused control has a
+# bright border; the button changes colour each time it is pressed.
+#
+# `tree` carries the controls as an accessibility tree
+# (`abi::contracts::accessibility`): a group holding a textbox "Message", a
+# button "Send", a secret textbox "Passcode" and a status that reads
+# "pressed N". The whole tree is sent at the start and whenever `actions`
+# asks with RESYNC; a change is sent as the changed nodes and the focus.
+# The secret field's value never enters the tree: its node carries the
+# length.
+#
+# What the fixture does with its inputs, each optional:
+#
+# `actions` (`AccessibilityActions`): ACTIVATE on the button presses it;
+# FOCUS moves the focus; RESYNC is answered with the whole tree.
+#
+# `text` (`TextEvents`, `abi::contracts::input::text`): COMMIT inserts at the
+# selection of the record's target, or of the focused field when the record
+# names none; DELETE and SELECT edit and move the selection; a composition's
+# preedit is display only and is not inserted.
+#
+# `keys` (`KeyEvents`): a key flagged `KEY_TEXT` has already arrived as text
+# and is not applied again. An unflagged Backspace, Delete, arrow, Home or
+# End edits the focused field; Tab moves the focus; Enter or Space on the
+# focused button presses it.
+#
+# `pointer` (`PointerEvents`): a press on a control focuses it, and presses
+# the button.
+
+[[ports]]
+name = "actions"
+direction = "input"
+content_type = "AccessibilityActions"
+required = false
+
+[[ports]]
+name = "text"
+index = 1
+direction = "input"
+content_type = "TextEvents"
+required = false
+
+[[ports]]
+name = "keys"
+index = 2
+direction = "input"
+content_type = "KeyEvents"
+required = false
+
+[[ports]]
+name = "pointer"
+index = 3
+direction = "input"
+content_type = "PointerEvents"
+required = false
+
+[[ports]]
+name = "tree"
+direction = "output"
+content_type = "AccessibilityTree"
+required = false
+[ports.facts]
+max_nodes = 5
+
+[[ports]]
+name = "pixels"
+index = 1
+direction = "output"
+content_type = "VideoRaster"
+required = false
+[ports.facts]
+formats = ["rgb565"]
+regions = ["bands"]
+width = 240
+height = 128
+
+[observability]
+exempt = "a fixture — its tree and its picture are what there is to observe"

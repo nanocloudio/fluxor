@@ -10,9 +10,19 @@
 //! live in [`aarch64`], parameterised by the platform at boot; the Cortex-M
 //! primitives are the modules below.
 
+/// A lock between cores over the exclusive accesses. Compiled wherever the
+/// processor has compare-and-swap, hosts included: it is plain atomics, so a
+/// host test contends for it from two threads. A target without it
+/// (ARMv6-M) has no second core to exclude.
+#[cfg(target_has_atomic = "32")]
+pub mod core_lock;
 /// Critical-section implementation for builds that do not link one.
 #[cfg(feature = "rp-critical-section")]
-mod critical_section_impl;
+pub mod critical_section_impl;
+/// The EL2 to EL1 drop of an AArch64 entry path, as assembly text, and the
+/// entry level it records. Always compiled: text and arithmetic, so a host
+/// test reads the drop the kernels assemble.
+pub mod el2_drop;
 /// NVIC addressing arithmetic. Always compiled — it is pure arithmetic with
 /// no asm, so a host `cargo test` exercises it on every architecture.
 pub mod nvic;

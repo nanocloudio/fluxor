@@ -1,6 +1,7 @@
 //! Sys — HAL seam, critical-section guard, errno, kernel log ring,
-//! resource ledger, wall-clock observation ledger.
+//! resource ledger, wall-clock observation ledger, cycle and cache counters.
 
+pub mod counters;
 pub mod errno;
 pub mod guard;
 pub mod hal;

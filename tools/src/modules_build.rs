@@ -1588,11 +1588,25 @@ fn compile_module_pic(
     // each of these is an artefact that reads a wrong address at run time.
     relocation_refusals(&obj)?.into_result(&cand.name)?;
 
-    // The walk reads the module and the crates it links as one call graph:
-    // the module's own assembly calls into them by name.
+    // 2) Link object → PIC ELF.
+    let ld_script = pick_linker_script(cand, &opts.project_root);
+    if opts.verbose {
+        eprintln!("[modules] link  {cand_name}", cand_name = cand.name);
+    }
+    if let Err(e) = link_module(spec, &ld_script, &obj_path, &elf_path, sdk, &cand.name) {
+        let _ = std::fs::remove_file(&asm_path);
+        return Err(e);
+    }
+
+    // The walk reads the module and the crates it links, as the link kept
+    // them, as one call graph: the module's own assembly calls into them by
+    // name.
     let mut asm_set = vec![asm_path.clone()];
     asm_set.extend(sdk.asm().iter().cloned());
-    let stack = measure_stack(&asm_set, spec.module_target);
+    let elf = std::fs::read(&elf_path)
+        .map_err(|e| Error::Module(format!("{}: {e}", elf_path.display())))?;
+    let linked = sdk_rlibs::elf_functions(&elf)?;
+    let stack = measure_stack(&asm_set, spec.module_target, &linked);
     // The object is what links; the assembly has been read.
     let _ = std::fs::remove_file(&asm_path);
     let measured_stack = match stack {
@@ -1619,31 +1633,6 @@ fn compile_module_pic(
         }
     };
 
-    // 2) Link object → PIC ELF.
-    let ld_script = pick_linker_script(cand, &opts.project_root);
-    let linker = spec.linker.as_ref().expect("PIC path requires linker");
-    let mut ld = Command::new(linker.program);
-    if let Some(flavor) = linker.flavor {
-        ld.arg("-flavor").arg(flavor);
-    }
-    ld.arg("-T")
-        .arg(&ld_script)
-        .arg("--gc-sections")
-        .arg("--no-undefined")
-        // The runtime's ABI attestation: rooting it keeps the runtime's
-        // object (its panic handler and intrinsics) in every module.
-        .arg("--undefined=FLUXOR_ABI_SURFACE")
-        .arg("-o")
-        .arg(&elf_path)
-        .arg(&obj_path)
-        .arg("--start-group")
-        .args(sdk.rlibs())
-        .arg("--end-group");
-    if opts.verbose {
-        eprintln!("[modules] link  {cand_name}", cand_name = cand.name);
-    }
-    run_step(ld, "linker")?;
-
     // 3) Pack ELF → .fmod (in-process, no subshell). Header name is the
     // BASE module type (`embed_name`), never the variant-suffixed
     // filename — graphs bind by fnv1a(type_name).
@@ -1662,12 +1651,131 @@ fn compile_module_pic(
     Ok(BuildOutcome::Built)
 }
 
+/// Link module `name`'s object into its PIC ELF against the crates it
+/// links, then hold what the link kept of a crate judged as linked to the
+/// position-independence rules ([`sdk_rlibs::SdkLibs::check_as_linked`]).
+fn link_module(
+    spec: &AbiSpec,
+    ld_script: &Path,
+    obj_path: &Path,
+    elf_path: &Path,
+    sdk: &sdk_rlibs::SdkLibs,
+    name: &str,
+) -> Result<()> {
+    let linker = spec.linker.as_ref().expect("PIC path requires linker");
+    let mut ld = Command::new(linker.program);
+    if let Some(flavor) = linker.flavor {
+        ld.arg("-flavor").arg(flavor);
+    }
+    ld.arg("-T")
+        .arg(ld_script)
+        .arg("--gc-sections")
+        .arg("--no-undefined")
+        // The runtime's ABI attestation: rooting it keeps the runtime's
+        // object (its panic handler and intrinsics) in every module.
+        .arg("--undefined=FLUXOR_ABI_SURFACE")
+        .arg("-o")
+        .arg(elf_path)
+        .arg(obj_path)
+        .arg("--start-group")
+        .args(sdk.rlibs())
+        .arg("--end-group")
+        // What the link loads (twice: GNU ld names archive members only
+        // then) and what it drops, so what it keeps of a crate judged as
+        // linked can be judged.
+        .arg("--trace")
+        .arg("--trace")
+        .arg("--print-gc-sections");
+    let linked = ld
+        .output()
+        .map_err(|e| Error::Module(format!("linker: {e}")))?;
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&linked.stdout),
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    if !linked.status.success() {
+        let script = std::fs::read_to_string(ld_script).unwrap_or_default();
+        if let Some(refusal) = image_region_refusal(name, &report, &script) {
+            return Err(Error::Module(refusal));
+        }
+        let tail: Vec<&str> = report
+            .lines()
+            .filter(|l| {
+                !l.contains("removing unused section ")
+                    && !l.ends_with(".o)")
+                    && !l.ends_with(".o")
+                    && !l.ends_with(".rlib")
+            })
+            .collect();
+        let tail = &tail[tail.len().saturating_sub(20)..];
+        return Err(Error::Module(format!(
+            "linker exited {}\n    {}",
+            linked.status.code().unwrap_or(-1),
+            tail.join("\n    ")
+        )));
+    }
+    sdk.check_as_linked(&report, name)
+}
+
+/// The length in bytes of the one region a module image is linked into, as
+/// the link script `script` states it (`LENGTH = 512K`).
+fn image_region_bytes(script: &str) -> Option<u64> {
+    let after = script.split("LENGTH").nth(1)?;
+    let value = after.trim_start().strip_prefix('=')?.trim_start();
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    let n: u64 = digits.parse().ok()?;
+    Some(match value[digits.len()..].chars().next() {
+        Some('K') => n * 1024,
+        Some('M') => n * 1024 * 1024,
+        _ => n,
+    })
+}
+
+/// What a link that overflowed the module image region says to the module's
+/// author, or `None` when `report` is some other failure. The linker names
+/// its own region and a section; the author needs the module, its size
+/// against the limit, and where large constant data goes instead.
+fn image_region_refusal(name: &str, report: &str, script: &str) -> Option<String> {
+    // lld: "section '.rodata' will not fit in region 'FLASH': overflowed by
+    // 5768 bytes"; GNU ld: "region `FLASH' overflowed by 5768 bytes".
+    let over = report
+        .lines()
+        .filter(|l| l.contains("will not fit in region") || l.contains("overflowed by"))
+        .filter_map(|l| {
+            let tail = l.split("overflowed by").nth(1)?;
+            tail.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .max();
+    if over.is_none() && !report.contains("will not fit in region") {
+        return None;
+    }
+    let region = image_region_bytes(script);
+    let limit = region.map_or_else(
+        || "the module image region".to_string(),
+        |r| format!("the {} KiB ({r} B) module image region", r / 1024),
+    );
+    let size = match (over, region) {
+        (Some(over), Some(region)) => format!("is {} B, {over} B past", region + over),
+        (Some(over), None) => format!("is {over} B past"),
+        (None, _) => "does not fit".to_string(),
+    };
+    Some(format!(
+        "module '{name}': its image (code and constant data) {size} {limit}, the most one \
+         module may link. Data of that size belongs in a program the instance reads in \
+         place, not in the module: name the file with `program:` on the module's graph \
+         entry (or give it as an asset to a param that takes one) and read it with \
+         `PROGRAM_INFO`."
+    ))
+}
+
 /// The module's worst-case stack depth, read from the assembly its compile
 /// wrote. `Err` says why the call graph has no bound (recursion, a frame
 /// sized at run time); such a module must declare its depth.
 fn measure_stack(
     asm_paths: &[PathBuf],
     triple: &str,
+    linked: &std::collections::BTreeSet<String>,
 ) -> std::result::Result<crate::stack_depth::Depth, String> {
     let isa = crate::stack_depth::Isa::for_target(triple)
         .ok_or_else(|| format!("no stack reading for {triple}"))?;
@@ -1681,7 +1789,7 @@ fn measure_stack(
         .map_err(|e| format!("{}: {e}", asm_paths[0].display()))?;
     let roots = crate::stack_depth::entry_points(&module_asm);
     let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
-    crate::stack_depth::worst_case(&asm, isa, &roots)
+    crate::stack_depth::worst_case(&asm, isa, &roots, &|f| linked.contains(f))
 }
 
 /// What a module object holds that cannot work once the kernel places the
@@ -1775,6 +1883,12 @@ impl Refusals {
 /// code and data alike: a reference from a non-allocated section (debug info)
 /// is never executed.
 fn relocation_refusals(obj: &[u8]) -> Result<Refusals> {
+    relocation_refusals_in(obj, &|_| true)
+}
+
+/// [`relocation_refusals`] over the sections `judged` names: a relocation
+/// counts only when the section it is written into is one of them.
+fn relocation_refusals_in(obj: &[u8], judged: &dyn Fn(&str) -> bool) -> Result<Refusals> {
     struct Shdr {
         name: u64,
         ty: u64,
@@ -1961,7 +2075,8 @@ fn relocation_refusals(obj: &[u8]) -> Result<Refusals> {
 
     // GOT and writable-data references, from every allocated section.
     for rel in &rels {
-        if header(rel.info)?.flags & SHF_ALLOC == 0 {
+        let into = header(rel.info)?;
+        if into.flags & SHF_ALLOC == 0 || !judged(&name(into.name)?) {
             continue;
         }
         let symtab = header(rel.link)?;
@@ -2005,6 +2120,9 @@ fn relocation_refusals(obj: &[u8]) -> Result<Refusals> {
     let ptr = if elf64 { 8u64 } else { 4 };
     for rel in &rels {
         let target = header(rel.info)?;
+        if !judged(&name(target.name)?) {
+            continue;
+        }
         let symtab = header(rel.link)?;
         // Every absolute relocation into this section: (offset, bytes it points at).
         let mut absolutes: Vec<(u64, u64, u64)> = Vec::new(); // (r_off, shndx, address)
@@ -2400,6 +2518,58 @@ pub fn holds_fmod(dir: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// The crates a module links, built for `spec` under one directory the
+    /// tests share and cached across runs (the stamps keep them current).
+    /// One build at a time: two tests of one binary would otherwise write
+    /// the same files at once.
+    fn test_rlibs(spec: &AbiSpec) -> sdk_rlibs::SdkLibs {
+        static ONE_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = ONE_BUILD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sdk_rlibs::ensure(
+            &repo_root(),
+            &repo_root().join("target/fluxor-tests"),
+            spec,
+            true,
+            false,
+        )
+        .expect("the crates build")
+    }
+
+    /// A module too large for the image region is refused in the author's
+    /// terms: the module, its size against the region the link script
+    /// states, and where data of that size goes. Any other link failure is
+    /// left to the linker's own words.
+    #[test]
+    fn an_oversize_module_image_is_refused_naming_the_module_and_the_region() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/fluxor-rt/module.ld"),
+        )
+        .unwrap();
+        assert_eq!(image_region_bytes(&script), Some(512 * 1024));
+        let lld = "rust-lld: error: section '.rodata' will not fit in region 'FLASH': \
+                   overflowed by 5768 bytes\nrust-lld: error: section '.data' will not fit in \
+                   region 'FLASH': overflowed by 5768 bytes\n";
+        let gnu = "ld: mod.elf section `.rodata' will not fit in region `FLASH'\n\
+                   ld: region `FLASH' overflowed by 5768 bytes\n";
+        for report in [lld, gnu] {
+            let e = image_region_refusal("glyph_atlas", report, &script).expect("an overflow");
+            assert!(
+                e.contains("module 'glyph_atlas'")
+                    && e.contains("is 530056 B, 5768 B past")
+                    && e.contains("512 KiB (524288 B)")
+                    && e.contains("`program:`")
+                    && !e.contains("FLASH"),
+                "{e}"
+            );
+        }
+        assert_eq!(
+            image_region_refusal("m", "rust-lld: error: undefined symbol: memchr\n", &script),
+            None
+        );
+    }
+
     /// A repo of portable cores only (a module tree with no manifests, so
     /// no `[ci].targets`) lints nothing, as its build builds nothing.
     #[test]
@@ -2742,6 +2912,14 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
             "[project]\nname = \"p\"\n[ci]\ntargets = [\"bcm2712\"]\n",
         )
         .unwrap();
+        // The project's own descriptor: the test reads no catalog outside it.
+        let silicon = root.join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        std::fs::copy(
+            repo_root().join("targets/silicon/bcm2712.toml"),
+            silicon.join("bcm2712.toml"),
+        )
+        .unwrap();
         BuildOpts {
             project_root: root.to_path_buf(),
             selector: TargetSelector::All,
@@ -2817,6 +2995,102 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
         }
     }
 
+    /// A module that composes and encodes a graph through `fluxor_contracts`
+    /// links, on both linkers: what it carries of the crate is position
+    /// independent.
+    const CONTRACTS_COMPOSES: &str = r#"
+#![no_std]
+use fluxor_contracts::graph::{self, plan, EdgeRecord, Endpoint, GraphSpec, ModuleRecord};
+use fluxor_rt as _;
+#[no_mangle]
+#[link_section = ".text.module_step"]
+pub extern "C" fn module_step(out: *mut u8) -> i32 {
+    let module = ModuleRecord { name_hash: graph::name_hash(b"probe"), ..ModuleRecord::default() };
+    let modules = [module; 2];
+    let edges = [EdgeRecord { from: Endpoint::New(0), to: Endpoint::New(1), ..EdgeRecord::default() }];
+    let (mut order, mut indeg) = ([0u16; 2], [0u16; 2]);
+    if plan::order(2, &edges, false, &mut order, &mut indeg).is_err() {
+        return -1;
+    }
+    let spec = GraphSpec { order: &order, modules: &modules, edges: &edges, ..GraphSpec::default() };
+    // SAFETY: the caller lends 256 bytes.
+    let out = unsafe { core::slice::from_raw_parts_mut(out, 256) };
+    match graph::encode_into(&spec, out) { Ok(n) => n as i32, Err(_) => -1 }
+}
+"#;
+
+    /// A module that reaches the crate's table of attribute keys: a table of
+    /// pointers, which no module may carry.
+    const CONTRACTS_NAME_TABLE: &str = r#"
+#![no_std]
+use fluxor_rt as _;
+#[no_mangle]
+#[link_section = ".text.module_step"]
+pub extern "C" fn module_step(key: *const u8, len: usize) -> bool {
+    // SAFETY: the caller lends `len` bytes of UTF-8.
+    let key = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key, len)) };
+    fluxor_contracts::observability::is_valid_attribute_key(key)
+}
+"#;
+
+    /// The contracts crate is judged as each module links it: a module that
+    /// composes a graph through it builds, and one that reaches a table of
+    /// pointers in it is refused, naming the crate — on lld (aarch64) and on
+    /// GNU ld (thumb) alike, whose link reports differ.
+    #[test]
+    fn a_module_carries_only_what_it_reaches_of_the_contracts_crate() {
+        for abi in ["aarch64", "thumbv8m", "thumbv6m"] {
+            let spec = abi_spec(abi).expect("recipe");
+            let sdk = test_rlibs(spec);
+            let dir = tempfile::tempdir().unwrap();
+            let link = |tag: &str, source: &str| -> Result<()> {
+                let src = dir.path().join(format!("{tag}.rs"));
+                let obj = dir.path().join(format!("{tag}.o"));
+                std::fs::write(&src, source).unwrap();
+                let out = Command::new("rustc")
+                    .args(["--crate-type", PIC_CRATE_TYPE, "--edition", "2021"])
+                    .args(["--target", spec.module_target, "-O"])
+                    .arg("-C")
+                    .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
+                    .args(spec.extra_rustflags)
+                    .args(cfg_abi_args(spec))
+                    .args(sdk.extern_args())
+                    .arg("--out-dir")
+                    .arg(dir.path())
+                    .arg(format!("--emit=obj={}", obj.display()))
+                    .arg(&src)
+                    .output()
+                    .expect("rustc runs");
+                assert!(
+                    out.status.success(),
+                    "{abi} {tag}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let ld = sdk_rlibs::module_ld(&repo_root()).expect("module.ld");
+                link_module(
+                    spec,
+                    &ld,
+                    &obj,
+                    &dir.path().join(format!("{tag}.elf")),
+                    &sdk,
+                    tag,
+                )
+            };
+            if let Err(e) = link("composes", CONTRACTS_COMPOSES) {
+                panic!("{abi}: a module composing a graph is refused: {e}");
+            }
+            let err = match link("name_table", CONTRACTS_NAME_TABLE) {
+                Ok(()) => panic!("{abi}: a module reaching a pointer table linked"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("name_table (through fluxor_contracts)")
+                    && err.contains("absolute pointers"),
+                "{abi}: {err}"
+            );
+        }
+    }
+
     /// The build step itself refuses, strict or lenient, before it links: a
     /// module whose code writes a `static mut` never becomes an artefact.
     #[test]
@@ -2841,14 +3115,7 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
             };
             // The crates a module links, cached across runs: the stamp keeps
             // them current.
-            let sdk = sdk_rlibs::ensure(
-                &repo_root(),
-                &repo_root().join("target/fluxor-tests"),
-                spec,
-                true,
-                false,
-            )
-            .expect("the crates build");
+            let sdk = test_rlibs(spec);
             let err = match compile_module_pic(&cand, spec, dir.path(), &opts, &sdk) {
                 Ok(_) => panic!("strict={strict}: a writable static built"),
                 Err(e) => e.to_string(),

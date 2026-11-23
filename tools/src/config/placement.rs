@@ -488,6 +488,7 @@ mod placement_tests {
             serves: None,
             contract_optional: false,
             facts: Default::default(),
+            fact_params: Default::default(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,

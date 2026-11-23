@@ -13,9 +13,8 @@
 //! contract's own helpers (`abi::contracts::input::surface_traits`), so the
 //! thresholds are never duplicated. Modalities + gamepad count are taken
 //! verbatim from params (no `/proc`, no DOM on bare metal — the board declares
-//! what is wired). A USB-gamepad hot-plug path would later bump the epoch; v1
-//! is a static declaration and emits the baseline once the output channel is
-//! ready.
+//! what is wired). The declaration is static: the module emits the one record
+//! once the output channel is ready.
 //!
 //! It also covers the **screenless** case (an rp2350 + I2S speaker, like an
 //! iPod Shuffle): set `display_count = 0` and the geometry is irrelevant — the
@@ -30,6 +29,13 @@
 //!   5 display_count  (u32) — attached displays; 0 = headless (audio-only)
 //!   6 audio_channels (u32) — 0 none, 1 mono, 2 stereo, …
 //!   7 audio_rate     (u32) — output sample rate (Hz)
+//!   8 dpr_eighths    (u32) — surface pixels per logical pixel, in eighths
+//!                            (8 = 1x, 12 = 1.5x, 16 = 2x)
+//!
+//! `width` and `height` are the viewport in logical pixels; the panel's own
+//! pixels are `viewport x dpr_eighths / 8`, the raster a producer renders to
+//! be shown 1:1. A board with a dense panel declares the two together. A
+//! panel with no display (`display_count = 0`) reports no ratio.
 //!
 //! Output: 24-byte MSG_TRAITS record (content type `SurfaceTraits`).
 
@@ -52,11 +58,13 @@ use fluxor_rt::*;
 
 use abi::contracts::input::surface_traits as st;
 
-const EVENT_RECORD: usize = 24;
-
 // Default modality set for a typical fixed panel: a key path plus physical
 // buttons. Boards override via the `modalities` param.
 const DEFAULT_MODALITIES: u32 = (st::MODALITY_KEY | st::MODALITY_PHYSICAL_BUTTONS) as u32;
+
+// One surface pixel per logical pixel unless the board declares a denser
+// panel.
+const DEFAULT_DPR_EIGHTHS: u32 = st::DPR_1X as u32;
 
 #[repr(C)]
 struct PanelState {
@@ -69,6 +77,7 @@ struct PanelState {
     display_count: u8,
     audio_channels: u8,
     audio_rate: u32,
+    dpr_eighths: u8,
     prev_w_class: u8,
     prev_h_class: u8,
     epoch: u32,
@@ -78,6 +87,7 @@ struct PanelState {
 mod params_def {
     use super::p_u32;
     use super::PanelState;
+    use super::DEFAULT_DPR_EIGHTHS;
     use super::DEFAULT_MODALITIES;
 
     fluxor_rt::define_params! {
@@ -97,6 +107,12 @@ mod params_def {
             => |s, d, len| { s.audio_channels = p_u32(d, len, 0, 0) as u8; };
         7, audio_rate, u32, 0
             => |s, d, len| { s.audio_rate = p_u32(d, len, 0, 0); };
+        8, dpr_eighths, u32, DEFAULT_DPR_EIGHTHS
+            => |s, d, len| {
+                // A ratio is 1..=255 eighths; the build refuses any other.
+                let v = p_u32(d, len, 0, DEFAULT_DPR_EIGHTHS);
+                s.dpr_eighths = if v == 0 || v > 255 { super::st::DPR_1X } else { v as u8 };
+            };
     }
 }
 
@@ -176,25 +192,29 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         let orient = st::orientation_for(s.width, s.height);
         s.epoch = s.epoch.wrapping_add(1);
 
-        let mut buf = [0u8; EVENT_RECORD];
-        buf[0] = st::MSG_TRAITS;
-        buf[1] = orient;
-        buf[2] = s.prev_w_class;
-        buf[3] = s.prev_h_class;
-        buf[4..6].copy_from_slice(&s.width.to_le_bytes());
-        buf[6..8].copy_from_slice(&s.height.to_le_bytes());
-        buf[8..10].copy_from_slice(&s.modalities.to_le_bytes());
-        buf[10] = s.gamepad_count;
-        buf[11] = s.audio_channels;
-        buf[12..16].copy_from_slice(&s.audio_rate.to_le_bytes());
-        buf[16..20].copy_from_slice(&s.epoch.to_le_bytes());
-        buf[20] = st::AUTHORITY_PANEL;
-        buf[21] = s.display_count;
-        buf[22] = 0;
-        buf[23] = 0;
+        let buf = st::encode(&st::Traits {
+            orientation: orient,
+            size_class_w: s.prev_w_class,
+            size_class_h: s.prev_h_class,
+            viewport_w_px: s.width,
+            viewport_h_px: s.height,
+            modalities: s.modalities,
+            gamepad_count: s.gamepad_count,
+            audio_channels: s.audio_channels,
+            audio_rate_hz: s.audio_rate,
+            epoch: s.epoch,
+            authority: st::AUTHORITY_PANEL,
+            display_count: s.display_count,
+            // A panel with no display has no pixels to state a ratio for.
+            dpr_eighths: if s.display_count == st::DISPLAY_HEADLESS {
+                st::DPR_UNREPORTED
+            } else {
+                s.dpr_eighths
+            },
+        });
 
-        let n = (sys.channel_write)(s.out_chan, buf.as_ptr(), EVENT_RECORD);
-        if n == EVENT_RECORD as i32 {
+        let n = (sys.channel_write)(s.out_chan, buf.as_ptr(), buf.len());
+        if n == buf.len() as i32 {
             s.emitted = true;
         }
         StepReturn::Continue

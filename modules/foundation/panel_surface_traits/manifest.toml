@@ -6,9 +6,9 @@ hardware_targets = ["bcm2712", "rp2350"]
 # same wire shape as the Linux and browser authorities. Emits one 24-byte
 # `input::surface_traits::MSG_TRAITS` record describing the statically-declared
 # panel surface — viewport (width/height), derived orientation + size class, the
-# wired input modalities (a MODALITY_* bitmask), and gamepad count — so an app
-# adapts to a buttoned speaker/instrument panel the same way it adapts to a
-# browser window. Orientation/size-class use the contract's own helpers (no
+# wired input modalities (a MODALITY_* bitmask), gamepad count, and the device
+# pixel ratio (`dpr_eighths`) — so an app adapts to a buttoned
+# speaker/instrument panel the same way it adapts to a browser window. Orientation/size-class use the contract's own helpers (no
 # threshold duplication). A consumer wired to `events` reacts to the record; an
 # unwired graph is unaffected.
 
@@ -17,15 +17,21 @@ name = "events"
 direction = "output"
 content_type = "SurfaceTraits"
 buffer_size = 64
-# EVENT_RECORD — one 24-byte record per write.
+# One 24-byte record per write.
 max_record = 24
 
 # PIC module: the param schema (width / height / modalities / gamepad_count /
-# display_count / audio_channels / audio_rate) is embedded via `define_params!`
-# in mod.rs, not declared here. Boards set the values in their graph YAML.
-# `modalities` is the input::surface_traits MODALITY_* bitmask (default 0x21 =
-# key | physical_buttons); `display_count = 0` declares a screenless audio-only
-# device (rp2350 + I2S speaker).
+# display_count / audio_channels / audio_rate / dpr_eighths) is embedded via
+# `define_params!` in mod.rs, not declared here. Boards set the values in their
+# graph YAML. `modalities` is the input::surface_traits MODALITY_* bitmask
+# (default 0x21 = key | physical_buttons); `display_count = 0` declares a
+# screenless audio-only device (rp2350 + I2S speaker).
+#
+# `width` and `height` are the viewport in logical pixels. `dpr_eighths` is
+# surface pixels per logical pixel, in eighths (default 8 = 1x; 12 = 1.5x,
+# 16 = 2x): the panel's own pixels are `viewport x dpr_eighths / 8`, and a
+# board with a dense panel declares the two together. A panel with no
+# display reports no ratio (0).
 
 # Module-scope observability — exempt.
 [observability]

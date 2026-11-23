@@ -615,7 +615,7 @@ pub use slot::ModuleSlot;
 
 /// Owner lifecycle on a running graph (free, pause, resume) and step budgets.
 pub mod live;
-pub use live::{free_owner, FreeError, StepBudget};
+pub use live::{free_owner, FreeError, StepBudget, STEP_BUDGET_HARD_CAP_US};
 
 /// Native modules: the platform's own, found by name hash.
 pub mod native;

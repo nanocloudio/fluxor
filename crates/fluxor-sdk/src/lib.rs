@@ -39,6 +39,11 @@ pub mod hash_index;
 
 pub mod gpu;
 
+pub mod video;
+
+/// The whole-tree check of the accessibility contract.
+pub mod accessibility;
+
 pub mod cores {
     //! State machines more than one module runs.
     pub mod nat;

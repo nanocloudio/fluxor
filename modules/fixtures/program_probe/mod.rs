@@ -6,6 +6,11 @@
 //! each other and with the file the graph named. With `poke: 1` it then
 //! reads the first byte past what it is granted of its program region,
 //! which an isolated module must not be able to do.
+//!
+//! With `blob` set (a param that takes an asset) it then opens that value
+//! with `fluxor_rt::asset` and reports what the target handed it: a program
+//! hashed in place and through `PROGRAM_READ`, or a file left to the `fs`
+//! contract.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -23,8 +28,13 @@ use abi::kernel_abi::{program as pg, PROGRAM_INFO, PROGRAM_READ};
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
+use fluxor_rt::asset::{self, Asset};
 use fluxor_rt::*;
 pub use fluxor_sdk::crypto::sha256::*;
+
+/// Bytes of the `blob` param the probe keeps: a program reference, a bundle
+/// URL or a path.
+const BLOB_MAX: usize = 160;
 
 #[repr(C)]
 pub struct State {
@@ -34,8 +44,16 @@ pub struct State {
     /// over the network says nothing before its address is bound.
     delay: u32,
     /// 0 = ask for the program, 1 = reading through the kernel, 2 = reading
-    /// in place, 3 = report, 4 = done.
+    /// in place, 3 = report, 4 = open the asset, 5 = reading it through the
+    /// kernel, 6 = reading it in place, 7 = report it, 8 = done.
     phase: u8,
+    /// The `blob` param's value and its length; 0 when the graph sets none.
+    blob: [u8; BLOB_MAX],
+    blob_len: u8,
+    /// The asset's slot, size and in-place address (0 when it has none).
+    asset_slot: u8,
+    asset_size: u32,
+    asset_addr: usize,
     info: [u8; pg::INFO_LEN],
     at: u32,
     through: Sha256,
@@ -49,6 +67,18 @@ mod params_def {
         State;
         1, poke, u8, 0 => |s, d, len| { s.poke = p_u8(d, len, 0, 0); };
         2, delay, u32, 0 => |s, d, len| { s.delay = p_u32(d, len, 0, 0); };
+        3, blob, str, 0 => |s, d, len| {
+            // A value too long to keep is kept as none: the probe reports
+            // only an asset it opened whole.
+            if len <= BLOB_MAX {
+                let mut i = 0;
+                while i < len {
+                    s.blob[i] = *d.add(i);
+                    i += 1;
+                }
+                s.blob_len = len as u8;
+            }
+        };
     }
 }
 
@@ -181,8 +211,104 @@ unsafe fn probe_step(s: &mut State) {
             s.phase = 4;
             report(s, addr, size);
         }
+        4 => open_asset(s),
+        5 => {
+            if s.at >= s.asset_size {
+                s.at = 0;
+                s.phase = 6;
+                return;
+            }
+            let got = asset::read(sys, s.asset_slot, s.at, &mut s.buf);
+            if got <= 0 {
+                s.at = s.asset_size;
+                return;
+            }
+            s.through.update(&s.buf[..got as usize]);
+            s.at += got as u32;
+        }
+        6 => {
+            if s.asset_addr == 0 || s.at >= s.asset_size {
+                s.phase = 7;
+                return;
+            }
+            let n = core::cmp::min(512, s.asset_size - s.at) as usize;
+            let bytes = core::slice::from_raw_parts((s.asset_addr + s.at as usize) as *const u8, n);
+            s.inplace.update(bytes);
+            s.at += n as u32;
+        }
+        7 => {
+            s.phase = 8;
+            report_asset(s);
+        }
         _ => {}
     }
+}
+
+/// Open the `blob` param's value as an asset and say what it is: a file
+/// (left to the `fs` contract), a refusal, or a program to hash.
+unsafe fn open_asset(s: &mut State) {
+    let sys = &*s.syscalls;
+    if s.blob_len == 0 {
+        s.phase = 8;
+        return;
+    }
+    let mut line = [0u8; 48];
+    let mut n = 0;
+    let (blob, len) = (s.blob, s.blob_len as usize);
+    match asset::open(sys, &blob[..len]) {
+        Ok(Asset::Fs(path)) => {
+            put(&mut line, &mut n, b"[asset] fs len=");
+            put_dec(&mut line, &mut n, path.len() as u32);
+            dev_log(sys, 3, line.as_ptr(), n);
+            s.phase = 8;
+        }
+        Err(rc) => {
+            put(&mut line, &mut n, b"[asset] error=-");
+            put_dec(&mut line, &mut n, rc.unsigned_abs());
+            dev_log(sys, 3, line.as_ptr(), n);
+            s.phase = 8;
+        }
+        Ok(found) => {
+            // A program: `open` accepted the value, so it names a slot.
+            let slot = asset::slot(&blob[..len]).unwrap_or(0);
+            let (addr, size) = match found {
+                Asset::InPlace(bytes) => (bytes.as_ptr() as usize, bytes.len() as u32),
+                _ => (0, asset::size(sys, slot).unwrap_or(0)),
+            };
+            s.asset_slot = slot;
+            s.asset_addr = addr;
+            s.asset_size = size;
+            s.through = Sha256::new();
+            s.inplace = Sha256::new();
+            s.at = 0;
+            s.phase = 5;
+        }
+    }
+}
+
+/// `[asset] slot=<n> size=<n> addr=<hex8> inplace=<sha8|none> read=<sha8>`.
+unsafe fn report_asset(s: &mut State) {
+    let sys = &*s.syscalls;
+    let mut line = [0u8; 120];
+    let mut n = 0;
+    let mut hx = [0u8; 8];
+    put(&mut line, &mut n, b"[asset] slot=");
+    put_dec(&mut line, &mut n, u32::from(s.asset_slot));
+    put(&mut line, &mut n, b" size=");
+    put_dec(&mut line, &mut n, s.asset_size);
+    put(&mut line, &mut n, b" addr=");
+    put_hex32(&mut line, &mut n, s.asset_addr as u32);
+    put(&mut line, &mut n, b" inplace=");
+    if s.asset_addr != 0 {
+        hex8(&s.inplace.clone().finalize(), &mut hx);
+        put(&mut line, &mut n, &hx);
+    } else {
+        put(&mut line, &mut n, b"none");
+    }
+    put(&mut line, &mut n, b" read=");
+    hex8(&s.through.clone().finalize(), &mut hx);
+    put(&mut line, &mut n, &hx);
+    dev_log(sys, 3, line.as_ptr(), n);
 }
 
 unsafe fn report(s: &mut State, addr: u64, size: u32) {

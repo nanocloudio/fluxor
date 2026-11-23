@@ -21,10 +21,10 @@ use crate::error::{Error, Result};
 /// Resolve `~/.fluxor/workspace.toml`. `$FLUXOR_WORKSPACE` overrides
 /// the default location — primarily for tests.
 pub fn workspace_file_path() -> Result<PathBuf> {
-    if let Some(v) = std::env::var_os("FLUXOR_WORKSPACE") {
+    if let Some(v) = crate::project::env_var("FLUXOR_WORKSPACE") {
         return Ok(PathBuf::from(v));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
+    let home = crate::project::env_var("HOME").ok_or_else(|| {
         Error::Config(
             "cannot resolve workspace file: neither $HOME nor $FLUXOR_WORKSPACE is set".into(),
         )
@@ -43,6 +43,13 @@ pub struct WorkspaceSection {
     /// Absolute paths to live project checkouts.
     #[serde(default)]
     pub members: Vec<PathBuf>,
+    /// Members whose working trees a build reads directly: the ABI epoch
+    /// is computed from the tree's registry and the target and stack
+    /// catalog is read from its `targets/` and `stacks/`. Every other
+    /// member is built against through what it published, so an edit in
+    /// progress in its tree reaches no consumer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_trees: Vec<PathBuf>,
 }
 
 /// Load `~/.fluxor/workspace.toml` if it exists. Returns `Ok(None)`
@@ -58,44 +65,6 @@ pub fn load_workspace() -> Result<Option<Workspace>> {
     let ws: Workspace = toml::from_str(&text)
         .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
     Ok(Some(ws))
-}
-
-/// Canonicalised workspace-member roots, excluding the current project.
-///
-/// Module lookup consults these last, so a graph can name a module owned by a
-/// sibling checkout (wave's `http`, say) and still resolve its manifest for
-/// validation. This mirrors sync's live-member policy, where a member's
-/// checkout state (its `:latest` store tags) wins over replayed pins.
-///
-/// The workspace file is user-local and gitignored, so this is a developer
-/// convenience only — never a build dependency. Fluxor must not require its
-/// downstreams to be checked out, and anything that only resolves through this
-/// path will not resolve on a clean clone or in CI.
-///
-/// Cached for the process lifetime: `standard_module_dirs` runs per module
-/// lookup, and re-reading plus re-parsing the file for every module in a graph
-/// is pure waste. A malformed or unreadable file yields an empty list — a
-/// broken dev-local convenience must not fail an otherwise valid build.
-pub fn member_roots(project: &Path) -> &'static [PathBuf] {
-    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    let all = ROOTS.get_or_init(|| match load_workspace() {
-        Ok(Some(ws)) => ws
-            .workspace
-            .members
-            .into_iter()
-            .map(|m| m.canonicalize().unwrap_or(m))
-            .collect(),
-        _ => Vec::new(),
-    });
-    // `project` is not part of the cache key: within one invocation the project
-    // root is fixed, and filtering here keeps the cached vector reusable.
-    if all.iter().any(|m| m == project) {
-        // Rare enough (one allocation per process) to leak deliberately rather
-        // than thread a lifetime through every caller.
-        static FILTERED: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-        return FILTERED.get_or_init(|| all.iter().filter(|m| *m != project).cloned().collect());
-    }
-    all
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +315,7 @@ mod tests {
         let ws = Workspace {
             workspace: WorkspaceSection {
                 members: vec![tmp.clone()],
+                live_trees: Vec::new(),
             },
         };
         let found = current_member(&ws, &nested);
@@ -362,6 +332,7 @@ mod tests {
         let ws = Workspace {
             workspace: WorkspaceSection {
                 members: vec![tmp.clone()],
+                live_trees: Vec::new(),
             },
         };
         let found = current_member(&ws, &other);

@@ -36,14 +36,6 @@ fn is_uefi(target: &str) -> bool {
     matches!(target, "uefi" | "qemu-uefi-arm64" | "ec2-arm64")
 }
 
-/// Targets whose kernel runs execution domains on cores of their own (its
-/// `smp` cargo feature): an edge between two domains is split into two
-/// channels joined by a ring, so it takes a second channel, its consumer side
-/// (`resource_ledger::cross_domain_edges`).
-pub fn kernel_bridges_domains(target: &str) -> bool {
-    is_bcm2712(target) || is_uefi(target)
-}
-
 /// The kernel profile a target compiles. Unknown targets get the RP profile:
 /// a graph that fits the smallest profile fits everywhere.
 pub fn kernel_profile(target: &str) -> &'static str {
@@ -191,6 +183,32 @@ pub fn kernel_max_edges(target: &str) -> usize {
     } else {
         eval(profile_body(kernel_profile(target)), "GRAPH_EDGES").unwrap_or(128) as usize
     }
+}
+
+/// What one edge between cores takes of the RP kernel's static pool before
+/// the arenas are placed (`platform/rp/chip.rs::plan_tables`): its ring, two
+/// slots of one channel buffer each with the ring's indices
+/// (`domains::cross::CrossDomainChannel`, 16,704 bytes with `RING_SLOTS` 2
+/// and an 8 KiB `CHANNEL_BUFFER_SIZE`), and its edge record
+/// (`CrossDomainEdge`, 20 bytes). The state arena a graph is admitted
+/// against is smaller by this much for each such edge.
+pub const RP_CORE_CROSSING_BYTES: u64 = fluxor_contracts::core_map::RP_CROSSING_BYTES as u64;
+
+/// What `crossings` edges between cores take from the state arena of
+/// `runtime`'s kernel: the RP kernels plan their bridge rings out of the one
+/// pool the arenas share; every other kernel sizes them apart.
+pub fn crossing_arena_charge(runtime: &str, crossings: u64) -> u64 {
+    match kernel_profile(runtime) {
+        "profile_rp" => crossings * RP_CORE_CROSSING_BYTES,
+        _ => 0,
+    }
+}
+
+/// The loader's ceiling on one module's code (`MAX_MODULE_CODE_SIZE`), in
+/// bytes, where `target`'s kernel profile fixes one. The RP profile's is per
+/// die, which the silicon TOML carries (`[kernel] module_code_kb`).
+pub fn kernel_module_code_ceiling(target: &str) -> Option<u64> {
+    eval(profile_body(kernel_profile(target)), "MAX_MODULE_CODE_SIZE")
 }
 
 /// `MAX_GRAPH_EDGES` of a kernel that sizes its edge tables at boot
@@ -446,21 +464,33 @@ pub struct GraphShape {
     pub workload_modules: u64,
     /// Their edges, summed.
     pub workload_edges: u64,
-    /// Node-graph edges that cross execution domains ([`crossing_count`]):
-    /// where the kernel bridges domains ([`kernel_bridges_domains`]) each
-    /// takes a second channel, its consumer side.
+    /// Node-graph edges the kernel bridges between cores
+    /// ([`crossing_count`]): each takes a second channel, its consumer side.
     pub crossings: u64,
 }
 
-/// Node-graph edges that cross execution domains, as the kernel's plan counts
-/// them (`resource_ledger::cross_domain_edges`): an edge whose two modules sit
-/// in different domains, or whose edge class is cross-core. Each edge is
+/// Node-graph edges the kernel bridges between cores, as its plan counts
+/// them (`resource_ledger::cross_domain_edges`): none where `smp` steps
+/// every domain on core 0; elsewhere an edge whose two modules step on
+/// different cores, or whose edge class is cross-core. Each edge is
 /// `(from domain, to domain, cross_core)`; a tee or merge takes the domain of
 /// the module it fans on, so fanning adds none.
-pub fn crossing_count(edges: impl IntoIterator<Item = (Option<u8>, Option<u8>, bool)>) -> u64 {
+pub fn crossing_count(
+    smp: &crate::target::SmpFacts,
+    edges: impl IntoIterator<Item = (Option<u8>, Option<u8>, bool)>,
+) -> u64 {
+    if !smp.bridges_cores() {
+        return 0;
+    }
     edges
         .into_iter()
-        .filter(|&(from, to, cross_core)| cross_core || from != to)
+        .filter(|&(from, to, cross_core)| {
+            cross_core
+                || match (from, to) {
+                    (Some(from), Some(to)) => smp.crosses_cores(from, to),
+                    (from, to) => from != to,
+                }
+        })
         .count() as u64
 }
 
@@ -552,10 +582,7 @@ pub fn plan_pool(
         "module_slots" => {
             shape.modules + shape.fans + shape.workload_modules + shape.workload_edges
         }
-        "channels" if kernel_bridges_domains(target) => {
-            shape.edges + shape.fans + 2 * shape.workload_edges + shape.crossings
-        }
-        "channels" => shape.edges + shape.fans + 2 * shape.workload_edges,
+        "channels" => shape.edges + shape.fans + 2 * shape.workload_edges + shape.crossings,
         "owners" => 1 + shape.workloads,
         "sandboxes" if profile == "profile_linux" => {
             plan_pool(target, "owners", shape, declared, entries)

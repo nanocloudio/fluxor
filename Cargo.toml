@@ -141,7 +141,7 @@ rp-critical-section = [
 
 # Single binary for both RP2350A and RP2350B. Always compile with B (superset).
 # Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
-chip-rp2350b = ["rp", "rp-critical-section", "embedded-platform", "kernel-mpu"]
+chip-rp2350b = ["rp", "rp-critical-section", "embedded-platform", "kernel-mpu", "smp"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
 chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform", "kernel-mpu"]
 
@@ -167,7 +167,9 @@ rp-otp-provision = []
 #   kernel-mpu: MPU-based module isolation on a microcontroller: gated
 #              modules run unprivileged on their own process stack behind the
 #              gateway, inside regions from the shared planner.
-#   smp:       multiple hardware execution domains (multi-core domain ordering).
+#   smp:       domains on more than one core: a domain loop per core, rings
+#              bridging the edges between cores, and the quiesce that parks
+#              the other cores.
 #   dtb:       boot configuration/identity read from a device tree.
 #   pq-vault:  the key vault's ML-DSA suites. A signing operation needs ~58 KB
 #              of polynomial scratch and it is a kernel static, so this is a
@@ -270,6 +272,9 @@ host-hsm = ["host-linux", "cryptoki"]
 host-image = ["host-linux", "image"]
 
 [build-dependencies]
+# The domain-to-core map's rules, which the build script holds a target's
+# `[smp]` to.
+fluxor-contracts = { path = "contracts", default-features = false }
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 

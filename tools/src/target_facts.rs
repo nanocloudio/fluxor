@@ -146,9 +146,30 @@ pub struct TargetFacts {
     /// hand-off. True only where a Fluxor driver owns the transmit ring;
     /// a hosted stack's wire belongs to its host kernel.
     pub nic_tx_drain: bool,
+    /// `counter.cycles` `clock` and `counter.icache` `scope`: what the
+    /// target's counters count, from its `[counters]` table. Filled by
+    /// [`TargetFacts::for_target`]; a row answered by name alone
+    /// ([`TargetFacts::for_runtime`]) has read no target file and carries
+    /// neither.
+    pub counters: crate::target::CounterFacts,
 }
 
+/// A row that has read no target file.
+const NO_COUNTERS: crate::target::CounterFacts = crate::target::CounterFacts {
+    cycles: None,
+    icache: None,
+};
+
 impl TargetFacts {
+    /// Facts for a loaded target: its runtime's row, and what its own file
+    /// declares.
+    pub fn for_target(target: &crate::target::TargetDescriptor) -> Self {
+        Self {
+            counters: target.counters,
+            ..Self::for_runtime(target.runtime())
+        }
+    }
+
     /// Facts for a runtime id. Unknown names answer the weakest
     /// row — no clock, base suites, software custody — so a requirement on an
     /// unregistered target fails closed.
@@ -164,6 +185,7 @@ impl TargetFacts {
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
             // Bare metal with no RTC: the kernel vouches for wall time once
             // a time-sync module (`sntp`) anchors it from a quorum of
@@ -178,6 +200,7 @@ impl TargetFacts {
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: true,
+                counters: NO_COUNTERS,
             },
             // Bare metal on firmware that hands the wall clock over once, at
             // handoff, and no sealing key — a cloud guest is offered none —
@@ -191,6 +214,7 @@ impl TargetFacts {
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
             // No RTC, but the kernel vouches for wall time once `sntp`
             // anchors it, as on bcm2712; no room for the ML-DSA scratch; an
@@ -204,6 +228,7 @@ impl TargetFacts {
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
             // No RTC and no `sntp` build, no room for the ML-DSA scratch, no
             // OTP and so no sealing.
@@ -215,6 +240,7 @@ impl TargetFacts {
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
             // The browser host offers no synchronisation evidence.
             "wasm" => Self {
@@ -225,6 +251,7 @@ impl TargetFacts {
                 net: NET_WASM,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
             _ => Self {
                 time_wall_source: None,
@@ -234,6 +261,7 @@ impl TargetFacts {
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
+                counters: NO_COUNTERS,
             },
         }
     }
@@ -244,6 +272,8 @@ impl TargetFacts {
     pub fn fact(&self, capability: &str, fact: &str) -> Option<&'static str> {
         match (capability, fact) {
             ("time.wall", "source") => self.time_wall_source,
+            ("counter.cycles", "clock") => self.counters.cycles,
+            ("counter.icache", "scope") => self.counters.icache,
             _ => None,
         }
     }
@@ -279,6 +309,8 @@ impl TargetFacts {
         }
         let defining_fact = match capability {
             "time.wall" => "source",
+            "counter.cycles" => "clock",
+            "counter.icache" => "scope",
             _ => return false,
         };
         self.fact(capability, defining_fact).is_some()
@@ -307,7 +339,7 @@ pub enum ParamResolution {
 /// `resolutions` being one outcome per `when` condition in order.
 ///
 /// Refuses when every condition holds and the target does not provide the
-/// capability — and refuses when any condition cannot be resolved at all,
+/// capability, or provides it with a fact the entry does not accept — and refuses when any condition cannot be resolved at all,
 /// since a requirement nobody can evaluate is not one that has been met.
 pub fn check_requires_when(
     resolutions: &[ParamResolution],
@@ -355,6 +387,23 @@ pub fn check_requires_when(
             runtime,
             params.join(" / "),
         )));
+    }
+    if triggered {
+        for (fact, wanted) in &rw.facts {
+            let has = facts.fact(&rw.capability, fact);
+            if !has.is_some_and(|v| wanted.iter().any(|w| w == v)) {
+                return Err(Error::Config(format!(
+                    "requires target capability `{}` with `{fact}` = {}, but runtime `{}` \
+                     provides `{fact}` = {}. Place this module on a target whose `{}` is \
+                     what it needs.",
+                    rw.capability,
+                    wanted.join(" | "),
+                    runtime,
+                    has.unwrap_or("none"),
+                    rw.capability,
+                )));
+            }
+        }
     }
     Ok(())
 }

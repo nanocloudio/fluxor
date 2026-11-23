@@ -1422,15 +1422,19 @@ fn downstream_latency(st: &StagedAdd) {
 
 /// Hand the node's interrupt-mode modules to their dispatchers, then start
 /// the timer dispatcher at the shortest period among the `timer` domains
-/// that registered one.
+/// that registered one, each core's own shortest recorded beside it.
 fn register_isr_modules(st: &StagedAdd) {
     let s = sched();
     let mut registered = 0usize;
     let mut min_period_us = u32::MAX;
+    let mut core_min_us = [u32::MAX; MAX_DOMAINS];
     for k in 0..st.n() {
         match super::register_isr_module(s, &s.modules, st.slot(k), true) {
-            Some(super::IsrRegistration::Timer { period_us }) => {
+            Some(super::IsrRegistration::Timer { period_us, core }) => {
                 min_period_us = min_period_us.min(period_us);
+                if let Some(c) = core_min_us.get_mut(usize::from(core)) {
+                    *c = (*c).min(period_us);
+                }
                 registered += 1;
             }
             Some(super::IsrRegistration::Irq) => registered += 1,
@@ -1441,6 +1445,12 @@ fn register_isr_modules(st: &StagedAdd) {
         log::info!(
             "[isr] starting the timer dispatcher, period={min_period_us}us, {registered} modules"
         );
+        for (core, &us) in core_min_us.iter().enumerate() {
+            crate::kernel::exec::timer::set_core_period_us(
+                core,
+                if us == u32::MAX { 0 } else { us },
+            );
+        }
         crate::kernel::exec::timer::start(min_period_us);
     }
 }

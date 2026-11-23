@@ -61,15 +61,18 @@ pub fn buffer_arena_bytes(target: &TargetDescriptor) -> Option<u64> {
 
 /// What the platform `target` runs adds to graph preparation.
 pub fn platform(target: &TargetDescriptor) -> RingPlatform {
-    platform_of(target.runtime())
+    RingPlatform {
+        domain_cores: target.smp.domain_cores,
+        ..platform_of(target.runtime())
+    }
 }
 
 /// What the kernel of `runtime` adds to graph preparation: its mailbox
-/// groups, and whether it bridges domains.
+/// groups, and the core each of its domains steps on.
 pub fn platform_of(runtime: &str) -> RingPlatform {
     RingPlatform {
         buffer_groups: ring_size::buffer_groups(crate::capacity::kernel_max_edges(runtime)),
-        split_cross_domain: crate::capacity::kernel_bridges_domains(runtime),
+        domain_cores: crate::target::smp_of(runtime).domain_cores,
     }
 }
 
@@ -469,13 +472,16 @@ fn check_composed(
         modules: (graph.modules.len() + graph.fans.len()) as u64,
         edges: compiled.len() as u64,
         fans: crate::capacity::fan_count(&compiled),
-        crossings: crate::capacity::crossing_count(graph.edges.iter().map(|e| {
-            (
-                domain(e.from),
-                domain(e.to),
-                e.class == EdgeClass::CrossCore,
-            )
-        })),
+        crossings: crate::capacity::crossing_count(
+            &target.smp,
+            graph.edges.iter().map(|e| {
+                (
+                    domain(e.from),
+                    domain(e.to),
+                    e.class == EdgeClass::CrossCore,
+                )
+            }),
+        ),
         ..Default::default()
     };
     let entries: Vec<(String, u64)> = config
@@ -585,6 +591,7 @@ mod tests {
             serves: None,
             contract_optional: false,
             facts: Default::default(),
+            fact_params: Default::default(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -791,17 +798,61 @@ mod tests {
         check(&config).expect("the default reserve");
         config["capacity"] = serde_json::json!({"channels": 0});
         check(&config).expect("the crossings are derived, not reserved");
-        let shape = crate::capacity::GraphShape {
+        // Three edges, each between domain 0 and domain 1.
+        let shape = |target: &str| crate::capacity::GraphShape {
             modules: 6,
             edges: 3,
-            crossings: 3,
+            crossings: crate::capacity::crossing_count(
+                &crate::target::smp_of(target),
+                (0..3).map(|_| (Some(0), Some(1), false)),
+            ),
             ..Default::default()
         };
         let entries = vec![("channels".to_string(), 0)];
-        let plan = crate::capacity::plan_pool("pi5", "channels", &shape, &[], &entries);
-        assert_eq!(plan.ceiling(), 6);
-        let linux = crate::capacity::plan_pool("linux", "channels", &shape, &[], &entries);
-        assert_eq!(linux.ceiling(), 3, "Linux bridges no domains");
+        let channels = |target: &str| {
+            crate::capacity::plan_pool(target, "channels", &shape(target), &[], &entries).ceiling()
+        };
+        assert_eq!(channels("pi5"), 6);
+        assert_eq!(channels("linux"), 3, "Linux steps every domain on one core");
+        assert_eq!(channels("rp2040"), 3, "RP2040 steps every domain on core 0");
+        assert_eq!(channels("pico2w"), 6, "RP2350 steps domain 1 on core 1");
+    }
+
+    /// Crossings follow cores: on RP2350 only an edge to or from domain 1
+    /// is bridged, and a cross-core class edge is bridged wherever the
+    /// kernel bridges at all.
+    #[test]
+    fn crossings_are_counted_by_core() {
+        let count = |target: &str, edges: &[(Option<u8>, Option<u8>, bool)]| {
+            crate::capacity::crossing_count(&crate::target::smp_of(target), edges.iter().copied())
+        };
+        let d = |from: u8, to: u8| (Some(from), Some(to), false);
+        assert_eq!(count("rp2350", &[d(0, 1), d(1, 0), d(1, 3)]), 3);
+        assert_eq!(count("rp2350", &[d(0, 2), d(2, 3), d(0, 0), d(1, 1)]), 0);
+        assert_eq!(count("rp2350", &[(Some(0), Some(0), true)]), 1);
+        assert_eq!(count("bcm2712", &[d(0, 2), d(2, 3), d(0, 0)]), 2);
+        assert_eq!(count("rp2040", &[d(0, 1), (Some(0), Some(0), true)]), 0);
+        assert_eq!(count("linux", &[d(0, 1), d(2, 3)]), 0);
+    }
+
+    /// The ring plan splits the same edges the channel count bridges.
+    #[test]
+    fn rings_are_split_by_core() {
+        let rings = |target: &str, second: u8| {
+            let (config, blob, src, dst) = graph_in(1, 1024, |k| if k == 0 { 0 } else { second });
+            let composed = fluxor_contracts::graph::decode(&blob).unwrap();
+            let target = crate::target::load_target(target, &root()).expect("target loads");
+            let graph = decode(&config, &composed, &facts(&src, &dst)).unwrap();
+            let plan = graph.plan(platform(&target)).unwrap();
+            plan.rings
+                .iter()
+                .filter(|r| r.ends.role == fluxor_contracts::graph::plan::RingRole::CrossDomain)
+                .count()
+        };
+        assert_eq!(rings("pico2w", 1), 1, "domain 1 is core 1 on RP2350");
+        assert_eq!(rings("pico2w", 2), 0, "domain 2 shares core 0's loop");
+        assert_eq!(rings("pico", 1), 0, "RP2040 runs one loop");
+        assert_eq!(rings("pi5", 2), 1);
     }
 
     /// RP places its buffer arena per graph at the plan's figure, so an entry

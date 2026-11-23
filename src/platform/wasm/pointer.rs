@@ -1,34 +1,30 @@
-//! `wasm_browser_pointer` native module: pointer / touch input source.
+//! `wasm_browser_pointer` native module: pointer, touch and wheel input
+//! source.
 //!
-//! Pulls W3C PointerEvent state from the host shim's DOM queue and
-//! emits `input::pointer::MSG_EVENT` records on the output channel.
-//! Multi-pointer (touch) is supported: each contact gets its own
-//! `pointer_id` and the shim emits events for all active pointers.
+//! Pulls pointer records from the host shim's queue and forwards them on
+//! the output channel. Each contact has its own `pointer_id`; positions and
+//! pixel wheel deltas are in surface pixels.
 //!
-//! Wire shape on `pointer.events`:
-//!   `crates/fluxor-abi/src/contracts/input/pointer.rs::MSG_EVENT` —
-//!   16-byte records (msg_type / pointer_id / event_kind / buttons /
-//!   modifiers / pressure / x:i16 / y:i16).
+//! Wire shape on `pointer.events`: `abi::contracts::input::pointer` records.
 //!
-//! Host shim contract: `host_pointer_pop(buf, len)` returns one
-//! 16-byte record per call.
+//! Host shim contract: `host_pointer_pop(buf, len)` writes one record per
+//! call and returns its length, or 0 when the queue is empty.
 
+use crate::abi::contracts::input::pointer;
 use crate::abi::platform::native::wasm::wasm_browser_pointer as tags;
 use crate::kernel::exec::scheduler;
 use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
-use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_pointer_pop(buf: *mut u8, len: usize) -> i32;
 }
 
-const EVENT_RECORD: usize = 16;
-
 #[repr(C)]
 pub(crate) struct PointerState {
     pub out_chan: i32,
-    pub buf: [u8; EVENT_RECORD],
+    /// The record in hand; `relay_records` holds one the channel refused.
+    pub buf: [u8; pointer::EVENT_SIZE],
 }
 
 unsafe fn alloc_state(out_chan: i32) -> *mut PointerState {
@@ -42,7 +38,7 @@ unsafe fn alloc_state(out_chan: i32) -> *mut PointerState {
         raw,
         PointerState {
             out_chan,
-            buf: [0u8; EVENT_RECORD],
+            buf: [0u8; pointer::EVENT_SIZE],
         },
     );
     raw
@@ -65,17 +61,9 @@ unsafe extern "C" fn pointer_step(state: *mut u8) -> i32 {
             return 0;
         }
 
-        loop {
-            let n = host_pointer_pop(st.buf.as_mut_ptr(), st.buf.len());
-            if n <= 0 {
-                break;
-            }
-            let n = n as usize;
-            let written = channel::channel_write(st.out_chan, st.buf.as_ptr(), n.min(st.buf.len()));
-            if written <= 0 {
-                break;
-            }
-        }
+        super::relay_records(st.out_chan, &mut st.buf, host_pointer_pop, |b| {
+            pointer::decode(b).is_some()
+        });
         0
     }
 }

@@ -470,19 +470,31 @@ pub(crate) fn resolve_dependency(
 ) -> Result<Vec<Artifact>> {
     let mut out: Vec<Artifact> = dependency_index(store, dep)?
         .into_iter()
-        .filter(|a| match a.kind.as_str() {
-            "source" | "runtime" => true,
-            "module" => match (abis, a.target.as_deref()) {
-                (Some(set), Some(t)) => set.contains(t),
-                // No target list, or an untargeted module child: pin
-                // rather than silently drop.
-                _ => true,
-            },
-            _ => false,
-        })
+        .filter(|a| pinned_for(a, abis))
         .collect();
     fill_content(store, &mut out);
     Ok(out)
+}
+
+/// Whether a dependency's index child is pinned for a project building for
+/// `abis`: every source and runtime, and a module whose target is among
+/// `abis` (every module when `None`).
+fn pinned_for(a: &Artifact, abis: Option<&BTreeSet<String>>) -> bool {
+    match a.kind.as_str() {
+        "source" | "runtime" => true,
+        "module" => match (abis, a.target.as_deref()) {
+            (Some(set), Some(t)) => set.contains(t),
+            // No target list, or an untargeted module child: pin
+            // rather than silently drop.
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `dep` has a published project index to resolve from.
+pub(crate) fn dependency_published(store: &OciStore, dep: &str) -> bool {
+    store.resolve(&format!("{dep}/meta:latest")).is_ok()
 }
 
 /// The stacks and packages a project references by name.
@@ -751,11 +763,25 @@ fn pin_references(
 pub fn resolve_project(project_root: &Path) -> Result<Vec<Artifact>> {
     let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
     let store = OciStore::open(crate::oci_store::store_root()?)?;
-    let abis = ci_target_abis(project_root)?;
-    let mut out = Vec::new();
+    let mut offered = Vec::new();
     for dep in deps {
-        out.extend(resolve_dependency(&store, &dep.name, abis.as_ref())?);
+        offered.extend(resolve_dependency(&store, &dep.name, None)?);
     }
+    // `[ci] targets` names resolve through a target catalog, and a project
+    // with no `targets/` of its own reads the one it pins: stage that catalog
+    // where `fluxor sync` does before the names are resolved, so the pins
+    // that need the catalog never wait on pins that carry it.
+    for catalog in offered
+        .iter()
+        .filter(|a| a.kind == "source" && a.name == crate::project::CATALOG_SOURCE)
+    {
+        crate::store_sync::materialize_artifact(&store, project_root, catalog)?;
+    }
+    let abis = ci_target_abis(project_root)?;
+    let mut out: Vec<Artifact> = offered
+        .into_iter()
+        .filter(|a| pinned_for(a, abis.as_ref()))
+        .collect();
     sort_entries(&mut out);
     Ok(out)
 }
@@ -1010,15 +1036,34 @@ pub(crate) fn read_pinned_manifest(store: &OciStore, entry: &Artifact) -> Result
         .map_err(|e| Error::Config(format!("corrupt manifest {}: {e}", entry.digest)))
 }
 
-/// The current ecosystem epoch (hex). When fluxor itself is a live
-/// workspace member, the epoch is computed from the member's TREE
-/// (`abi_pin::compute`) — the tree and the compiled-in const diverge
-/// exactly during an epoch move, the only moment the check matters.
-/// Otherwise the CLI's compiled-in const is authoritative.
+/// The current ecosystem epoch (hex): the CLI's compiled-in const, the
+/// epoch of the Fluxor it was published with. Only when the workspace names
+/// fluxor's checkout among its `live_trees` is the epoch computed from that
+/// TREE (`abi_pin::compute`), for a build made against Fluxor work not yet
+/// published; a tree that does not compute is then an error naming it.
 pub fn current_epoch_hex(live_projects: &BTreeMap<String, PathBuf>) -> Result<String> {
+    let trees: Vec<PathBuf> = match crate::workspace::load_workspace() {
+        Ok(Some(ws)) => ws
+            .workspace
+            .live_trees
+            .iter()
+            .map(|t| t.canonicalize().unwrap_or_else(|_| t.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
     for path in live_projects.values() {
-        if crate::abi_pin::has_abi_surface(path) {
-            return Ok(crate::abi_pin::compute(path)?.digest_hex);
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if crate::abi_pin::has_abi_surface(path) && trees.contains(&canon) {
+            return crate::abi_pin::compute(path)
+                .map(|p| p.digest_hex)
+                .map_err(|e| {
+                    Error::Config(format!(
+                        "the live Fluxor tree {} (a workspace `live_trees` entry) has no \
+                         computable ABI epoch: {e} — fix the tree, or remove it from \
+                         `live_trees` to build against published Fluxor",
+                        path.display()
+                    ))
+                });
         }
     }
     Ok(crate::hash::abi_surface_digest()

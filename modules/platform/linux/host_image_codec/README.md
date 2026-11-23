@@ -2,7 +2,9 @@
 
 Linux-only native module. Reads a complete encoded image (JPEG, PNG, BMP,
 GIF) from its `encoded` input, decodes via the `image` crate, resizes
-to the target dimensions, and emits a single RGB565 frame on `pixels`.
+to the target dimensions, and sends the picture on `pixels` as one
+`VideoRaster` record: the region header of a whole-surface frame
+(`abi::contracts::video_raster`), then the RGB565 pixels.
 
 Pairs with `linux_display` so a hosted graph can show real images
 without a board-side image codec module.
@@ -56,13 +58,13 @@ Configured via `[[params]]` in [manifest.toml](manifest.toml):
 | `scale_mode` | enum | `fit`                       | `fit` preserves aspect with black letterbox; `stretch` fills the target dimensions  |
 | `max_bytes`  | u32  | 4194304 (range 1024..=64M)  | hard cap on encoded input size before the codec gives up                            |
 
-Width and height must match the downstream `linux_display`. Nothing
-checks that they agree; if they don't, the display garbles the frame.
+The record states its own surface, so the downstream display takes the
+picture's extent from the stream.
 
 ## Behaviour
 
 - Reads encoded bytes incrementally from the channel into an internal
   buffer. Decode happens once an EOF signal is received from upstream
   (channel drained for ≥ N consecutive ticks).
-- Emits exactly one frame, then closes its output.
+- Sends one frame for each image it reads, then waits for the next.
 - Decode failures log once and emit nothing.

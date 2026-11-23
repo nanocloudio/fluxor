@@ -703,11 +703,25 @@ pub struct RingPlatform {
     /// Mailbox groups the kernel has (`ring_size::buffer_groups` of its
     /// graph-edge capacity).
     pub buffer_groups: usize,
-    /// Every edge whose ends step in different domains, or whose class is
-    /// `CrossCore`, is split into a producer-side and a consumer-side
-    /// channel joined by a pump, and the consumer side is a default ring of
-    /// its own.
-    pub split_cross_domain: bool,
+    /// The core each execution domain steps on, by domain index. Where any
+    /// domain steps off core 0 the kernel bridges cores: every edge whose
+    /// ends step on different cores, or whose class is `CrossCore`, is
+    /// split into a producer-side and a consumer-side channel joined by a
+    /// pump, and the consumer side is a default ring of its own. Edges
+    /// between domains of one core stay one channel.
+    pub domain_cores: [u8; crate::core_map::DOMAINS],
+}
+
+impl RingPlatform {
+    /// Whether the kernel bridges cores: some domain steps off core 0.
+    pub fn bridges_cores(&self) -> bool {
+        crate::core_map::has_secondary(&self.domain_cores)
+    }
+
+    /// Whether an edge between domains `from` and `to` crosses cores.
+    pub fn crosses_cores(&self, from: u8, to: u8) -> bool {
+        crate::core_map::crosses_cores(&self.domain_cores, usize::from(from), usize::from(to))
+    }
 }
 
 /// An end of a ring.
@@ -864,10 +878,10 @@ pub fn rings(
         totals.arena += r.arena;
         each(r);
     }
-    if platform.split_cross_domain {
+    if platform.bridges_cores() {
         for (i, e) in edges.iter().enumerate() {
             let crosses = match (nodes.domain(e.from), nodes.domain(e.to)) {
-                (Some(a), Some(b)) => a != b,
+                (Some(a), Some(b)) => platform.crosses_cores(a, b),
                 _ => false,
             };
             if !crosses && e.class != EdgeClass::CrossCore {

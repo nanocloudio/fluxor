@@ -1,8 +1,9 @@
 // Platform: RP family (RP2040, RP2350A/B) — Cortex-M.
 //
-// One thread, one loop: the reset vector, clock bring-up, USB device stack
-// and step loop are all this tree's own, and the graph is stepped from a
-// single synchronous loop that idles in `WFE`.
+// The reset vector, clock bring-up, USB device stack and step loop are all
+// this tree's own. Core 0 steps its domains from one synchronous loop that
+// idles in `WFE`; on the RP2350 the second core steps domain 1 from the
+// shared domain loop (`platform/rp/core1.rs`).
 
 use fluxor::platform::rp_io::pio as pio_util;
 
@@ -15,11 +16,16 @@ use fluxor::platform::planner::{self, PioRole};
 /// dispatches through the vector table's default interrupt handler →
 /// `irq_trampoline`. The `event_handle` and `ack` parameters are
 /// unused on RP (dispatch is by IRQ number). Returns 0.
+///
+/// Each core has an NVIC only it can write, so a line is enabled by the core
+/// it is bound to: at once when that is the calling core, and otherwise
+/// recorded for core 1, which applies its line set before it next runs a
+/// pass. A line one core owns is refused to the other.
 fn rp_irq_bind(
     irq: u32,
     _event_handle: i32,
     _ack: fluxor::kernel::sys::hal::IrqAck,
-    _target_core: u8,
+    target_core: u8,
 ) -> i32 {
     // NVIC line ceiling, from the rp-pac `Interrupt` enum: the highest line on
     // each chip is SWI_IRQ_5 — 31 on RP2040, 52 on RP235x. The build-time
@@ -33,6 +39,42 @@ fn rp_irq_bind(
     if irq > NVIC_IRQ_MAX {
         return fluxor::kernel::sys::errno::EINVAL;
     }
+    // The DMA's two lines are the kernel's: the scan lists' interrupt.
+    if fluxor::platform::rp_dma::IRQ_LINES.contains(&(irq as u16)) {
+        return fluxor::kernel::sys::errno::EBUSY;
+    }
+    #[cfg(feature = "smp")]
+    {
+        use fluxor::platform::rp_core1 as core1;
+        let here = fluxor::platform::chip::core_id();
+        if target_core == 1 {
+            if CORE0_LINES[(irq / 32) as usize].load(core::sync::atomic::Ordering::Acquire)
+                & (1 << (irq % 32))
+                != 0
+            {
+                return fluxor::kernel::sys::errno::EBUSY;
+            }
+            return if core1::bind_line(irq) {
+                if here == 1 {
+                    core1::mask_line(irq, false);
+                }
+                0
+            } else {
+                fluxor::kernel::sys::errno::EINVAL
+            };
+        }
+        if target_core != 0 || here != 0 {
+            // Core 0's NVIC is core 0's to write.
+            return fluxor::kernel::sys::errno::ENOTSUP;
+        }
+        if core1::owns_line(irq) {
+            return fluxor::kernel::sys::errno::EBUSY;
+        }
+        CORE0_LINES[(irq / 32) as usize]
+            .fetch_or(1 << (irq % 32), core::sync::atomic::Ordering::AcqRel);
+    }
+    #[cfg(not(feature = "smp"))]
+    let _ = target_core;
     // Unmasking is sound: the line only fires once its peripheral asserts,
     // and an unowned fire is masked by `DefaultHandler`. A number outside the
     // NVIC window is refused rather than wrapped onto another line.
@@ -42,8 +84,20 @@ fn rp_irq_bind(
     0
 }
 
-/// HAL `irq_mask` for RP: one NVIC clear- or set-enable write.
+/// The lines bound to core 0, a bit per line, so a bind for core 1 of a line
+/// core 0 holds is refused.
+#[cfg(feature = "smp")]
+static CORE0_LINES: [core::sync::atomic::AtomicU32; 2] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 2];
+
+/// HAL `irq_mask` for RP: one NVIC clear- or set-enable write, on the core
+/// that owns the line.
 fn rp_irq_mask(irq: u32, masked: bool) {
+    #[cfg(feature = "smp")]
+    if fluxor::platform::rp_core1::owns_line(irq) {
+        fluxor::platform::rp_core1::mask_line(irq, masked);
+        return;
+    }
     if let Ok(irq) = u16::try_from(irq) {
         if masked {
             fluxor::arch::cortex_m::nvic_mask(irq);
@@ -53,8 +107,23 @@ fn rp_irq_mask(irq: u32, masked: bool) {
     }
 }
 
-/// HAL `irq_unbind` for RP: mask the NVIC line `rp_irq_bind` enabled.
+/// HAL `irq_unbind` for RP: mask the NVIC line `rp_irq_bind` enabled, on the
+/// core that owns it.
 fn rp_irq_unbind(irq: u32) -> i32 {
+    #[cfg(feature = "smp")]
+    {
+        if fluxor::platform::rp_core1::owns_line(irq) {
+            return if fluxor::platform::rp_core1::unbind_line(irq) {
+                0
+            } else {
+                fluxor::kernel::sys::errno::EINVAL
+            };
+        }
+        if irq < 64 {
+            CORE0_LINES[(irq / 32) as usize]
+                .fetch_and(!(1 << (irq % 32)), core::sync::atomic::Ordering::AcqRel);
+        }
+    }
     match u16::try_from(irq) {
         Ok(irq) if fluxor::arch::cortex_m::nvic_mask(irq) => 0,
         _ => fluxor::kernel::sys::errno::EINVAL,
@@ -430,29 +499,25 @@ fn rp_step_guard_post_check() {
 }
 
 fn rp_read_cycle_count() -> u32 {
-    // SAFETY: DWT CYCCNT at 0xE000_1004 is a Cortex-M debug-block register.
-    unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
+    fluxor::platform::rp_counters::cycle_count()
 }
 
 fn rp_module_timer_init() {
-    // SAFETY: DEMCR (TRCENA) and DWT_CTRL (CYCCNTENA) are Cortex-M debug
-    // registers; single boot-thread enabler.
-    unsafe {
-        let demcr = 0xE000_EDFC as *mut u32;
-        let val = core::ptr::read_volatile(demcr);
-        core::ptr::write_volatile(demcr, val | (1 << 24));
-        let dwt_ctrl = 0xE000_1000 as *mut u32;
-        let val = core::ptr::read_volatile(dwt_ctrl);
-        core::ptr::write_volatile(dwt_ctrl, val | 1);
-    }
+    fluxor::platform::rp_counters::enable_cycle_counter();
 }
 
 fn rp_module_timer_start(period_us: u32) {
     step_guard_backend::rp_isr_backend_start(period_us);
+    // Core 1 arms its own alarm, at its own period, when it next applies
+    // what core 0 recorded for it.
+    #[cfg(feature = "smp")]
+    fluxor::platform::rp_core1::changed();
 }
 
 fn rp_module_timer_stop() {
     step_guard_backend::rp_isr_backend_stop();
+    #[cfg(feature = "smp")]
+    fluxor::platform::rp_core1::changed();
 }
 
 fn rp_module_timer_poll() {
@@ -591,13 +656,13 @@ static RP_HAL_OPS: HalOps = HalOps {
     runtime_params: rp_runtime_params,
     init_gpio: |gpio| fluxor::platform::rp_io::gpio::init_all_from_config(gpio),
     csprng_fill: rp_csprng_fill,
-    core_id: || 0,
+    core_id: fluxor::platform::chip::core_id,
     irq_bind: rp_irq_bind,
     irq_unbind: rp_irq_unbind,
     irq_mask: rp_irq_mask,
     sleep_until: rp_sleep_until,
-    smp_quiesce_peers: || false,
-    smp_release_peers: || {},
+    smp_quiesce_peers: rp_quiesce_peers,
+    smp_release_peers: rp_release_peers,
     smp_max_domains: || 1,
     protection_set_enabled: |_| {},
     protection_reset: || {},
@@ -618,6 +683,30 @@ static RP_HAL_OPS: HalOps = HalOps {
     },
     metal_device: None,
 };
+
+/// HAL `smp_quiesce_peers`: park core 1 at its pass boundary for a
+/// structural change. The wait is the kernel's time, not the stepping
+/// module's: core 0's step deadline moves past it.
+fn rp_quiesce_peers() -> bool {
+    #[cfg(feature = "smp")]
+    {
+        let started = fluxor::platform::rp_timer::alarm::now_raw_lo();
+        // A core 1 that stopped on a fault never parks: the wait ends in
+        // the node's reset instead.
+        let parked = fluxor::kernel::exec::domains::quiesce_peers_watching(watch_core1);
+        let waited = fluxor::platform::rp_timer::alarm::now_raw_lo().wrapping_sub(started);
+        fluxor::arch::cortex_m::interrupt_free(|| step_guard_backend::rp_step_guard_defer(waited));
+        parked
+    }
+    #[cfg(not(feature = "smp"))]
+    false
+}
+
+/// HAL `smp_release_peers`: release what [`rp_quiesce_peers`] parked.
+fn rp_release_peers() {
+    #[cfg(feature = "smp")]
+    fluxor::kernel::exec::domains::release_quiesce();
+}
 
 fn rp_now_unix_millis() -> u64 {
     #[cfg(not(feature = "chip-rp2040"))]
@@ -742,6 +831,15 @@ fn rp_setup_graph() -> i32 {
         Ok(st) => st,
         Err(e) => return e,
     };
+    // Every edge between a domain on core 0 and one on core 1 is split into
+    // two channels joined by a ring; an edge between two domains of one core
+    // stays a plain channel.
+    #[cfg(feature = "smp")]
+    if let Err(why) = fluxor::kernel::exec::domains::cross::bridge_edges() {
+        log::error!("[graph] {why}");
+        scheduler::splice::abandon(staged);
+        return -1;
+    }
 
     // Ownership must be live before any provider handle is opened.
     if let Err(e) = fluxor::kernel::exec::bare_metal::apply_owner_plan() {
@@ -767,10 +865,35 @@ fn rp_setup_graph() -> i32 {
         crumb(slot + 1);
         rp_spin_ms(1);
     };
-    match scheduler::instantiate_graph(staged, &mut wait, &mut each) {
+    let loaded = match scheduler::instantiate_graph(staged, &mut wait, &mut each) {
         Ok(n) => n as i32,
-        Err(e) => e,
+        Err(e) => return e,
+    };
+    #[cfg(feature = "smp")]
+    {
+        use fluxor::kernel::exec::domains;
+        use fluxor::platform::rp_core1 as core1;
+        domains::record_module_counts();
+        // The second core is started for the first graph that places a
+        // module on it, into its wait for the release: every flash write of
+        // this instantiation is done, and nothing detaches XIP again before
+        // core 1 has reached RAM.
+        if core1::DOMAIN.is_some_and(domains::is_active) && !core1::launched() {
+            if core1::launch() {
+                log::info!("[core1] launched, waiting for the graph's release");
+            } else {
+                log::error!("[core1] did not answer the launch");
+            }
+        }
+        if let Some(d) = domains::coreless_domain(&core1::PLATFORM) {
+            log::error!(
+                "[graph] domain {d} has modules but core {} is not running; refusing the graph",
+                domains::domain_core(d)
+            );
+            return -1;
+        }
     }
+    loaded
 }
 
 /// Spin for roughly `ms` milliseconds on the monotonic clock.
@@ -794,6 +917,29 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         core::ptr::write_volatile(crash.add(1), PANIC_MARKER);
         core::ptr::write_volatile(crash, CRASH_MAGIC);
     }
+
+    // A panic on core 1 ends core 1: the UART is core 0's, and a reset
+    // request from here would reset this core alone. Core 0 reports it and
+    // resets the node, with the crash record above kept.
+    #[cfg(feature = "smp")]
+    if fluxor::platform::chip::core_id() != 0 {
+        if let Some(loc) = info.location() {
+            log::error!("[panic] core=1 {}:{}", loc.file(), loc.line());
+        }
+        fluxor::platform::rp_core1::stop_for_node_fault(
+            fluxor::platform::rp_core1::NodeFaultKind::Panic,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+    // The reset below is of this core alone: the other core goes back to
+    // the bootrom first, so it runs nothing of this image while the bootrom
+    // and then the reset handler take the flash and the statics from under
+    // it.
+    #[cfg(feature = "smp")]
+    fluxor::platform::rp_core1::stop();
 
     fluxor::platform::rp_uart::write_str("[fluxor] panic: ");
     if let Some(loc) = info.location() {
@@ -833,6 +979,16 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
     // than boot the same image into the same wedge.
     fluxor::platform::rp_watchdog::recover_from_wedge();
 
+    // The watchdog before the clocks: each failure below can only spin, with
+    // no console that reaches anyone and no USB, and a board left spinning
+    // there answers to nothing but its power switch. Armed, it resets, and
+    // the boot after that takes the reset for the wedge it was and goes to
+    // BOOTSEL. Until the crystal is up the tick divides the ring oscillator,
+    // which is the slower of the two, so the timeout is long by their
+    // ratio; it is armed again, exactly, once the clock tree is.
+    fluxor::platform::rp_watchdog::arm_for_boot();
+    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::CLOCKS);
+
     // The console before the PLLs, running from the crystal.
     //
     // `clk_peri` is disabled out of reset, so a UART brought up before this
@@ -842,8 +998,9 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
     // clock bring-up, which is where a boot is most likely to die.
     //
     // If even the crystal will not start there is nothing left to report
-    // with, so that case parks. A board dead this early is dead before any
-    // instrument exists, and saying so requires the instrument.
+    // with, so that case spins until the watchdog takes the board to
+    // BOOTSEL. A board dead this early is dead before any instrument
+    // exists, and saying so requires the instrument.
     match fluxor::platform::rp_clocks::bringup::start_peri_from_xosc(XOSC_HZ) {
         Ok(peri_hz) => {
             fluxor::platform::rp_uart::init(peri_hz);
@@ -947,18 +1104,47 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         park_reporting("[fluxor] boot: domain loop setup failed\r\n");
     }
 
+    #[cfg(feature = "smp")]
+    fluxor::kernel::exec::domains::install(&fluxor::platform::rp_core1::PLATFORM);
+    fluxor::platform::rp_counters::enable_cycle_counter();
+    fluxor::kernel::sys::counters::install(&fluxor::platform::rp_counters::SOURCE);
+
     // Build, run, rebuild. The loop returns when the reconfigure module
     // asks for a rebuild; the graph is then set up again from the staged
-    // configuration.
+    // configuration, with core 1 parked while it is.
+    #[cfg(feature = "smp")]
+    let mut rebuilding = false;
     loop {
         fluxor::platform::rp_uart::write_str("[fluxor] boot: building graph\r\n");
         fluxor::platform::rp_watchdog::arm_for_boot();
+        #[cfg(feature = "smp")]
+        if rebuilding {
+            use fluxor::kernel::exec::domains;
+            domains::request_quiesce();
+            domains::wait_parked_watching(watch_core1);
+            // SAFETY: core 1 is parked: its pump neither walks the edge
+            // table nor touches a ring.
+            unsafe { domains::cross::reset_cross_state() };
+        }
         let module_count = rp_setup_graph();
         if module_count < 0 {
             park_reporting("[fluxor] boot: graph setup failed\r\n");
         }
         log::info!("[boot] ready modules={module_count}");
         scheduler::log_arena_usage();
+        #[cfg(feature = "smp")]
+        {
+            use fluxor::kernel::exec::domains;
+            if rebuilding {
+                domains::release_quiesce();
+            } else {
+                domains::release();
+            }
+            if fluxor::platform::rp_core1::DOMAIN.is_some_and(domains::is_active) {
+                fluxor::platform::rp_core1::go();
+            }
+            rebuilding = true;
+        }
         if rp_run_domain_loop(module_count as usize) {
             log::info!("[reconfigure] domain loop yielded, rebuilding graph");
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
@@ -1037,7 +1223,7 @@ fn crash_info_once() {
 /// Step the graph until either a rebuild is requested (returns `true`) or
 /// the graph halts (returns `false`).
 ///
-/// One thread, one loop: the graph is stepped, the USB device stack is
+/// Core 0's loop: its domains are stepped, the USB device stack is
 /// pumped, the console is drained, and the core idles in `WFE` until the
 /// earlier of the pacer's deadline and the device stack's. Nothing here can
 /// wait on anything else, which is what keeps the USB pump serviced under
@@ -1052,11 +1238,27 @@ fn rp_run_domain_loop(module_count: usize) -> bool {
     fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::DOMAIN_LOOP);
 
     loop {
+        // A kernel fault or a panic on core 1 is the node's: report it and
+        // reset. Otherwise core 1's liveness gates the feed: a core 1 that
+        // has stopped passing and is not parked for this core lets the
+        // watchdog run out.
+        #[cfg(feature = "smp")]
+        {
+            watch_core1();
+            if fluxor::platform::rp_core1::alive() {
+                fluxor::platform::rp_watchdog::feed();
+            }
+        }
+        #[cfg(not(feature = "smp"))]
         fluxor::platform::rp_watchdog::feed();
         crash_info_once();
-        fluxor::platform::rp_io::gpio::poll_gpio_edges();
+        fluxor::platform::rp_providers::exclusive(fluxor::platform::rp_io::gpio::poll_gpio_edges);
 
         let pass = scheduler::pass::tick_all();
+        step_guard_backend::pass_ended();
+        // This core's halves of the bridges to core 1.
+        #[cfg(feature = "smp")]
+        fluxor::kernel::exec::domains::pump_core(0);
         match pass.result {
             StepResult::Continue => {}
             StepResult::Done => {
@@ -1108,6 +1310,8 @@ fn rp_run_domain_loop(module_count: usize) -> bool {
                 if entry > reserve {
                     log::error!("[stack] kernel reached {entry} B under a module; its reserve is {reserve} B");
                 }
+                #[cfg(feature = "smp")]
+                report_core1();
             }
         }
 
@@ -1128,9 +1332,8 @@ fn rp_run_domain_loop(module_count: usize) -> bool {
         // Arm the alarm before parking, and disarm after.
         //
         // `WFE` wakes on an *enabled* interrupt, an `SEV`, or a spurious
-        // event. Nothing else runs on this core, so
-        // there is no `SEV` to come — the alarm is the only thing that can
-        // end the sleep. Without it `wait_for_wake` parks on the first
+        // event. Nothing else runs on this core, and no `SEV` is owed to it
+        // — the alarm is the only thing certain to end the sleep. Without it `wait_for_wake` parks on the first
         // iteration and never re-reads the clock, which stops the USB pump
         // below it and takes the board off the bus with every earlier stage
         // of boot having succeeded. `rp_sleep_until` arms the same alarm for
@@ -1150,6 +1353,122 @@ fn rp_run_domain_loop(module_count: usize) -> bool {
         fluxor::platform::rp_timer::disarm_scheduler_alarm();
 
         scheduler::pass::wake_all();
+    }
+}
+
+/// Reset the node if core 1 has stopped on a kernel fault or a panic.
+/// Called wherever core 0 waits for core 1, and at the top of every pass.
+#[cfg(feature = "smp")]
+fn watch_core1() {
+    if let Some(fault) = fluxor::platform::rp_core1::node_fault() {
+        reset_for_core1_fault(fault);
+    }
+}
+
+/// How long core 0 keeps the console pumped after it has logged a fault of
+/// core 1, before it resets the node: long enough for a host with the port
+/// open to read the line.
+#[cfg(feature = "smp")]
+const FAULT_REPORT_US: u64 = 200_000;
+
+/// Core 1 ended in a kernel fault or a panic: log it, keep it as the crash
+/// record the next boot reports, and reset the whole node through the
+/// bootrom. Never returns.
+#[cfg(feature = "smp")]
+fn reset_for_core1_fault(fault: fluxor::platform::rp_core1::NodeFault) -> ! {
+    use fluxor::platform::rp_core1::NodeFaultKind;
+    let what = match fault.kind {
+        NodeFaultKind::Fault => "fault",
+        NodeFaultKind::Panic => "panic",
+    };
+    log::error!(
+        "[fault] core=1 {what} pc={:08x} lr={:08x} cfsr={:08x} bfar={:08x} mod={}; resetting the node",
+        fault.pc,
+        fault.lr,
+        fault.cfsr,
+        fault.bfar,
+        fault.module
+    );
+    let crash = (&raw mut CRASH_DATA) as *mut u32;
+    // SAFETY: the 8-word `.uninit` record; the magic is written last.
+    unsafe {
+        let pc = match fault.kind {
+            NodeFaultKind::Fault => fault.pc,
+            NodeFaultKind::Panic => PANIC_MARKER,
+        };
+        core::ptr::write_volatile(crash.add(1), pc);
+        core::ptr::write_volatile(crash.add(2), fault.lr);
+        core::ptr::write_volatile(crash.add(3), fault.module);
+        core::ptr::write_volatile(crash.add(4), scheduler::pass_count(0));
+        core::ptr::write_volatile(crash.add(5), 0);
+        core::ptr::write_volatile(crash.add(6), fault.cfsr);
+        core::ptr::write_volatile(crash.add(7), fault.bfar);
+        core::ptr::write_volatile(crash, CRASH_MAGIC);
+    }
+    fluxor::platform::rp_core1::stop();
+    let until = fluxor::platform::rp_timer::now_us().saturating_add(FAULT_REPORT_US);
+    while fluxor::platform::rp_timer::now_us() < until {
+        rp_usb_step();
+        debug_drain_poll();
+    }
+    // A reset of the whole chip, which the next boot does not take for a
+    // wedge. If the bootrom refuses it, this core's own reset is what is
+    // left.
+    let _ = fluxor::platform::rp_bootrom::reboot_to_flash();
+    fluxor::arch::cortex_m::system_reset()
+}
+
+/// Core 1's liveness and stack, on core 0's periodic report: its domain's
+/// passes, its heartbeat, the parks it took between steps for an XIP detach,
+/// its step guard's stray fires, and the measured depth of its stack against
+/// the region and the kernel's reserve under a module.
+#[cfg(feature = "smp")]
+fn report_core1() {
+    use fluxor::platform::rp_core1 as core1;
+    let Some(domain) = core1::DOMAIN else {
+        return;
+    };
+    if !core1::running() {
+        return;
+    }
+    let (peak, region) = core1::stack_peak();
+    let entry = fluxor::platform::rp_boot::stack_entry_depth_on(1);
+    let reserve = fluxor::platform::chip::SECONDARY_STACK_RESERVE;
+    // The rate core 1's module-timer handler ran at since the last report,
+    // against the monotonic clock: reported once a whole window has passed
+    // with the timer running at both ends of it.
+    static mut LAST_TIMER: (u32, u64) = (0, 0);
+    let runs = fluxor::platform::rp_step_guard::module_timer_runs(1);
+    let now_us = fluxor::platform::rp_timer::now_us();
+    // SAFETY: core 0's loop is the only reader and writer.
+    let (last_runs, last_us) = unsafe { LAST_TIMER };
+    // SAFETY: as above.
+    unsafe { LAST_TIMER = (runs, now_us) };
+    struct Rate(Option<u64>);
+    impl core::fmt::Display for Rate {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.0 {
+                Some(hz) => write!(f, "{hz}"),
+                None => f.write_str("none"),
+            }
+        }
+    }
+    let timer_hz = Rate((last_runs != 0 && now_us > last_us).then(|| {
+        u64::from(runs.wrapping_sub(last_runs)) * 1_000_000 / (now_us - last_us)
+    }));
+    log::info!(
+        "[core1] passes={} beat={} xip_parks={} worst_us={} guard_stray={} timer_hz={timer_hz} \
+         stack peak={peak} entry={entry} region={region} reserve={reserve}",
+        scheduler::pass_count(domain),
+        core1::heartbeat(),
+        core1::xip_parks(),
+        scheduler::domain_worst_step_us(domain),
+        fluxor::platform::rp_step_guard::stray_count_on(1),
+    );
+    if entry > reserve {
+        log::error!(
+            "[core1] kernel reached {entry} B under a module; its reserve is {reserve} B"
+        );
     }
 }
 
@@ -1343,6 +1662,11 @@ fn rp_usb_step() -> u32 {
 /// over the console being brought up, which is the one a person actually
 /// has.
 fn park_reporting(reason: &str) -> ! {
+    // Nothing runs beside the report: with the watchdog off, a core 1 that
+    // stopped inside a critical section would otherwise hold this loop's
+    // every log line and USB step for ever.
+    #[cfg(feature = "smp")]
+    fluxor::platform::rp_core1::stop();
     fluxor::platform::rp_watchdog::disarm();
     fluxor::platform::rp_uart::write_str(reason);
     fluxor::platform::rp_uart::flush();
@@ -1370,6 +1694,13 @@ fn park_reporting(reason: &str) -> ! {
 /// it needs no interrupt and never waits.
 #[unsafe(no_mangle)]
 pub extern "C" fn fluxor_fault_park(pc: u32, lr: u32, cfsr: u32, hfsr: u32, bfar: u32) -> ! {
+    // Core 0's own fault (core 1's goes to `rp_core1::fluxor_rp_core1_fault`
+    // from the fault entry). Core 1 goes back to the bootrom first: nothing
+    // runs beside the report, and with the watchdog off below, a core 1
+    // stopped inside a critical section could otherwise hold the report's
+    // every log line for ever.
+    #[cfg(feature = "smp")]
+    fluxor::platform::rp_core1::stop();
     fluxor::platform::rp_watchdog::disarm();
     use core::fmt::Write as _;
     let mut w = FixedWriter {

@@ -60,6 +60,7 @@ pub enum Rule {
     RetiredVocabulary,
     DescriptorHygiene,
     AbiLiteral,
+    RasterMagic,
 }
 
 impl Rule {
@@ -115,6 +116,7 @@ impl Rule {
             Rule::RetiredVocabulary,
             Rule::DescriptorHygiene,
             Rule::AbiLiteral,
+            Rule::RasterMagic,
         ]
         .into_iter()
         .find(|r| r.as_str() == name)
@@ -135,6 +137,7 @@ impl Rule {
             Rule::RetiredVocabulary => "retired-vocabulary",
             Rule::DescriptorHygiene => "descriptor-hygiene",
             Rule::AbiLiteral => "abi-literal",
+            Rule::RasterMagic => "raster-magic",
         }
     }
 }
@@ -389,13 +392,22 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         }
         let path = entry.path();
         let ext = path.extension().and_then(|s| s.to_str());
-        if ext != Some("rs") && ext != Some("md") {
+        if !matches!(ext, Some("rs" | "md" | "js" | "html")) {
             continue;
         }
         let rel = match path.strip_prefix(project_root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
+        if matches!(ext, Some("js" | "html")) {
+            if let Ok(content) = fs::read_to_string(path) {
+                report.files_scanned += 1;
+                report
+                    .violations
+                    .extend(scan_raster_magic_text(&rel, &content));
+            }
+            continue;
+        }
         if ext == Some("md") {
             // Prose is held to the vocabulary rule only, and only in the
             // repo that owns the surface it describes.
@@ -439,6 +451,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
         file_violations.extend(scan_descriptor_hygiene(&rel, &content));
         file_violations.extend(scan_abi_literals(&rel, &content));
+        file_violations.extend(scan_raster_magic(&rel, &content));
         report.violations.extend(file_violations);
     }
 
@@ -916,12 +929,13 @@ fn shadow_layer_is_empty(shadow_dir: &Path, project_root: &Path, layer: &str) ->
     }
 }
 
-/// SDK-mount rule. The ABI, the SDK and the module runtime are three crates
-/// a module links (`fluxor_abi`, `fluxor_sdk`, `fluxor_rt`); no file anywhere
-/// mounts their source by `#[path]` or `include!` — not from `crates/`, not
-/// from the tree `fluxor sync` stages under `target/fluxor/`, not from a
-/// `deps/` checkout. A mount compiles a second copy whose types are not the
-/// crate's and whose digest nothing checks.
+/// SDK-mount rule. The ABI, the SDK, the module runtime and the contracts are
+/// four crates a module links (`fluxor_abi`, `fluxor_sdk`, `fluxor_rt`,
+/// `fluxor_contracts`); no file anywhere mounts their source by `#[path]` or
+/// `include!` — not from `crates/` or `contracts/`, not from the tree
+/// `fluxor sync` stages under `target/fluxor/`, not from a `deps/` checkout.
+/// A mount compiles a second copy whose types are not the crate's and whose
+/// digest nothing checks.
 ///
 /// A sibling's shared source tree is still mounted, from the staged
 /// `target/fluxor/<project>-common/` and never a raw `deps/` checkout: a
@@ -937,7 +951,18 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
             continue;
         };
         let path = line[open + 1..].split('"').next().unwrap_or("");
-        let message = if ["fluxor-abi/", "fluxor-sdk/", "fluxor-rt/", "modules/sdk/"]
+        let contracts = path.contains("fluxor-contracts/")
+            || path.starts_with("contracts/src/")
+            || path.contains("/contracts/src/");
+        let message = if contracts {
+            format!(
+                "mounts fluxor-contracts source (`{path}`): it is a crate — a module imports \
+                 it, linked without `alloc` (`use fluxor_contracts::graph::{{self, plan}};`, \
+                 `graph::encode_into`, the `plan` passes), and a cargo project depends on the \
+                 staged crate (`fluxor-contracts = {{ path = \"target/fluxor/fluxor-contracts\" }}`) \
+                 instead of compiling a copy"
+            )
+        } else if ["fluxor-abi/", "fluxor-sdk/", "fluxor-rt/", "modules/sdk/"]
             .iter()
             .any(|c| path.contains(c))
         {
@@ -2066,6 +2091,129 @@ fn scan_abi_literals(rel: &Path, src: &str) -> Vec<Violation> {
     out
 }
 
+/// The one file that spells the raster region header's magic.
+const RASTER_MAGIC_HOME: &str = "crates/fluxor-abi/src/contracts/video_raster.rs";
+
+/// The raster region header's magic, read from its one definition.
+const RASTER_MAGIC: [u8; 4] = fluxor_abi::contracts::video_raster::MAGIC;
+
+/// The raster region header's magic is spelled once, in
+/// [`RASTER_MAGIC_HOME`]; every reader and writer names
+/// `abi::contracts::video_raster::MAGIC`. Anywhere else, a string or
+/// byte-string literal that is the magic, or a four-element array literal of
+/// its bytes, restates it. Literals inside macro invocations count: the scan
+/// is over the file's tokens.
+fn scan_raster_magic(rel: &Path, src: &str) -> Vec<Violation> {
+    use proc_macro2::{Delimiter, TokenStream, TokenTree};
+    if rel == Path::new(RASTER_MAGIC_HOME) {
+        return Vec::new();
+    }
+    // A byte of the magic as an integer or byte literal.
+    fn byte(lit: &proc_macro2::Literal) -> Option<u8> {
+        match syn::parse_str::<syn::Lit>(&lit.to_string()).ok()? {
+            syn::Lit::Int(i) => i.base10_parse::<u8>().ok(),
+            syn::Lit::Byte(b) => Some(b.value()),
+            syn::Lit::Char(c) => u8::try_from(c.value()).ok(),
+            _ => None,
+        }
+    }
+    // The elements of a bracketed group, when it is a list of four byte
+    // literals.
+    fn four_bytes(stream: &TokenStream) -> Option<[u8; 4]> {
+        let mut out = [0u8; 4];
+        let mut n = 0;
+        let mut want_comma = false;
+        for tt in stream.clone() {
+            match tt {
+                TokenTree::Literal(l) if !want_comma && n < 4 => {
+                    out[n] = byte(&l)?;
+                    n += 1;
+                    want_comma = true;
+                }
+                TokenTree::Punct(p) if want_comma && p.as_char() == ',' => want_comma = false,
+                _ => return None,
+            }
+        }
+        (n == 4).then_some(out)
+    }
+    fn walk(stream: TokenStream, rel: &Path, out: &mut Vec<Violation>) {
+        for tt in stream {
+            let (line, what) = match &tt {
+                TokenTree::Literal(l) => {
+                    let restated = match syn::parse_str::<syn::Lit>(&l.to_string()) {
+                        Ok(syn::Lit::Str(s)) => s.value().as_bytes() == RASTER_MAGIC,
+                        Ok(syn::Lit::ByteStr(b)) => b.value() == RASTER_MAGIC,
+                        _ => false,
+                    };
+                    if !restated {
+                        continue;
+                    }
+                    (l.span().start().line, "a literal")
+                }
+                TokenTree::Group(g) => {
+                    if g.delimiter() == Delimiter::Bracket
+                        && four_bytes(&g.stream()) == Some(RASTER_MAGIC)
+                    {
+                        (g.span().start().line, "an array")
+                    } else {
+                        walk(g.stream(), rel, out);
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            out.push(Violation {
+                path: rel.to_path_buf(),
+                line,
+                rule: Rule::RasterMagic,
+                message: format!(
+                    "{what} restates the raster region header's magic: name it as \
+                     `abi::contracts::video_raster::MAGIC` (defined once, in \
+                     {RASTER_MAGIC_HOME})"
+                ),
+            });
+        }
+    }
+    let mut out = Vec::new();
+    // A file that does not lex is reported by `scan_file`.
+    if let Ok(stream) = src.parse::<TokenStream>() {
+        walk(stream, rel, &mut out);
+    }
+    out
+}
+
+/// The text half of [`scan_raster_magic`], over `.js` and `.html`: script
+/// writes no raster header (a module does, through the ABI crate), so the
+/// magic's text or its bytes spelled as a hex list anywhere in such a file
+/// is a second definition.
+fn scan_raster_magic_text(rel: &Path, src: &str) -> Vec<Violation> {
+    use std::sync::OnceLock;
+    static PAT: OnceLock<regex::Regex> = OnceLock::new();
+    let pat = PAT.get_or_init(|| {
+        let text = regex::escape(std::str::from_utf8(&RASTER_MAGIC).expect("the magic is ASCII"));
+        let hex = RASTER_MAGIC
+            .iter()
+            .map(|b| format!("0x{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(r"\s*,\s*");
+        regex::Regex::new(&format!("{text}|(?i:{hex})")).expect("raster-magic pattern")
+    });
+    src.lines()
+        .enumerate()
+        .filter(|(_, line)| pat.is_match(line))
+        .map(|(i, _)| Violation {
+            path: rel.to_path_buf(),
+            line: i + 1,
+            rule: Rule::RasterMagic,
+            message: format!(
+                "script restates the raster region header's magic: a raster header is \
+                 written and read by a module through `abi::contracts::video_raster` \
+                 (defined once, in {RASTER_MAGIC_HOME})"
+            ),
+        })
+        .collect()
+}
+
 fn is_generated_marker(content: &str) -> bool {
     content
         .lines()
@@ -3166,6 +3314,94 @@ extern crate alloc;
         assert!(v
             .iter()
             .all(|v| v.rule == Rule::SdkMount && v.message.contains("crates")));
+    }
+
+    #[test]
+    fn sdk_mount_flags_every_mount_of_the_contracts_crate() {
+        // Spelled at run time, as above.
+        let (path, inc) = ("#[path", "include!(");
+        let src = format!(
+            "\n{path} = \"../../../target/fluxor/fluxor-contracts/src/lib.rs\"]\nmod fluxor_contracts;\n\
+             {inc}\"../../../deps/fluxor/contracts/src/graph.rs\");\n\
+             {path} = \"contracts/src/graph/plan.rs\"]\nmod plan;\n\
+             use fluxor_contracts::graph;\n"
+        );
+        let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), &src);
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            [2, 4, 5],
+            "got: {v:?}"
+        );
+        assert!(v.iter().all(|v| v.rule == Rule::SdkMount
+            && v.message.contains("fluxor-contracts")
+            && v.message.contains("use fluxor_contracts::graph")));
+    }
+
+    /// The magic, spelled at run time so this file does not restate it.
+    fn magic() -> String {
+        String::from_utf8(RASTER_MAGIC.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn raster_magic_flags_each_literal_form_outside_its_home() {
+        let m = magic();
+        let hex = RASTER_MAGIC.map(|b| format!("{b:#04x}")).join(", ");
+        let chars = RASTER_MAGIC.map(|b| format!("b'{}'", b as char)).join(", ");
+        let src = format!(
+            "const A: &[u8; 4] = b\"{m}\";\n\
+             const B: &str = \"{m}\";\n\
+             const C: [u8; 4] = [{hex}];\n\
+             const D: [u8; 4] = [{chars}];\n\
+             fn f(h: &[u8]) -> bool {{ assert_eq!(&h[..4], b\"{m}\"); h.starts_with(&[{hex}]) }}\n"
+        );
+        let v = scan_raster_magic(Path::new("modules/app/x/mod.rs"), &src);
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 5],
+            "got: {v:?}"
+        );
+        assert!(v
+            .iter()
+            .all(|v| v.rule == Rule::RasterMagic && v.message.contains("video_raster::MAGIC")));
+        // Its one definition.
+        assert!(scan_raster_magic(Path::new(RASTER_MAGIC_HOME), &src).is_empty());
+    }
+
+    #[test]
+    fn raster_magic_accepts_prose_other_arrays_and_the_named_constant() {
+        let m = magic();
+        let src = format!(
+            "// A {m} header opens every region.\n\
+             /// `{m}`\n\
+             const MSG: &str = \"bad {m} header\";\n\
+             const OTHER: [u8; 4] = [0x53, 0x52, 0x46, 0x32];\n\
+             const LONGER: [u8; 5] = [0x53, 0x52, 0x46, 0x31, 0x00];\n\
+             use fluxor_abi::contracts::video_raster::MAGIC;\n\
+             fn f(h: &[u8]) -> bool {{ h.starts_with(&MAGIC) }}\n"
+        );
+        let v = scan_raster_magic(Path::new("src/platform/linux/x.rs"), &src);
+        assert!(v.is_empty(), "got: {v:?}");
+    }
+
+    #[test]
+    fn raster_magic_text_rule_flags_script_and_markup() {
+        let m = magic();
+        let js = format!(
+            "const a = '{m}';\n\
+             const b = [0x53, 0x52, 0x46, 0x31];\n\
+             const c = new Uint8Array([0x53,0X52 , 0x46,\t0x31]);\n\
+             const d = [0x53, 0x52, 0x46];\n\
+             // nothing here\n"
+        );
+        for file in ["src/platform/wasm/host/host_shims.js", "docs/demo.html"] {
+            let v = scan_raster_magic_text(Path::new(file), &js);
+            assert_eq!(
+                v.iter().map(|v| v.line).collect::<Vec<_>>(),
+                [1, 2, 3],
+                "got: {v:?}"
+            );
+            assert!(v.iter().all(|v| v.rule == Rule::RasterMagic));
+        }
     }
 
     #[test]

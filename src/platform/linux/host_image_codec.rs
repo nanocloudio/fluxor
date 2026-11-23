@@ -2,12 +2,15 @@
 // frames sized to a target width/height. Reads encoded bytes
 // incrementally on `encoded`; once the upstream stalls (channel quiet
 // for ~EOF_TICKS consecutive steps), decodes the accumulated buffer,
-// resizes, and emits a single frame on `pixels`.
+// resizes, and sends the picture on `pixels` as one `VideoRaster` record:
+// the region header of a whole-surface frame
+// (`abi::contracts::video_raster`), then the pixels.
 //
-// Params are declared in `modules/platform/wasm/host_image_codec/manifest.toml`
+// Params are declared in `modules/platform/linux/host_image_codec/manifest.toml`
 // and packed into the kernel's TLV stream by the config tool.
 
 #[cfg(feature = "host-image")]
+use fluxor::abi::contracts::video_raster;
 
 #[cfg(feature = "host-image")]
 const EOF_TICKS: u32 = 200;
@@ -78,7 +81,7 @@ fn rgb888_to_rgb565_le(rgb: &[u8], dst: &mut [u8]) {
 }
 
 #[cfg(feature = "host-image")]
-fn decode_to_rgb565(
+fn decode_to_record(
     encoded: &[u8],
     target_w: usize,
     target_h: usize,
@@ -87,7 +90,7 @@ fn decode_to_rgb565(
     use image::imageops::FilterType;
     use image::GenericImageView;
 
-    let img = image::load_from_memory(encoded).map_err(|e| format!("decode failed: {}", e))?;
+    let img = image::load_from_memory(encoded).map_err(|e| format!("decode failed: {e}"))?;
     let (src_w, src_h) = img.dimensions();
     log::info!(
         "[host_image] decoded {}x{} → resizing to {}x{} ({:?})",
@@ -101,13 +104,24 @@ fn decode_to_rgb565(
         }
     );
 
-    let mut out = vec![0u8; target_w * target_h * 2];
+    // The record: the header of a whole-surface frame, then its pixels.
+    // The module's params keep both extents within a header's range.
+    let header = video_raster::Header::whole(
+        target_w as u16,
+        target_h as u16,
+        video_raster::FORMAT_RGB565,
+    )
+    .encode()
+    .map_err(|fault| format!("{target_w}x{target_h} is not a raster surface: {fault:?}"))?;
+    let mut record = vec![0u8; video_raster::HEADER + target_w * target_h * 2];
+    record[..video_raster::HEADER].copy_from_slice(&header);
+    let out = &mut record[video_raster::HEADER..];
     match mode {
         ScaleMode::Stretch => {
             let resized = img
                 .resize_exact(target_w as u32, target_h as u32, FilterType::Triangle)
                 .to_rgb8();
-            rgb888_to_rgb565_le(resized.as_raw(), &mut out);
+            rgb888_to_rgb565_le(resized.as_raw(), out);
         }
         ScaleMode::Fit => {
             let resized = img
@@ -136,7 +150,7 @@ fn decode_to_rgb565(
             }
         }
     }
-    Ok(out)
+    Ok(record)
 }
 
 /// # Safety
@@ -144,6 +158,7 @@ fn decode_to_rgb565(
 /// step's for its duration.
 #[cfg(feature = "host-image")]
 unsafe extern "C" fn host_image_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `HostImageState` by the loader.
     let st = unsafe { instance_state::<HostImageState>(state) };
 
     if st.failed {
@@ -153,6 +168,8 @@ unsafe extern "C" fn host_image_step(state: *mut u8) -> i32 {
     // Drain any pending output from a prior decoded-frame partial write.
     while st.pending_pos < st.pending.len() {
         let take = (st.pending.len() - st.pending_pos).min(WRITE_CHUNK);
+        // SAFETY: `pending_pos + take` is within `pending`; the channel
+        // copies the bytes.
         let w = unsafe {
             channel::channel_write(st.out_chan, st.pending.as_ptr().add(st.pending_pos), take)
         };
@@ -179,6 +196,7 @@ unsafe extern "C" fn host_image_step(state: *mut u8) -> i32 {
     }
 
     let mut buf = [0u8; 4096];
+    // SAFETY: `channel_read` writes at most `buf.len()` bytes.
     let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
     if n > 0 {
         let n = n as usize;
@@ -207,12 +225,12 @@ unsafe extern "C" fn host_image_step(state: *mut u8) -> i32 {
         return 0;
     }
 
-    // EOF reached — decode, resize, queue all output bytes for write.
+    // EOF reached — decode, resize, queue the whole record for write.
     log::info!("[host_image] eof — decoding {} bytes", st.encoded.len());
-    let frame = match decode_to_rgb565(&st.encoded, st.width, st.height, st.scale_mode) {
+    let frame = match decode_to_record(&st.encoded, st.width, st.height, st.scale_mode) {
         Ok(f) => f,
         Err(e) => {
-            log::warn!("[host_image] {}", e);
+            log::warn!("[host_image] {e}");
             st.failed = true;
             return 1;
         }

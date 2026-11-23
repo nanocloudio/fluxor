@@ -61,6 +61,18 @@ sink = "host"
 [platform.display]
 sink = "host"
 
+# Which core runs each execution domain: every domain on the one thread.
+[smp]
+cores = 1
+domain_cores = [0, 0, 0, 0]
+
+# What the counters a module reads through the `counters` contract count:
+# the facts of the target capabilities `counter.cycles` and `counter.icache`.
+# Cycles are the host's monotonic clock in microseconds; a hosted process
+# has no instruction-cache count.
+[counters]
+cycles = "system"
+
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module
 # requires a contract that neither the kernel (`channel`, `timer`, `event`,

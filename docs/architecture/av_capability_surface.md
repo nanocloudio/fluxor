@@ -23,8 +23,8 @@ AV pipelines move data on channels typed by `content_type`:
 | `AudioSample`   | Decoded audio samples               | tone/sample sources, mixers; `i2s_pio`, `linux_audio`, `wasm_browser_audio` (sinks) |
 | `AudioEncoded`  | Encoded audio access units          | re-encode, RTP / VoIP, storage paths                      |
 | `VideoEncoded`  | Encoded video access units          | hardware decode, transcoders, broadcast packagers         |
-| `VideoDraw`     | Retained / replayable draw lists    | UI / layout, browser, dashboard, remote-desktop UI        |
-| `VideoRaster`   | Raw pixel frames / regions          | image codecs, `wasm_browser_display_capture` (sources); `st7701s`, `linux_display`, `wasm_browser_canvas` (sinks) |
+| `VideoDraw`     | Retained / replayable draw lists    | UI / layout, dashboards, remote-desktop UI (sources); `st7701s`, `draw_raster` (consumers) |
+| `VideoRaster`   | Raw pixel frames / regions          | image codecs, `draw_raster`, `wasm_browser_display_capture` (sources); `linux_display`, `wasm_browser_canvas` (sinks); `st7701s` and `draw_raster` (surfaces a draw list places) |
 | `VideoScanout`  | Present-ready frames to a paced sink| compositor → HDMI / DSI sink, page-flip, vsync handoff    |
 | `MediaMuxed`    | Deliberate AV / timing / container  | recording, broadcast packaging, MP4 / TS streams          |
 
@@ -71,6 +71,133 @@ Source: `crates/fluxor-abi/src/contracts/encoded.rs` (`abi::contracts::encoded`)
   `NeedMore`, and admits each record through `Sequence`. The composer
   refuses fan-in onto an encoded input, since a merge interleaves two
   record streams beyond recovery.
+
+### 1.2 The draw list
+
+Source: `crates/fluxor-abi/src/contracts/video_draw.rs` (`abi::contracts::video_draw`).
+
+`VideoDraw` carries a draw list: an application that draws its own
+interface sends drawing records, and a consumer rasterises them. A
+consumer may retain the last committed frame's records and replay
+them, a few kilobytes standing in for a framebuffer.
+
+Every record is `[kind u8][flags u8][len u16]` and `len` payload bytes,
+little-endian. Geometry is `i32` fixed point in 1/64 of a device pixel;
+colours are sRGB `[r][g][b][a]`, not premultiplied.
+
+| Group | Records |
+|---|---|
+| Stream control | `STREAM` (surface extent, band height, nesting depth, resource limits, the producer's generation), `END` |
+| Resources | `RES_DEF` and `RES_DATA` (a glyph strike or a pixmap, usable once whole and its SHA-256 matches), `RES_DROP`, `RES_REF` (bytes the consumer already holds, found by digest) |
+| Frames and bands | `FRAME` (generation, revision, damage), `BAND`, `COMMIT` |
+| Paint state | `SAVE`, `RESTORE`, `CLIP_RECT`, `CLIP_RRECT`, `TRANSLATE` |
+| Drawing | `FILL_RECT`, `FILL_RRECT`, `BORDER`, `PIXMAP`, `GLYPHS`, `SURFACE` |
+
+- **Frames.** Records from `FRAME` to `COMMIT` are one frame, composited
+  in stream order. `damage` is the region the frame repaints.
+- **Bands.** A stream with a band height is banded: inside a frame every
+  drawing record sits in a `BAND`, bands cover the damage rows top to
+  bottom, and the paint state resets at each. A consumer that holds one
+  band of pixels, such as a panel driver scanning out, draws such a
+  stream without holding a frame.
+- **`SURFACE`** places the latest committed frame of one of the
+  consumer's raster inputs under or among the drawing: an interface
+  over a picture another producer draws. The raster arrives on its own
+  edge at its own pace, and a consumer that retains the frame's records
+  redraws them when that picture changes.
+- **Faults.** A record out of place, a value out of range, a resource
+  that cannot be used or resolved, or a limit of the consumer exceeded
+  is a stream fault: the consumer discards the frame in progress, keeps
+  its last committed output, logs the fault and its offset, and skips to
+  the next `STREAM`. `video_draw::Sequence` holds the rules, so every
+  consumer refuses the same streams.
+
+The reference rasteriser is library code (`fluxor_sdk::video::raster`):
+integer arithmetic of stated width and no floating point, so one stream
+gives the same bytes on every target. Its consumers:
+
+| Module | Draws into | Retains | Takes |
+|---|---|---|---|
+| `st7701s` (`draw`) | the panel, a band of `band_rows` rows at a time, again every refresh | two frames of `frame_bytes`; the frame shown changes whole at a refresh | every operation; damage `full`; one surface (`surface0`); `refresh_mhz` is its param ([displays.md](../guides/displays.md)) |
+| `draw_raster` (`draw`) | region rasters on `pixels`, a band at a time, when a frame commits or a surface changes | two frames of `frame_bytes`; its consumer holds the pixels | every operation; damage `full`; two surfaces |
+
+`video.draw` facts, declared under a port's `[ports.facts]`:
+
+| Fact | Values | Edge rule |
+|---|---|---|
+| `ops` | `fill_rect fill_rrect border pixmap glyphs clip_rect clip_rrect translate surface res_ref` | producer ⊆ consumer |
+| `pixmap_formats` | `rgba8 rgb565` | producer ⊆ consumer |
+| `glyph_formats` | `a1 a8` | producer ⊆ consumer |
+| `max_depth`, `max_resources`, `resource_bytes` | u32 | producer ≤ consumer |
+| `frame_bytes` | u32 | producer's largest frame ≤ what the consumer retains; a consumer declaring 0 retains nothing |
+| `band_rows` | u32 | when the consumer's `frame_bytes` is 0, the producer is banded in bands no taller than the consumer's |
+| `damage` | `full partial` | producer ⊆ consumer; a consumer that replays retained records takes `full` only |
+| `atomic` | `yes no` | producer ⊆ consumer; a producer that needs a frame shown whole declares `yes` |
+| `refresh_mhz` | u32 | consumer ≤ producer: the refresh a consumer scans at against the band rate the producer sustains |
+| `surfaces` | u32 | raster inputs the producer's `SURFACE` records name ≤ the consumer's |
+
+### 1.3 Region rasters
+
+Source: `crates/fluxor-abi/src/contracts/video_raster.rs` (`abi::contracts::video_raster`).
+
+Every record on a `VideoRaster` edge is a 20-byte header and then a
+region's pixels. There is no other form: the header is the stream's own
+statement of its format and geometry, and the port facts are the
+build-time check on top of it.
+
+```text
+[0..4]    magic      the contract's MAGIC
+[4..6]    surface_w  u16   the whole surface's extent
+[6..8]    surface_h  u16
+[8]       format     u8    rgb565 0, rgba8 1 (positions in RASTER_FORMATS)
+[9]       flags      u8    LAST 0x01, DAMAGE 0x02; other bits zero
+[10..12]  x          u16   the region's top-left
+[12..14]  y          u16
+[14..16]  w          u16   the region's extent, at least 1
+[16..18]  h          u16
+[18..20]  0          u16
+[20..]    pixels     w x h x bytes per pixel, rows top to bottom
+```
+
+- **Frames.** The region flagged `LAST` ends a frame. A consumer with
+  frame memory presents there, so a frame of several regions appears
+  whole.
+- **Damage frames and tiling frames.** With `DAMAGE` on every region,
+  each updates a retained surface and pixels outside the frame's regions
+  keep their content. With it on none, the regions tile the whole
+  surface top to bottom in full-width bands; a whole frame in one region
+  is the simplest case. One frame does not mix the two.
+- **A new surface.** A change of extent or format at a frame's start is
+  a new surface: the consumer reallocates, or refuses one past what it
+  declared. Inside a frame it is a fault.
+- **Faults.** A region outside its surface, an empty region, an unknown
+  format or flag, a non-zero reserved word, a surface past the
+  consumer's extent, a broken tiling or a surface change inside a frame:
+  the consumer discards the record, counts it, keeps its last presented
+  picture, and scans forward for the next header of the surface in use.
+  `Header::decode` and `Frames` hold the rules; no producer or consumer
+  indexes the header's bytes.
+- **Reading.** The content type is `Streamed`: a region of a large frame
+  is bigger than a small target's ring, and the header states the
+  record's length.
+
+`video.raster` facts:
+
+| Fact | Values | Edge rule |
+|---|---|---|
+| `formats` | `rgb565 rgba8` | producer ⊆ consumer |
+| `regions` | `damage bands` | producer ⊆ consumer |
+| `width`, `height` | u32 | the producer's largest surface ≤ what the consumer accepts |
+
+| Module | Role | Regions |
+|---|---|---|
+| `draw_raster` | producer | damage regions, a band at a time |
+| `wasm_browser_image_codec`, `host_image_codec` | producer | one whole-surface region a decoded picture |
+| `wasm_browser_display_capture` | producer | one whole-surface region a captured frame |
+| `wasm_browser_canvas` | consumer | both kinds, RGB565 and RGBA8, up to its `width` x `height` |
+| `linux_display` | consumer | both kinds, RGB565 and RGBA8, up to 4096 x 4096; file mode writes one PPM a presented frame |
+| `draw_raster` (`surface0`, `surface1`) | consumer | both kinds, held whole for `SURFACE` records |
+| `st7701s` (`surface0`) | consumer | both kinds, RGB565 and RGBA8, held whole up to `surface_bytes` for `SURFACE` records; shown scaled to the panel when `draw` is not wired. On an RP target the edge states its rate class (`rate: transaction`) |
 
 ### Where this is enforced
 
@@ -155,7 +282,26 @@ packing = "raw"
 
 Checked by `tools/src/config/validate.rs::validate_port_facts` on every
 edge where both ends declare the fact; a fact one end leaves out is
-unconstrained there. Subset rather than intersection: a demuxer that may
+unconstrained there. Every numeric fact has one rule, by name
+(`vocabulary::NUMERIC_FACT_RULES`): equal, a ceiling (producer ≤
+consumer), or a floor (consumer ≤ producer, as `video.draw`'s
+`refresh_mhz`: a consumer's refresh against the rate the producer
+sustains). A rule that reads two facts is named beside the table
+(`CROSS_FACT_RULES`) and judged on every edge of its capability:
+`video.draw`'s banding rule refuses a consumer that retains no frame
+(`frame_bytes = 0`) any producer that is not banded in bands within the
+consumer's `band_rows`, whether or not the producer declares `band_rows`.
+
+A numeric fact may take its value from one of the module's integer
+params instead of stating it:
+
+```toml
+[ports.facts]
+refresh_mhz = { param = "refresh_mhz" }
+```
+
+The composer reads it per instance: what the graph sets for that param,
+or the param's default. Subset rather than intersection: a demuxer that may
 emit MP3 must not bind an AAC-only decoder. The runtime truth is still
 the `STREAM` record — a port that carries whatever a file holds declares
 no `codec` fact and validates in-band.

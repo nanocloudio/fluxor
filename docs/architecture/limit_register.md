@@ -137,7 +137,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | decision-seam hold (`pkt_id` slot) | `PKT_SLOT_BITS` (8) | 256 | `MAX_PACKET_HOLD` | crates/fluxor-abi/src/config.rs | 32 | The profile's figure for `ip`'s declared capacity `packet_holds` (8 on wasm, 4 on embedded), which a graph turning the seam on states: none exist with the seam off, and a graph may declare more, up to the 256 slots a `pkt_id` names (refused at construction past it), held in `ip`'s heap at one full frame a slot. An arrival with every slot taken is refused and counted (`hold_refused`), never displaces a held packet |
 | workload lane (`ip` provider, `workload::NET_PROVIDE`) | u8 | 255 | `LANE_CEILING` | src/kernel/workload/net_attach.rs | 255 | The provider states its lane capacity when it claims the role (`ip` param `lanes`), and the kernel sizes its lane tables to it — carved on bcm2712 and uefi, allocated on Linux — keeping `max(previous, stated)` across rebuilds; an attach past it is `ENOSPC`. The `u8` lane id is the ceiling; the static profiles (wasm, RP) hold `STATIC_LANES` |
 | contract class (first grant word, manifest head) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the first grant word. Registration past the ceiling is refused EINVAL, and an op of a class the registry does not assign is refused ENOSYS by `check_grant` |
-| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 45 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the first grant word and of the kernel's vtable registry; the generator refuses an id at or past it |
+| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 46 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the first grant word and of the kernel's vtable registry; the generator refuses an id at or past it |
 | op-level grant (second grant word, manifest head) | u64 bit position | 64 | `MAX_GRANTS` | tools/src/abi_registry.rs | 64 | 17 of 64 bits assigned; the generator refuses a bit at or past 64 and a grant no op needs |
 | module index (`ModuleId`: exec order, owners, fault ids, wire fields) | u16 | 65535 | `MAX_MODULES` | src/kernel/config.rs | 4096 | `0xFFFF` is `NO_MODULE`, the no-owner sentinel. On Linux this is the module-index range: the config's module record carries a u16 id and a `ModuleMask` holds one bit per index, while the scheduler's per-module tables are sized at boot from the graph — its modules, fans and resident workloads plus the `module_slots` reserve (`resource_ledger::plan`) — and grown a segment at a time by live adds; a plan past the range is refused at boot naming `module_slots`. On bcm2712, uefi and RP the same range, with the tables sized from the plan within it (1024 on bcm2712 and uefi, carved from the DRAM zone the machine describes; 32 on RP, from the kernel's static pool); on wasm, the static table, 48. The telemetry ring holds one PSTATUS round of it. Kernel capacity, not ABI: modules read the live slot count at runtime (`internal::reconfigure::SLOT_CAPACITY`). Asserts: `src/kernel/exec/scheduler/mod.rs` (below the sentinel) |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
@@ -458,7 +458,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Pre-pass budget share | `PRE_PASS_BUDGET_SHARE` | src/kernel/exec/scheduler/mod.rs | 20 | Policy: the pre-pass modules of a domain together may take 1/20 of its tick before the cooperative pass (5 µs of a 100 µs tick, 50 µs of a 1 ms one) |
 | Buffer groups | `BUFFER_GROUPS` | src/kernel/exec/scheduler/mod.rs | — | Derived, not chosen: the `buffer_group` values the scheduler's per-group tables span (`ring_size::buffer_groups`) — the whole `u8` (256) where the edge range exceeds 128, half of it elsewhere, where those tables are on the stack. Groups 1–31 are the config's; from `RECORD_FAN_GROUP_FIRST` (32) up each is one edge around a record fan, so it bounds those edges per graph. A record fan that finds no free group fails graph preparation (`no buffer group left`); the composer's fan pass searches the same range (`fluxor_contracts::graph::plan`) |
 | Secondary cores | `MAX_SECONDARY_CORES` | src/platform/bcm2712/multicore.rs | 3 | Hardware: the BCM2712's four Cortex-A76 cores, one the boot core |
-| Cross-core ring depth | `RING_SLOTS` | src/kernel/exec/domains/cross.rs | 8 | Policy: slots in one cross-core SPSC ring |
+| Cross-core ring depth | `RING_SLOTS` | src/kernel/exec/domains/cross.rs | — | Policy, per capacity profile: slots in one cross-core SPSC ring, 8, and 2 on RP. On RP a ring comes out of the kernel pool, and two slots hold a frame in flight and the next behind it |
 | Cross-core slot | `SLOT_DATA_SIZE` | src/kernel/exec/domains/cross.rs | — | Derived, not chosen: one channel buffer (`CHANNEL_BUFFER_SIZE`) per cross-core ring slot |
 | Cross-core DMA arena | `DMA_ARENA_SIZE` | src/platform/bcm2712/multicore.rs | 65536 | Policy: the uncached arena cross-core descriptors live in |
 | Secondary-core stack | `CORE_STACK_SIZE` | src/platform/bcm2712/multicore.rs | 1048576 | Policy: each secondary core's kernel stack, matching the boot core's `kernel_stack_kb` |
@@ -629,7 +629,7 @@ MAX_ADD_MODULES | src/kernel/exec/scheduler/splice.rs | 64 | *
 MAX_ADD_EDGES | src/kernel/exec/scheduler/splice.rs | 192 | *
 ADD_STAGES | src/kernel/exec/scheduler/splice.rs | 2 | *
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 45 | *
+CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 46 | *
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
 MAX_OWNERS | src/kernel/workload/owner.rs | 4096 | *
 MAX_PATH | crates/fluxor-abi/src/config.rs | 200 | host
@@ -945,7 +945,8 @@ MAX_PRE_PASS_PER_DOMAIN | src/kernel/exec/scheduler/mod.rs | 4 | *
 PRE_PASS_BUDGET_SHARE | src/kernel/exec/scheduler/mod.rs | 20 | *
 BUFFER_GROUPS | src/kernel/exec/scheduler/mod.rs | rings::buffer_groups(MAX_GRAPH_EDGES) | *
 MAX_SECONDARY_CORES | src/platform/bcm2712/multicore.rs | 3 | *
-RING_SLOTS | src/kernel/exec/domains/cross.rs | 8 | *
+RING_SLOTS | src/kernel/exec/domains/cross.rs | 8 | non-rp
+RING_SLOTS | src/kernel/exec/domains/cross.rs | 2 | rp
 SLOT_DATA_SIZE | src/kernel/exec/domains/cross.rs | crate::abi::CHANNEL_BUFFER_SIZE | *
 DMA_ARENA_SIZE | src/platform/bcm2712/multicore.rs | 64 * 1024 | *
 CORE_STACK_SIZE | src/platform/bcm2712/multicore.rs | 1024 * 1024 | *

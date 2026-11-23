@@ -68,8 +68,11 @@ pub mod linux {
         pub const TAG_WIDTH: u8 = 12;
         pub const TAG_HEIGHT: u8 = 13;
         pub const TAG_SCALE: u8 = 14;
-        pub const TAG_HEADER: u8 = 15;
         pub const PORT_PIXELS: (u8, u8) = (0, 0);
+        pub const PORT_TREE: (u8, u8) = (0, 1);
+        pub const PORT_POINTER: (u8, u8) = (1, 0);
+        pub const PORT_KEYS: (u8, u8) = (1, 1);
+        pub const PORT_TEXT: (u8, u8) = (1, 2);
     }
     pub mod linux_eth {
         pub const NAME_HASH: u32 = 0xf682a08d;
@@ -153,6 +156,14 @@ pub mod wasm {
         pub const TAG_URL: u8 = 10;
         pub const PORT_BYTES: (u8, u8) = (1, 0);
     }
+    pub mod wasm_browser_accessibility {
+        pub const NAME_HASH: u32 = 0xcac9b881;
+        pub const STATE_BYTES: u32 = 64;
+        pub const HEAP_SEAT: [u32; 6] = [37888, 0, 0, 0, 0, 0];
+        pub const PORT_TREE: (u8, u8) = (0, 0);
+        pub const PORT_ACTIONS: (u8, u8) = (1, 0);
+        pub const PORT_TEXT: (u8, u8) = (1, 1);
+    }
     pub mod wasm_browser_action {
         pub const NAME_HASH: u32 = 0x288b3015;
         pub const STATE_BYTES: u32 = 64;
@@ -186,7 +197,6 @@ pub mod wasm {
         pub const HEAP_SEAT: [u32; 6] = [296, 4, 10, 11, 0, 0];
         pub const TAG_WIDTH: u8 = 10;
         pub const TAG_HEIGHT: u8 = 11;
-        pub const TAG_HEADER: u8 = 12;
         pub const PORT_PIXELS: (u8, u8) = (0, 0);
     }
     pub mod wasm_browser_compute {
@@ -202,7 +212,6 @@ pub mod wasm {
         pub const HEAP_SEAT: [u32; 6] = [290, 2, 10, 11, 0, 0];
         pub const TAG_WIDTH: u8 = 10;
         pub const TAG_HEIGHT: u8 = 11;
-        pub const TAG_HEADER: u8 = 12;
         pub const PORT_PIXELS: (u8, u8) = (1, 0);
     }
     pub mod wasm_browser_dom_input {
@@ -339,6 +348,10 @@ pub mod wasm {
             host_browser_fetch::STATE_BYTES,
         ),
         (
+            wasm_browser_accessibility::NAME_HASH,
+            wasm_browser_accessibility::STATE_BYTES,
+        ),
+        (
             wasm_browser_action::NAME_HASH,
             wasm_browser_action::STATE_BYTES,
         ),
@@ -429,6 +442,10 @@ pub mod wasm {
     /// Every native this platform's kernel seats a module heap for, as `(NAME_HASH, HEAP_SEAT)`.
     pub const HEAP_SEAT_BY_HASH: &[(u32, [u32; 6])] = &[
         (host_browser_fetch::NAME_HASH, host_browser_fetch::HEAP_SEAT),
+        (
+            wasm_browser_accessibility::NAME_HASH,
+            wasm_browser_accessibility::HEAP_SEAT,
+        ),
         (
             wasm_browser_action::NAME_HASH,
             wasm_browser_action::HEAP_SEAT,

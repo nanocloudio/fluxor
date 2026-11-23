@@ -1,17 +1,17 @@
-// linux_surface_traits_probe native module — demo consumer of the Surface Traits
-// surface on Linux. Reads `input::surface_traits::MSG_TRAITS` records from its
-// input port and logs the decoded fields via `log::info!`, proving the
-// round-trip end-to-end on a headless Linux box: linux_surface_traits →
-// channel → this probe. Mirrors the wasm `surface_traits_probe`. Not a
-// production module — it is the live acceptance check (criterion 1) for the
-// Linux authority.
+// linux_surface_traits_probe native module — a consumer of the Surface
+// Traits surface on Linux that logs what it reads. Each `MSG_TRAITS` record
+// on its input is decoded with the contract's own reader
+// (`abi::contracts::input::surface_traits`) and logged by field, so the
+// round trip linux_surface_traits → channel → this probe can be watched on
+// a host with no display. A record the contract refuses is counted and
+// logged as refused.
 
+use fluxor::abi::contracts::input::surface_traits as probe_contract;
 use fluxor::abi::platform::native::linux::linux_surface_traits_probe as surface_traits_probe_tags;
-
-const PROBE_EVENT_RECORD: usize = 24;
 
 struct LinuxSurfaceTraitsProbeState {
     in_chan: i32,
+    refused: u32,
 }
 
 /// # Safety
@@ -24,25 +24,31 @@ unsafe extern "C" fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
     if st.in_chan < 0 {
         return 0;
     }
-    let mut buf = [0u8; PROBE_EVENT_RECORD];
+    let mut buf = [0u8; probe_contract::EVENT_SIZE];
     loop {
         // SAFETY: channel_read takes (chan, *mut u8, max_len); buf is a stack
         // array sized to its length.
         let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
-        if n < PROBE_EVENT_RECORD as i32 {
+        if n < probe_contract::EVENT_SIZE as i32 {
             break;
         }
-        let orientation = buf[1];
-        let size_w = buf[2];
-        let size_h = buf[3];
-        let view_w = u16::from_le_bytes([buf[4], buf[5]]);
-        let view_h = u16::from_le_bytes([buf[6], buf[7]]);
-        let modalities = u16::from_le_bytes([buf[8], buf[9]]);
-        let epoch = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        let display_count = buf[21];
+        let Some(t) = probe_contract::decode(&buf) else {
+            st.refused = st.refused.wrapping_add(1);
+            log::warn!("[surface_traits] record refused; {} refused so far", st.refused);
+            continue;
+        };
         log::info!(
-            "[surface_traits] epoch={epoch} {view_w}x{view_h} orient={orientation} \
-             sizeW={size_w} sizeH={size_h} displays={display_count} modalities=0x{modalities:04x}"
+            "[surface_traits] epoch={} {}x{} orient={} sizeW={} sizeH={} displays={} \
+             dpr_eighths={} modalities=0x{:04x}",
+            t.epoch,
+            t.viewport_w_px,
+            t.viewport_h_px,
+            t.orientation,
+            t.size_class_w,
+            t.size_class_h,
+            t.display_count,
+            t.dpr_eighths,
+            t.modalities,
         );
     }
     0
@@ -50,8 +56,11 @@ unsafe extern "C" fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
 
 fn build_linux_surface_traits_probe(module_idx: usize, _params: &[u8]) -> Result<Box<LinuxSurfaceTraitsProbeState>, i32> {
     let in_chan = scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
-    let st = Box::new(LinuxSurfaceTraitsProbeState { in_chan });
-    log::info!("[inst] module {module_idx} = linux_surface_traits_probe (native, demo consumer; in_chan={in_chan})");
+    let st = Box::new(LinuxSurfaceTraitsProbeState {
+        in_chan,
+        refused: 0,
+    });
+    log::info!("[inst] module {module_idx} = linux_surface_traits_probe (native; in_chan={in_chan})");
     Ok(st)
 }
 

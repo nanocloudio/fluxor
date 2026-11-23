@@ -294,9 +294,9 @@ pub fn firmware_image_window(at: u32) -> u32 {
 /// `kernel_abi::SLOT_ADMITTED` answers.
 static SLOT_ADMITTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// The slots this boot's selector admitted, choosing first if boot has not.
+/// The slots this boot's selector admitted. Boot chooses the slot before it
+/// loads the graph's modules from it, so every module reads the choice made.
 pub fn admitted_slots() -> u8 {
-    let _ = crate::kernel::boot::config::read_layout();
     SLOT_ADMITTED.load(core::sync::atomic::Ordering::Acquire)
 }
 

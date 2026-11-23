@@ -5,15 +5,76 @@ builtin = true
 # to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
 # the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
-# Host display: file mode is a sink for raster; window mode adds scanout.
-# Reports both since the actual mode is selected by `mode` param.
+# Host display: a raster sink with frame memory. File mode writes each
+# presented frame to disk, window mode shows it in a host window, and the
+# mode is chosen by the `mode` param, so the capabilities name both.
 capabilities = ["video.raster", "video.scanout", "display.scanout", "presentation.clock"]
 
+# Every record on `pixels` is a region header
+# (`abi::contracts::video_raster`) and that region's pixels, in RGB565 or
+# RGBA8 as the header says. The stream states its surface, and the display
+# takes the extent of the surface in the stream, up to the extent declared
+# here. A frame's regions are shown together at its last one. A damage
+# frame changes only its regions, and the rest of the picture stays. A
+# record the contract refuses is counted and skipped, the picture stays as
+# last presented, and the stream is scanned forward for the next header.
 [[ports]]
 name = "pixels"
 direction = "input"
 content_type = "VideoRaster"
 required = true
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage", "bands"]
+width = 4096
+height = 4096
+
+# The application's accessibility tree
+# (`abi::contracts::accessibility`), followed for one purpose: while the
+# focused node is editable, the window allows its input method and places
+# it at that node's bounds; otherwise the input method is off, so an
+# application's keys never feed one. With `tree` unwired, text is what key
+# presses type.
+[[ports]]
+name = "tree"
+direction = "input"
+content_type = "AccessibilityTree"
+required = false
+[ports.facts]
+max_nodes = 1024
+
+# Window mode's input, as the window reports it. Positions and pixel wheel
+# deltas are in surface pixels: the pixels of the raster the window
+# presents. File and null modes send nothing on these.
+#
+# `pointer`: pointer records (`abi::contracts::input::pointer`) for the
+# mouse (pointer 0) and touch contacts, and `KIND_WHEEL` records: a line
+# scroll in 1/120 detent, a smooth scroll in eighths of a surface pixel.
+[[ports]]
+name = "pointer"
+direction = "output"
+content_type = "PointerEvents"
+required = false
+
+# `keys`: key records (`abi::contracts::input::key`). `key_code` is the
+# logical key, `scan_code` the evdev code. A key is flagged `KEY_TEXT` only
+# when its text was sent on `text`; every other key is the application's
+# to act on. While an input method composes, keys send no record.
+[[ports]]
+name = "keys"
+direction = "output"
+content_type = "KeyEvents"
+required = false
+
+# `text`: text records (`abi::contracts::input::text`), naming no node.
+# A key press that types text with neither Ctrl nor Meta held sends a
+# COMMIT; an input method sends its preedit as COMPOSE records and its
+# result as a COMMIT.
+[[ports]]
+name = "text"
+direction = "output"
+content_type = "TextEvents"
+required = false
 
 [[params]]
 name = "mode"
@@ -28,6 +89,8 @@ tag = 11
 type = "str"
 default = "./target/host-display/frame_%04d.ppm"
 
+# The window's first extent, in surface pixels, before a stream has stated
+# its surface; the window then takes the stream's.
 [[params]]
 name = "width"
 tag = 12
@@ -42,23 +105,13 @@ type = "u32"
 default = 480
 range = [1, 4096]
 
+# Window pixels per surface pixel, each way.
 [[params]]
 name = "scale"
 tag = 14
 type = "u32"
 default = 1
 range = [1, 16]
-
-# When 1, each frame on `pixels` is prefixed with a self-describing SRF1 header
-# (magic + w + h + format) and the display takes its geometry from the STREAM rather
-# than the width/height config — so the producer can resize without the two ends
-# agreeing on a static config. See sector modules/common/sector_raster.rs.
-[[params]]
-name = "header"
-tag = 15
-type = "u32"
-default = 0
-range = [0, 1]
 
 # Module-scope observability — exempt.
 [observability]

@@ -17,11 +17,12 @@ state_bytes_64 = 1
 #                                                |    ↓ WS BINARY frames
 #   wasm:                              ws_source → wasm_browser_canvas
 #
-# `wasm_browser_canvas` accumulates raw bytes into a `width*height*2`
-# RGB565 buffer and presents each completed frame; the wire shape on
-# this edge is the same as `wasm_browser_image_codec → canvas` in the
-# pure-wasm graph, so the canvas module doesn't care where the bytes
-# came from.
+# This module relays bytes and reads none of them: the remote
+# producer writes each record's region header
+# (`abi::contracts::video_raster`) and `wasm_browser_canvas` checks it.
+# The wire shape on this edge is the same as `wasm_browser_image_codec
+# → canvas` in the pure-wasm graph, so the canvas module doesn't care
+# where the records came from.
 #
 # Relative URLs (`url: /ws`) are resolved against the page's origin
 # by the host shim, so the same graph works from any port / host

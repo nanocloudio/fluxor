@@ -224,7 +224,7 @@ extern "C" fn secondary_main(number: u64) -> ! {
         unsafe { core::arch::asm!("wfi") };
         if domains::released() && domains::is_active(n) {
             log::info!("[smp] core={n} running domain={n}");
-            let ticks = domains::seed_core_tick(n);
+            let ticks = domains::seed_core_tick(n, &super::PLATFORM);
             // SAFETY: this core's timer.
             unsafe { timer::timer_set(ticks) };
             domains::run(n, &super::PLATFORM)

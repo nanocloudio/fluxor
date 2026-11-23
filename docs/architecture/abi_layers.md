@@ -886,6 +886,26 @@ the registry, and the ABI-surface pin machinery `abi_surface.rs` /
 `crypto`, `gpu`) and `crates/fluxor-rt` (the module runtime, one file per
 concern).
 
+### What a module links
+
+A module links four crates: the three above and `contracts/`
+(`fluxor-contracts`). The ABI-surface digest hashes `crates/fluxor-abi`
+and `contracts/src`, so the ABI is the first and the contracts' vocabulary;
+the SDK and the runtime are library code outside it. Linking the contracts
+crate into a module adds nothing to the digest: it is the same source the
+kernel and the tools already link, which is the point — a module that
+composes a graph (`graph::plan`) and encodes it (`graph::encode_into`)
+sends exactly what the kernel's admission decodes, with no second codec to
+drift. The codec stays in `fluxor-contracts` rather than moving into
+`fluxor-abi`: it is a host and tool vocabulary as much as a module one, and
+the ABI crate carries only what a module and the kernel exchange.
+
+A module gets the crate with `alloc` off: what returns a vector
+(`graph::encode`, `plan::compose`, `plan::plan`, the owner-log records)
+does not exist for it, and the allocation-free forms do. What the module's
+link keeps of the crate is held to the position-independence rules; the
+module guide ([module_architecture.md](module_architecture.md)) says how.
+
 An area earns a new directory when a concern stops reading as one
 of the existing areas — prefer widening an existing area over
 minting a new one.

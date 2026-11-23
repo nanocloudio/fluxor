@@ -10,13 +10,12 @@ MEMORY {
      */
     RAM : ORIGIN = 0x20000000, LENGTH = 512K
     /*
-     * RAM banks 8 and 9 use a direct mapping. They can be used to have
-     * memory areas dedicated for some specific job, improving predictability
-     * of access times.
-     * Example: Separate stacks for core0 and core1.
+     * SRAM8 and SRAM9 are direct-mapped, 4 KiB each, directly above the
+     * striped region. Together they are core 1's stack: nothing is linked
+     * into them.
      */
-    SRAM4 : ORIGIN = 0x20080000, LENGTH = 4K
-    SRAM5 : ORIGIN = 0x20081000, LENGTH = 4K
+    SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
+    SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
 }
 
 SECTIONS {
@@ -77,3 +76,14 @@ PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
  * constant. */
 PROVIDE(__flash_start__ = ORIGIN(FLASH));
 PROVIDE(__flash_end__ = ORIGIN(FLASH) + LENGTH(FLASH));
+
+/* Core 1's stack: SRAM8 and SRAM9, contiguous. */
+PROVIDE(__core1_stack_limit = ORIGIN(SRAM8));
+PROVIDE(__core1_stack_top = ORIGIN(SRAM9) + LENGTH(SRAM9));
+ASSERT(ORIGIN(SRAM9) == ORIGIN(SRAM8) + LENGTH(SRAM8), "SRAM8 and SRAM9 are not contiguous");
+
+/* Exclusive accesses are arbitrated between the cores only in main SRAM
+ * (0x20000000 to 0x20082000). Every lock word and atomic the two cores share
+ * is a static, so all static RAM must lie inside it. */
+ASSERT(__sdata >= 0x20000000 && __stack_limit <= 0x20082000,
+       "static RAM lies outside the SRAM the exclusive monitor covers");

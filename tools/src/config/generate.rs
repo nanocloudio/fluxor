@@ -248,14 +248,15 @@ fn generate_config_impl(
     };
     let validation_list: &[Value] = &validation_modules;
 
-    // Fail closed on a pinned module whose `manifest.toml` can't be resolved
-    // from the store, ahead of every gate below that reads the manifest map.
-    // The map-building loader can only warn-and-omit, and an omitted manifest
-    // is indistinguishable from "module has no manifest" — so without this
-    // the pin's whole purpose (validating wiring against the surface the
-    // pinned bytes ship) is silently skipped.
-    crate::config::assert_pinned_manifests_resolvable(
+    // Fail closed on a module whose manifest is found but rejected — a pin
+    // the store cannot serve, or a `manifest.toml` that does not parse or
+    // validate — ahead of every gate below that reads the manifest map. The
+    // map-building loader can only warn-and-omit, and an omitted manifest is
+    // indistinguishable from "module has no manifest": wiring would then
+    // report the module as never found.
+    crate::config::assert_module_manifests_resolvable(
         &Value::Array(validation_modules.clone()),
+        extra_module_dirs,
         resolved_target,
         project_root,
     )?;
@@ -428,10 +429,12 @@ fn generate_config_impl(
     // (`crate::runtime_abi`). Falls back to the raw token (which then fails
     // closed in `for_runtime`) when the registry doesn't know the name.
     let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
+    let target_desc =
+        target_opt.and_then(|t| crate::target::load_target(t, &crate::project::root()).ok());
     let runtime_owned = target_opt.map(|t| {
-        crate::target::load_target(t, &crate::project::root())
-            .map(|d| d.runtime().to_string())
-            .unwrap_or_else(|_| t.to_string())
+        target_desc
+            .as_ref()
+            .map_or_else(|| t.to_string(), |d| d.runtime().to_string())
     });
     let (mut workloads, workload_demand, workload_heaps) =
         build_workloads_counted(config, loc, extra_module_dirs, runtime_owned.as_deref())?;
@@ -527,7 +530,10 @@ fn generate_config_impl(
                 if !manifest.requires_when.is_empty() {
                     let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
                     let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
-                    let facts = crate::target_facts::TargetFacts::for_runtime(runtime);
+                    let facts = target_desc.as_ref().map_or_else(
+                        || crate::target_facts::TargetFacts::for_runtime(runtime),
+                        crate::target_facts::TargetFacts::for_target,
+                    );
                     for rw in &manifest.requires_when {
                         let resolutions: Vec<crate::target_facts::ParamResolution> = rw
                             .when
@@ -656,7 +662,9 @@ fn generate_config_impl(
     // `execution.profile` claim nothing and are unaffected.
     validate_execution_profile(config, &module_names, &manifests, resolved_target)?;
     validate_port_capabilities(config, &manifests)?;
-    validate_port_facts(config, &manifests)?;
+    validate_port_facts(config, &manifests, &|entry, param| {
+        bound_param_value(entry, param, loc)
+    })?;
     validate_connector_addressing(config)?;
 
     // One provider per (surface, selector), and every claim reaching a
@@ -696,6 +704,16 @@ fn generate_config_impl(
     validate_net_identity_writers(config, &module_names, &manifests)?;
     // One keeper of the key vault's durable image.
     validate_vault_store(config, &manifests)?;
+    // A module on a core other than 0 needs nothing only core 0 does.
+    if let Some(target) = target_desc.as_ref() {
+        validate_secondary_core_modules(
+            config,
+            validation_list,
+            &manifests,
+            &target.smp,
+            target.board_id.as_deref().unwrap_or(&target.id),
+        )?;
+    }
     // A module provider and the modules it serves share a domain (provider
     // code runs on the caller's core); one live-added workloads may reach
     // sits in the primary domain.
@@ -1030,18 +1048,22 @@ fn generate_config_impl(
     // The composed graph's shape: its fans are modules, their joining
     // edges edges.
     let composed_edges = composed_edge_tuples(&composition.edges);
-    let crossings = crate::capacity::crossing_count(composition.edges.iter().map(|e| {
-        let domain = |end: graph::Endpoint| {
-            end.new_index()
-                .and_then(|i| composition.modules.get(i))
-                .map(|m| m.domain)
-        };
-        (
-            domain(e.from),
-            domain(e.to),
-            e.class == graph::EdgeClass::CrossCore,
-        )
-    }));
+    let smp = crate::target::smp_of(target);
+    let crossings = crate::capacity::crossing_count(
+        &smp,
+        composition.edges.iter().map(|e| {
+            let domain = |end: graph::Endpoint| {
+                end.new_index()
+                    .and_then(|i| composition.modules.get(i))
+                    .map(|m| m.domain)
+            };
+            (
+                domain(e.from),
+                domain(e.to),
+                e.class == graph::EdgeClass::CrossCore,
+            )
+        }),
+    );
     let shape = crate::capacity::GraphShape {
         modules: composition.modules.len() as u64,
         edges: composition.edges.len() as u64,
@@ -1124,8 +1146,8 @@ fn fan_module_params(
     let manifest = manifests.get(ty).ok_or_else(|| {
         format!(
             "the graph wires one port to several, which a `{ty}` module joins, and no `{ty}` \
-             manifest resolves: build the foundation modules (`fluxor modules build`), or pin \
-             `{ty}` from a dependency"
+             manifest resolves: `{ty}` is a Fluxor module — a project that depends on fluxor \
+             pins it (`fluxor update`), and Fluxor builds it (`fluxor modules build`)"
         )
     })?;
     let tlv = plan::fan_params(fan.kind, plan::FRAMES_PER_STEP_DEFAULT, scratch).to_vec();
@@ -1751,6 +1773,40 @@ fn schema_param_is_one_of(
     }
 }
 
+/// The value of integer param `param` for the module instance `entry`:
+/// what the graph sets, or the schema default. The schema is the built
+/// artefact's, or a native module's manifest.
+fn bound_param_value(
+    entry: &Value,
+    param: &str,
+    loc: schema::ModuleLocation<'_>,
+) -> Result<BoundParam> {
+    let Some(name) = entry.get("name").and_then(Value::as_str) else {
+        return Ok(BoundParam::NoSchema);
+    };
+    let mtype = entry.get("type").and_then(Value::as_str).unwrap_or(name);
+    let Some(ps) = schema::load_schema_for_entry(entry, mtype, loc)?
+        .or_else(|| load_native_param_schema(mtype).map(|(_, s)| s))
+    else {
+        return Ok(BoundParam::NoSchema);
+    };
+    Ok(bound_param_in(entry, &ps, param))
+}
+
+/// [`bound_param_value`] against a schema at hand.
+fn bound_param_in(entry: &Value, ps: &schema::ParamSchema, param: &str) -> BoundParam {
+    let integer = ps.find(param).is_some_and(|p| {
+        matches!(
+            p.ptype,
+            schema::ParamType::U8 | schema::ParamType::U16 | schema::ParamType::U32
+        )
+    });
+    match schema::effective_param_value(entry, ps, param) {
+        Some(v) if integer => BoundParam::Value(v),
+        _ => BoundParam::NotAnInteger,
+    }
+}
+
 /// The graph's `workloads:` section, each as the subgraph the kernel admits
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
 /// the edges between them. Empty when the graph declares none. The resident
@@ -1876,17 +1932,23 @@ fn build_workloads_counted(
         .into_iter()
         .map(|(_, exec)| exec.mode)
         .collect();
+    // Every manifest a workload needs resolves as a node graph's do: its pin
+    // in the project's `fluxor.lock` first, then the search paths.
+    let workload_abi = (!loc.abi.is_empty()).then_some(loc.abi);
+    let pins =
+        crate::store_cli::lock_store_manifest_resolver(loc.project_root, workload_abi, None);
     // The fan types, resolved as the workload's own modules are: a fan a
     // workload's wiring needs runs as one of its modules.
-    let fan_manifests: HashMap<String, Manifest> = ["tee", "merge"]
-        .into_iter()
-        .filter_map(|ty| {
-            let root = resolve_module_root(ty, &manifest_search)?;
-            let abi = (!loc.abi.is_empty()).then_some(loc.abi);
-            let man = Manifest::from_toml_for_target(&root.join("manifest.toml"), abi).ok()?;
-            Some((ty.to_string(), man))
-        })
-        .collect();
+    let mut fan_manifests: HashMap<String, Manifest> = HashMap::new();
+    for ty in ["tee", "merge"] {
+        match type_manifest(ty, ty, None, &manifest_search, workload_abi, pins.as_ref()) {
+            TypeManifest::Found(man) => {
+                fan_manifests.insert(ty.to_string(), *man);
+            }
+            TypeManifest::Rejected(why) => return Err(Error::Config(why)),
+            TypeManifest::Absent => {}
+        }
+    }
     let mut workloads = Vec::new();
     for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
         let mods_yaml = workload_yaml
@@ -1973,17 +2035,20 @@ fn build_workloads_counted(
             // Resolved for the target's module ABI and the instance's
             // variant, as node-graph manifests are: the heap rule below
             // reads per-ABI, per-variant figures.
-            let manifest = resolve_module_root(mtype, &manifest_search)
-                .map(|root| root.join("manifest.toml"))
-                .filter(|mpath| mpath.exists())
-                .and_then(|mpath| {
-                    let abi = (!loc.abi.is_empty()).then_some(loc.abi);
-                    let mut man = Manifest::from_toml_for_target(&mpath, abi).ok()?;
-                    match m.get("variant").and_then(Value::as_str) {
-                        Some(v) => man.apply_variant(v).ok().map(|()| man),
-                        None => Some(man),
-                    }
-                });
+            let manifest = match type_manifest(
+                mname,
+                mtype,
+                m.get("variant").and_then(Value::as_str),
+                &manifest_search,
+                workload_abi,
+                pins.as_ref(),
+            ) {
+                TypeManifest::Found(man) => Some(*man),
+                TypeManifest::Rejected(why) => {
+                    return Err(Error::Config(format!("workload {pi}: {why}")));
+                }
+                TypeManifest::Absent => None,
+            };
             let mut local = m.clone();
             if let Some(obj) = local.as_object_mut() {
                 obj.insert("name".to_string(), Value::String(mname.to_string()));

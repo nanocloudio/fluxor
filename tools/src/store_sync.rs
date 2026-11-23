@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::oci_store::{
-    OciStore, ANN_ABI_SURFACE, ANN_INPUT_DIGEST, ANN_REF_NAME, MT_FLUXOR_RUNTIME, MT_FLUXOR_SOURCE,
+    OciStore, RuntimePlacement, ANN_ABI_SURFACE, ANN_INPUT_DIGEST, ANN_REF_NAME, MT_FLUXOR_RUNTIME,
+    MT_FLUXOR_SOURCE,
 };
 use crate::store_resolve::{
     read_manifest_layer_blob, read_pinned_manifest, read_store_lock, resolve_dependency,
@@ -79,9 +80,8 @@ pub struct SyncReport {
 }
 
 /// Workspace members as project-name → checkout-path. A member whose
-/// `fluxor.toml` is unreadable contributes nothing (a broken dev-local
-/// convenience must not fail an otherwise valid build — same policy as
-/// `workspace::member_roots`).
+/// `fluxor.toml` is unreadable contributes nothing: a broken dev-local
+/// convenience must not fail an otherwise valid build.
 fn member_projects() -> Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
     let Some(ws) = crate::workspace::load_workspace()? else {
@@ -160,14 +160,33 @@ pub fn sync_project(project_root: &Path, dry_run: bool) -> Result<SyncReport> {
         }
     }
     // Missing-entry addition (the declared pinned-means-pinned
-    // exception, made safe by the epoch check below): a declared
-    // dependency with no entries yet resolves latest and is added.
+    // exception, made safe by the epoch check below): every artifact a
+    // declared dependency publishes that the lockfile does not pin yet
+    // resolves latest and is added, so an artifact a pinned project adds
+    // later reaches its consumers. A pinned project keeps the module
+    // ABIs its pins already cover; a project with no module pins takes
+    // every ABI.
     let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
-    let pinned_projects: BTreeSet<String> = entries.iter().map(|e| e.project.clone()).collect();
     for dep in &deps {
-        if !pinned_projects.contains(&dep.name) {
-            entries.extend(resolve_dependency(&store, &dep.name, None)?);
+        let pinned: Vec<&Artifact> = entries.iter().filter(|e| e.project == dep.name).collect();
+        if !pinned.is_empty() && !crate::store_resolve::dependency_published(&store, &dep.name) {
+            continue;
         }
+        let abis: BTreeSet<String> = pinned
+            .iter()
+            .filter(|e| e.kind == "module")
+            .filter_map(|e| e.target.clone())
+            .collect();
+        let held: BTreeSet<(String, String, Option<String>)> = pinned
+            .iter()
+            .map(|e| (e.kind.clone(), e.name.clone(), e.target.clone()))
+            .collect();
+        let offered = resolve_dependency(&store, &dep.name, (!abis.is_empty()).then_some(&abis))?;
+        entries.extend(
+            offered
+                .into_iter()
+                .filter(|a| !held.contains(&(a.kind.clone(), a.name.clone(), a.target.clone()))),
+        );
     }
     sort_entries(&mut entries);
 
@@ -240,7 +259,21 @@ fn staleness_advisories(
         let current = match member_digests.entry(e.project.as_str()) {
             std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::btree_map::Entry::Vacant(v) => {
-                v.insert(crate::store_publish::project_input_digests(member_path)?)
+                // The comparison reads the member's working tree, which may
+                // hold work in progress; an advisory it cannot make is said
+                // so, and the build goes on with the published pins.
+                match crate::store_publish::project_input_digests(member_path) {
+                    Ok(d) => v.insert(d),
+                    Err(err) => {
+                        warnings.push(format!(
+                            "warning: cannot compare {} with its checkout {} ({err}); \
+                             building against what it published",
+                            e.project,
+                            member_path.display()
+                        ));
+                        v.insert(BTreeMap::new())
+                    }
+                }
             }
         };
         if let (Some(published), Some(now)) =
@@ -261,15 +294,12 @@ fn staleness_advisories(
 /// content differs from the published one. Absent build output is not
 /// a difference — after `make clean` there is nothing to compare.
 fn runtime_differs_from_build(store: &OciStore, e: &Artifact, member: &Path) -> Result<bool> {
-    let (Some(triple), Some(published)) = (e.target.as_deref(), runtime_layer_digest(store, e)?)
+    let (Some(target), Some(published)) = (e.target.as_deref(), runtime_layer_digest(store, e)?)
     else {
         return Ok(false);
     };
-    let bin = member
-        .join("target")
-        .join(triple)
-        .join("release")
-        .join(&e.name);
+    let placement = RuntimePlacement::of(&read_pinned_manifest(store, e)?.annotations);
+    let bin = placement.path(member, target, &e.name);
     let Ok(bytes) = fs::read(&bin) else {
         return Ok(false);
     };
@@ -312,7 +342,11 @@ fn missing_layer_err(e: &Artifact) -> Error {
 
 /// Materialise one lockfile entry into the project tree. Every write
 /// verifies blob bytes against their digest (via `read_blob`).
-fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> Result<String> {
+pub(crate) fn materialize_artifact(
+    store: &OciStore,
+    project_root: &Path,
+    e: &Artifact,
+) -> Result<String> {
     match e.kind.as_str() {
         "module" => {
             let manifest = read_pinned_manifest(store, e)?;
@@ -372,14 +406,15 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .find(|l| l.media_type == MT_FLUXOR_RUNTIME)
                 .ok_or_else(|| missing_layer_err(e))?;
             let bytes = read_manifest_layer_blob(store, &e.name, &e.digest, &layer.digest)?;
-            let triple = e.target.as_deref().ok_or_else(|| {
-                Error::Config(format!("runtime '{}' pin has no host triple", e.name))
-            })?;
-            let dest = project_root
-                .join("target")
-                .join(path_component("runtime triple", triple)?)
-                .join("release")
-                .join(path_component("runtime name", &e.name)?);
+            let target = e
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::Config(format!("runtime '{}' pin has no target", e.name)))?;
+            let dest = RuntimePlacement::of(&manifest.annotations).path(
+                project_root,
+                path_component("runtime target", target)?,
+                path_component("runtime name", &e.name)?,
+            );
             if !file_matches(&dest, &bytes) {
                 write_file_atomic(&dest, &bytes, true)?;
             }
@@ -565,7 +600,10 @@ fn file_matches(path: &Path, bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn write_file_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+/// Write `bytes` to `path` through a file beside it renamed into place: a
+/// reader never sees a partial file, and a process that has `path` open or
+/// mapped keeps the bytes it opened.
+pub fn write_file_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::Config(format!("no parent dir for {}", path.display())))?;
@@ -1366,7 +1404,7 @@ mod tests {
 
     /// Serialise every FLUXOR_STORE / FLUXOR_WORKSPACE-touching test
     /// (env vars are process-global; cargo runs tests threaded).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn env_lock() -> crate::project::tests::EnvLockGuard {
         crate::oci_store::test_env_lock()
     }
 
@@ -1635,6 +1673,251 @@ mod tests {
         // ensure_synced replays without re-resolving and stays green.
         let replayed = ensure_synced(&consumer).unwrap();
         assert_eq!(replayed.len(), 1);
+    }
+
+    /// Fluxor publishes each board's kernel image beside its other
+    /// runtimes, and a consumer's sync writes it where a firmware-image
+    /// build and a rig scenario read it, `target/<board>/`: a consumer
+    /// needs no Fluxor checkout to build or flash a board.
+    #[test]
+    fn a_boards_kernel_image_reaches_a_consumer_through_sync() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let fluxor = scratch.path().join("fluxor");
+        fake_project(&fluxor, "fluxor", &[]);
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for rel in ["targets/boards/pico2w.toml", "targets/silicon/rp2350.toml"] {
+            let to = fluxor.join(rel);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(repo.join(rel), &to).unwrap();
+        }
+        let built = fluxor.join("target/pico2w");
+        std::fs::create_dir_all(&built).unwrap();
+        std::fs::write(built.join("firmware.elf"), b"\x7fELF kernel").unwrap();
+        std::fs::write(built.join("firmware.bin"), b"kernel image").unwrap();
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["fluxor"]);
+
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            (
+                "FLUXOR_WORKSPACE",
+                &scratch.path().join("no-workspace.toml"),
+            ),
+        ]);
+        let tags =
+            crate::store_publish::publish_project_to_store(&fluxor, &["runtime"], false).unwrap();
+        for file in crate::store_publish::BOARD_KERNEL_FILES {
+            assert!(
+                tags.iter()
+                    .any(|t| t == &format!("fluxor/run/{file}-pico2w:latest")),
+                "{file}: {tags:?}"
+            );
+        }
+
+        let report = sync_project(&consumer, false).unwrap();
+        let kernels: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|e| e.kind == "runtime" && e.target.as_deref() == Some("pico2w"))
+            .collect();
+        assert_eq!(kernels.len(), 2, "{:?}", report.entries);
+        assert_eq!(
+            std::fs::read(consumer.join("target/pico2w/firmware.bin")).unwrap(),
+            b"kernel image"
+        );
+        assert_eq!(
+            std::fs::read(consumer.join("target/pico2w/firmware.elf")).unwrap(),
+            b"\x7fELF kernel"
+        );
+        assert!(
+            !consumer.join("target/pico2w/release").exists(),
+            "a kernel image is a board's, not a cargo release binary"
+        );
+    }
+
+    /// A Fluxor checkout publishing the four crates every module links and,
+    /// with `catalog`, its `stacks/`, `targets/` (the `rp2040` silicon
+    /// descriptor) and native-module manifests as the catalog.
+    fn fake_fluxor(root: &Path, catalog: bool) {
+        fake_project(root, "fluxor", &[]);
+        for dir in [
+            "crates/fluxor-abi",
+            "crates/fluxor-sdk",
+            "crates/fluxor-rt",
+            "contracts/src",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("lib.rs"), "pub fn f() {}\n").unwrap();
+        }
+        std::fs::write(
+            root.join("contracts/Cargo.toml"),
+            "[package]\nname = \"fluxor-contracts\"\n",
+        )
+        .unwrap();
+        if catalog {
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+            std::fs::create_dir_all(root.join("stacks")).unwrap();
+            std::fs::write(root.join("stacks/README.md"), "stacks\n").unwrap();
+            let rel = "targets/silicon/rp2040.toml";
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::copy(repo.join(rel), root.join(rel)).unwrap();
+            let native = "modules/platform/linux/linux_net/manifest.toml";
+            std::fs::create_dir_all(root.join(native).parent().unwrap()).unwrap();
+            std::fs::copy(repo.join(native), root.join(native)).unwrap();
+        }
+    }
+
+    /// A lock written before a pinned project published an artifact gains
+    /// that artifact at the next sync: the catalog Fluxor publishes beside
+    /// the four crates reaches a consumer whose lock pins only the crates.
+    #[test]
+    fn sync_adds_an_artifact_a_pinned_project_publishes_later() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let fluxor = scratch.path().join("fluxor");
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["fluxor"]);
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            (
+                "FLUXOR_WORKSPACE",
+                &scratch.path().join("no-workspace.toml"),
+            ),
+        ]);
+
+        fake_fluxor(&fluxor, false);
+        crate::store_publish::publish_project_to_store(&fluxor, &["source"], false).unwrap();
+        let first = sync_project(&consumer, false).unwrap();
+        assert_eq!(first.entries.len(), 4, "{:?}", first.entries);
+
+        fake_fluxor(&fluxor, true);
+        crate::store_publish::publish_project_to_store(&fluxor, &["source"], false).unwrap();
+        let second = sync_project(&consumer, false).unwrap();
+        let names: Vec<&str> = second.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&crate::project::CATALOG_SOURCE),
+            "the catalog is pinned: {names:?}"
+        );
+        assert_eq!(second.entries.len(), 5, "{names:?}");
+        assert!(consumer
+            .join(crate::project::SYNCED_CATALOG)
+            .join("targets/silicon/rp2040.toml")
+            .is_file());
+        assert!(consumer
+            .join(crate::project::SYNCED_CATALOG)
+            .join("modules/platform/linux/linux_net/manifest.toml")
+            .is_file());
+    }
+
+    /// `fluxor update` resolves `[ci] targets` through the catalog it is
+    /// pinning: a project with no `targets/` of its own, no install root
+    /// and no lock names a target Fluxor publishes.
+    #[test]
+    fn update_resolves_targets_through_the_catalog_it_pins() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let fluxor = scratch.path().join("fluxor");
+        fake_fluxor(&fluxor, true);
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["fluxor"]);
+        let mut toml = std::fs::read_to_string(consumer.join("fluxor.toml")).unwrap();
+        toml.push_str("\n[ci]\ntargets = [\"rp2040\"]\n");
+        std::fs::write(consumer.join("fluxor.toml"), toml).unwrap();
+        let no_install = scratch.path().join("no-install");
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            (
+                "FLUXOR_WORKSPACE",
+                &scratch.path().join("no-workspace.toml"),
+            ),
+            (crate::project::ENV_PROJECT_ROOT, &consumer),
+            (crate::project::ENV_INSTALL_ROOT, &no_install),
+        ]);
+        crate::store_publish::publish_project_to_store(&fluxor, &["source"], false).unwrap();
+
+        crate::store_resolve::cmd_update(&consumer, None).unwrap();
+        let lock = read_store_lock(&consumer).unwrap().unwrap();
+        assert!(
+            lock.artifacts
+                .iter()
+                .any(|a| a.name == crate::project::CATALOG_SOURCE),
+            "{:?}",
+            lock.artifacts
+        );
+        assert!(consumer
+            .join(crate::project::SYNCED_CATALOG)
+            .join("targets/silicon/rp2040.toml")
+            .is_file());
+    }
+
+    /// A consumer builds against what Fluxor published while Fluxor's
+    /// working tree holds an edit that does not parse: a workspace member
+    /// is used through its published pins. Only a project that names the
+    /// tree among the workspace's `live_trees` reads it, and is then refused
+    /// naming the tree.
+    #[test]
+    fn a_member_tree_mid_edit_reaches_only_a_project_that_reads_it_live() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let fluxor = scratch.path().join("fluxor-checkout");
+        fake_project(&fluxor, "producer", &[]);
+        std::fs::create_dir_all(fluxor.join("modules/common")).unwrap();
+        std::fs::write(fluxor.join("modules/common/core.rs"), "pub fn f() {}\n").unwrap();
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["producer"]);
+        let store = scratch.path().join("store");
+        let ws = scratch.path().join("workspace.toml");
+        let _scope = EnvScope::set(&[("FLUXOR_STORE", &store), ("FLUXOR_WORKSPACE", &ws)]);
+        crate::store_publish::publish_project_to_store(&fluxor, &["source"], false).unwrap();
+
+        // The checkout, after publishing, holds an ABI surface whose
+        // registry does not parse: another session's edit in progress.
+        let surface = fluxor.join("crates/fluxor-abi/src/abi_surface");
+        std::fs::create_dir_all(&surface).unwrap();
+        std::fs::write(surface.join("srcpin.rs"), "").unwrap();
+        std::fs::create_dir_all(fluxor.join("crates/fluxor-abi/registry")).unwrap();
+        std::fs::write(
+            fluxor.join("crates/fluxor-abi/registry/registry.toml"),
+            "[[contract]\ngrant = \n",
+        )
+        .unwrap();
+        assert!(
+            crate::abi_pin::compute(&fluxor).is_err(),
+            "the tree is broken"
+        );
+
+        let workspace = |live: bool| {
+            let live = if live {
+                format!("\"{}\"", fluxor.display())
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &ws,
+                format!(
+                    "[workspace]\nmembers = [\"{}\"]\nlive_trees = [{live}]\n",
+                    fluxor.display()
+                ),
+            )
+            .unwrap();
+        };
+
+        workspace(false);
+        let report = sync_project(&consumer, false).expect("built against the published pins");
+        assert_eq!(report.entries.len(), 1);
+        assert!(consumer
+            .join("target/fluxor/producer-common/core.rs")
+            .is_file());
+
+        workspace(true);
+        let e = sync_project(&consumer, false).unwrap_err().to_string();
+        assert!(
+            e.contains("the live Fluxor tree")
+                && e.contains(&fluxor.display().to_string())
+                && e.contains("live_trees"),
+            "{e}"
+        );
     }
 
     /// A producer republish (retag) must never break a workspace
@@ -2116,6 +2399,7 @@ mod tests {
                 "fluxor",
                 "0.0.1",
                 "host-triple",
+                RuntimePlacement::Release,
                 b"published build\n",
                 &meta,
             )

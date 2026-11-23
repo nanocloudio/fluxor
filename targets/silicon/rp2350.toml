@@ -227,8 +227,12 @@ ram_size = "0x80000"
 
 [kernel]
 watchdog_ctrl = "0x400D8000"
-# PSM watchdog-select register and the mask that puts every block but the
-# oscillators under the watchdog, so a watchdog trigger is a whole-chip reset.
+# PSM watchdog-select register and the mask of the power-on state machine's
+# blocks a watchdog trigger resets: bits 2 to 24, every block from the ring
+# and crystal oscillators up through both processors (datasheet section
+# 7.4.4, `WDSEL`), which leaves out only `PROC_COLD` (bit 0) and `OTP`
+# (bit 1). A watchdog trigger is a whole-chip reset, and the bootrom treats a
+# watchdog reset that selected the oscillators as a boot it can trust.
 psm_wdsel = "0x40018008"
 psm_wdsel_mask = "0x01fffffc"
 boot2_src = "0x400e0000"
@@ -386,6 +390,45 @@ provider_alarms = [3]
 # here uses that driver.
 foreign_instance = "TIMER0"
 foreign_alarms = [0]
+
+# Core 1's own instance. Each timer counts from its own tick and the two
+# counters agree on rate only, so core 1 arms deadlines relative to this
+# counter and never against `monotonic`. Alarm 0 stays the external time
+# driver's (`foreign_alarms`); the three lines below are enabled in core 1's
+# NVIC alone.
+secondary = "TIMER0"
+secondary_base = "0x400B0000"
+secondary_alarms = [
+    { index = 1, owner = "step_guard", irq = 1 },
+    { index = 2, owner = "scheduler", irq = 2 },
+    { index = 3, owner = "module_timer", irq = 3 },
+]
+
+# Which core runs each execution domain. One domain loop runs per core,
+# passing over that core's domains in index order: domain 1 has core 1 to
+# itself, and domains 0, 2 and 3 share core 0's loop.
+[smp]
+cores = 2
+domain_cores = [0, 1, 0, 0]
+# Core 1's stack: SRAM8 and SRAM9, the two direct-mapped 4 KiB banks above
+# the striped region. `reserve_kb` is the kernel's own share under a module
+# stepped there: its pass frames where it calls the module, the deepest call
+# the module can make back into the kernel (a provider open, through the
+# provider table to a handler and the logger) and one interrupt on top. The
+# firmware build measures that sum in the linked image and refuses an image
+# where it is over the reserve. A module that is not gated is admitted
+# against the rest, 2 KiB; a gated one runs on the stack in its private
+# region.
+secondary_stack = { base = "0x20080000", size_kb = 8, reserve_kb = 6 }
+
+# What the hardware counters a module reads through the `counters` contract
+# count: the facts of the target capabilities `counter.cycles` and
+# `counter.icache`. Cycles are the DWT cycle counter, one per core; the
+# instruction-cache figures are the XIP cache's hit and access counters, one
+# pair for both cores and every flash-reading DMA.
+[counters]
+cycles = "core"
+icache = "node"
 
 # The contracts this platform registers a provider for, named as a manifest's
 # `requires_contract` names them. The composer refuses a graph whose module

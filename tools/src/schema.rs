@@ -487,6 +487,10 @@ pub(crate) const SKIP_KEYS: &[&str] = &[
     // program section (`modules::collect_programs`), never a wire param.
     "program",
     "programs",
+    // The params the build resolved an asset for
+    // (`graph_assets::ASSET_PARAMS_KEY`): the composer's check, never a
+    // wire param.
+    "asset_params",
     "wiring",
     "preset",
     "presets",
@@ -1532,7 +1536,7 @@ fn pack_voice_inner(
 ///     module-table builder reports that one separately).
 ///   - `Err` — the module IS pinned in `fluxor.lock` but its pinned artifact
 ///     could not be resolved. Failing closed here mirrors
-///     `config::assert_pinned_manifests_resolvable` on the manifest half of the
+///     `config::assert_module_manifests_resolvable` on the manifest half of the
 ///     same pin: a pinned module that hard-fails port validation must not
 ///     silently build with its params dropped.
 pub fn load_schema_for_module(
@@ -1626,7 +1630,7 @@ fn pin_label(project_root: &Path, module_type: &str, abi: &str) -> String {
     }
 }
 
-/// Sibling wording of `assert_pinned_manifests_resolvable`'s error so the two
+/// Sibling wording of `assert_module_manifests_resolvable`'s error so the two
 /// halves of a broken pin — manifest and params — read as one failure class.
 fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
     crate::Error::Config(format!(
@@ -2374,7 +2378,7 @@ mod tests {
     /// produce must ABORT the build naming module, pin and cause — never
     /// collapse to "this module has no params" and pack an empty TLV
     /// section, which ships the module unconfigured (a connector with no
-    /// `endpoint`). Sibling of `config::assert_pinned_manifests_resolvable`,
+    /// `endpoint`). Sibling of `config::assert_module_manifests_resolvable`,
     /// which already fails closed on the manifest half of the same pin.
     #[test]
     fn pinned_module_with_unresolvable_store_is_a_hard_error() {

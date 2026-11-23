@@ -1,18 +1,28 @@
-//! The three crates every module links — `fluxor_abi`, `fluxor_sdk`,
-//! `fluxor_rt` — built once per module ABI as rlibs.
+//! The four crates every module links — `fluxor_abi`, `fluxor_sdk`,
+//! `fluxor_rt` and `fluxor_contracts` — built once per module ABI as rlibs.
 //!
 //! Each is compiled with the module build's own flags, one codegen unit (so
 //! a crate is one object and its `#[used]` statics travel with whatever the
 //! module pulls from it), a fixed `-C metadata` (so the mangled names a
 //! module's assembly calls are the names the rlib's assembly defines) and its
 //! source path remapped to the crate name (so panic locations carry a short
-//! path, not this machine's). The source comes from `crates/<name>` in
+//! path, not this machine's). The source comes from the crate's own tree in
 //! fluxor and from the synced `target/fluxor/<name>` everywhere else.
 //!
-//! A built rlib is held to what a module is held to: every object passes
-//! `relocation_refusals`, and the three together leave no symbol undefined —
-//! as a set, since `fluxor_abi` and `fluxor_sdk` call the `memcpy` and
-//! `__aeabi_*` helpers only `fluxor_rt` defines. A stamp over the crate
+//! A crate's features are the module build's choice, not the crate's
+//! defaults: a module has no global allocator, so `fluxor_contracts` is
+//! compiled with `alloc` off and its heap-owning items (`graph::encode`,
+//! `graph::plan::compose`, the owner-log records) do not exist for a module.
+//! The allocation-free codec and composition passes do.
+//!
+//! A built rlib is held to what a module is held to. A crate whose every
+//! item a module may carry ([`PicCheck::Whole`]) has every object pass
+//! `relocation_refusals` when it is built; a crate that also serves the
+//! kernel and the tools ([`PicCheck::AsLinked`]) has what each module's link
+//! keeps of it pass, judged from the linker's garbage-collection report. The
+//! four together leave no symbol undefined —
+//! as a set, since `fluxor_abi`, `fluxor_sdk` and `fluxor_contracts` call the
+//! `memcpy` and `__aeabi_*` helpers only `fluxor_rt` defines. A stamp over the crate
 //! sources, the compiler and the flags skips a rebuild that would produce the
 //! same bytes.
 
@@ -22,14 +32,68 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use super::{cfg_abi_args, relocation_refusals, run_step, AbiSpec, PIC_RELOCATION_MODEL};
+use super::{
+    cfg_abi_args, relocation_refusals, relocation_refusals_in, run_step, AbiSpec,
+    PIC_RELOCATION_MODEL,
+};
 use crate::error::{Error, Result};
 
-/// The crates, in dependency order: each may use only those before it.
-const CRATES: [(&str, &str); 3] = [
-    ("fluxor-abi", "fluxor_abi"),
-    ("fluxor-sdk", "fluxor_sdk"),
-    ("fluxor-rt", "fluxor_rt"),
+/// How a crate's objects are held to the position-independence rules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PicCheck {
+    /// Every object, when the rlib is built: nothing in the crate is
+    /// anything a module may not carry.
+    Whole,
+    /// What each module's link keeps: the crate also holds code the kernel
+    /// and the tools use (formatting, tables of names), which a module that
+    /// never reaches it does not carry.
+    AsLinked,
+}
+
+/// One crate a module links.
+struct ModuleCrate {
+    /// The published and synced name: `target/fluxor/<dir_name>`.
+    dir_name: &'static str,
+    /// The crate name a module imports.
+    name: &'static str,
+    /// The crate's tree in the fluxor checkout, relative to its root.
+    in_tree: &'static str,
+    /// The features the crate declares, for `--check-cfg`.
+    declared: &'static [&'static str],
+    pic: PicCheck,
+}
+
+/// The crates, in dependency order: each may use only those before it. No
+/// declared feature is enabled for a module.
+const CRATES: [ModuleCrate; 4] = [
+    ModuleCrate {
+        dir_name: "fluxor-abi",
+        name: "fluxor_abi",
+        in_tree: "crates/fluxor-abi",
+        declared: &[],
+        pic: PicCheck::Whole,
+    },
+    ModuleCrate {
+        dir_name: "fluxor-sdk",
+        name: "fluxor_sdk",
+        in_tree: "crates/fluxor-sdk",
+        declared: &[],
+        pic: PicCheck::Whole,
+    },
+    ModuleCrate {
+        dir_name: "fluxor-rt",
+        name: "fluxor_rt",
+        in_tree: "crates/fluxor-rt",
+        declared: &[],
+        pic: PicCheck::Whole,
+    },
+    ModuleCrate {
+        dir_name: "fluxor-contracts",
+        name: "fluxor_contracts",
+        in_tree: "contracts",
+        declared: &["alloc"],
+        pic: PicCheck::AsLinked,
+    },
 ];
 
 /// The rlibs for one module ABI, and the assembly each was compiled to.
@@ -46,9 +110,9 @@ impl SdkLibs {
             "-L".to_string(),
             format!("dependency={}", self.dir.display()),
         ];
-        for ((_, name), rlib) in CRATES.iter().zip(&self.rlibs) {
+        for (c, rlib) in CRATES.iter().zip(&self.rlibs) {
             args.push("--extern".into());
-            args.push(format!("{name}={}", rlib.display()));
+            args.push(format!("{}={}", c.name, rlib.display()));
         }
         args
     }
@@ -58,26 +122,101 @@ impl SdkLibs {
         &self.rlibs
     }
 
-    /// The assembly of all three, for the module's stack walk.
+    /// The assembly of all four, for the module's stack walk.
     pub fn asm(&self) -> &[PathBuf] {
         &self.asm
     }
+
+    /// Hold what module `module`'s link kept of each [`PicCheck::AsLinked`]
+    /// crate to the position-independence rules. `report` is the link's
+    /// `--trace --trace` and `--print-gc-sections` output: of each member the
+    /// link loaded, every section it does not name as removed is in the
+    /// module.
+    pub fn check_as_linked(&self, report: &str, module: &str) -> Result<()> {
+        let removed = gc_removed(report)?;
+        let none = BTreeSet::new();
+        for (c, rlib) in CRATES.iter().zip(&self.rlibs) {
+            if c.pic != PicCheck::AsLinked {
+                continue;
+            }
+            for (member, obj) in ar_objects(&std::fs::read(rlib)?)? {
+                let file = format!("{}({member})", rlib.display());
+                // `--trace --trace` names each archive member the link loaded
+                // on a line of its own, `<archive>(<member>)` from lld and
+                // `(<archive>)<member>` from GNU ld; a member never loaded is
+                // not in the module.
+                let gnu = format!("({}){member}", rlib.display());
+                if !report
+                    .lines()
+                    .any(|l| l.trim_end() == file || l.trim_end() == gnu)
+                {
+                    continue;
+                }
+                let gone = removed.get(&file).unwrap_or(&none);
+                relocation_refusals_in(&obj, &|sec| !gone.contains(sec))?
+                    .into_result(&format!("{module} (through {})", c.name))?;
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Where crate `dir_name` (`fluxor-abi`, …) is compiled from: this tree's
-/// `crates/`, or the source tree `fluxor sync` staged.
-pub fn crate_dir(project_root: &Path, dir_name: &str) -> Option<PathBuf> {
-    [
-        project_root.join("crates").join(dir_name),
-        project_root.join("target/fluxor").join(dir_name),
-    ]
-    .into_iter()
-    .find(|d| d.join("src/lib.rs").is_file())
+/// The sections a link removed, by input file (`<archive>(<member>)` for an
+/// archive member), from its `--print-gc-sections` report. GNU ld writes
+/// `removing unused section '<section>' in file '<file>'`, lld
+/// `removing unused section <file>:(<section>)`. A removal line in neither
+/// shape is an error: an unread line would count a removed section as kept,
+/// and that refuses a module for code it does not carry.
+fn gc_removed(report: &str) -> Result<std::collections::BTreeMap<String, BTreeSet<String>>> {
+    const MARK: &str = "removing unused section ";
+    let mut out: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
+    for line in report.lines() {
+        let Some(at) = line.find(MARK) else {
+            continue;
+        };
+        let rest = &line[at + MARK.len()..];
+        let parsed = if let Some(r) = rest.strip_prefix('\'') {
+            r.split_once("' in file '")
+                .and_then(|(sec, file)| Some((file.strip_suffix('\'')?, sec)))
+        } else {
+            rest.rfind(":(")
+                .and_then(|k| Some((&rest[..k], rest[k + 2..].strip_suffix(')')?)))
+        };
+        let (file, section) = parsed.ok_or_else(|| {
+            Error::Module(format!(
+                "linker garbage-collection report: unread line `{line}`"
+            ))
+        })?;
+        out.entry(file.to_string())
+            .or_default()
+            .insert(section.to_string());
+    }
+    Ok(out)
+}
+
+/// Where crate `c` is compiled from: its tree in this checkout (a tree whose
+/// manifest names the package, so another project's `contracts/` is never
+/// taken for it), or the source tree `fluxor sync` staged.
+fn crate_dir(project_root: &Path, c: &ModuleCrate) -> Option<PathBuf> {
+    let in_tree = project_root.join(c.in_tree);
+    let package = format!("name = \"{}\"", c.dir_name);
+    let ours = std::fs::read_to_string(in_tree.join("Cargo.toml")).is_ok_and(|m| {
+        m.lines()
+            .any(|l| l.split_whitespace().collect::<Vec<_>>().join(" ") == package)
+    });
+    let staged = project_root.join("target/fluxor").join(c.dir_name);
+    [ours.then_some(in_tree), Some(staged)]
+        .into_iter()
+        .flatten()
+        .find(|d| d.join("src/lib.rs").is_file())
 }
 
 /// The module link script, which ships with `fluxor-rt`.
 pub fn module_ld(project_root: &Path) -> Option<PathBuf> {
-    crate_dir(project_root, "fluxor-rt")
+    CRATES
+        .iter()
+        .find(|c| c.dir_name == "fluxor-rt")
+        .and_then(|c| crate_dir(project_root, c))
         .map(|d| d.join("module.ld"))
         .filter(|p| p.is_file())
 }
@@ -99,7 +238,7 @@ fn crate_files(dir: &Path) -> Vec<PathBuf> {
 pub fn newest_source(project_root: &Path) -> Option<std::time::SystemTime> {
     CRATES
         .iter()
-        .filter_map(|(dir, _)| crate_dir(project_root, dir))
+        .filter_map(|c| crate_dir(project_root, c))
         .flat_map(|d| crate_files(&d))
         .filter_map(|f| f.metadata().ok()?.modified().ok())
         .max()
@@ -135,7 +274,6 @@ fn rlib_flags(spec: &AbiSpec, strict: bool) -> Vec<String> {
     f.extend(["-C".into(), "embed-bitcode=no".into()]);
     f.extend(spec.extra_rustflags.iter().map(|s| (*s).to_string()));
     f.extend(cfg_abi_args(spec));
-    f.extend(["--check-cfg".into(), "cfg(feature, values())".into()]);
     f.extend([
         "-D".into(),
         if strict {
@@ -148,7 +286,17 @@ fn rlib_flags(spec: &AbiSpec, strict: bool) -> Vec<String> {
     f
 }
 
-/// Build (or find current) the three rlibs for `spec` under
+/// The `--check-cfg` that declares crate `c`'s features: a `cfg(feature)`
+/// the crate does not declare stays an error.
+fn check_cfg(c: &ModuleCrate) -> [String; 2] {
+    let values: Vec<String> = c.declared.iter().map(|f| format!("\"{f}\"")).collect();
+    [
+        "--check-cfg".into(),
+        format!("cfg(feature, values({}))", values.join(", ")),
+    ]
+}
+
+/// Build (or find current) the four rlibs for `spec` under
 /// `<out_root>/<abi>/sdk/`.
 pub fn ensure(
     project_root: &Path,
@@ -169,16 +317,19 @@ pub fn ensure(
     // Each crate's stamp folds in the ones before it: a changed dependency
     // is a changed compile.
     let mut chain = Sha256::new();
-    for (dir_name, name) in CRATES {
-        let src = crate_dir(project_root, dir_name).ok_or_else(|| {
+    for c in &CRATES {
+        let (dir_name, name) = (c.dir_name, c.name);
+        let check_cfg = check_cfg(c);
+        let src = crate_dir(project_root, c).ok_or_else(|| {
             Error::Module(format!(
-                "crate `{dir_name}` not found under crates/ or target/fluxor/ (run `fluxor sync`)"
+                "crate `{dir_name}` not found at {} or under target/fluxor/ (run `fluxor sync`)",
+                c.in_tree
             ))
         })?;
         chain.update(name.as_bytes());
         chain.update(spec.module_target.as_bytes());
         chain.update(rustc.as_bytes());
-        for f in &flags {
+        for f in flags.iter().chain(&check_cfg) {
             chain.update(f.as_bytes());
             chain.update([0]);
         }
@@ -222,6 +373,7 @@ pub fn ensure(
                 .arg(format!("metadata={name}"))
                 .arg(format!("--remap-path-prefix={}={dir_name}", src.display()))
                 .args(&flags)
+                .args(&check_cfg)
                 .args(libs.extern_args())
                 .arg("--out-dir")
                 .arg(&scratch)
@@ -234,7 +386,7 @@ pub fn ensure(
             let built = run_step(cmd, "rustc");
             let _ = std::fs::remove_dir_all(&scratch);
             built.map_err(|e| Error::Module(format!("{name}: {e}")))?;
-            if spec.linker.is_some() {
+            if spec.linker.is_some() && c.pic == PicCheck::Whole {
                 for (member, obj) in ar_objects(&std::fs::read(&rlib)?)? {
                     relocation_refusals(&obj)?.into_result(&format!("{name} ({member})"))?;
                 }
@@ -252,17 +404,22 @@ pub fn ensure(
     Ok(libs)
 }
 
-/// Refuse when the three rlibs, together, call a symbol none of them
+/// Refuse when the [`PicCheck::Whole`] rlibs call a symbol none of the four
 /// defines: a module linking them would fail at `--no-undefined`, every one
-/// of them, for a reason no module could fix.
+/// of them, for a reason no module could fix. What a [`PicCheck::AsLinked`]
+/// crate calls is the module's link's to answer: its `--no-undefined` judges
+/// the sections the module keeps, so a module that never reaches the crate's
+/// formatting does not need what that formatting calls.
 fn closed_as_a_set(libs: &SdkLibs) -> Result<()> {
     let mut defined = BTreeSet::new();
     let mut undefined = BTreeSet::new();
-    for rlib in &libs.rlibs {
+    for (c, rlib) in CRATES.iter().zip(&libs.rlibs) {
         for (_, obj) in ar_objects(&std::fs::read(rlib)?)? {
             let (d, u) = elf_symbols(&obj)?;
             defined.extend(d);
-            undefined.extend(u);
+            if c.pic == PicCheck::Whole {
+                undefined.extend(u);
+            }
         }
     }
     let open: Vec<String> = undefined.difference(&defined).cloned().collect();
@@ -270,7 +427,7 @@ fn closed_as_a_set(libs: &SdkLibs) -> Result<()> {
         return Ok(());
     }
     Err(Error::Module(format!(
-        "the fluxor_abi/fluxor_sdk/fluxor_rt rlibs call {} symbol(s) none of them defines: {} \
+        "the fluxor_abi/fluxor_sdk/fluxor_rt rlibs call {} symbol(s) none of the module crates defines: {} \
          (a libcore entry point the runtime does not shim, or code that needs a crate it does not depend on)",
         open.len(),
         open.join(", ")
@@ -322,6 +479,41 @@ fn ar_objects(ar: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 /// The global and weak symbols an ELF object defines, and those it uses
 /// without defining.
 fn elf_symbols(obj: &[u8]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut defined = BTreeSet::new();
+    let mut undefined = BTreeSet::new();
+    each_symbol(obj, |sym, info, shndx| {
+        let bind = info >> 4;
+        if bind != 1 && bind != 2 {
+            return; // locals are the object's own business
+        }
+        if shndx == 0 {
+            // A weak reference may stay unresolved; a global one may not.
+            if bind == 1 {
+                undefined.insert(sym.to_string());
+            }
+        } else {
+            defined.insert(sym.to_string());
+        }
+    })?;
+    Ok((defined, undefined))
+}
+
+/// Every function an ELF file defines, local or not: of a linked module,
+/// the functions its link kept.
+pub(super) fn elf_functions(elf: &[u8]) -> Result<BTreeSet<String>> {
+    const STT_FUNC: u8 = 2;
+    let mut out = BTreeSet::new();
+    each_symbol(elf, |sym, info, shndx| {
+        if info & 0xf == STT_FUNC && shndx != 0 {
+            out.insert(sym.to_string());
+        }
+    })?;
+    Ok(out)
+}
+
+/// Call `f(name, st_info, st_shndx)` for every named symbol of an ELF
+/// file's symbol tables.
+fn each_symbol(obj: &[u8], mut f: impl FnMut(&str, u8, usize)) -> Result<()> {
     let bad = || Error::Module("object: malformed ELF".into());
     let get = |o: usize, n: usize| obj.get(o..o.checked_add(n)?);
     let u16_at = |o: usize| -> Result<usize> {
@@ -366,8 +558,6 @@ fn elf_symbols(obj: &[u8]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
             )
         })
     };
-    let mut defined = BTreeSet::new();
-    let mut undefined = BTreeSet::new();
     for i in 0..shnum {
         let (ty, off, size, link, entsize) = section(i)?;
         if ty != 2 || entsize == 0 {
@@ -386,25 +576,13 @@ fn elf_symbols(obj: &[u8]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
                     u16_at(s + 14)?,
                 )
             };
-            let bind = info >> 4;
-            if bind != 1 && bind != 2 {
-                continue; // locals are the object's own business
-            }
             let tail = strtab.get(name..).ok_or_else(bad)?;
             let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-            let sym = String::from_utf8_lossy(&tail[..end]).into_owned();
-            if sym.is_empty() {
-                continue;
-            }
-            if shndx == 0 {
-                // A weak reference may stay unresolved; a global one may not.
-                if bind == 1 {
-                    undefined.insert(sym);
-                }
-            } else {
-                defined.insert(sym);
+            let sym = String::from_utf8_lossy(&tail[..end]);
+            if !sym.is_empty() {
+                f(&sym, info, shndx);
             }
         }
     }
-    Ok((defined, undefined))
+    Ok(())
 }

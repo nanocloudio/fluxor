@@ -1,11 +1,13 @@
-//! `wasm_browser_image_codec` native module: encoded-image → RGB565
-//! transformer that delegates the actual decode to the browser via
+//! `wasm_browser_image_codec` native module: encoded image → `VideoRaster`
+//! transformer that delegates the decode to the browser via
 //! `createImageBitmap` + `OffscreenCanvas`.
 //!
-//! Wasm-host analogue of `host_image_codec` on linux (which uses the
-//! `image` crate). Same contract: `encoded` in (OctetStream),
-//! `pixels` out (VideoRaster, RGB565 LE), params `width`/`height`/
-//! `max_bytes`.
+//! Wasm-host analogue of `host_image_codec` on linux. Same contract:
+//! `encoded` in (OctetStream), `pixels` out (VideoRaster), params
+//! `width`/`height`/`max_bytes`. Each decoded image goes out as one region
+//! record (`abi::contracts::video_raster`): a header covering the whole
+//! `width` x `height` surface, written here, then the RGB565 pixels the shim
+//! decoded.
 //!
 //! State machine, per-step:
 //!
@@ -20,7 +22,7 @@
 //!                                                   ▼
 //!                            ┌────────────────────────────────────┐
 //!                            │           Outputting               │
-//!                            │  loop:                             │
+//!                            │  region header, then loop:         │
 //!                            │    host_image_decode_recv → buf    │
 //!                            │    channel_write(out, buf)         │
 //!                            └────────────────┬───────────────────┘
@@ -37,6 +39,7 @@
 //! `createImageBitmap`'s async-ness behind the same poll-then-pull
 //! pattern as `host_browser_fetch`.
 
+use crate::abi::contracts::video_raster::{self, Header};
 use crate::abi::platform::native::wasm::wasm_browser_image_codec as tags;
 use crate::kernel::exec::scheduler;
 use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
@@ -260,10 +263,34 @@ unsafe fn decoding_step(st: &mut ImageCodecState) -> i32 {
     let size = host_image_decode_size(st.handle);
     match size {
         s if s >= 0 => {
-            // Ready — start streaming out. (Size value itself isn't
-            // needed: width*height*2 is the contract; we just trust
-            // host_image_decode_recv to return EOF when drained.)
-            st.phase = Phase::Outputting as u8;
+            // Ready. The frame goes out as one region covering the whole
+            // surface: its header is queued ahead of the pixels the shim
+            // hands over, which are `width` x `height` in the format the
+            // header names.
+            let header = Header::whole(st.width, st.height, video_raster::FORMAT_RGB565);
+            let queued = if header.pixel_len() == s as u64 {
+                header.write(&mut st.rx)
+            } else {
+                None
+            };
+            match queued {
+                Some(n) => {
+                    st.pending_pos = 0;
+                    st.pending_len = n as u32;
+                    st.phase = Phase::Outputting as u8;
+                }
+                None => {
+                    log::warn!(
+                        "[image-codec] decoded {s} bytes are not a {}x{} frame",
+                        st.width,
+                        st.height
+                    );
+                    st.phase = Phase::Error as u8;
+                    let _ = host_image_decode_close(st.handle);
+                    st.handle = -1;
+                    let _ = channel::channel_set_hup(st.out_chan);
+                }
+            }
         }
         -1 => {
             // Pending — try again next tick.

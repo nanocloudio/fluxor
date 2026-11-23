@@ -55,6 +55,8 @@ pub mod genstore_wire;
 pub mod gpu_exec_wire;
 /// The header every node image opens with, and its codec.
 pub mod node_image;
+/// UTF-8 text inside wire records: validation and scalar counts.
+pub mod utf8_text;
 
 /// The signing root item a kernel image carries, which the packager writes.
 pub mod image_root;

@@ -338,6 +338,7 @@ pub fn load_graph(config_path: &std::path::Path, project_root: &std::path::Path)
     // `${asset:<name>}` resolves by the graph's target family once its
     // params are rendered (an asset's `path:` may name one). Resolving
     // names the file a build step would write; it never runs one.
+    crate::graph_assets::refuse_written_asset_params(&config, config_path)?;
     if crate::graph_assets::names_an_asset(&config) {
         let family = crate::resolve_target(&config, None)?.family;
         crate::graph_assets::resolve_placeholders(&mut config, config_path, &family, project_root)?;

@@ -512,7 +512,7 @@ mod tests {
 
     const PLATFORM: RingPlatform = RingPlatform {
         buffer_groups: 64,
-        split_cross_domain: false,
+        domain_cores: [0, 0, 0, 0],
     };
 
     fn module(name: &str, hash: u32) -> GraphModule {

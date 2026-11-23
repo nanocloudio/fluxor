@@ -43,11 +43,7 @@ use fluxor::abi::platform::native::linux::linux_surface_traits::{
 /// checked every step.
 const RESCAN_TICKS: u32 = 240;
 
-const ORIENT_PORTRAIT: u8 = 0;
-const ORIENT_LANDSCAPE: u8 = 1;
-
-const AUTHORITY_LINUX: u8 = 1;
-const EVENT_RECORD: usize = 24;
+use fluxor::abi::contracts::input::surface_traits as traits_contract;
 
 struct LinuxSurfaceTraitsState {
     out_chan: i32,
@@ -90,37 +86,6 @@ fn current_geom(cfg_w: u16, cfg_h: u16) -> (u16, u16) {
 #[cfg(not(feature = "host-window"))]
 fn current_geom(cfg_w: u16, cfg_h: u16) -> (u16, u16) {
     (cfg_w, cfg_h)
-}
-
-#[allow(clippy::too_many_arguments, reason = "fixed wire-record field set")]
-fn encode(
-    buf: &mut [u8; EVENT_RECORD],
-    orient: u8,
-    size_w: u8,
-    size_h: u8,
-    w: u16,
-    h: u16,
-    modalities: u16,
-    pads: u8,
-    audio_ch: u8,
-    audio_rate: u32,
-    epoch: u32,
-) {
-    buf[0] = 0x01; // MSG_TRAITS
-    buf[1] = orient;
-    buf[2] = size_w;
-    buf[3] = size_h;
-    buf[4..6].copy_from_slice(&w.to_le_bytes());
-    buf[6..8].copy_from_slice(&h.to_le_bytes());
-    buf[8..10].copy_from_slice(&modalities.to_le_bytes());
-    buf[10] = pads;
-    buf[11] = audio_ch;
-    buf[12..16].copy_from_slice(&audio_rate.to_le_bytes());
-    buf[16..20].copy_from_slice(&epoch.to_le_bytes());
-    buf[20] = AUTHORITY_LINUX;
-    buf[21] = 1; // display_count — a Linux host presents on a display (window/framebuffer)
-    buf[22] = 0;
-    buf[23] = 0;
 }
 
 /// # Safety
@@ -168,27 +133,26 @@ unsafe extern "C" fn linux_surface_traits_step(state: *mut u8) -> i32 {
     // skip the record).
     let w_class = size_class_for(w, st.prev_w_class);
     let h_class = size_class_for(h, st.prev_h_class);
-    let orient = if w >= h {
-        ORIENT_LANDSCAPE
-    } else {
-        ORIENT_PORTRAIT
-    };
     let epoch = st.epoch.wrapping_add(1);
 
-    let mut buf = [0u8; EVENT_RECORD];
-    encode(
-        &mut buf,
-        orient,
-        w_class,
-        h_class,
-        w,
-        h,
-        st.cached_modalities,
-        st.cached_pads,
-        audio_ch,
-        audio_rate,
+    let buf = traits_contract::encode(&traits_contract::Traits {
+        orientation: traits_contract::orientation_for(w, h),
+        size_class_w: w_class,
+        size_class_h: h_class,
+        viewport_w_px: w,
+        viewport_h_px: h,
+        modalities: st.cached_modalities,
+        gamepad_count: st.cached_pads,
+        audio_channels: audio_ch,
+        audio_rate_hz: audio_rate,
         epoch,
-    );
+        authority: traits_contract::AUTHORITY_LINUX,
+        // A Linux host presents on one display: a window or a framebuffer.
+        display_count: 1,
+        // The display takes a raster of the viewport's own extent and
+        // magnifies it itself, so a surface pixel is a logical pixel.
+        dpr_eighths: traits_contract::DPR_1X,
+    });
     // SAFETY: channel_write takes (chan, *const u8, len); buf is a stack array
     // sized to its length. The kernel FIFO write is all-or-nothing, so a
     // non-full return is EAGAIN (channel full), not a partial/corrupt record.

@@ -131,6 +131,52 @@ pub const ANN_ABI_SURFACE: &str = "io.fluxor.abi-surface";
 pub const ANN_INPUT_DIGEST: &str = "io.fluxor.input-digest";
 /// Host triple of a runtime artifact's binary layer.
 pub const ANN_RUNTIME_TRIPLE: &str = "io.fluxor.runtime.triple";
+/// Where a runtime lands under a project's `target/`: `release` or `board`
+/// ([`RuntimePlacement`]).
+pub const ANN_RUNTIME_PLACEMENT: &str = "io.fluxor.runtime.placement";
+
+/// Where a runtime artifact is built, and where `fluxor sync` writes it,
+/// under a project's `target/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePlacement {
+    /// A binary cargo builds: `target/<triple>/release/<name>`, its target
+    /// a host triple (`fluxor-linux`, the wasm kernel).
+    Release,
+    /// A board's kernel image: `target/<board>/<name>`, its target the
+    /// board id, where `tools/firmware.sh` writes `firmware.elf` and
+    /// `firmware.bin` and a firmware-image build reads them.
+    Board,
+}
+
+impl RuntimePlacement {
+    /// The annotation value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Board => "board",
+        }
+    }
+
+    /// The placement a manifest's annotations name.
+    pub fn of(annotations: &Annotations) -> Self {
+        match annotations.get(ANN_RUNTIME_PLACEMENT).map(String::as_str) {
+            Some("board") => Self::Board,
+            _ => Self::Release,
+        }
+    }
+
+    /// The runtime `name` built for `target`, under `project_root`.
+    pub fn path(self, project_root: &Path, target: &str, name: &str) -> PathBuf {
+        match self {
+            Self::Release => project_root
+                .join("target")
+                .join(target)
+                .join("release")
+                .join(name),
+            Self::Board => project_root.join("target").join(target).join(name),
+        }
+    }
+}
 
 pub const PROVENANCE_LOCAL: &str = "local-build";
 pub const PROVENANCE_PUBLISHED: &str = "published";
@@ -277,17 +323,17 @@ pub struct ImageIndex {
 /// Resolve the store root: `$FLUXOR_STORE` override, else
 /// `$XDG_DATA_HOME/fluxor/store`, else `$HOME/.local/share/fluxor/store`.
 pub fn store_root() -> Result<PathBuf> {
-    if let Some(v) = std::env::var_os("FLUXOR_STORE") {
+    if let Some(v) = crate::project::env_var("FLUXOR_STORE") {
         if !v.is_empty() {
             return Ok(PathBuf::from(v));
         }
     }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(xdg) = crate::project::env_var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("fluxor").join("store"));
         }
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
+    let home = crate::project::env_var("HOME").ok_or_else(|| {
         Error::Config(
             "cannot resolve store root: none of $FLUXOR_STORE, $XDG_DATA_HOME, $HOME set".into(),
         )
@@ -1658,6 +1704,7 @@ impl OciStore {
         name: &str,
         version: &str,
         triple: &str,
+        placement: RuntimePlacement,
         binary: &[u8],
         meta: &ArtifactMeta<'_>,
     ) -> Result<Prepared> {
@@ -1673,6 +1720,7 @@ impl OciStore {
         let (bin_digest, bin_size) = stage(&mut staged, binary, true);
         let mut annotations = base_annotations("runtime", meta);
         annotations.insert(ANN_RUNTIME_TRIPLE.into(), triple.into());
+        annotations.insert(ANN_RUNTIME_PLACEMENT.into(), placement.as_str().into());
         let manifest = ImageManifest {
             schema_version: 2,
             media_type: MT_OCI_MANIFEST.into(),
@@ -2742,7 +2790,7 @@ pub fn sha256_hex_prefixed(bytes: &[u8]) -> String {
 /// tests also exclude the project-discovery tests that set the same
 /// variables.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_env_lock() -> crate::project::tests::EnvLockGuard {
     crate::project::tests::ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

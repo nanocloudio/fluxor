@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "uefi", "linux"]
+
+# Fixture that reads `MeasurementStream` records whose block is 32-bit
+# little-endian samples and logs each one decoded:
+#   [sample_log] seq=<n> t_us=<low 32 bits of the record's time> v=<a>,<b>,...
+# A record the contract's decoder refuses, or whose block is not a whole
+# number of samples, is `[sample_log] bad len=<bytes read>`.
+
+[[ports]]
+name = "samples"
+direction = "input"
+content_type = "MeasurementStream"
+requires_capability = "measurement.stream"
+# The 16-byte header and up to eight 32-bit samples.
+max_record = 48
+buffer_size = 256
+
+[observability]
+exempt = "measurement fixture; its '[sample_log]' lines are the observable, consumed by the rig scenarios' rules"

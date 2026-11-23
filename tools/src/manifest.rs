@@ -470,13 +470,14 @@ fn normalise_port_facts(
     port: Option<&str>,
     content_type: &str,
     raw: Option<std::collections::BTreeMap<String, toml::Value>>,
-) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+) -> Result<PortFacts> {
     use fluxor_contracts::vocabulary::{
         fact_rule, facts_for, surface_capability, FactRule, PORT_SCOPED_CAPABILITIES,
     };
     let mut out = std::collections::BTreeMap::new();
+    let mut bound = std::collections::BTreeMap::new();
     let Some(raw) = raw else {
-        return Ok(out);
+        return Ok((out, bound));
     };
     let port = port.unwrap_or("<unnamed>");
     let Some(capability) =
@@ -502,6 +503,18 @@ fn normalise_port_facts(
             )));
         };
         let values = match (fact_rule(&fact, admitted), value) {
+            (FactRule::Exact | FactRule::Ceiling | FactRule::Floor, toml::Value::Table(t)) => {
+                let param = match (t.len(), t.get("param")) {
+                    (1, Some(toml::Value::String(p))) if !p.is_empty() => p.clone(),
+                    _ => {
+                        return Err(Error::Module(format!(
+                            "port `{port}`: fact `{fact}` takes an integer, or                              `{{ param = \"<name>\" }}` to take its value from one of the                              module's integer params."
+                        )))
+                    }
+                };
+                bound.insert(fact, param);
+                continue;
+            }
             (FactRule::Subset, toml::Value::String(v)) => vec![v],
             (FactRule::Subset, toml::Value::Array(items)) => {
                 let mut vs = Vec::with_capacity(items.len());
@@ -526,7 +539,7 @@ fn normalise_port_facts(
                 }
                 vs
             }
-            (FactRule::Exact | FactRule::Ceiling, toml::Value::Integer(i)) => {
+            (FactRule::Exact | FactRule::Ceiling | FactRule::Floor, toml::Value::Integer(i)) => {
                 let Ok(n) = u32::try_from(i) else {
                     return Err(Error::Module(format!(
                         "port `{port}`: fact `{fact}` takes a u32, got {i}."
@@ -559,8 +572,15 @@ fn normalise_port_facts(
         }
         out.insert(fact, values);
     }
-    Ok(out)
+    Ok((out, bound))
 }
+
+/// A port's `[ports.facts]` as parsed: the facts stated as values, and the
+/// numeric facts bound to a param (fact name to param name).
+type PortFacts = (
+    std::collections::BTreeMap<String, Vec<String>>,
+    std::collections::BTreeMap<String, String>,
+);
 
 /// Validate `[[requires_when]]` entries: the capability must be one a
 /// target provides (`TARGET_CAPABILITIES`), spelled canonically, and the
@@ -586,7 +606,36 @@ fn validate_requires_when(entries: Vec<TomlRequiresWhen>) -> Result<Vec<Requires
             )));
         }
         let when = parse_when(e.when, &format!("[[requires_when]] for `{capability}`"))?;
-        out.push(RequiresWhen { capability, when });
+        let facts = parse_when(
+            e.fact,
+            &format!("[[requires_when]] for `{capability}`: `fact`"),
+        )?;
+        let schema = fluxor_contracts::vocabulary::facts_for(&capability).unwrap_or(&[]);
+        for (fact, values) in &facts {
+            let Some((_, admitted)) = schema.iter().find(|(name, _)| name == fact) else {
+                return Err(Error::Module(format!(
+                    "[[requires_when]] for `{capability}`: `{fact}` is not a fact of that \
+                     capability (its facts: {})",
+                    schema
+                        .iter()
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            };
+            if let Some(bad) = values.iter().find(|v| !admitted.contains(&v.as_str())) {
+                return Err(Error::Module(format!(
+                    "[[requires_when]] for `{capability}`: `{bad}` is not a value of fact \
+                     `{fact}` (one of: {})",
+                    admitted.join(", "),
+                )));
+            }
+        }
+        out.push(RequiresWhen {
+            capability,
+            when,
+            facts,
+        });
     }
     Ok(out)
 }
@@ -939,6 +988,11 @@ pub struct PortSpec {
     /// Tools-side only (not serialized); compared across each edge by
     /// `config::validate::validate_port_facts`.
     pub facts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Numeric facts whose value is one of the instance's integer params
+    /// (`refresh_mhz = { param = "refresh_mhz" }`), fact name to param name.
+    /// The composer reads the value per instance: what the graph sets, or
+    /// the param's schema default. Tools-side only.
+    pub fact_params: std::collections::BTreeMap<String, String>,
     /// Whether this module, as a contract provider, cannot answer its
     /// contract until it has heard on this input (`gates_readiness`,
     /// default `true`): a `fat32` answers `EAGAIN` until its `blocks` input
@@ -1924,6 +1978,10 @@ pub struct Manifest {
     /// `.fmod` modules carry their schema embedded in the binary; native modules
     /// declare it here so the config tool can validate YAML and pack TLV.
     pub params: Vec<ManifestParam>,
+    /// The params whose value the module opens as an asset
+    /// (`[[params]] asset = true`), by name. A graph may give only these
+    /// `${asset:<name>}`. TOML-only: the composer's check, never serialized.
+    pub asset_params: Vec<String>,
     /// How the module's timekeeping relates to the scheduler tick. Default
     /// `Unattested` (no declaration). The
     /// config validator rejects `TickCounted`/`Guaranteed` on any adaptive
@@ -1985,6 +2043,7 @@ impl Default for Manifest {
             wasm_opt_level: None,
             opt_level: None,
             params: Vec::new(),
+            asset_params: Vec::new(),
             timer_class: TimerClass::Unattested,
             step_period_ticks: 0,
             execution: None,
@@ -2501,19 +2560,16 @@ impl Manifest {
             return Ok(hit.clone());
         }
         // Per-root manifest layouts, targeting a fluxor source tree
-        // (modules/ at the root). Downstream projects reach these via
-        // the install-root / sibling-checkout search roots below — the
-        // published crate source artifacts ship no per-platform
-        // manifests.
+        // (modules/ at the root). Downstream projects reach Fluxor's
+        // native-module manifests through the install root: the synced
+        // `fluxor-catalog` carries `modules/platform/`.
         const SOURCE_TREE_DIRS: &[&str] = MODULE_LAYERS;
 
         // Search roots are walked in order:
         //   1. Project root (CWD-relative discovery via marker walk, or
         //      `$FLUXOR_PROJECT_ROOT` override).
-        //   2. Install root (`$FLUXOR_INSTALL_ROOT` or exe-prefix
-        //      derivation). Downstream consumers point this at a
-        //      sibling fluxor checkout so native modules resolve
-        //      without requiring a fully-synced registry.
+        //   2. Install root (`$FLUXOR_INSTALL_ROOT`, a `live_trees`
+        //      checkout, the synced catalog, or exe-prefix derivation).
         //   3. Bare CWD as the final fallback so existing call sites
         //      that ran from fluxor's repo root continue to work.
         //
@@ -2532,14 +2588,6 @@ impl Manifest {
         let cwd = std::env::current_dir().unwrap_or_default();
         if !search_roots.contains(&cwd) {
             search_roots.push(cwd);
-        }
-        // Sibling checkouts last, so an in-tree module always wins a name
-        // clash. See `workspace::member_roots` for why this is a dev
-        // convenience and not a resolution path anything shippable may rely on.
-        for member in crate::workspace::member_roots(&project) {
-            if !search_roots.contains(member) {
-                search_roots.push(member.clone());
-            }
         }
 
         let mut found: Option<Manifest> = None;
@@ -2766,7 +2814,7 @@ impl Manifest {
                 idx
             };
 
-            let facts = normalise_port_facts(
+            let (facts, fact_params) = normalise_port_facts(
                 p.name.as_deref(),
                 CONTENT_TYPES[content_type as usize],
                 p.facts,
@@ -2828,6 +2876,7 @@ impl Manifest {
                     None => None,
                 },
                 facts,
+                fact_params,
                 gates_readiness,
                 accepts_record: match &p.accepts_record {
                     Some(v) => v.resolve(abi, "accepts_record")?,
@@ -2972,18 +3021,35 @@ impl Manifest {
         let builtin = toml_val.builtin.unwrap_or(false);
 
         let raw_params = toml_val.params.unwrap_or_default();
-        // `[[params]]` belongs to native modules. PIC (`.fmod`) modules carry
-        // their schema in the binary via the `define_params!` macro;
-        // declaring it again in the manifest would create two sources
-        // of truth for the same wire layout.
-        if !builtin && !raw_params.is_empty() {
-            return Err(Error::Module(format!(
-                "[[params]] is only valid on native modules (`builtin = true`). \
-                 PIC modules embed their schema via `define_params!`. \
-                 Got {} param(s) on a non-native manifest.",
-                raw_params.len(),
-            )));
+        // `[[params]]` is a native module's schema. A PIC (`.fmod`) module
+        // carries its schema in the binary (`define_params!`), and declaring
+        // it again here would be a second source for one wire layout; its
+        // entries only mark the params that take an asset.
+        let asset_params: Vec<String> = raw_params
+            .iter()
+            .filter(|p| p.asset)
+            .map(|p| p.name.clone())
+            .collect();
+        if !builtin {
+            if let Some(p) = raw_params.iter().find(|p| {
+                !p.asset
+                    || p.tag.is_some()
+                    || p.ptype.is_some()
+                    || p.default.is_some()
+                    || p.values.is_some()
+                    || p.range.is_some()
+                    || p.required
+            }) {
+                return Err(Error::Module(format!(
+                    "param '{}': a PIC module embeds its param schema via `define_params!`; \
+                     its manifest's [[params]] entries mark the params that take an asset \
+                     (`name = \"{}\"`, `asset = true`) and state nothing else. A full \
+                     [[params]] schema belongs to a native module (`builtin = true`).",
+                    p.name, p.name,
+                )));
+            }
         }
+        let raw_params = if builtin { raw_params } else { Vec::new() };
 
         let mut params: Vec<ManifestParam> = Vec::new();
         for p in raw_params {
@@ -3016,7 +3082,13 @@ impl Manifest {
                     p.name, prev.name,
                 )));
             }
-            let ptype = match p.ptype.as_str() {
+            let Some(ptype_name) = p.ptype.as_deref() else {
+                return Err(Error::Module(format!(
+                    "param '{}': missing `type` (u8, u16, u32, str or enum)",
+                    p.name
+                )));
+            };
+            let ptype = match ptype_name {
                 "u8" => ManifestParamType::U8,
                 "u16" => ManifestParamType::U16,
                 "u32" => ManifestParamType::U32,
@@ -3029,6 +3101,14 @@ impl Manifest {
                     )));
                 }
             };
+
+            if p.asset && ptype != ManifestParamType::Str {
+                return Err(Error::Module(format!(
+                    "param '{}': `asset = true` marks a `str` param, whose value names the \
+                     asset; this one is `{ptype_name}`",
+                    p.name
+                )));
+            }
 
             // Enum: values list is required; each name maps to its index.
             let mut enum_values: Vec<(String, u8)> = Vec::new();
@@ -3496,6 +3576,7 @@ impl Manifest {
             wasm_opt_level,
             opt_level,
             params,
+            asset_params,
             timer_class,
             step_period_ticks,
             execution,
@@ -3811,6 +3892,7 @@ impl Manifest {
                 serves: None,
                 contract_optional: false,
                 facts: std::collections::BTreeMap::new(),
+                fact_params: std::collections::BTreeMap::new(),
                 gates_readiness: true,
                 accepts_record: 0,
                 retains_send: false,
@@ -3963,6 +4045,7 @@ impl Manifest {
             wasm_opt_level: None,      // toml-only, not serialized
             opt_level: None,           // toml-only, not serialized
             params: Vec::new(),        // toml-only, not serialized
+            asset_params: Vec::new(),  // toml-only, not serialized
             // timer_class is a TOML-only build-time concern (drives the config
             // validator's adaptive-tick gate); not serialized into the binary, so
             // a binary-loaded manifest is Unattested (fail-closed) by default.
@@ -4401,6 +4484,10 @@ struct TomlRequiresWhen {
     /// `when = { param = "value", other = ["a", "b"] }` — every parameter
     /// must match one of its listed values.
     when: std::collections::BTreeMap<String, TomlWhenValues>,
+    /// `fact = { clock = "core" }` — the values of the capability's facts
+    /// the module can work with; see [`RequiresWhen::facts`].
+    #[serde(default)]
+    fact: std::collections::BTreeMap<String, TomlWhenValues>,
 }
 
 /// A `when` value: one admitted value or a list of them.
@@ -4435,6 +4522,11 @@ pub struct RequiresWhen {
     /// `(param, admitted values)`, ordered by parameter name — a TOML
     /// inline table has no declaration order worth preserving.
     pub when: Vec<(String, Vec<String>)>,
+    /// `(fact, accepted values)` of the capability, ordered by fact name:
+    /// the target must provide the capability with each fact at one of the
+    /// values (`counter.cycles` with `clock = "core"`). Empty when the
+    /// capability's presence is all the module needs.
+    pub facts: Vec<(String, Vec<String>)>,
 }
 
 /// `[requires]` TOML section. Used by `check_target_capabilities` to
@@ -4572,9 +4664,10 @@ struct TomlParam {
     /// `tag = N` — the permanent TLV tag for this parameter. Required on
     /// every native entry; see `ManifestParam::tag`.
     tag: Option<u8>,
-    /// One of: u8, u16, u32, str, enum
+    /// One of: u8, u16, u32, str, enum. Stated by a native module; a PIC
+    /// module's entry carries none (its schema is `define_params!`'s).
     #[serde(rename = "type")]
-    ptype: String,
+    ptype: Option<String>,
     /// TOML may parse the default as int, string, or enum-name; capture
     /// raw and resolve in `Manifest::from_toml`.
     default: Option<toml::Value>,
@@ -4588,6 +4681,11 @@ struct TomlParam {
     /// silently misconfigure the graph.
     #[serde(default)]
     required: bool,
+    /// `asset = true`: the module opens this string param's value as an
+    /// asset (`fluxor_rt::asset::open`), so a graph may give it
+    /// `${asset:<name>}`. See [`Manifest::asset_params`].
+    #[serde(default)]
+    asset: bool,
 }
 
 /// A capacity value in port TOML: either flat (`buffer_size = 4096`)
@@ -5287,6 +5385,7 @@ mod tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -5310,6 +5409,7 @@ mod tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -5352,6 +5452,7 @@ mod tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -5482,6 +5583,7 @@ mod tests {
             serves: None,
             contract_optional: false,
             facts: std::collections::BTreeMap::new(),
+            fact_params: std::collections::BTreeMap::new(),
             gates_readiness: true,
             accepts_record: 0,
             retains_send: false,
@@ -6047,7 +6149,8 @@ default = 1
         let err = parse_toml(src).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("[[params]] is only valid on native modules"),
+            msg.contains("a PIC module embeds its param schema via `define_params!`")
+                && msg.contains("param 'x'"),
             "unexpected message: {msg}",
         );
     }
@@ -6466,7 +6569,6 @@ store_subscriptions = 1
         ("linux_display", "width", "u32", 12),
         ("linux_display", "height", "u32", 13),
         ("linux_display", "scale", "u32", 14),
-        ("linux_display", "header", "u32", 15),
         ("linux_eth", "ifname", "str", 10),
         ("linux_eth", "mac", "str", 11),
         ("linux_eth", "mode", "enum", 12),
@@ -6491,10 +6593,8 @@ store_subscriptions = 1
         ("wasm_browser_audio", "lead_ms", "u8", 12),
         ("wasm_browser_canvas", "width", "u16", 10),
         ("wasm_browser_canvas", "height", "u16", 11),
-        ("wasm_browser_canvas", "header", "u16", 12),
         ("wasm_browser_display_capture", "width", "u16", 10),
         ("wasm_browser_display_capture", "height", "u16", 11),
-        ("wasm_browser_display_capture", "header", "u16", 12),
         ("wasm_browser_gpu", "width", "u16", 10),
         ("wasm_browser_gpu", "height", "u16", 11),
         ("wasm_browser_image_codec", "width", "u16", 10),

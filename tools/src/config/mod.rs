@@ -137,6 +137,26 @@ pub fn composed_json(g: &graph::ComposedGraph<'_>) -> Map<String, Value> {
 
 /// The module records of a config blob, in slot order, fans included: each
 /// one's `name_hash` (FNV-1a of its type) and its params TLV.
+/// The node-graph edges of a built config that `smp`'s kernel bridges
+/// between cores (`capacity::crossing_count`): each as its two modules'
+/// domains and whether its class is cross-core.
+pub fn core_crossings(data: &[u8], smp: &crate::target::SmpFacts) -> Result<u64> {
+    let cfg = decode_blob(data)?;
+    let composed = cfg.graph().composed();
+    let domains: Vec<u8> = composed.modules().map(|m| m.domain).collect();
+    let domain = |end: graph::Endpoint| end.new_index().and_then(|i| domains.get(i).copied());
+    Ok(crate::capacity::crossing_count(
+        smp,
+        composed.edges().map(|e| {
+            (
+                domain(e.from),
+                domain(e.to),
+                e.class == graph::EdgeClass::CrossCore,
+            )
+        }),
+    ))
+}
+
 pub fn module_entries(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
     let cfg = decode_blob(data)?;
     Ok(cfg

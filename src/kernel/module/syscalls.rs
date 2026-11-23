@@ -397,7 +397,7 @@ pub fn init_providers() {
     // backend), a hardware backend; each handle names the backend that
     // holds its key. Consumers never name a platform — they read
     // PROBE/CUSTODY/DESCRIBE.
-    provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
+    provider::register(dev_class::KEY_VAULT, primary_stack_key_vault);
     provider::register(
         crate::abi::registry::metal_device::ID,
         crate::kernel::module::metal_device::dispatch,
@@ -406,7 +406,7 @@ pub fn init_providers() {
     // need the `seal_key` grant.
     provider::register(
         crate::abi::registry::vault_store::ID,
-        key_vault_provider_dispatch,
+        primary_stack_key_vault,
     );
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
@@ -522,7 +522,7 @@ static BRIDGE_VTABLE: crate::kernel::module::provider::ProviderVTable =
 static KEY_VAULT_VTABLE: crate::kernel::module::provider::ProviderVTable =
     crate::kernel::module::provider::ProviderVTable {
         contract: crate::kernel::module::provider::contract::KEY_VAULT,
-        call: key_vault_provider_dispatch,
+        call: primary_stack_key_vault,
         query: None,
         default_close_op: contracts::key_vault::DESTROY,
         poll: None,
@@ -714,13 +714,13 @@ static HAL_PWM_VTABLE: crate::kernel::module::provider::ProviderVTable =
         poll: None,
     };
 
-/// KEY_VAULT provider adapter — forwards to the router.
-fn key_vault_provider_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: UserSpan<'_>,
-) -> i32 {
+/// The key vault's provider: the router, on a stack that holds a signature
+/// (see [`primary_stack_dispatch`]); `ENOTSUP` on a small one.
+#[inline(never)]
+fn primary_stack_key_vault(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    if on_small_stack() {
+        return errno::ENOTSUP;
+    }
     crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, data)
 }
 
@@ -1154,6 +1154,26 @@ pub fn register_dev_query_extension(f: QueryExtensionFn) {
     }
 }
 
+/// The platform's answer to whether the calling core steps on a stack too
+/// small for the kernel's deepest calls: a secondary core with a small stack
+/// of its own. None registered: every core's stack holds them.
+static mut SMALL_STACK: Option<fn() -> bool> = None;
+
+/// Name the platform's small-stack test. Boot-time, or `None` to clear it.
+pub fn register_small_stack(f: Option<fn() -> bool>) {
+    // SAFETY: as `register_system_extension` — boot-time installation.
+    unsafe {
+        SMALL_STACK = f;
+    }
+}
+
+/// Whether the calling core steps on a small stack ([`register_small_stack`]).
+fn on_small_stack() -> bool {
+    // SAFETY: written once at boot before any module runs; a word-sized copy.
+    let test = unsafe { *core::ptr::addr_of!(SMALL_STACK) };
+    test.is_some_and(|f| f())
+}
+
 fn system_extension() -> Option<ExtensionFn> {
     // SAFETY: written once at boot before any module runs; a word-sized copy.
     unsafe { *core::ptr::addr_of!(SYSTEM_EXTENSION) }
@@ -1171,7 +1191,7 @@ fn dev_query_extension() -> Option<QueryExtensionFn> {
 /// is running, never from the request.
 fn handle_program_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::kernel_abi::{
-        program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SIGNING_ROOT, SLOT_ADMITTED,
+        program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SLOT_ADMITTED,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
@@ -1196,13 +1216,6 @@ fn handle_program_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32
                 errno::ENOSYS
             }
         }
-        SIGNING_ROOT => match crate::kernel::security::root::signing_root() {
-            Some(root) => match answer(arg, &root) {
-                Ok(()) => 32,
-                Err(e) => e,
-            },
-            None => errno::ENOENT,
-        },
         PROGRAM_INFO => {
             let Some(out) = arg.get_mut(..pg::INFO_LEN) else {
                 return E_INVAL;
@@ -1280,94 +1293,38 @@ fn signal_core(arg: &[u8]) -> i32 {
     }
 }
 
-/// The kernel bucket's provider: every class-routed op (the kernel's own and
-/// every contract the registry routes by class) and the platform contracts
-/// that share it.
-fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
-    use crate::abi::contracts::resource;
-    use crate::abi::contracts::telemetry;
-    use crate::abi::internal::diag;
-    use crate::abi::internal::{bridge, monitor, reconfigure};
-    use crate::abi::kernel_abi::doorbell::DOORBELL_RING;
-    use crate::abi::kernel_abi::{
-        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
-        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE, SIGNAL_CORE,
-    };
-    use crate::abi::registry::lend;
-    use crate::kernel::exec::scheduler;
-    match opcode {
-        SIGNAL_CORE => signal_core(arg),
-        // ── Core primitives ──
-        SELF_INDEX
-        | NET_IDENT_PROVIDER
-        | BOOT_INCARNATION
-        | ARENA_GET
-        | REPORT_LATENCY
-        | REPORT_STEP_EFFECT
-        | LOG_WRITE
-        | SERIAL_WRITE
-        | GET_HW_ETHERNET_MAC
-        | HANDLE_POLL
-        | RANDOM_FILL
-        | MODULE_INSTANCE_PARAMS
-        | MODULE_FLOW_BUDGET
-        | bridge::SELF_BRIDGE
-        | monitor::INTERRUPT_METRICS => handle_core_primitive(handle, opcode, arg, data),
-        // A module provider rings a doorbell it was handed: `[doorbell u32]`.
-        DOORBELL_RING => match arg_u32(arg) {
-            Some(d) => crate::kernel::ipc::event::doorbell_ring_by(
-                d as i32,
-                scheduler::current_module_id(),
-            ),
-            None => E_INVAL,
-        },
-        crate::abi::kernel_abi::PROGRAM_INFO
-        | crate::abi::kernel_abi::PROGRAM_READ
-        | crate::abi::kernel_abi::SIGNING_ROOT
-        | crate::abi::kernel_abi::SLOT_ADMITTED
-        | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, data),
-        // ── Lends ──
-        lend::OPEN => {
-            let mut span = data;
-            crate::kernel::ipc::lend::open(handle, arg, &mut span)
-        }
-        lend::RESOLVE => crate::kernel::ipc::lend::resolve(arg),
-        lend::RETURN => crate::kernel::ipc::lend::give_back(arg),
-        lend::CLOSE => crate::kernel::ipc::lend::close(handle),
-        resource::ELASTIC_ALLOC => handle_elastic_alloc(arg),
-        // A module provider's refusal of a pool it serves, counted by the
-        // ledger; `module_deny` admits the pool's server alone.
-        resource::LEDGER_DENY => match *arg {
-            [a, b, ..] => crate::kernel::sys::resource_ledger::module_deny(
-                u16::from_le_bytes([a, b]),
-                scheduler::current_module_index(),
-            ),
-            _ => E_INVAL,
-        },
-        telemetry::TLM_EMIT
-        | telemetry::TLM_SUBSCRIBE
-        | telemetry::TLM_DRAIN
-        | telemetry::TLM_STATS => handle_telemetry_op(handle, opcode, arg, data),
-        // ── Diagnostics / log transport ──
-        diag::LOG_RING_DRAIN => handle_diag_op(opcode, data),
-        // ── Bridge channel operations ──
-        bridge::WRITE | bridge::READ | bridge::POLL | bridge::INFO => {
-            // `handle` = the bridge's slot (its route's inner index).
-            if handle < 0 {
-                return E_INVAL;
-            }
-            crate::kernel::ipc::isr_ring::dispatch(handle as usize, opcode, arg, data)
-        }
-        // ── Fault monitor ──
-        monitor::FAULT_MONITOR_SUBSCRIBE
-        | monitor::FAULT_MONITOR_POP
-        | monitor::FAULT_STATS_QUERY
-        | monitor::FAULT_RAISE
-        | monitor::STEP_HISTOGRAM_QUERY
-        | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg),
+/// Whether `opcode` is one the kernel answers on the primary stack alone:
+/// the `reconfigure` contract (a change of the graph, a staged update) and
+/// the signing root, which reads and checks the image's layout.
+fn primary_stack_op(opcode: u32) -> bool {
+    opcode >> 8 == u32::from(crate::abi::registry::reconfigure::ID)
+        || opcode == crate::abi::kernel_abi::SIGNING_ROOT
+}
 
-        // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
+/// The ops of [`primary_stack_op`]. They run the kernel's deepest frames (a
+/// signature check, the loader), so a core that steps on a small stack of its
+/// own is refused `ENOTSUP` before any of them runs
+/// ([`register_small_stack`]). The firmware build's stack bound counts a
+/// `primary_stack_*` function for its own frame and no deeper on such a
+/// core, which holds because the refusal is the function's first act.
+#[inline(never)]
+fn primary_stack_dispatch(opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    use crate::abi::internal::reconfigure;
+    use crate::kernel::exec::scheduler;
+    if on_small_stack() {
+        return errno::ENOTSUP;
+    }
+    match opcode {
+        crate::abi::kernel_abi::SIGNING_ROOT => {
+            match crate::kernel::security::root::signing_root() {
+                Some(root) => match answer(arg, &root) {
+                    Ok(()) => 32,
+                    Err(e) => e,
+                },
+                None => errno::ENOENT,
+            }
+        }
+        // ── Live reconfigure primitives ──
         reconfigure::SET_PHASE
         | reconfigure::CALL_DRAIN
         | reconfigure::MARK_FINISHED
@@ -1431,6 +1388,102 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
             Some(&cmd) => crate::kernel::module::ota_stage::stage_ctrl(cmd),
             None => E_INVAL,
         },
+        _ => E_NOSYS,
+    }
+}
+
+/// The kernel bucket's provider: every class-routed op (the kernel's own and
+/// every contract the registry routes by class) and the platform contracts
+/// that share it.
+fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    use crate::abi::contracts::resource;
+    use crate::abi::contracts::telemetry;
+    use crate::abi::internal::diag;
+    use crate::abi::internal::{bridge, monitor};
+    use crate::abi::kernel_abi::doorbell::DOORBELL_RING;
+    use crate::abi::kernel_abi::{
+        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
+        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE, SIGNAL_CORE,
+    };
+    use crate::abi::registry::lend;
+    use crate::kernel::exec::scheduler;
+    match opcode {
+        SIGNAL_CORE => signal_core(arg),
+        // ── Core primitives ──
+        SELF_INDEX
+        | NET_IDENT_PROVIDER
+        | BOOT_INCARNATION
+        | ARENA_GET
+        | REPORT_LATENCY
+        | REPORT_STEP_EFFECT
+        | LOG_WRITE
+        | SERIAL_WRITE
+        | GET_HW_ETHERNET_MAC
+        | HANDLE_POLL
+        | RANDOM_FILL
+        | MODULE_INSTANCE_PARAMS
+        | MODULE_FLOW_BUDGET
+        | bridge::SELF_BRIDGE
+        | monitor::INTERRUPT_METRICS => handle_core_primitive(handle, opcode, arg, data),
+        // A module provider rings a doorbell it was handed: `[doorbell u32]`.
+        DOORBELL_RING => match arg_u32(arg) {
+            Some(d) => crate::kernel::ipc::event::doorbell_ring_by(
+                d as i32,
+                scheduler::current_module_id(),
+            ),
+            None => E_INVAL,
+        },
+        crate::abi::kernel_abi::PROGRAM_INFO
+        | crate::abi::kernel_abi::PROGRAM_READ
+        | crate::abi::kernel_abi::SLOT_ADMITTED
+        | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, data),
+        // ── Lends ──
+        lend::OPEN => {
+            let mut span = data;
+            crate::kernel::ipc::lend::open(handle, arg, &mut span)
+        }
+        lend::RESOLVE => crate::kernel::ipc::lend::resolve(arg),
+        lend::RETURN => crate::kernel::ipc::lend::give_back(arg),
+        lend::CLOSE => crate::kernel::ipc::lend::close(handle),
+        resource::ELASTIC_ALLOC => handle_elastic_alloc(arg),
+        // A module provider's refusal of a pool it serves, counted by the
+        // ledger; `module_deny` admits the pool's server alone.
+        resource::LEDGER_DENY => match *arg {
+            [a, b, ..] => crate::kernel::sys::resource_ledger::module_deny(
+                u16::from_le_bytes([a, b]),
+                scheduler::current_module_index(),
+            ),
+            _ => E_INVAL,
+        },
+        telemetry::TLM_EMIT
+        | telemetry::TLM_SUBSCRIBE
+        | telemetry::TLM_DRAIN
+        | telemetry::TLM_STATS => handle_telemetry_op(handle, opcode, arg, data),
+        // ── Cycle and instruction-cache counters ──
+        crate::abi::contracts::counters::DESCRIBE | crate::abi::contracts::counters::READ => {
+            crate::kernel::sys::counters::dispatch(opcode, arg)
+        }
+        // ── Diagnostics / log transport ──
+        diag::LOG_RING_DRAIN => handle_diag_op(opcode, data),
+        // ── Bridge channel operations ──
+        bridge::WRITE | bridge::READ | bridge::POLL | bridge::INFO => {
+            // `handle` = the bridge's slot (its route's inner index).
+            if handle < 0 {
+                return E_INVAL;
+            }
+            crate::kernel::ipc::isr_ring::dispatch(handle as usize, opcode, arg, data)
+        }
+        // ── Fault monitor ──
+        monitor::FAULT_MONITOR_SUBSCRIBE
+        | monitor::FAULT_MONITOR_POP
+        | monitor::FAULT_STATS_QUERY
+        | monitor::FAULT_RAISE
+        | monitor::STEP_HISTOGRAM_QUERY
+        | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg),
+
+        // ── Live reconfigure, graph mutation, staging; the signing root ──
+        op if primary_stack_op(op) => primary_stack_dispatch(op, arg, data),
 
         _ => match system_extension() {
             // Platform extension for hardware-specific opcodes.

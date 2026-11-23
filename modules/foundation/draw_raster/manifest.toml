@@ -1,0 +1,132 @@
+version = "1.0.0"
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "wasm", "uefi"]
+# Draws what has arrived when it is stepped; nothing here is timed.
+timer_class = "agnostic"
+capabilities = ["video.draw", "video.raster"]
+
+# The reference rasteriser as a module: a draw list in
+# (`abi::contracts::video_draw`), pixels out (`abi::contracts::video_raster`).
+#
+# It retains the last committed frame's records, not its pixels: a frame is
+# drawn a band at a time into one band buffer and sent as regions that update
+# the consumer's retained surface (`FLAG_DAMAGE`, the last with `FLAG_LAST`).
+# So every frame's damage must be the whole surface, and the consumer of
+# `pixels` holds the picture.
+#
+# `surface0` and `surface1` are raster inputs a SURFACE record places: each is
+# held whole at its own resolution, double-buffered. When one commits a
+# frame, the box around the retained frame's SURFACE records that name it is
+# drawn again and sent. A new STREAM drops the retained frame, and the
+# surface shown so far is sent black until the stream's first COMMIT.
+#
+# A faulted stream is logged with the fault and the byte offset, the frame
+# in progress is discarded, and records are skipped to the next STREAM.
+#
+# A RES_REF record names a glyph pack or a strike the instance holds in
+# place: an asset the graph gives one of the `pack` params
+# (`pack0: ${asset:<name>}`), which the build makes a program of the
+# instance. The module reads it where the node image keeps it and copies
+# nothing; it hashes each one once after it starts, a slice a step, and
+# takes no stream until that is done. A `pack` param on a target that does
+# not keep the asset readable in place is refused at construction.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name           | Type | Default | Description |
+# |-----|----------------|------|---------|-------------|
+# | 1   | width          | u16  | 480     | Widest surface a STREAM may open. |
+# | 2   | height         | u16  | 480     | Tallest surface a STREAM may open. |
+# | 3   | format         | u8   | rgb565  | Output pixels: `rgb565` or `rgba8`. |
+# | 4   | band_bytes     | u32  | 23040   | The band buffer, three bytes a pixel: a band is as many rows as fit (16 at 480 wide). A stream wider than a third of it is refused. |
+# | 5   | frame_bytes    | u32  | 8192    | The largest frame retained, FRAME through COMMIT. Two are held. |
+# | 6   | resource_bytes | u32  | 16384   | Bytes of defined resources live at once. |
+# | 7   | record_bytes   | u32  | 2048    | The largest record read: a producer keeps each RES_DATA and GLYPHS record within it. |
+# | 8   | surface_bytes  | u32  | 0       | The largest surface each raster input holds, in its own format; 0 for a graph with no surfaces. |
+# | 9-12 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack or one strike. |
+
+[[params]]
+name = "pack0"
+asset = true
+
+[[params]]
+name = "pack1"
+asset = true
+
+[[params]]
+name = "pack2"
+asset = true
+
+[[params]]
+name = "pack3"
+asset = true
+
+[[ports]]
+name = "draw"
+direction = "input"
+content_type = "VideoDraw"
+required = true
+# A frame's records, or a band's regions, arrive in one step: the ring
+# holds them where the target has the room.
+buffer_size = { default = 8192, aarch64 = 32768, wasm32 = 32768 }
+[ports.facts]
+ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref"]
+pixmap_formats = ["rgba8", "rgb565"]
+glyph_formats = ["a1", "a8"]
+max_depth = 8
+max_resources = 16
+damage = ["full"]
+atomic = ["yes", "no"]
+surfaces = 2
+
+[[ports]]
+name = "surface0"
+index = 1
+direction = "input"
+content_type = "VideoRaster"
+required = false
+# A frame's records, or a band's regions, arrive in one step: the ring
+# holds them where the target has the room.
+buffer_size = { default = 8192, aarch64 = 32768, wasm32 = 32768 }
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage", "bands"]
+
+[[ports]]
+name = "surface1"
+index = 2
+direction = "input"
+content_type = "VideoRaster"
+required = false
+# A frame's records, or a band's regions, arrive in one step: the ring
+# holds them where the target has the room.
+buffer_size = { default = 8192, aarch64 = 32768, wasm32 = 32768 }
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage", "bands"]
+
+[[ports]]
+name = "pixels"
+direction = "output"
+content_type = "VideoRaster"
+required = true
+# A frame's records, or a band's regions, arrive in one step: the ring
+# holds them where the target has the room.
+buffer_size = { default = 8192, aarch64 = 32768, wasm32 = 32768 }
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage"]
+
+[capacities]
+# One block from the heap: the read buffer, two retained frames, the
+# resource arena, the band, one output row (four bytes a pixel of `width`)
+# and two buffers for each of the two raster inputs.
+heap_per_param = { base = 192, params = [
+    { tag = 1, default = 480, bytes_each = 4 },
+    { tag = 4, default = 23040, bytes_each = 1 },
+    { tag = 5, default = 8192, bytes_each = 2 },
+    { tag = 6, default = 16384, bytes_each = 1 },
+    { tag = 7, default = 2048, bytes_each = 1 },
+    { tag = 8, default = 0, bytes_each = 4 },
+] }
+
+[observability]
+exempt = "a rasteriser — the frames it sends are what there is to observe; a refused stream is logged with its fault and offset"

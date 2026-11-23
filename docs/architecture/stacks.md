@@ -353,8 +353,7 @@ assets:
     params: { fonts: "${asset:sans.gpk}" }
 ```
 
-A module param names an asset with `${asset:<name>}`, as a whole value or
-inside text:
+A module param names an asset with `${asset:<name>}`:
 
 ```yaml
 modules:
@@ -368,17 +367,67 @@ It resolves by the graph's target family, on the parsed graph, after
 | Family | `${asset:<name>}` is |
 |---|---|
 | `wasm` | `asset://<name>`, served from the wasm bundle's `fluxor.assets` section through the FS contract |
-| `linux` | the absolute path of the asset's file: a path entry's file, or a built asset's `target/assets/<name>` under the graph's project |
-| any other | refused: a bare-metal image carries no asset area a module could open an asset from by name |
+| `linux` | the absolute path of the asset's file: a path entry's file, or a built asset's `target/assets/<inputs>/<name>` under the graph's project |
+| `rp2`, `bcm`, `uefi` | `program:<slot>`: the asset is a program of the module instance, carried in the node image and read in place |
+| any other | refused, naming the families that give a module an asset |
 
-A name `assets:` does not declare is refused, naming the graph. Resolving a placeholder never builds anything, so a check
-(`fluxor build --check`, `fluxor ci`, `fluxor run --validate-only`) renders
-the path a build would write without running a build step.
+On `wasm` and `linux` the placeholder may also sit inside a longer value
+and anywhere in the graph. On a family whose node image carries programs
+the asset becomes a **program of the instance whose param names it**
+([module_architecture.md](module_architecture.md), "Programs"): the build
+appends `{ file: <the asset's file>, kind: <its name> }` to the instance's
+`programs:` (its one `program:` becoming the first of the list), in the
+order of the param names that name an asset, and the param reads
+`program:<slot>`. Two params of one instance that name one asset share the
+slot; two instances each carry their own copy, because every owner's
+programs lie in a region of their own. There the placeholder is the whole
+value of a module param and nothing else: inside a longer value, outside a
+module's params, or in a workload's module (a workload image carries no
+programs, and the kernel finds programs only for the node graph's own
+modules) it is refused, naming the module and the param.
+
+A param takes an asset only if its module says so. The module's manifest
+marks it:
+
+```toml
+[[params]]
+name = "document"
+asset = true
+```
+
+and the module opens the value with `fluxor_rt::asset::open`, which tells
+the three forms apart: a program it reads in place where the kernel
+answers an address (flash on an RP board, the loaded node image on
+aarch64), a program it reads through `PROGRAM_READ` where there is none,
+or a file for the FS contract. On a native module the mark is one more key
+of the param's `[[params]]` entry, which must be a `str`. A graph that
+gives an asset to a param not marked is refused on every family, naming
+the module, the param and the manifest lines to add. The build records the
+params it resolved under the module entry's `asset_params` key for that
+check; the key is never written in a graph.
+
+A name `assets:` does not declare is refused, naming the graph. Resolving
+a placeholder never builds anything, so a check (`fluxor build --check`,
+`fluxor ci`, `fluxor run --validate-only`) renders the path a build would
+write without running a build step.
+
+**Limits on a board.** Assets count as programs: 255 a node image and 256
+an instance, and the refusal names the asset that crossed. An RP node
+image, assets included, fits one graph slot of the board's flash
+(`flash_layout::graph_flash`; 1,144 KiB on a 4 MiB part with the RP2350
+kernel reserve), and an image past it is refused naming the slot, the
+image and its three largest programs. An `isolated` instance reads its
+programs through one MPU region: the RP2350 draws any 32-byte-granular
+span, while the RP2040 needs a power-of-two region aligned to its size, so
+there the build plans the region at its address in the image and in both
+graph slots and refuses one the MPU cannot draw, naming the instance, the
+region and the remedies (`protection: contained`, a smaller asset, or an
+RP2350 board).
 
 **Building.** `fluxor build`, and with it `fluxor run` and a scenario's
 component builds, builds every `build:` entry first, for any target. For
 each, it composes a Linux graph in the graph's own project, under
-`target/assets/.build/<name>/`:
+`target/assets/.build/<inputs>/<name>/`:
 
 ```yaml
 target: linux
@@ -396,7 +445,11 @@ wiring:
 It builds that graph and runs it on the project's host runtime (the
 `fluxor-linux` `fluxor sync` installs under
 `target/<host triple>/release/`), keeping stdout as the asset's file,
-`target/assets/<name>`. From there a built asset is a file like any
+`target/assets/<inputs>/<name>`. `<inputs>` is a digest of what builds
+the asset — the bound name, `from:`, and its params with each
+`${asset:}` resolved — so two graphs of one project that build one name
+from different params each keep their own file, and a Linux run reads the
+bytes its own graph built. From there a built asset is a file like any
 other: a wasm bundle bakes it, a Linux module reads it by path. The build
 fails, naming the graph, the asset, the bound name and the stack, when the
 runtime exits non-zero or writes nothing; it prints the step's diagnostics,

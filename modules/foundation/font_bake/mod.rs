@@ -121,7 +121,7 @@ fluxor_rt::name_table!(
     OPTION_ERRORS = [
         b"`format` is a glyph pack format: `a8` or `a1`",
         b"`sizes` lists whole pixel sizes, 1 to 1024, separated by commas",
-        b"`scales` lists whole scales, 1 to 8, separated by commas",
+        b"`scales` lists device pixel ratios in eighths, 0.125 to 8 (1, 1.25, 1.5, 2), separated by commas",
         b"more than 64 strikes",
         b"`chars` is a unicode-range list: `U+0020-007E, U+2026`",
         b"more than 64 `chars` ranges",
@@ -280,7 +280,19 @@ fn step_bake(s: &mut State) {
     let (format, np, nc) = match parsed {
         Ok(v) => v,
         Err(why) => {
-            error(s, OPTION_ERRORS.get(why as usize));
+            // The refused item, copied out of the params it borrows from.
+            let mut item = [0u8; 32];
+            let n = why.item.len().min(item.len());
+            item[..n].copy_from_slice(&why.item[..n]);
+            let code = why.code;
+            begin(s);
+            put(s, OPTION_ERRORS.get(code as usize));
+            if n > 0 {
+                put(s, b": `");
+                put(s, &item[..n]);
+                put(s, b"`");
+            }
+            end(s);
             s.phase = PH_WRITE;
             return;
         }

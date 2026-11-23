@@ -1,6 +1,8 @@
-//! Edges between execution domains: each is split at the domain boundary into
-//! a producer-side and a consumer-side channel joined by a lock-free SPSC ring,
-//! and each side's domain pumps its half on its own core.
+//! Edges between execution domains on different cores: each is split at the
+//! boundary into a producer-side and a consumer-side channel joined by a
+//! lock-free SPSC ring, and each side's domain pumps its half on its own core.
+//! An edge between two domains of one core stays a plain channel: one loop
+//! steps both ends.
 //!
 //! ## SPSC ring
 //!
@@ -12,9 +14,11 @@
 //!
 //! ## Signalling
 //!
-//! The producer writes the slot, publishes the head with Release, then issues
-//! `dmb ish` + `sev`, which ends a wait in WFE. A consumer domain idling in WFI
-//! takes the frame on its next pass, so its tick bounds the delivery latency.
+//! The producer writes the slot, publishes the head with Release, then
+//! signals the other cores (the platform's `signal`: a barrier and `sev`),
+//! which ends a wait for an event. A consumer domain waiting for its tick
+//! interrupt takes the frame on its next pass, so its tick bounds the
+//! delivery latency.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,8 +31,13 @@ use crate::kernel::exec::scheduler::{self, MAX_DOMAINS};
 /// that crosses domains.
 pub const MAX_CROSS_CHANNELS: usize = 256;
 
-/// Number of slots in each ring buffer. Must be a power of 2.
+/// Number of slots in each ring buffer. Must be a power of 2. A ring's slots
+/// come out of the kernel's static pool on a microcontroller, where two hold
+/// a frame in flight and the next behind it.
+#[cfg(not(feature = "rp"))]
 pub const RING_SLOTS: usize = 8;
+#[cfg(feature = "rp")]
+pub const RING_SLOTS: usize = 2;
 
 /// Mask for wrapping ring indices (RING_SLOTS - 1).
 const RING_MASK: u32 = (RING_SLOTS - 1) as u32;
@@ -42,13 +51,12 @@ pub const SLOT_DATA_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 
 // ── Cross-domain telemetry ────────────────────────────────────────────────
 //
-// Three aggregate counters show a bridge losing or holding back data, so an
+// Two aggregate counters show a bridge refusing or holding back data, so an
 // overloaded destination can be diagnosed on a running node:
 //
-// * `CROSS_DOMAIN_DROPS` — the ring refused a frame the producer pump had
-//   already read out of the producer's mailbox: a frame lost. The pump checks
-//   for room first, so this is a frame the ring cannot carry (one claimed by
-//   another producing core), never a full ring.
+// * `CROSS_DOMAIN_DROPS` — the ring refused the producer pump: a ring
+//   claimed by another producing core, never a full ring (the pump checks
+//   for room first). The record stays in the producer's channel.
 // * `CROSS_DOMAIN_BACKPRESSURE` — a pump pass that stopped with frames left
 //   where they were: the ring full on the producer side, or the consumer's
 //   channel without room for the next frame. Nothing is lost, but a sustained
@@ -206,21 +214,8 @@ impl CrossDomainChannel {
         }
         let len = src.len();
 
-        // SPSC enforcement: claim or verify producer core
-        #[cfg(target_arch = "aarch64")]
-        {
-            let my_core = current_core_id_inline();
-            let prev = self.producer_core.compare_exchange(
-                PRODUCER_NONE,
-                my_core,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-            match prev {
-                Ok(_) => {}                          // We claimed it
-                Err(owner) if owner == my_core => {} // Already ours
-                Err(_) => return false,              // Different core owns this channel
-            }
+        if !self.claim_producer() {
+            return false;
         }
 
         let head = self.head.val.load(Ordering::Relaxed);
@@ -246,11 +241,79 @@ impl CrossDomainChannel {
         // Publish the new head (Release ensures slot writes are visible first)
         self.head.val.store(head.wrapping_add(1), Ordering::Release);
 
-        // Ends a consumer's wait in WFE; one idling in WFI takes the frame on
-        // its next pass.
-        crate::arch::aarch64::cpu::signal_cores();
+        // Ends a consumer's wait for an event; one waiting for its tick
+        // takes the frame on its next pass.
+        super::signal();
 
         true
+    }
+
+    /// SPSC enforcement: the first core to produce claims the ring, and a
+    /// send from any other core is refused.
+    fn claim_producer(&self) -> bool {
+        let my_core = super::core_id() as u32;
+        match self.producer_core.compare_exchange(
+            PRODUCER_NONE,
+            my_core,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => true,
+            Err(owner) => owner == my_core,
+        }
+    }
+
+    /// Enqueue one frame the caller writes in place (producer side): `fill`
+    /// is handed the next free slot's payload and returns the bytes it wrote,
+    /// or `None` to enqueue nothing. Returns the frame's length, `None` when
+    /// the ring is full, another core owns the producer side, or `fill`
+    /// declined.
+    pub fn send_with(
+        &self,
+        fill: impl FnOnce(&mut [u8; SLOT_DATA_SIZE]) -> Option<usize>,
+    ) -> Option<usize> {
+        if !self.claim_producer() {
+            return None;
+        }
+        let head = self.head.val.load(Ordering::Relaxed);
+        let tail = self.tail.val.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= RING_SLOTS as u32 {
+            return None;
+        }
+        let slot_idx = (head & RING_MASK) as usize;
+        // SAFETY: SPSC ring: the single producer owns the slot at `head`
+        // until it publishes the new head; `slot_idx < RING_SLOTS`.
+        let len = unsafe {
+            let slot_ptr = &self.slots[slot_idx] as *const RingSlot as *mut RingSlot;
+            let len = fill(&mut *core::ptr::addr_of_mut!((*slot_ptr).data))?.min(SLOT_DATA_SIZE);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*slot_ptr).len), len as u32);
+            len
+        };
+        self.head.val.store(head.wrapping_add(1), Ordering::Release);
+        super::signal();
+        Some(len)
+    }
+
+    /// Dequeue the oldest frame, read in place (consumer side): `take` is
+    /// handed the frame and the frame leaves the ring when it returns.
+    /// `None` when the ring is empty.
+    pub fn recv_with<R>(&self, take: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let tail = self.tail.val.load(Ordering::Relaxed);
+        let head = self.head.val.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let slot_idx = (tail & RING_MASK) as usize;
+        // SAFETY: SPSC consumer: the slot at `tail` was published by the
+        // producer with Release and is not rewritten until the tail moves.
+        let r = unsafe {
+            let slot_ptr = &self.slots[slot_idx] as *const RingSlot;
+            let len = (core::ptr::read_volatile(core::ptr::addr_of!((*slot_ptr).len)) as usize)
+                .min(SLOT_DATA_SIZE);
+            take(&(&*core::ptr::addr_of!((*slot_ptr).data))[..len])
+        };
+        self.tail.val.store(tail.wrapping_add(1), Ordering::Release);
+        Some(r)
     }
 
     /// The length of the oldest frame, without consuming it; `None` when the
@@ -323,13 +386,6 @@ impl CrossDomainChannel {
     }
 }
 
-/// The running core's number, for SPSC enforcement.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn current_core_id_inline() -> u32 {
-    crate::arch::aarch64::cpu::current_core_id() as u32
-}
-
 // Channel pool: one SPSC ring per cross-domain edge of the graph, carved when
 // the graph is bridged ([`size_cross`]).
 static CROSS_CHANNELS: crate::kernel::mem::table::Table<CrossDomainChannel, 0> =
@@ -372,6 +428,14 @@ pub unsafe fn size_cross(n: usize) -> Result<(), crate::kernel::mem::table::Tabl
     edges.reserve(n)?;
     edges.grow(n)
 }
+
+// What an edge between cores takes of the RP kernel's pool is a figure the
+// graph builder charges a graph's state arena: the two are one constant.
+#[cfg(all(feature = "rp", target_pointer_width = "32"))]
+const _: () = assert!(
+    core::mem::size_of::<CrossDomainChannel>() + core::mem::size_of::<CrossDomainEdge>()
+        == fluxor_contracts::core_map::RP_CROSSING_BYTES
+);
 
 // ============================================================================
 // Cross-domain edge tracking
@@ -497,14 +561,15 @@ pub fn bridge_edges() -> Result<usize, &'static str> {
     let n_compiled_edges = sched.edge_count;
     // Size the ring and edge tables for this graph's cross-domain edges
     // before any is registered.
+    let crosses = |edge: &scheduler::Edge| {
+        edge.edge_class == EdgeClass::CrossCore
+            || super::crosses_cores(
+                scheduler::module_domain_id(edge.from_module) as usize,
+                scheduler::module_domain_id(edge.to_module) as usize,
+            )
+    };
     let crossing = (0..n_compiled_edges)
-        .filter(|&e| {
-            let edge = sched.edges[e];
-            edge.channel >= 0
-                && (scheduler::module_domain_id(edge.from_module)
-                    != scheduler::module_domain_id(edge.to_module)
-                    || edge.edge_class == EdgeClass::CrossCore)
-        })
+        .filter(|&e| sched.edges[e].channel >= 0 && crosses(&sched.edges[e]))
         .count();
     // SAFETY: graph prep (boot) or full quiesce (rebuild): no pump walks the
     // tables.
@@ -524,8 +589,7 @@ pub fn bridge_edges() -> Result<usize, &'static str> {
         let to = edge_snapshot.to_module;
         let from_domain = scheduler::module_domain_id(from);
         let to_domain = scheduler::module_domain_id(to);
-        let is_cross = from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
-        if !is_cross {
+        if !crosses(&edge_snapshot) {
             e += 1;
             continue;
         }
@@ -682,24 +746,30 @@ pub fn pump(domain_id: usize) {
                 if rec <= 0 {
                     break; // nothing buffered
                 }
-                let mut buf = [0u8; SLOT_DATA_SIZE];
-                let want = (rec as usize).min(buf.len());
-                // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
-                // channel_read writes ≤ `want <= buf.len()` bytes.
-                let n = unsafe {
-                    crate::kernel::ipc::channel::channel_read(
-                        edge.local_out_handle,
-                        buf.as_mut_ptr(),
-                        want,
-                    )
-                };
-                if n <= 0 {
-                    break; // producer mailbox empty
-                }
-                // The ring had room, so a refusal is a frame it cannot carry
-                // (another core claimed the producer side): counted as lost.
-                if !ch.send(&buf[..n as usize]) {
-                    CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
+                // The record is read straight into the ring's next slot. The
+                // ring had room, so a refusal is a ring another core claimed
+                // the producer side of: the record stays in the producer's
+                // channel and the refusal is counted.
+                let mut read = 0i32;
+                let sent = ch.send_with(|slot| {
+                    let want = (rec as usize).min(slot.len());
+                    // SAFETY: `slot` is `SLOT_DATA_SIZE` writable bytes;
+                    // channel_read writes at most `want` of them.
+                    read = unsafe {
+                        crate::kernel::ipc::channel::channel_read(
+                            edge.local_out_handle,
+                            slot.as_mut_ptr(),
+                            want,
+                        )
+                    };
+                    usize::try_from(read).ok().filter(|&n| n > 0)
+                });
+                if sent.is_none() {
+                    if read == 0 {
+                        // The slot was never offered: the ring refused this
+                        // core as its producer.
+                        CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
                     break;
                 }
                 let mi = flow_index(edge.from_domain as usize, edge.to_domain as usize);
@@ -741,19 +811,21 @@ pub fn pump(domain_id: usize) {
                     CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
-                let mut buf = [0u8; SLOT_DATA_SIZE];
-                let Some(len) = ch.try_recv(&mut buf) else {
+                // The frame is written straight from its slot; the channel
+                // was just confirmed to have room for all of it, so the
+                // write is complete.
+                let delivered = ch.recv_with(|frame| {
+                    // SAFETY: `frame` is the slot's valid bytes.
+                    unsafe {
+                        crate::kernel::ipc::channel::channel_write(
+                            edge.local_in_handle,
+                            frame.as_ptr(),
+                            frame.len(),
+                        );
+                    }
+                });
+                if delivered.is_none() {
                     break; // ring drained between peek and recv
-                };
-                // SAFETY: `len == slot_len <= SLOT_DATA_SIZE = buf.len()`, and
-                // the FIFO was just confirmed to have room for the whole slot,
-                // so this write is complete (no truncation).
-                unsafe {
-                    crate::kernel::ipc::channel::channel_write(
-                        edge.local_in_handle,
-                        buf.as_ptr(),
-                        len,
-                    );
                 }
                 let mi = flow_index(edge.from_domain as usize, edge.to_domain as usize);
                 XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);

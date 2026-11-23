@@ -118,36 +118,159 @@ fn read_ci_stamp(project_root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Source-artifact candidates for a project, as
-/// `(name, dir, tar prefix)`. Fluxor publishes the three crates every
-/// module links — `fluxor-abi`, `fluxor-sdk`, `fluxor-rt`, each its
-/// `crates/<name>` tree unprefixed, so `fluxor sync` stages it at
-/// `target/fluxor/<name>/` where the module build compiles it to an rlib —
-/// and `fluxor-contracts` = `contracts/src/**` under `src/`. A sibling
-/// publishes `modules/common/**` as `<project>-common`, unprefixed.
-fn source_candidates(
-    pr: &Path,
-    project_name: &str,
-) -> Vec<(String, PathBuf, Option<&'static str>)> {
+/// The trees one source artifact takes in: each `(dir, tar prefix)`.
+type SourceParts = Vec<(PathBuf, Option<&'static str>)>;
+
+/// Source-artifact candidates for a project, as `(name, parts)`, each part
+/// a `(dir, tar prefix)` the artifact's tree takes in. Fluxor publishes the
+/// four crates every module links — `fluxor-abi`, `fluxor-sdk`,
+/// `fluxor-rt`, each its `crates/<name>` tree unprefixed, and
+/// `fluxor-contracts` = its `Cargo.toml` and `src/**`, the crate without its
+/// tests — so `fluxor sync`
+/// stages each at `target/fluxor/<name>/` where the module build compiles it
+/// to an rlib; and `fluxor-catalog`, its `stacks/`, `targets/` and the
+/// manifests of the native modules its runtimes carry (`modules/platform/`),
+/// which a consumer resolves stacks, target descriptors and those modules'
+/// ports from once synced. A
+/// sibling publishes `modules/common/**` as `<project>-common`, unprefixed.
+fn source_candidates(pr: &Path, project_name: &str) -> Vec<(String, SourceParts)> {
     if project_name == "fluxor" {
+        let one = |name: &str, dir: PathBuf, prefix| (name.to_string(), vec![(dir, prefix)]);
         [
-            ("fluxor-abi", pr.join("crates/fluxor-abi"), None),
-            ("fluxor-sdk", pr.join("crates/fluxor-sdk"), None),
-            ("fluxor-rt", pr.join("crates/fluxor-rt"), None),
-            ("fluxor-contracts", pr.join("contracts/src"), Some("src")),
+            one("fluxor-abi", pr.join("crates/fluxor-abi"), None),
+            one("fluxor-sdk", pr.join("crates/fluxor-sdk"), None),
+            one("fluxor-rt", pr.join("crates/fluxor-rt"), None),
+            (
+                "fluxor-contracts".to_string(),
+                vec![
+                    (pr.join("contracts/Cargo.toml"), Some("Cargo.toml")),
+                    (pr.join("contracts/src"), Some("src")),
+                ],
+            ),
+            (
+                crate::project::CATALOG_SOURCE.to_string(),
+                vec![
+                    (pr.join("stacks"), Some("stacks")),
+                    (pr.join("targets"), Some("targets")),
+                    (pr.join("modules/platform"), Some("modules/platform")),
+                ],
+            ),
         ]
         .into_iter()
-        .filter(|(_, d, _)| d.is_dir())
-        .map(|(n, d, p)| (n.to_string(), d, p))
+        .filter(|(_, parts)| parts.iter().all(|(p, _)| p.exists()))
         .collect()
     } else {
         let common = pr.join("modules/common");
         if common.is_dir() {
-            vec![(format!("{project_name}-common"), common, None)]
+            vec![(format!("{project_name}-common"), vec![(common, None)])]
         } else {
             Vec::new()
         }
     }
+}
+
+/// Why each module a Fluxor stack (`stacks/*.toml`) injects that Fluxor owns
+/// would reach a consumer with no manifest, one refusal per module. A
+/// consumer composes a stack from the published catalog and wires the
+/// modules it injects by their ports. A Fluxor module ships its manifest
+/// either as a native module's manifest under `modules/platform/`, which
+/// the catalog carries, or inside the `.fmod` artifact of a module Fluxor
+/// publishes. A module Fluxor does not own is the consumer's to supply, from
+/// its own tree or a dependency's pins. Empty when every Fluxor module a
+/// stack injects ships.
+pub fn catalog_stack_refusals(pr: &Path) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct StackFile {
+        #[serde(default)]
+        variant: Vec<Injection>,
+        #[serde(default)]
+        overlay: Vec<Injection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Injection {
+        #[serde(default)]
+        modules: Vec<Injected>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Injected {
+        name: String,
+        #[serde(rename = "type")]
+        type_name: Option<String>,
+    }
+
+    let native = pr.join("modules/platform");
+    // Fluxor's modules whose manifest reaches no consumer, with why.
+    let mut unshipped = std::collections::BTreeMap::new();
+    for m in crate::modules_build::list(pr)? {
+        let why = if m.builtin {
+            (!m.manifest.starts_with(&native))
+                .then_some("a native module outside modules/platform/, which the catalog carries")
+        } else {
+            crate::manifest::publish_withheld(&m.manifest)?
+                .is_some()
+                .then_some("a module withheld from publishing")
+        };
+        if let Some(why) = why {
+            unshipped.insert(m.name, why);
+        }
+    }
+
+    let dir = pr.join("stacks");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut stacks: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    stacks.sort();
+    let mut refusals = Vec::new();
+    for path in stacks {
+        let rel = path.strip_prefix(pr).unwrap_or(&path).display().to_string();
+        let file: StackFile = toml::from_str(&std::fs::read_to_string(&path)?)
+            .map_err(|e| Error::Config(format!("{rel}: {e}")))?;
+        let mut named = std::collections::BTreeSet::new();
+        for m in file
+            .variant
+            .iter()
+            .chain(&file.overlay)
+            .flat_map(|i| &i.modules)
+        {
+            let ty = m.type_name.as_deref().unwrap_or(&m.name);
+            if let Some(why) = unshipped.get(ty) {
+                if named.insert(ty.to_string()) {
+                    refusals.push(format!(
+                        "{rel} injects Fluxor's module '{ty}', whose manifest no consumer \
+                         receives: it is {why}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(refusals)
+}
+
+/// The files of a source artifact's `parts`, in one sorted tree. A part is
+/// a directory, walked under its prefix, or a single file, stored at its
+/// prefix.
+fn collect_source(parts: &[(PathBuf, Option<&'static str>)]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for (path, prefix) in parts {
+        if path.is_file() {
+            let name = match prefix {
+                Some(p) => p.to_string(),
+                None => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            files.push((name, std::fs::read(path).map_err(Error::Io)?));
+        } else {
+            files.extend(collect_tree(path, *prefix)?);
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
 }
 
 /// Per-artifact input digests for everything the project publishes —
@@ -157,8 +280,8 @@ fn source_candidates(
 pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
     let identity = require_project_identity(pr)?;
     let mut out = BTreeMap::new();
-    for (name, dir, prefix) in source_candidates(pr, &identity.name) {
-        out.insert(name, input_digest_hex(&collect_tree(&dir, prefix)?));
+    for (name, parts) in source_candidates(pr, &identity.name) {
+        out.insert(name, input_digest_hex(&collect_source(&parts)?));
     }
     // Roots a module's out-of-dir source references may resolve
     // within: this project plus every workspace-member checkout.
@@ -342,13 +465,21 @@ pub fn publish_project_into(
         (input_hex.map(str::to_string), ci_hex)
     };
 
-    // Source trees: fluxor publishes `fluxor-abi`, `fluxor-sdk` and
-    // `fluxor-rt` (each its `crates/` tree) and `fluxor-contracts`
-    // (contracts/src/** under `src/`); siblings publish modules/common/**
-    // as `<name>-common`.
+    // Source trees ([`source_candidates`]): fluxor's module crates and its
+    // catalog; siblings publish modules/common/** as `<name>-common`.
     if want("source") {
-        for (name, dir, prefix) in source_candidates(&pr, &identity.name) {
-            let files = collect_tree(&dir, prefix)?;
+        if identity.name == "fluxor" {
+            let refusals = catalog_stack_refusals(&pr)?;
+            if !refusals.is_empty() {
+                return Err(Error::Config(format!(
+                    "the {} would publish stacks a consumer cannot wire:\n  {}",
+                    crate::project::CATALOG_SOURCE,
+                    refusals.join("\n  ")
+                )));
+            }
+        }
+        for (name, parts) in source_candidates(&pr, &identity.name) {
+            let files = collect_source(&parts)?;
             let input_hex = input_digests
                 .get(&name)
                 .cloned()
@@ -582,17 +713,11 @@ pub fn publish_project_into(
         }
     }
 
-    // Runtimes: `[project].runtimes` binaries, plus — for fluxor — the
-    // CLI itself, which is a runtime artifact the launcher resolves.
+    // Runtimes ([`runtimes_to_publish`]): `[project].runtimes` binaries,
+    // and for fluxor the CLI and every board's kernel image.
     if want("runtime") {
-        let mut names = identity.runtimes.clone();
-        if identity.name == "fluxor" && !names.iter().any(|n| n == "fluxor") {
-            names.push("fluxor".to_string());
-        }
-        let host = detect_host_target()?;
-        for entry in names {
-            let (triple, name) = runtime_entry(&entry, &host)?;
-            let bin = pr.join("target").join(&triple).join("release").join(&name);
+        for (target, name, placement) in runtimes_to_publish(&pr, &identity)? {
+            let bin = placement.path(&pr, &target, &name);
             if !bin.is_file() {
                 if verbose {
                     println!("runtime {name}: not built at {} — skipped", bin.display());
@@ -603,7 +728,7 @@ pub fn publish_project_into(
             // Reading and hashing a runtime is the one step of a publish that
             // takes real time, so it says what it is doing while it does it.
             println!(
-                "  runtime {name} ({:.1} MB) — hashing",
+                "  runtime {name} for {target} ({:.1} MB) — hashing",
                 bytes.len() as f64 / 1_048_576.0
             );
             let meta = ArtifactMeta {
@@ -619,7 +744,8 @@ pub fn publish_project_into(
             prepared.push(store.prepare_runtime(
                 &name,
                 &identity.version,
-                &triple,
+                &target,
+                placement,
                 &bytes,
                 &meta,
             )?);
@@ -717,6 +843,46 @@ pub fn publish_project_into(
         .collect();
 
     Ok(tags)
+}
+
+/// The kernel image files of a board, as `tools/firmware.sh` writes them.
+pub const BOARD_KERNEL_FILES: [&str; 2] = ["firmware.elf", "firmware.bin"];
+
+/// Every runtime a project publishes, as `(target, name, placement)`:
+/// its `[project].runtimes` binaries ([`runtime_entry`]); for fluxor, the
+/// CLI, and each board's kernel image ([`BOARD_KERNEL_FILES`] under
+/// `target/<board>/`) for every board in its target registry, so a
+/// consumer builds a firmware image — and runs a board's rig scenario —
+/// from what `fluxor sync` materialises, with no Fluxor checkout.
+fn runtimes_to_publish(
+    pr: &Path,
+    identity: &crate::project::ProjectIdentity,
+) -> Result<Vec<(String, String, crate::oci_store::RuntimePlacement)>> {
+    use crate::oci_store::RuntimePlacement;
+    let mut names = identity.runtimes.clone();
+    if identity.name == "fluxor" && !names.iter().any(|n| n == "fluxor") {
+        names.push("fluxor".to_string());
+    }
+    let host = detect_host_target()?;
+    let mut out = Vec::new();
+    for entry in names {
+        let (triple, name) = runtime_entry(&entry, &host)?;
+        out.push((triple, name, RuntimePlacement::Release));
+    }
+    if identity.name == "fluxor" {
+        for target in crate::target::list_targets_under(pr) {
+            let Ok(t) = crate::target::load_target(&target, pr) else {
+                continue;
+            };
+            if t.kind != crate::target::TargetKind::Board || t.build_id() != target {
+                continue;
+            }
+            for file in BOARD_KERNEL_FILES {
+                out.push((target.clone(), file.to_string(), RuntimePlacement::Board));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Artefact names whose module manifest declares `[publish] withheld`,
@@ -1344,9 +1510,11 @@ mod tests {
     }
 
     /// Fluxor publishes the three module crates as their own trees,
-    /// unprefixed, and `fluxor-contracts` = contracts/src/** under `src/`.
+    /// unprefixed, `fluxor-contracts` = its `Cargo.toml` and `src/**`, and
+    /// `fluxor-catalog` = its `stacks/`, `targets/` and native-module
+    /// manifests (`modules/platform/`) in one tree.
     #[test]
-    fn fluxor_publishes_the_module_crates_and_contracts() {
+    fn fluxor_publishes_the_module_crates_contracts_and_catalog() {
         let scratch = tempfile::tempdir().unwrap();
         let pr = scratch.path().join("fluxor");
         for c in ["fluxor-abi", "fluxor-sdk", "fluxor-rt"] {
@@ -1360,6 +1528,21 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pr.join("contracts/src/lib.rs"), "pub mod contracts {}\n").unwrap();
+        std::fs::write(
+            pr.join("contracts/Cargo.toml"),
+            "[package]\nname = \"fluxor-contracts\"\n",
+        )
+        .unwrap();
+        // The crate's own tests stay in the checkout.
+        std::fs::create_dir_all(pr.join("contracts/tests")).unwrap();
+        std::fs::write(pr.join("contracts/tests/t.rs"), "#[test]\nfn t() {}\n").unwrap();
+        std::fs::create_dir_all(pr.join("stacks")).unwrap();
+        std::fs::write(pr.join("stacks/audio.toml"), "name = \"audio\"\n").unwrap();
+        std::fs::create_dir_all(pr.join("targets/boards")).unwrap();
+        std::fs::write(pr.join("targets/boards/b.toml"), "[board]\n").unwrap();
+        let native = pr.join("modules/platform/linux/linux_net");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(native.join("manifest.toml"), "version = \"0.1.0\"\n").unwrap();
 
         let store_dir = scratch.path().join("store");
         let _env = crate::oci_store::test_env_lock();
@@ -1395,7 +1578,80 @@ mod tests {
         );
         assert_eq!(
             first_entry_name("fluxor/src/fluxor-contracts:latest"),
-            "src/lib.rs"
+            "Cargo.toml"
+        );
+        let contracts =
+            super::collect_source(&super::source_candidates(&pr, "fluxor")[3].1).unwrap();
+        assert_eq!(
+            contracts
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["Cargo.toml", "src/lib.rs"]
+        );
+        assert!(
+            tags.iter().any(|t| t == "fluxor/src/fluxor-catalog:latest"),
+            "{tags:?}"
+        );
+        let catalog = super::collect_source(&super::source_candidates(&pr, "fluxor")[4].1).unwrap();
+        assert_eq!(
+            catalog.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            [
+                "modules/platform/linux/linux_net/manifest.toml",
+                "stacks/audio.toml",
+                "targets/boards/b.toml"
+            ]
+        );
+        assert_eq!(
+            first_entry_name("fluxor/src/fluxor-catalog:latest"),
+            "modules/platform/linux/linux_net/manifest.toml"
+        );
+    }
+
+    /// A stack may inject a module its consumer supplies, but not one of
+    /// Fluxor's own whose manifest no consumer receives: a native module's
+    /// manifest outside `modules/platform/` is refused, naming the stack and
+    /// the module; under `modules/platform/` it ships.
+    #[test]
+    fn a_stack_injecting_a_fluxor_module_no_consumer_can_wire_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path();
+        std::fs::write(
+            pr.join("fluxor.toml"),
+            "[project]\nname = \"fluxor\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pr.join("stacks")).unwrap();
+        std::fs::write(
+            pr.join("stacks/net.toml"),
+            "[stack]\nname = \"net\"\n\n[[variant]]\nmatch = { family = \"linux\" }\n\
+             modules = [{ name = \"net\", type = \"linux_net\" }, { name = \"http\" }]\n",
+        )
+        .unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let native = repo.join("modules/platform/linux/linux_net/manifest.toml");
+        let place = |layer: &str| {
+            let dir = pr.join(layer).join("linux_net");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(&native, dir.join("manifest.toml")).unwrap();
+            dir
+        };
+
+        let misplaced = place("modules/foundation");
+        let refusals = super::catalog_stack_refusals(pr).unwrap();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(
+            refusals[0].contains("stacks/net.toml")
+                && refusals[0].contains("'linux_net'")
+                && refusals[0].contains("outside modules/platform/"),
+            "{refusals:?}"
+        );
+
+        std::fs::remove_dir_all(misplaced).unwrap();
+        place("modules/platform/linux");
+        assert_eq!(
+            super::catalog_stack_refusals(pr).unwrap(),
+            Vec::<String>::new()
         );
     }
 

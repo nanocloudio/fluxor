@@ -120,6 +120,10 @@ pub mod contracts {
         pub mod ws_control;
         pub mod ws_frame;
     }
+    /// The accessibility tree an application that draws its own controls
+    /// publishes (`AccessibilityTree`), and the actions a platform mirror
+    /// sends back (`AccessibilityActions`).
+    pub mod accessibility;
     /// The records a controller and a target's node agent exchange: desired
     /// workload package, descriptor revision, idempotency identity, observed activation
     /// and fenced status.
@@ -127,6 +131,9 @@ pub mod contracts {
     /// The `AudioSample` stream's records: PCM frames and the in-band format
     /// record that states their rate.
     pub mod audio_sample;
+    /// A cycle counter and instruction-cache counts, read by a granted
+    /// module around a region of its own code.
+    pub mod counters;
     /// The exchange records every request and its answer travel in, between
     /// any requester and any provider, and the collector a provider uses to
     /// take requests whole.
@@ -190,6 +197,14 @@ pub mod contracts {
     pub mod measurement;
     /// Measured-quantity surface — the `SensorSample` content type's record.
     pub mod sensor;
+    /// The `VideoDraw` record stream: resources, frames, bands, paint state
+    /// and drawing operations, and the validator every consumer admits them
+    /// through. The rasteriser that draws them (`fluxor_sdk::video::raster`)
+    /// is library code, not ABI.
+    pub mod video_draw;
+    /// The region header every `VideoRaster` record carries, and the frame
+    /// rules over a sequence of regions.
+    pub mod video_raster;
     /// Platform-neutral isolated-workload surface (contract class `0x1A`).
     pub mod workload;
     pub mod input {
@@ -200,6 +215,8 @@ pub mod contracts {
         pub mod midi;
         pub mod pointer;
         pub mod surface_traits;
+        /// Text and composition records (`TextEvents`).
+        pub mod text;
     }
 }
 

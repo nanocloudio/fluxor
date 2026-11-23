@@ -17,6 +17,12 @@ ram_size = "0x80000000"
 flash_base = "0x00000000"
 flash_size = "0x00000000"
 
+# QEMU enters the kernel at EL1, under an EL2 it cannot ask about its traps,
+# so the kernel programs no performance monitor here: the cycle count is the
+# system clock, and there is no instruction-cache count.
+[counters]
+cycles = "system"
+
 # No reserved pins — virtual platform
 [gpio]
 reserved_pins = []

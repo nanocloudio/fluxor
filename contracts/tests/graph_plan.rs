@@ -13,7 +13,7 @@ use fluxor_contracts::ring_size::{
 
 const HOST: RingPlatform = RingPlatform {
     buffer_groups: 256,
-    split_cross_domain: false,
+    domain_cores: [0, 0, 0, 0],
 };
 
 fn port(direction: u8, index: u8, buffer_size: u32, frame: FrameKind) -> PlanPort {
@@ -189,7 +189,7 @@ fn a_cross_domain_edge_adds_a_default_consumer_ring_where_split() {
     }];
     let split = RingPlatform {
         buffer_groups: 256,
-        split_cross_domain: true,
+        domain_cores: [0, 1, 2, 3],
     };
     assert_eq!(plan(&modules, &edges, HOST).unwrap().total(), 65_536);
     assert_eq!(
@@ -203,6 +203,32 @@ fn a_cross_domain_edge_adds_a_default_consumer_ring_where_split() {
         ..edge(0, 0, 1, 0)
     }];
     assert_eq!(plan(&same, &cross, split).unwrap().rings.len(), 2);
+}
+
+/// The split follows cores, not domains: two domains one core's loop passes
+/// over share their edges as plain channels.
+#[test]
+fn an_edge_between_domains_of_one_core_is_not_split() {
+    let at = |domain: u8| PlanModule {
+        domain,
+        ..PlanModule::default()
+    };
+    let second_core = RingPlatform {
+        buffer_groups: 256,
+        domain_cores: [0, 1, 0, 0],
+    };
+    let rings = |from: u8, to: u8| {
+        plan(&[at(from), at(to)], &[edge(0, 0, 1, 0)], second_core)
+            .unwrap()
+            .rings
+            .len()
+    };
+    assert_eq!(rings(0, 1), 2);
+    assert_eq!(rings(1, 0), 2);
+    assert_eq!(rings(1, 3), 2);
+    assert_eq!(rings(0, 2), 1);
+    assert_eq!(rings(2, 3), 1);
+    assert_eq!(rings(1, 1), 1);
 }
 
 #[test]
@@ -225,7 +251,7 @@ fn an_aliased_edge_that_crosses_domains_still_gets_its_consumer_ring() {
     ];
     let split = RingPlatform {
         buffer_groups: buffer_groups(1536),
-        split_cross_domain: true,
+        domain_cores: [0, 1, 2, 3],
     };
     let p = plan(&modules, &edges, split).unwrap();
     assert_eq!(p.aliased, 1);

@@ -6,11 +6,14 @@ builtin = true
 # which the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Browser pointer input source. Subscribes to DOM PointerEvents on
-# the host page (mouse, touch, stylus unified) and emits
-# `input::pointer::MSG_EVENT` records on the output port. Multi-
+# Browser pointer input source. Subscribes to DOM PointerEvents and
+# wheel events on the host page (mouse, touch, stylus unified) and
+# emits `input::pointer::MSG_EVENT` records on the output port. Multi-
 # pointer is supported: each contact has its own pointer_id; the
-# host shim multiplexes them into a single event stream.
+# host shim multiplexes them into a single event stream. Positions
+# and pixel wheel deltas are in surface pixels: the pixels of the
+# raster the surface presents. Wheel and trackpad scroll arrive as
+# `KIND_WHEEL` records, at most one per unit per animation frame.
 #
 # Used by the `pointer` platform stack (stacks/pointer.toml) to
 # resolve `platform.pointer: {}` on wasm targets. A pointer-to-gamepad

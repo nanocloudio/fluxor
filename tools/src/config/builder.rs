@@ -1497,7 +1497,7 @@ pub(crate) fn parse_domain_execs(config: &Value) -> Result<Vec<(String, DomainEx
 /// typo'd domain name (or a stale config referencing a removed domain)
 /// silently route modules to the default partition, hiding capacity
 /// and budget mismatches the rest of the validator counts on.
-fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
+pub(crate) fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
     let domain_name = match module.get("domain").and_then(|d| d.as_str()) {
         Some(name) => name,
         None => return Ok(0),
@@ -1585,6 +1585,10 @@ const NON_PARAM_KEYS: &[&str] = &[
     // program section (`modules::collect_programs`), never a wire param.
     "program",
     "programs",
+    // The params the build resolved an asset for
+    // (`graph_assets::ASSET_PARAMS_KEY`), held against the manifest by
+    // `check_asset_params`; never a wire param.
+    "asset_params",
     "wiring",
     "preset",
     "presets",
@@ -1628,6 +1632,55 @@ const NON_PARAM_KEYS: &[&str] = &[
     // A member of an included stack (`fluxor_tools::stack::STACK_MEMBER_KEY`).
     "_stack_member",
 ];
+
+/// Hold the params the build resolved an asset for
+/// (`graph_assets::ASSET_PARAMS_KEY`, recorded on the entry) against the
+/// module's manifest: each must be one the module declares it opens as an
+/// asset (`[[params]] asset = true`), and, where the module's built schema
+/// is at hand, a string param of it. A value that names an asset is a URL,
+/// a path or a program reference by the target; only a module that opens
+/// it as an asset reads all three.
+fn check_asset_params(
+    module: &Value,
+    name: &str,
+    type_name: &str,
+    manifest: Option<&Manifest>,
+    pic_schema: Option<&schema::ParamSchema>,
+) -> Result<()> {
+    let Some(recorded) = module.get(crate::graph_assets::ASSET_PARAMS_KEY) else {
+        return Ok(());
+    };
+    let params: Vec<&str> = recorded
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for param in params {
+        if !manifest.is_some_and(|m| m.asset_params.iter().any(|p| p == param)) {
+            return Err(Error::Config(format!(
+                "module '{name}': `{param}` is given an asset (`${{asset:<name>}}`), but \
+                 module type '{type_name}' does not declare that param as one it opens as \
+                 an asset. If it does (`fluxor_rt::asset::open`), add to its manifest:\n\
+                 [[params]]\nname = \"{param}\"\nasset = true"
+            )));
+        }
+        if let Some(schema) = pic_schema {
+            let is_string = schema.find(param).is_some_and(|p| {
+                matches!(
+                    p.ptype,
+                    schema::ParamType::Str | schema::ParamType::StrChunked
+                )
+            });
+            if !is_string {
+                return Err(Error::Config(format!(
+                    "module '{name}': `{param}` is given an asset, and module type \
+                     '{type_name}' marks it `asset = true`, but its params \
+                     (`define_params!`) hold no string param of that name"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A module entry's `variant:` names one of the type's `[[variant]]` builds,
 /// so it is a string. Any other value selects no variant and is not a param
@@ -2017,6 +2070,12 @@ fn validate_yaml_params(
             continue;
         }
         if schema::SKIP_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        // What an interrupt-mode module's entry declares about itself
+        // (`board::INTERRUPT_MODE_KEYS`) is the entry's, held by the board
+        // check, unless the module has a parameter of that name.
+        if crate::board::INTERRUPT_MODE_KEYS.contains(&key.as_str()) && schema.find(key).is_none() {
             continue;
         }
 
@@ -2787,7 +2846,7 @@ fn build_module_entry_in(
     // the wire format is identical at the kernel boundary.
     //
     // `?` propagates only the pinned-but-unresolvable case, which is a hard
-    // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
+    // error (sibling of `assert_module_manifests_resolvable`). "No `.fmod`
     // schema" stays `Ok(None)` and falls through to the native path — a
     // native module is never pinned and has no `.fmod`.
     let pic_schema = schema::load_schema_for_entry(module, type_name, loc)?;
@@ -2813,6 +2872,13 @@ fn build_module_entry_in(
     // at build time rather than letting it silently drop at runtime.
     validate_heap_subtree(module, type_name)?;
     validate_variant_key(module, type_name)?;
+    check_asset_params(
+        module,
+        name,
+        type_name,
+        manifests.get(name),
+        pic_schema.as_ref(),
+    )?;
 
     if let Some(param_schema) = pic_schema {
         validate_yaml_params(module, &param_schema, type_name)?;
@@ -3714,6 +3780,52 @@ mod tests {
         b.extend_from_slice(b"decision");
         b.push(0); // no enum values
         schema::ParamSchema::from_bytes(&b).expect("schema bytes")
+    }
+
+    /// A module with a parameter of its own composes in an interrupt-mode
+    /// domain: the keys its entry declares for the mode are not parameters.
+    /// A key that is neither is still unknown, and a module that has a
+    /// parameter named like one of them (a `trust` anchor set) has that key
+    /// checked as its parameter.
+    #[test]
+    fn interrupt_mode_declarations_are_not_params() {
+        let schema = blob_param_schema();
+        let entry = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({
+                "name": "t", "domain": "fast", "decision": { "hex": "00" }
+            });
+            m.as_object_mut()
+                .expect("entry")
+                .extend(extra.as_object().expect("keys").clone());
+            m
+        };
+        for keys in [
+            serde_json::json!({ "trust": "platform", "max_cycles": 2000 }),
+            serde_json::json!({ "trust": "platform", "irq": 7 }),
+        ] {
+            validate_yaml_params(&entry(keys.clone()), &schema, "timer_beat")
+                .unwrap_or_else(|e| panic!("{keys}: {e}"));
+        }
+        let e = validate_yaml_params(
+            &entry(serde_json::json!({ "trust": "platform", "max_cycle": 2000 })),
+            &schema,
+            "timer_beat",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("unknown param 'max_cycle'"), "{e}");
+
+        // `trust`, a string param (tag 3) of this schema.
+        let mut b = vec![b'S', b'P', 1, 1, 3, 5, 0, 0, 0, 0, 5];
+        b.extend_from_slice(b"trust");
+        b.push(0);
+        let anchors = schema::ParamSchema::from_bytes(&b).expect("schema bytes");
+        validate_yaml_params(
+            &serde_json::json!({ "name": "srv", "trust": "system", "max_cycles": 1 }),
+            &anchors,
+            "tls",
+        )
+        .expect("its own param, and the mode's key");
     }
 
     /// A blob param's inline `{hex: …}` entry is its value, not a group of

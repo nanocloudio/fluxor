@@ -530,6 +530,9 @@ fn owned_fd(fd_handle: i32) -> Result<&'static DmaFdSlot, i32> {
 
 fn dma_fd_start(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
     let dma = owned_fd(fd_handle)?;
+    if list_running(fd_index(fd_handle)) {
+        return Err(errno::EBUSY);
+    }
     let ch_a = dma.channel_a.load(Ordering::Acquire);
     let ch_b = dma.channel_b.load(Ordering::Acquire);
     let t = transfer_of(fd_handle, ch_a, arg)?;
@@ -580,6 +583,9 @@ fn reload_of(fd_handle: i32, dma: &DmaFdSlot, arg: &[u8]) -> Result<(u32, u32), 
 
 fn dma_fd_queue(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
     let dma = owned_fd(fd_handle)?;
+    if list_running(fd_index(fd_handle)) {
+        return Err(errno::EBUSY);
+    }
     let (read, count) = reload_of(fd_handle, dma, arg)?;
     let active = dma.active_ch();
     let inactive = dma.inactive_ch();
@@ -611,6 +617,9 @@ fn dma_fd_queue(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
 
 fn dma_fd_restart(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
     let dma = owned_fd(fd_handle)?;
+    if list_running(fd_index(fd_handle)) {
+        return Err(errno::EBUSY);
+    }
     let (read, count) = reload_of(fd_handle, dma, arg)?;
     // SAFETY: the fd's active channel, moving memory to a FIFO; `read` lies
     // in the caller's lend.
@@ -622,6 +631,7 @@ fn dma_fd_free(fd_handle: i32) -> i32 {
         Ok(d) => d,
         Err(e) => return e,
     };
+    dma_list_stop(fd_index(fd_handle));
     let ch_a = dma.channel_a.load(Ordering::Acquire);
     let ch_b = dma.channel_b.load(Ordering::Acquire);
     dma_abort(ch_a);
@@ -638,6 +648,18 @@ fn dma_fd_poll_ready(index: i32) -> bool {
     };
     if !dma.allocated.load(Ordering::Acquire) {
         return false;
+    }
+    // An fd running a list is readable when entries have been sent since
+    // its owner last read the status.
+    let listed = crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked on the owner's core.
+        unsafe { lists() }
+            .running
+            .get(fd_index(index))
+            .and_then(|r| r.as_ref().map(|r| r.list.ready()))
+    });
+    if let Some(ready) = listed {
+        return ready;
     }
     let active = dma.active_ch();
     if channel_is_busy(active) {
@@ -658,11 +680,12 @@ fn dma_fd_poll_ready(index: i32) -> bool {
 }
 
 fn release_dma_fds_owned_by(module_idx: ModuleId) {
-    for dma in DMA_FD_SLOTS.iter() {
+    for (index, dma) in DMA_FD_SLOTS.iter().enumerate() {
         if !dma.allocated.load(Ordering::Acquire) || dma.owner.load(Ordering::Acquire) != module_idx
         {
             continue;
         }
+        dma_list_stop(index);
         for ch in [
             dma.channel_a.load(Ordering::Acquire),
             dma.channel_b.load(Ordering::Acquire),
@@ -674,6 +697,399 @@ fn release_dma_fds_owned_by(module_idx: ModuleId) {
         }
         dma.clear();
     }
+}
+
+// ============================================================================
+// DMA scan lists
+// ============================================================================
+//
+// A list runs on a DMA fd's two channels and a third claimed for it: the
+// fd's first channel moves the data, its second loads the first from the
+// list's control blocks, the third rewinds the list (`platform::rp_dma_list`
+// holds the rules; this is the registers). The data channel's completion
+// raises `DMA_IRQ_0` on core 0 or `DMA_IRQ_1` on a second core, whichever
+// runs the owning module's domain, and the handler accounts for the entries
+// the scan has passed.
+//
+// A list's state is touched by its owner's syscalls and by that interrupt,
+// both on the owner's core, the syscalls with that core's interrupts masked;
+// and by core 0 for a flash write or a module's release, with any other core
+// parked.
+
+use crate::platform::rp_dma_list::{self as dma_list, List, Pool, Shape};
+
+/// The kernel's one table of control blocks, 16-byte aligned so a block is
+/// one ring of the control channel's write address.
+#[repr(C, align(16))]
+struct BlockTable(core::cell::UnsafeCell<[[u32; 4]; dma_list::POOL_BLOCKS]>);
+// SAFETY: written a word at a time through volatile stores, under the rules
+// above; read by the DMA.
+unsafe impl Sync for BlockTable {}
+
+static LIST_BLOCKS: BlockTable =
+    BlockTable(core::cell::UnsafeCell::new([[0; 4]; dma_list::POOL_BLOCKS]));
+
+/// Each fd's fill word, which a fill entry sends over and over, and the
+/// word its rewind channel writes: the address of its first block.
+static LIST_FILL: [portable_atomic::AtomicU32; MAX_DMA_FDS] =
+    [const { portable_atomic::AtomicU32::new(0) }; MAX_DMA_FDS];
+static LIST_REWIND: [portable_atomic::AtomicU32; MAX_DMA_FDS] =
+    [const { portable_atomic::AtomicU32::new(0) }; MAX_DMA_FDS];
+
+/// A list running on an fd.
+#[derive(Clone, Copy)]
+struct RunningList {
+    list: List,
+    data: u8,
+    control: u8,
+    rewind: u8,
+    /// The core that runs the owner's domain, and so takes the interrupt.
+    core: u8,
+    /// The owner's lend the entries send from, and the bytes one entry
+    /// moves.
+    lend: u32,
+    span_bytes: u32,
+}
+
+struct ListState {
+    running: [Option<RunningList>; MAX_DMA_FDS],
+    pool: Pool,
+}
+
+struct ListCell(core::cell::UnsafeCell<ListState>);
+// SAFETY: accessed under the rules at the head of this section.
+unsafe impl Sync for ListCell {}
+
+static LISTS: ListCell = ListCell(core::cell::UnsafeCell::new(ListState {
+    running: [None; MAX_DMA_FDS],
+    pool: Pool::new(),
+}));
+
+/// The lists' state.
+///
+/// # Safety
+/// The caller is the owner's syscall with its core's interrupts masked, the
+/// owner's core's DMA interrupt, or core 0 with any other core parked.
+unsafe fn lists() -> &'static mut ListState {
+    // SAFETY: the caller's contract.
+    unsafe { &mut *LISTS.0.get() }
+}
+
+/// The block table as the DMA and the list rules see it.
+struct ListBus {
+    control: u8,
+}
+
+impl dma_list::Bus for ListBus {
+    fn write(&mut self, block: usize, word: usize, value: u32) {
+        if block < dma_list::POOL_BLOCKS && word < 4 {
+            // SAFETY: a word of the table, in bounds.
+            unsafe {
+                core::ptr::write_volatile(
+                    (LIST_BLOCKS.0.get() as *mut u32).add(block * 4 + word),
+                    value,
+                );
+            }
+        }
+    }
+
+    fn control_offset(&mut self) -> u32 {
+        // SAFETY: the list's control channel, allocated to its fd.
+        unsafe { read32(chan(self.control as usize, dma::addr::READ_ADDR)) }
+            .wrapping_sub(LIST_BLOCKS.0.get() as u32)
+    }
+}
+
+/// The fd slot index of `fd_handle`.
+fn fd_index(fd_handle: i32) -> usize {
+    (fd_handle - DMA_FD_BASE) as usize
+}
+
+/// Whether a list runs on fd slot `index`.
+fn list_running(index: usize) -> bool {
+    crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked on the calling core.
+        unsafe { lists() }
+            .running
+            .get(index)
+            .is_some_and(Option::is_some)
+    })
+}
+
+fn dma_list_start(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
+    use crate::abi::platform::rp::dma_raw::list_start;
+    let dma = owned_fd(fd_handle)?;
+    let index = fd_index(fd_handle);
+    let args = list_start::decode(arg).ok_or(E_INVAL)?;
+    let data = dma.channel_a.load(Ordering::Acquire);
+    let control = dma.channel_b.load(Ordering::Acquire);
+    if list_running(index) || channel_is_busy(data) || channel_is_busy(control) {
+        return Err(errno::EBUSY);
+    }
+    let (size, width) = unit_of(args.flags).ok_or(E_INVAL)?;
+    let fifo = fifo_of(args.dreq)?;
+    if !fifo.to_peripheral {
+        return Err(E_INVAL);
+    }
+    let span_bytes = (args.count as usize)
+        .checked_mul(width)
+        .and_then(|b| u32::try_from(b).ok())
+        .ok_or(E_INVAL)?;
+    // One entry's span must lie inside the lend at all.
+    lent_at(fd_handle, args.lend, 0, span_bytes as usize, true)?;
+    if !List::fits(args.entries) {
+        return Err(E_NOMEM);
+    }
+    let rewind = dma_alloc_channel();
+    if rewind < 0 {
+        return Err(E_NOMEM);
+    }
+    let rewind = rewind as u8;
+    let table = LIST_BLOCKS.0.get() as u32;
+    let core = chip::core_id().min(1) as u8;
+
+    let block = |incr: bool, chain: u8| {
+        dma::CtrlTrig::default()
+            .enable(true)
+            .data_size(size)
+            .incr_read(incr)
+            .treq_sel(args.dreq)
+            .chain_to(chain)
+            .0
+    };
+    crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked; no list runs on this fd yet.
+        let state = unsafe { lists() };
+        let Some(first) = state.pool.take(args.entries) else {
+            dma_free_channel(rewind);
+            return Err(E_NOMEM);
+        };
+        LIST_FILL[index].store(args.fill, Ordering::Release);
+        LIST_REWIND[index].store(
+            table + u32::from(first) * dma_list::BLOCK_BYTES,
+            Ordering::Release,
+        );
+        let shape = Shape {
+            first,
+            entries: args.entries,
+            write_addr: fifo.addr,
+            trans_count: dma::trans_count(args.count),
+            fill_addr: LIST_FILL[index].as_ptr() as u32,
+            ctrl_fill: block(false, control),
+            ctrl_armed: block(true, control),
+            ctrl_fill_last: block(false, rewind),
+            ctrl_armed_last: block(true, rewind),
+        };
+        let list = List::start(shape, &mut ListBus { control });
+        state.running[index] = Some(RunningList {
+            list,
+            data,
+            control,
+            rewind,
+            core,
+            lend: args.lend,
+            span_bytes,
+        });
+        let quiet_word = dma::CtrlTrig::default()
+            .enable(true)
+            .data_size(dma::DataSize::Word)
+            .treq_sel(dma::TREQ_PERMANENT)
+            .irq_quiet(true);
+        let (d, c, r) = (data as usize, control as usize, rewind as usize);
+        let base = chip::DMA_BASE as usize;
+        // SAFETY: the fd's two channels and the one just allocated, all
+        // idle; the interrupt registers of this silicon's DMA block.
+        unsafe {
+            // The data channel's completion reaches this core's line.
+            write32(base + dma::addr::INTR, 1 << data);
+            crate::platform::rp_regs::set_bits(base + dma::addr::INTE[core as usize], 1 << data);
+            // The rewind channel: one word, the list's first block, into the
+            // control channel's read pointer, which restarts it.
+            write32(
+                chan(r, dma::addr::READ_ADDR),
+                LIST_REWIND[index].as_ptr() as u32,
+            );
+            write32(
+                chan(r, dma::addr::WRITE_ADDR),
+                chan(c, dma::addr::AL3_READ_ADDR_TRIG) as u32,
+            );
+            write32(chan(r, dma::addr::TRANS_COUNT), dma::trans_count(1));
+            write32(chan(r, dma::addr::AL1_CTRL), quiet_word.chain_to(rewind).0);
+            // The control channel: four words a block into the data
+            // channel's registers, wrapping back to the first of them.
+            write32(
+                chan(c, dma::addr::WRITE_ADDR),
+                chan(d, dma::addr::AL1_CTRL) as u32,
+            );
+            write32(chan(c, dma::addr::TRANS_COUNT), dma::trans_count(4));
+            write32(
+                chan(c, dma::addr::READ_ADDR),
+                table + u32::from(first) * dma_list::BLOCK_BYTES,
+            );
+            compiler_fence(Ordering::SeqCst);
+            // Its control word last: writing it loads block 0, which starts
+            // the data channel.
+            write32(
+                chan(c, dma::addr::CTRL_TRIG),
+                quiet_word
+                    .incr_read(true)
+                    .incr_write(true)
+                    .ring_write(4)
+                    .chain_to(control)
+                    .0,
+            );
+        }
+        crate::arch::cortex_m::nvic_unmask(dma::IRQ_LINES[core as usize]);
+        Ok(0)
+    })
+}
+
+fn dma_list_arm(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
+    use crate::abi::platform::rp::dma_raw::list_arm;
+    owned_fd(fd_handle)?;
+    let index = fd_index(fd_handle);
+    let (entry, offset) = list_arm::decode(arg).ok_or(E_INVAL)?;
+    crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked on the owner's core.
+        let Some(running) = unsafe { lists() }.running[index].as_mut() else {
+            return Err(E_INVAL);
+        };
+        if entry >= running.list.shape().entries {
+            return Err(E_INVAL);
+        }
+        let read = lent_at(
+            fd_handle,
+            running.lend,
+            offset,
+            running.span_bytes as usize,
+            true,
+        )?;
+        let mut bus = ListBus {
+            control: running.control,
+        };
+        match running.list.arm(&mut bus, entry, read) {
+            Ok(()) => Ok(0),
+            Err(dma_list::ArmError::NoEntry) => Err(E_INVAL),
+            Err(dma_list::ArmError::Busy) => Err(errno::EBUSY),
+        }
+    })
+}
+
+fn dma_list_status(fd_handle: i32, arg: &mut [u8]) -> Result<i32, i32> {
+    use crate::abi::platform::rp::dma_raw::list_status;
+    owned_fd(fd_handle)?;
+    let index = fd_index(fd_handle);
+    let out = arg.get_mut(..list_status::LEN).ok_or(E_INVAL)?;
+    let (position, underruns) = crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked on the owner's core.
+        let running = unsafe { lists() }.running[index].as_mut().ok_or(E_INVAL)?;
+        let mut bus = ListBus {
+            control: running.control,
+        };
+        Ok::<_, i32>(running.list.status(&mut bus))
+    })?;
+    out.copy_from_slice(&list_status::encode(position, underruns));
+    Ok(0)
+}
+
+/// Stop the list on fd slot `index`, if one runs: its three channels idle
+/// and disabled, its interrupt off, its blocks and its third channel free.
+fn dma_list_stop(index: usize) {
+    crate::arch::cortex_m::interrupt_free(|| {
+        // SAFETY: interrupts masked; the caller is the owner or releases
+        // for it with any other core parked.
+        let state = unsafe { lists() };
+        let Some(running) = state.running.get_mut(index).and_then(Option::take) else {
+            return;
+        };
+        let base = chip::DMA_BASE as usize;
+        // The loaders first, disabled so the data channel's last completion
+        // starts nothing; then the data channel.
+        for ch in [running.control, running.rewind, running.data] {
+            // SAFETY: the list's own channels.
+            unsafe { write32(chan(ch as usize, dma::addr::AL1_CTRL), 0) };
+            let _ = dma_abort(ch);
+            // SAFETY: as above; a load in flight when the first write
+            // landed may have enabled the data channel again.
+            unsafe { write32(chan(ch as usize, dma::addr::AL1_CTRL), 0) };
+        }
+        // SAFETY: the interrupt registers of this silicon's DMA block.
+        unsafe {
+            crate::platform::rp_regs::clear_bits(
+                base + dma::addr::INTE[running.core as usize],
+                1 << running.data,
+            );
+            write32(base + dma::addr::INTR, 1 << running.data);
+        }
+        let shape = *running.list.shape();
+        state.pool.give(shape.first, shape.entries);
+        dma_free_channel(running.rewind);
+    });
+}
+
+/// Return every armed entry of every list to fill. Core 0, with its
+/// interrupts masked and any other core parked, before it holds them for a
+/// flash erase or program: no interrupt returns a sent entry to fill
+/// meanwhile, and one left armed would be sent again a lap later from a
+/// span its owner has since reused. The entries go out as fill and count as
+/// underruns.
+pub fn dma_lists_disarm_all() {
+    // SAFETY: the caller's contract is this function's.
+    for running in unsafe { lists() }.running.iter_mut().flatten() {
+        let mut bus = ListBus {
+            control: running.control,
+        };
+        running.list.disarm_all(&mut bus);
+    }
+}
+
+/// The data-channel completion interrupt of the lists `core` owns.
+fn dma_list_interrupt(core: usize) {
+    let base = chip::DMA_BASE as usize;
+    // SAFETY: this core's interrupt status of the DMA block.
+    let pending = unsafe { read32(base + dma::addr::INTS[core]) };
+    let mut ours = 0u32;
+    // SAFETY: this core's interrupt; its lists are touched nowhere else
+    // with this core's interrupts enabled.
+    for running in unsafe { lists() }.running.iter_mut().flatten() {
+        let bit = 1u32 << running.data;
+        if usize::from(running.core) != core || pending & bit == 0 {
+            continue;
+        }
+        ours |= bit;
+        // SAFETY: the raw flag, cleared before the pointer is read so a
+        // completion after the read raises the interrupt again.
+        unsafe { write32(base + dma::addr::INTR, bit) };
+        let mut bus = ListBus {
+            control: running.control,
+        };
+        running.list.advance(&mut bus);
+    }
+    // A flag that is no list's would raise the line for ever.
+    let stray = pending & !ours;
+    if stray != 0 {
+        // SAFETY: as above.
+        unsafe { crate::platform::rp_regs::clear_bits(base + dma::addr::INTE[core], stray) };
+    }
+    if ours != 0 {
+        crate::kernel::sys::hal::wake_scheduler();
+    }
+}
+
+/// # Safety
+/// ISR vector entry, invoked by the NVIC on core 0, never directly.
+#[no_mangle]
+pub unsafe extern "C" fn DMA_IRQ_0() {
+    dma_list_interrupt(0);
+}
+
+/// # Safety
+/// ISR vector entry, invoked by the NVIC on the second core, never directly.
+#[no_mangle]
+pub unsafe extern "C" fn DMA_IRQ_1() {
+    #[cfg(feature = "smp")]
+    crate::platform::rp_core1::count_interrupt();
+    dma_list_interrupt(1);
 }
 
 // ============================================================================
@@ -761,7 +1177,24 @@ fn gpio_request_input(pin_num: u8, pull: u8) -> i32 {
 // Per-class provider dispatchers (RP-specific)
 // ============================================================================
 
-fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
+/// Run `f` with the other core kept out, when another core runs a domain:
+/// the platform providers' state is one copy that either core's modules
+/// reach, and a provider call is short. With core 1 running no domain there
+/// is no other core to keep out.
+#[inline]
+pub fn exclusive<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "smp")]
+    if crate::platform::rp_core1::running() {
+        return critical_section::with(|_| f());
+    }
+    f()
+}
+
+fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    exclusive(|| gpio_ops(handle, opcode, arg, data))
+}
+
+fn gpio_ops(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     use crate::abi::contracts::hal::gpio as dev_gpio;
     // `handle` is the pin a claim names, or `WATCH_BASE` plus the pin for an
     // edge watch.
@@ -1033,8 +1466,23 @@ fn rp_system_extension_dispatch(
     handle: i32,
     opcode: u32,
     arg: &mut [u8],
-    mut data: UserSpan<'_>,
+    data: UserSpan<'_>,
 ) -> i32 {
+    use crate::abi::internal::flash;
+    // The flash ops detach execute-in-place, which parks the other core
+    // between two of its steps: they run outside the cores' lock, which a
+    // core waiting to park could otherwise be spinning on. They are core 0's
+    // alone and keep the other core out by parking it.
+    if matches!(
+        opcode,
+        flash::SIDEBAND | flash::RAW_ERASE | flash::RAW_PROGRAM
+    ) {
+        return system_extension_ops(handle, opcode, arg, data);
+    }
+    exclusive(|| system_extension_ops(handle, opcode, arg, data))
+}
+
+fn system_extension_ops(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::flash;
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
     use crate::abi::platform::rp::{
@@ -1847,6 +2295,9 @@ fn rp_system_extension_dispatch(
         dma_raw::fd::START => rc(dma_fd_start(handle, arg)),
         dma_raw::fd::RESTART => rc(dma_fd_restart(handle, arg)),
         dma_raw::fd::QUEUE => rc(dma_fd_queue(handle, arg)),
+        dma_raw::fd::LIST_START => rc(dma_list_start(handle, arg)),
+        dma_raw::fd::LIST_ARM => rc(dma_list_arm(handle, arg)),
+        dma_raw::fd::LIST_STATUS => rc(dma_list_status(handle, arg)),
         dma_raw::fd::FREE => dma_fd_free(handle),
         // ── SYS_CLOCK_HZ ──
         SYS_CLOCK_HZ => match arg.get_mut(..4) {
@@ -1913,6 +2364,11 @@ fn init_rp_providers() {
     // loader when their PIC module's manifest names it in `provider_contracts`.
     // Register system extension for hardware opcodes (raw register bridges)
     register_system_extension(rp_system_extension_dispatch);
+    // Core 1 steps on the 8 KiB of `[smp] secondary_stack`.
+    #[cfg(feature = "smp")]
+    crate::kernel::module::syscalls::register_small_stack(Some(|| {
+        crate::platform::chip::core_id() != 0
+    }));
 }
 
 // HAL GPIO: open-style opcodes (CLAIM, SET_INPUT, SET_OUTPUT) answer the

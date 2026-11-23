@@ -155,7 +155,8 @@ a ring after the close rings nothing.
 Every loop drives one pass engine (`src/kernel/exec/scheduler/pass.rs`):
 `pass::run(domain, kind)` steps one domain, either a full tick
 (`PassKind::Tick`) or only the woken modules (`PassKind::Wake(&mask)`).
-A single-core loop (RP, Linux, wasm) runs every domain in order through
+A loop over every domain of its core (RP core 0, Linux, wasm) runs them in
+order through
 `pass::tick_all()` and `pass::wake_all()`, then sleeps until the
 deadline the tick pass returned or a wake, whichever comes first:
 

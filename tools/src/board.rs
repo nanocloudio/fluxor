@@ -151,11 +151,19 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
     }
 }
 
+/// What a module entry in an interrupt-mode domain declares about itself,
+/// read by [`validate_isr_modules`]: keys of the entry, not parameters of
+/// the module. The composer's parameter check passes each one that the
+/// module's schema does not declare as a parameter of its own (tls and quic
+/// declare a `trust` parameter, their anchors).
+pub(crate) const INTERRUPT_MODE_KEYS: [&str; 3] = ["trust", "max_cycles", "irq"];
+
 /// Validate interrupt-mode module declarations.
 ///
 /// A module's execution mode is its domain's `exec:`; a module carries no
 /// `tier:` and no `rate_hz:` of its own (a `timer` domain declares the
-/// cadence). Modules in a `timer` or `irq` domain must have:
+/// cadence). Modules in a `timer` or `irq` domain must have
+/// ([`INTERRUPT_MODE_KEYS`]):
 /// - `trust: "platform"` (an ISR runs privileged)
 /// - for `timer`, a declared `max_cycles` that fits the domain's period, and
 ///   a combined `timer` budget under half of that period
@@ -648,6 +656,56 @@ mod tests {
             errors.iter().any(|e| e.contains("unknown key `rate_hz`")),
             "{errors:?}"
         );
+    }
+
+    /// A module in a `timer` domain states its trust and its cycle budget,
+    /// and one in an `irq` domain its trust and its line; each missing key
+    /// is refused by name.
+    #[test]
+    fn an_interrupt_mode_module_states_its_trust_budget_and_line() {
+        let graph = |timer: Value, irq: Value| {
+            json!({
+                "execution": { "domains": [
+                    { "name": "main" },
+                    { "name": "fast", "exec": "timer", "rate_hz": 1000 },
+                    { "name": "line", "exec": "irq" }
+                ]},
+                "modules": [timer, irq]
+            })
+        };
+        let timer = json!({ "name": "t", "domain": "fast", "trust": "platform", "max_cycles": 2000, "spin": 4 });
+        let irq = json!({ "name": "i", "domain": "line", "trust": "platform", "irq": 7 });
+        assert!(isr_errors(&graph(timer.clone(), irq.clone())).is_empty());
+
+        let without = |module: &Value, key: &str| {
+            let mut m = module.clone();
+            m.as_object_mut().expect("entry").remove(key);
+            m
+        };
+        for (config, says) in [
+            (
+                graph(without(&timer, "trust"), irq.clone()),
+                "(t): an `exec: timer` module requires trust: \"platform\"",
+            ),
+            (
+                graph(without(&timer, "max_cycles"), irq.clone()),
+                "(t): an `exec: timer` module requires a max_cycles declaration",
+            ),
+            (
+                graph(timer.clone(), without(&irq, "trust")),
+                "(i): an `exec: irq` module requires trust: \"platform\"",
+            ),
+            (
+                graph(timer.clone(), without(&irq, "irq")),
+                "(i): an `exec: irq` module requires an 'irq' field",
+            ),
+        ] {
+            let errors = isr_errors(&config);
+            assert!(
+                errors.iter().any(|e| e.contains(says)),
+                "{says}: {errors:?}"
+            );
+        }
     }
 
     #[test]

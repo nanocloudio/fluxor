@@ -1,26 +1,145 @@
 version = "1.0.0"
 type = "Sink"
 hardware_targets = ["rp2350"]
+# The PIO blocks and the register SPI pins are reached through the raw
+# bridge: the driver claims the two PIO blocks it is given.
 grants = ["rp_raw"]
-# DSI/PIO panel scanout: paced sink, owns the display refresh timeline so
-# it qualifies as a `presentation.clock` for solo display groups.
-capabilities = ["video.raster", "video.scanout", "display.scanout", "presentation.clock"]
+# A panel scanned out by PIO and a DMA scan list: it owns the display's
+# refresh timeline, so it qualifies as a `presentation.clock` for solo
+# display groups.
+capabilities = ["video.draw", "video.raster", "video.scanout", "display.scanout", "presentation.clock"]
 deferred_ready = true
 
+# An ST7701S RGB-parallel panel, drawn from a draw list
+# (`abi::contracts::video_draw`).
+#
+# The driver retains the last committed frame's records, not its pixels,
+# and draws them again every refresh, a band of `band_rows` rows at a time,
+# into a ring of `ring_rows / band_rows` band slots. So every frame's
+# damage must be the whole surface, a frame takes effect whole at the first
+# refresh after its COMMIT, and the panel's memory is the ring, one scratch
+# band and the records, whatever the picture.
+#
+# Scan-out timing depends on no software: four PIO state machines make
+# sync, DE and the pixel clock, and a DMA scan list sends one entry a band,
+# from a ring slot when the driver armed it in time and as
+# `underrun_rgb565` when it did not. A band drawn late is shown as that
+# colour for one refresh and counted in `underruns`; timing never moves.
+# A renderer slower than the refresh shows some of the bands each refresh.
+# A flash erase or program on the node blanks the panel to that colour for
+# its length (the kernel returns every armed entry to fill before it holds
+# interrupts); the bands are counted, and the picture is whole again
+# within a refresh of its end.
+#
+# `surface0` is a raster input a SURFACE record places, held whole at its
+# own resolution, double-buffered. With no `draw` edge the driver shows
+# `surface0` scaled to the panel (nearest texel).
+#
+# The refresh rate is the graph's: `refresh_mhz`, from which the driver
+# sets the sync divider against the system clock. It refuses a rate whose
+# pixel clock is above `pclk_max_khz` or an eighth of the system clock.
+#
+# Pins: 16 data pins in a row from `data0_pin`; `de_pin`, `vsync_pin`,
+# `hsync_pin`, `pclk_pin` in a row in that order; all 20 in GPIO 0-31 or
+# all in GPIO 16-47. Anything else is refused. The defaults are the
+# Waveshare RP2350-Touch-LCD-4 board's. `bl_pin = 255`: no backlight pin.
+#
+# A RES_REF record names a glyph pack or a strike the instance holds in
+# place: an asset the graph gives one of the `pack` params, which the build
+# makes a program of the instance. The driver draws from it where the node
+# image keeps it, hashing each once after it starts, a slice a step, and
+# takes no stream until that is done.
+#
+# A faulted stream is logged with the fault and the byte offset, the frame
+# in progress is discarded, the retained frame keeps showing, and records
+# are skipped to the next STREAM.
+#
+# Placement: a `poll` domain on a core of its own draws without regard to a
+# tick. In a `tick` domain the tick must be shorter than the scan takes
+# over `ring_rows - band_rows` rows, and the domain's other members must
+# leave the core time to draw a refresh; on a shared core that means a
+# lower `refresh_mhz`.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name            | Type | Default | Description |
+# |-----|-----------------|------|---------|-------------|
+# | 1   | cs_pin          | u8   | 18      | Register SPI chip select. |
+# | 2   | sck_pin         | u8   | 2       | Register SPI clock. |
+# | 3   | sda_pin         | u8   | 3       | Register SPI data. |
+# | 4   | rst_pin         | u8   | 19      | Panel reset. |
+# | 5   | bl_pin          | u8   | 40      | Backlight, active low; 255 for none. |
+# | 6   | de_pin          | u8   | 20      | DE. |
+# | 7   | hsync_pin       | u8   | 22      | HSYNC: `de_pin + 2`. |
+# | 8   | vsync_pin       | u8   | 21      | VSYNC: `de_pin + 1`. |
+# | 9   | pclk_pin        | u8   | 23      | Pixel clock: `de_pin + 3`. |
+# | 10  | data0_pin       | u8   | 24      | The first of 16 data pins. |
+# | 11  | width           | u16  | 480     | Active pixels a line, at most 480. |
+# | 12  | height          | u16  | 480     | Active lines. |
+# | 13  | pio_sync        | u8   | 1       | PIO block of the sync state machines. |
+# | 14  | pio_data        | u8   | 2       | PIO block of the DE and pixel state machines. |
+# | 15  | mirror_x        | u8   | 1       | 1 reverses the panel's source scan direction. |
+# | 16  | refresh_mhz     | u32  | 60000   | Refresh rate, mHz. |
+# | 17  | pclk_max_khz    | u32  | 18000   | The fastest pixel clock the panel takes. |
+# | 18  | band_rows       | u16  | 16      | Rows of a band; divides `height` into three or more bands, as many as the kernel's scan-list table has free (64 entries for every list of the node). |
+# | 19  | ring_rows       | u16  | 48      | Rows the ring holds: 3 to 32 bands. |
+# | 20  | frame_bytes     | u32  | 8192    | The largest frame retained, FRAME through COMMIT. Two are held. |
+# | 21  | resource_bytes  | u32  | 16384   | Bytes of defined resources live at once; 0 when every resource is a RES_REF. |
+# | 22  | record_bytes    | u32  | 1024    | The largest record read: a producer keeps each RES_DATA and GLYPHS record within it. |
+# | 23  | surface_bytes   | u32  | 0       | The largest surface `surface0` holds, in its own format; 0 for a graph without it. |
+# | 24  | underrun_rgb565 | u16  | 0       | The colour of a band that was not drawn in time. |
+# | 25  | status_s        | u8   | 0       | Seconds between `[st7701s] measured_mhz=… refreshes=… underruns=…` log lines; 0 for none. |
+# | 26-29 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack or one strike. |
+
+[[params]]
+name = "pack0"
+asset = true
+
+[[params]]
+name = "pack1"
+asset = true
+
+[[params]]
+name = "pack2"
+asset = true
+
+[[params]]
+name = "pack3"
+asset = true
+
 [[ports]]
-name = "pixels"
+name = "draw"
+direction = "input"
+content_type = "VideoDraw"
+required = false
+# A retained draw list: a frame is a few kilobytes of records and arrives
+# when the picture changes, not once a refresh.
+rate_class_default = "transaction"
+[ports.facts]
+ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref"]
+pixmap_formats = ["rgba8", "rgb565"]
+glyph_formats = ["a1", "a8"]
+max_depth = 8
+max_resources = 16
+resource_bytes = { param = "resource_bytes" }
+frame_bytes = { param = "frame_bytes" }
+damage = ["full"]
+atomic = ["yes", "no"]
+refresh_mhz = { param = "refresh_mhz" }
+surfaces = 1
+
+[[ports]]
+name = "surface0"
+index = 1
 direction = "input"
 content_type = "VideoRaster"
 required = false
-buffer_size = 4096
+[ports.facts]
+formats = ["rgb565", "rgba8"]
+regions = ["damage", "bands"]
 
 [[resources]]
 requires_contract = "gpio"
 access = "write"
-
-[[resources]]
-requires_contract = "pio"
-access = "exclusive"
 
 [[resources]]
 requires_contract = "timer"
@@ -32,6 +151,18 @@ access = "write"
 requires_contract = "platform_dma_fd"
 access = "write"
 
-# Module-scope observability — exempt.
+[capacities]
+# One block from the heap: the ring (two bytes a pixel of a 480-pixel row),
+# the scratch band (three), two retained frames, the resource arena, the
+# read buffer and two buffers for `surface0`.
+heap_per_param = { base = 128, params = [
+    { tag = 19, default = 48, bytes_each = 960 },
+    { tag = 18, default = 16, bytes_each = 1440 },
+    { tag = 20, default = 8192, bytes_each = 2 },
+    { tag = 21, default = 16384, bytes_each = 1 },
+    { tag = 22, default = 1024, bytes_each = 1 },
+    { tag = 23, default = 0, bytes_each = 2 },
+] }
+
 [observability]
-exempt = "display scanout — frame/refresh rate is the metric that matters, not byte throughput"
+metrics = ["refreshes", "underruns", "late_frames", "render_us_per_band", "refresh_mhz"]

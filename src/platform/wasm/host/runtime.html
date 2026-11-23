@@ -569,40 +569,50 @@
     // The wire shape it expects: a `keyCode` whose bit 15 is the
     // pressed/released flag (host_input_pop writes key_lo/key_hi; the
     // consumer reads `pressed = key_hi & 0x80`, `code = low 15 bits`).
-    // This queue is passed to buildHostImports below; previously nothing
-    // fed it, so the wasm player had no working input at all.
+    // This queue is passed to buildHostImports below.
+    //
+    // Keys come from the keyboard producer in host_shims.js
+    // (`installKeyboard`): it queues each key for the KEY capability driver
+    // (`wasm_browser_keyboard` ← `__fluxor_keyboard_queue`, input::key
+    // records, one task after the keydown so a key the mirror's text field
+    // turned into text carries KEY_TEXT) and reports it here for this
+    // queue. Each driver drains its own queue, so a graph chooses exactly
+    // one source per port.
     const inputQueue = [];
     const PRESSED_BIT = 0x8000;
+    let keyboard = null;
+    window.__fluxorShimReady.then(() => {
+      keyboard = window.fluxor.installKeyboard(window, {
+        onKey: (code, down) => window.fluxor.putDomInput(inputQueue, [
+          { keyCode: (code & 0x7fff) | (down ? PRESSED_BIT : 0), modifiers: 0 },
+        ]),
+      });
+    });
+    // A key with no DOM event behind it: an on-screen control.
     function pushKey(code, down) {
-      inputQueue.push({ keyCode: (code & 0x7fff) | (down ? PRESSED_BIT : 0), modifiers: 0 });
-      // Also feed the canonical KEY capability driver
-      // (`wasm_browser_keyboard` ← `__fluxor_keyboard_queue`,
-      // input::key records). Without this, graphs that wire the
-      // keyboard driver (rather than `wasm_browser_dom_input`) never
-      // see physical keys unless a presentation overlay declares
-      // symbolic key controls. Each driver drains its own queue, so
-      // graphs still choose exactly one source per port.
-      const kbQ = window.__fluxor_keyboard_queue
-        || (window.__fluxor_keyboard_queue = []);
-      kbQ.push({ kind: down ? 0x01 : 0x02, modifiers: 0, repeat: 0,
-                 keyCode: code & 0x7fff, scanCode: 0 });
+      if (keyboard) keyboard.key(code, down);
     }
-    // Physical keyboard → queue. Dedupe auto-repeat by tracking held
-    // codes, and swallow the default action (scroll on arrows/space) so
-    // the page stays put while playing.
-    const heldKeys = new Set();
-    window.addEventListener('keydown', (e) => {
-      const c = e.keyCode || e.which;
-      if (!c) return;
-      if (!heldKeys.has(c)) { heldKeys.add(c); pushKey(c, true); }
-      if ([13, 16, 32, 37, 38, 39, 40].includes(c)) e.preventDefault();
-    });
-    window.addEventListener('keyup', (e) => {
-      const c = e.keyCode || e.which;
-      if (!c) return;
-      heldKeys.delete(c);
-      pushKey(c, false);
-    });
+
+    // The accessibility mirror (`wasm_browser_accessibility`): DOM over the
+    // display surface, created when the graph's mirror module opens. What
+    // the module says to it arrives as messages, from the kernel on this
+    // thread or from the Worker; what it raises goes back through the
+    // input queues.
+    let mirror = null;
+    function accessibilityMessage(m, surfaceEl) {
+      if (!mirror) {
+        mirror = window.fluxor.createAccessibilityMirror(window, {
+          surface: surfaceEl,
+          noteText: () => { if (keyboard) keyboard.noteText(); },
+          log: (text) => append(text, 'info'),
+        });
+      }
+      mirror.handle(m);
+    }
+    // The mirror sits where the canvas is shown: it follows every frame
+    // (a raster may change extent) and every resize.
+    function layoutMirror() { if (mirror) mirror.layout(); }
+    window.addEventListener('resize', layoutMirror);
 
     // Player mode: when the scenario declares `presentation.controls`,
     // build the canvas + on-screen control layout that mirrors the
@@ -809,34 +819,22 @@
     // platform's button driver produces. Downstream `gesture`
     // counts clicks and emits FMP commands.
     function installPointerListeners(el) {
-      const pointerQ = window.__fluxor_pointer_queue
-        || (window.__fluxor_pointer_queue = []);
-      const buttonQ = window.__fluxor_button_queue
-        || (window.__fluxor_button_queue = []);
+      // Records go through `fluxor.pushInput`, which keeps each queue
+      // within its cap when the graph holds no module that drains it.
+      const pushPointerRecord = (rec) => window.fluxor.pushInput(window, 'pointer', rec);
+      const pushButton = (byte) => window.fluxor.pushInput(window, 'button', byte);
+      // Page coordinates in surface pixels: the pixels of the raster the
+      // surface presents (its canvas's own extent, not a fixed basis: a
+      // raster stream states its surface per frame and may change it), or
+      // the canonical 960×540 for a surface with no canvas. One mapping,
+      // in host_shims.js, serves these listeners, the wheel and the
+      // accessibility mirror.
       function localCoords(ev) {
-        // Map page coords into the surface's logical pixel space (the canvas's
-        // intrinsic raster size when mounted, else the canonical 960×540). The
-        // shared, unit-tested helper lives in browser_overlay_runtime.js; the
-        // fallback below mirrors it (canvas intrinsic dims, NOT a hardcoded
-        // basis — a self-describing SRF1 raster resizes per frame and a fixed
-        // 960×540 would mis-scale every tap on any other geometry).
-        if (window.FluxorOverlay && window.FluxorOverlay.surfaceLocalCoords) {
-          return window.FluxorOverlay.surfaceLocalCoords(el, ev.clientX, ev.clientY);
-        }
-        const canvas = el.tagName === 'CANVAS' ? el
-          : (el.querySelector && el.querySelector('canvas'));
-        const target = canvas || el;
-        const rect = target.getBoundingClientRect();
-        const lw = (canvas && canvas.width) || 960;
-        const lh = (canvas && canvas.height) || 540;
-        return {
-          x: Math.round((ev.clientX - rect.left) * (lw / (rect.width || lw))),
-          y: Math.round((ev.clientY - rect.top) * (lh / (rect.height || lh))),
-        };
+        return window.fluxor.surfacePoint(el, ev.clientX, ev.clientY);
       }
       function pushPointer(ev, kind) {
         const { x, y } = localCoords(ev);
-        pointerQ.push({
+        pushPointerRecord({
           pointerId: ev.pointerId & 0xFF,
           kind,
           buttons: ev.buttons & 0xFF,
@@ -853,13 +851,14 @@
       function setButton(pressed) {
         if (pressed && !buttonHeld) {
           buttonHeld = true;
-          buttonQ.push(0x01);
+          pushButton(0x01);
         } else if (!pressed && buttonHeld) {
           buttonHeld = false;
-          buttonQ.push(0x00);
+          pushButton(0x00);
         }
       }
-      // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL, 7=MOVE_REL
+      // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL, 7=MOVE_REL,
+      // 8=WHEEL (from `installWheel`, below)
       //
       // Pointer Lock: double-click the surface to capture the mouse (FPS
       // look); Esc releases it (browser default). While locked, motion is
@@ -884,7 +883,7 @@
           const dx = Math.max(-32767, Math.min(32767, e.movementX | 0));
           const dy = Math.max(-32767, Math.min(32767, e.movementY | 0));
           if (dx || dy) {
-            pointerQ.push({
+            pushPointerRecord({
               pointerId: e.pointerId & 0xFF, kind: 7,
               buttons: e.buttons & 0xFF, modifiers: 0, pressure: 0,
               x: dx, y: dy,
@@ -904,6 +903,9 @@
       // graphs that need to distinguish primary vs secondary clicks
       // wire `wasm_browser_pointer` directly instead.)
       el.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+      // Wheel and trackpad scroll over the surface: KIND_WHEEL records in
+      // the same queue, positioned by the same mapping.
+      window.fluxor.installWheel(window, el);
     }
 
     function buildOverlayButtons(el) {
@@ -1067,6 +1069,7 @@
     }
 
     function teardownKernel() {
+      if (mirror) { mirror.close(); mirror = null; }
       stepRunning = false;
       if (loopHandle) { cancelAnimationFrame(loopHandle); loopHandle = null; }
       if (workerRef) { workerRef.terminate(); workerRef = null; }
@@ -1094,7 +1097,14 @@
           case 'log': append(`[wasm] ${m.msg}`, m.level >= 3 ? 'err' : ''); if (m.level >= 2) console.log('[wasm] ' + m.msg); break;
           case 'panic': append(`[wasm PANIC] ${m.msg}`, 'err'); break;
           case 'perf': console.log(`[perf] ${m.ticksPerSec} ticks/s, ${m.bursts} bursts, ${m.budgetBound} budget-bound (${m.budgetMs}ms/${m.stepMax}) [worker]`); break;
-          case 'canvas-frame': setStatus(`rendered ${m.w}×${m.h}`); break;
+          case 'canvas-frame':
+            // The transferred canvas keeps the attributes it left with: the
+            // page learns the raster's extent from the frame the Worker shows.
+            window.fluxor.noteSurfaceExtent(canvas, m.w, m.h);
+            setStatus(`rendered ${m.w}×${m.h}`);
+            layoutMirror();
+            break;
+          case 'a11y': accessibilityMessage(m, displayEl); break;
           case 'audio': { audio.schedule(new Int16Array(m.pcm), m.sampleRate, m.channels); worker.postMessage({ type: 'audio-lead', leadUs: Number(audio.leadUs()), cursor: audio.frameCursor(), ready: audio.ready() }); break; }
         }
       };
@@ -1123,14 +1133,13 @@
         worker.postMessage({ type: 'audio-lead', leadUs: Number(audio.leadUs()), cursor: audio.frameCursor(), ready: audio.ready() });
       }, 10);
 
-      // Forward input the page captures (keyboard queue + pointer/button queues) to
-      // the Worker; it repopulates the queues host_shims' *_pop functions drain.
+      // Forward input the page captures — the wasm_browser_dom_input queue and
+      // every per-class queue (keyboard, pointer, button, gamepad, action, surface
+      // traits, the mirror's text edits and accessibility actions) — to the
+      // Worker; it repopulates the queues host_shims' *_pop functions drain.
       const fwd = () => {
         if (!workerRef) return;
-        const kbd = inputQueue.splice(0);
-        const ptr = (window.__fluxor_pointer_queue || []).splice(0);
-        const btn = (window.__fluxor_button_queue || []).splice(0);
-        if (kbd.length || ptr.length || btn.length) worker.postMessage({ type: 'input', keyboard: kbd, pointer: ptr, button: btn });
+        window.fluxor.postInputBatch(window, inputQueue, (m) => worker.postMessage(m));
         setTimeout(fwd, 16);
       };
       fwd();
@@ -1185,7 +1194,8 @@
           append(`[wasm PANIC] ${msg}`, 'err');
           teardownKernel();
         },
-        onCanvasFrame: (w, h) => setStatus(`rendered ${w}×${h}`),
+        onCanvasFrame: (w, h) => { setStatus(`rendered ${w}×${h}`); layoutMirror(); },
+        onAccessibility: (m) => accessibilityMessage(m, displayEl),
         canvasContainer: displayEl,
         fetchUrlOverride: (req) => currentAssetUrl || req,
         assetBank: bundleAssetBank,
@@ -1451,6 +1461,10 @@
         if (window.FluxorOverlay && window.FluxorOverlay.installSurfaceTraits) {
           window.__fluxor_surface_traits = window.FluxorOverlay.installSurfaceTraits(window);
         }
+        // Gamepad API producer: one poll per animation frame into
+        // `__fluxor_gamepad_queue`, drained by `wasm_browser_gamepad` wherever
+        // the kernel steps. Harmless if no module drains the queue.
+        window.__fluxor_gamepads = window.fluxor.installGamepadPoller(window);
         const playlistUrls = await resolvePlaylist(scenario);
 
         // Hand off to the role-specific navigator. We pick the

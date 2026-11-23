@@ -109,12 +109,12 @@ pub mod gpio {
     /// # Safety
     ///
     /// `static mut` is technically UB for shared access under Rust's memory model.
-    /// This is sound here because the platform is single-core and synchronous:
-    /// syscalls run inside the scheduler tick and cannot
-    /// preempt each other.  Each slot is further guarded by `CLAIMED`, ensuring
-    /// only one logical owner accesses a slot at a time.  If the executor ever
-    /// becomes multi-core or preemptive, these must be wrapped in
-    /// `Mutex<CriticalSectionRawMutex, _>`.
+    /// This is sound here because access is serialised: syscalls run inside
+    /// a pass and cannot preempt each other on one core, and where a second
+    /// core runs a domain every GPIO provider call and the edge poll run
+    /// with the other core kept out (`rp_providers::exclusive`).  Each slot
+    /// is further guarded by `CLAIMED`, ensuring only one logical owner
+    /// accesses a slot at a time.
     static mut SLOTS: [GpioSlot; MAX_GPIO] = [const { GpioSlot::new() }; MAX_GPIO];
 
     /// Validate handle and return the index plus a mutable reference to the slot.

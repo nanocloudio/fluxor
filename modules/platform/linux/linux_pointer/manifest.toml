@@ -6,18 +6,25 @@ builtin = true
 # the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Native Linux pointer/touch input authority — the evdev counterpart of
-# `wasm_browser_pointer`. Reads Linux `input_event` records from an evdev
-# device (`/dev/input/eventN`) and emits `input::pointer::MSG_EVENT`
-# 16-byte records on its `events` port, so a content-plane UI
-# (truffle_shell, content_controls) can hit-test taps on a connected LCD
-# touchscreen or mouse with no host chrome.
+# Native Linux pointer/touch input authority: the evdev source of
+# `PointerEvents`. Reads Linux `input_event` records from an evdev device
+# (`/dev/input/eventN`) and writes pointer records
+# (`abi::contracts::input::pointer`) on `events`, so an application that
+# draws its own interface can hit-test a touchscreen or a mouse and scroll
+# with its wheel.
 #
-# Absolute touch (`ABS_X`/`ABS_Y`, `ABS_MT_POSITION_X`/`_Y` + `BTN_TOUCH`)
-# and relative mouse (`REL_X`/`REL_Y` + `BTN_LEFT`) both map to
-# down/move/up pointer records, scaled from the device's axis range to the
-# surface's logical geometry. `path` may also be a FIFO carrying the same
-# `input_event` byte layout, for headless testing without hardware.
+# Absolute touch (`ABS_X`/`ABS_Y`, `ABS_MT_POSITION_X`/`_Y` with
+# `BTN_TOUCH`) and relative mouse (`REL_X`/`REL_Y` with `BTN_LEFT`) both
+# map to down, move and up records, scaled from the device's axis range to
+# the surface. The wheel maps to `KIND_WHEEL` records in 1/120 detent:
+# `REL_WHEEL_HI_RES` and `REL_HWHEEL_HI_RES` as they are, `REL_WHEEL` and
+# `REL_HWHEEL` times 120 from a device that sends no high-resolution code.
+# Positive `dy` scrolls toward the end, positive `dx` toward the right. At
+# most one wheel record is sent a step, the step's movement summed.
+#
+# A record the channel refuses is held and offered again; while records
+# wait the device is not read. `path` may also be a FIFO carrying the same
+# `input_event` byte layout, for a run with no hardware.
 
 [[ports]]
 name = "events"
@@ -32,7 +39,8 @@ tag = 10
 type = "str"
 default = "/dev/input/event0"
 
-# Tag 11/12 — logical surface geometry the coords are scaled into.
+# Tag 11/12 — the surface's extent, in surface pixels, that positions are
+# scaled into.
 [[params]]
 name = "width"
 tag = 11
@@ -45,9 +53,9 @@ tag = 12
 type = "u32"
 default = 540
 
-# Tag 13/14 — device absolute-axis maxima for scaling. 0 = axes are
-# already in logical space (pass-through; the default for mice and for
-# pre-scaled FIFO test input).
+# Tag 13/14 — device absolute-axis maxima for scaling. 0 = the axes are
+# already surface pixels (the default: a mouse, or a FIFO written in
+# surface pixels).
 [[params]]
 name = "x_max"
 tag = 13

@@ -64,10 +64,14 @@ pub const ENV_INSTALL_ROOT: &str = "FLUXOR_INSTALL_ROOT";
 pub enum InstallDiscoverySource {
     /// `$FLUXOR_INSTALL_ROOT` env var pointed at a usable directory.
     EnvVar,
-    /// A `~/.fluxor/workspace.toml` member's checkout carries
-    /// `stacks/` + `targets/`. Carries the member's `[project].name`
-    /// (from its `fluxor.toml`) for diagnostic rendering.
-    WorkspaceMember { project_name: String },
+    /// A checkout `~/.fluxor/workspace.toml` names among its
+    /// `live_trees` carries `stacks/` + `targets/`. Carries the member's
+    /// `[project].name` (from its `fluxor.toml`) for diagnostic rendering.
+    LiveTree { project_name: String },
+    /// The catalog `fluxor sync` staged from published Fluxor under the
+    /// project, `target/fluxor/fluxor-catalog/`: its stacks, targets and
+    /// native-module manifests.
+    SyncedCatalog,
     /// Found `<exe-prefix>/share/fluxor/{stacks,targets}` from the
     /// running binary's path — matches a `make install`-style layout
     /// where the binary lives at `<prefix>/bin/fluxor`.
@@ -97,23 +101,26 @@ pub struct InstallRoot {
 ///
 /// 1. **`$FLUXOR_INSTALL_ROOT` env var** when set to a directory
 ///    that has the install markers (`stacks/` + `targets/`).
-/// 2. **`~/.fluxor/workspace.toml` member** whose checkout carries
-///    the install markers. When a downstream project declares
-///    fluxor as a live workspace member, the catalog falls out for
-///    free — no env-var pointer required.
-/// 3. **Walk from `std::env::current_exe()`** looking for
+/// 2. **A `~/.fluxor/workspace.toml` `live_trees` checkout** that
+///    carries the install markers: a project building against Fluxor
+///    work not yet published names fluxor's checkout there.
+/// 3. **The synced catalog**: the `fluxor-catalog` source the current
+///    project's `fluxor sync` staged from published Fluxor, at
+///    `target/fluxor/fluxor-catalog/`. A workspace member that is not a
+///    live tree is used through this, never its working tree.
+/// 4. **Walk from `std::env::current_exe()`** looking for
 ///    - `<prefix>/share/fluxor/{stacks,targets}` (matches the
 ///      Make / Debian-style install layout where the binary lives
 ///      at `<prefix>/bin/fluxor`).
 ///    - `<prefix>/{stacks,targets}` directly (matches a flat
 ///      install where stacks/targets sit next to the bin dir).
-/// 4. **`None`** when nothing matches. In dev mode, the project
+/// 5. **`None`** when nothing matches. In dev mode, the project
 ///    root walk-up already finds the source tree's
 ///    `stacks/+targets/`, so the install root being `None` is a
 ///    no-op fallback.
 pub fn install_root() -> Option<InstallRoot> {
     // 1. Env override.
-    if let Ok(p) = std::env::var(ENV_INSTALL_ROOT) {
+    if let Some(p) = env_var(ENV_INSTALL_ROOT) {
         let path = PathBuf::from(&p);
         if has_install_markers(&path) {
             return Some(InstallRoot {
@@ -123,15 +130,12 @@ pub fn install_root() -> Option<InstallRoot> {
         }
     }
 
-    // 2. Workspace member with install markers. Workspace mode
-    //    routes source crates / fmods / runtimes through live member
-    //    checkouts, and the catalogs follow them. First member whose
-    //    root has both markers wins (in practice only fluxor's own
-    //    checkout passes). Silent skip on missing / unparseable
-    //    workspace.toml — broken user state should never block the
-    //    exe-walk fallback.
+    // 2. A live tree with install markers: first wins (in practice only
+    //    fluxor's own checkout passes). Silent skip on missing /
+    //    unparseable workspace.toml — broken user state should never
+    //    block the fallbacks.
     if let Ok(Some(ws)) = crate::workspace::load_workspace() {
-        for member in &ws.workspace.members {
+        for member in &ws.workspace.live_trees {
             if !has_install_markers(member) {
                 continue;
             }
@@ -148,12 +152,21 @@ pub fn install_root() -> Option<InstallRoot> {
             let canon = member.canonicalize().unwrap_or_else(|_| member.clone());
             return Some(InstallRoot {
                 path: canon,
-                source: InstallDiscoverySource::WorkspaceMember { project_name },
+                source: InstallDiscoverySource::LiveTree { project_name },
             });
         }
     }
 
-    // 3. Walk from the running binary's path.
+    // 3. The catalog synced from published Fluxor into this project.
+    let synced = discover().path.join(SYNCED_CATALOG);
+    if has_install_markers(&synced) {
+        return Some(InstallRoot {
+            path: synced.canonicalize().unwrap_or(synced),
+            source: InstallDiscoverySource::SyncedCatalog,
+        });
+    }
+
+    // 4. Walk from the running binary's path.
     if let Ok(exe) = std::env::current_exe() {
         // `<prefix>/bin/fluxor` → `<prefix>` is `exe.parent().parent()`.
         // Use `.parent()` only when both `bin` and the prefix exist.
@@ -178,6 +191,102 @@ pub fn install_root() -> Option<InstallRoot> {
 
     None
 }
+
+/// The source artifact Fluxor publishes its `stacks/` and `targets/` as.
+macro_rules! catalog_source {
+    () => {
+        "fluxor-catalog"
+    };
+}
+
+/// The name of the source artifact Fluxor publishes its `stacks/` and
+/// `targets/` as.
+#[allow(
+    dead_code,
+    reason = "read by the library's store modules; the binary compiles this file without them"
+)]
+pub const CATALOG_SOURCE: &str = catalog_source!();
+
+/// The environment variable `name`, as project and install discovery read it.
+pub fn env_var(name: &str) -> Option<std::ffi::OsString> {
+    discovery_env::var(name)
+}
+
+/// The working directory project discovery starts from.
+pub fn current_dir() -> std::io::Result<PathBuf> {
+    discovery_env::current_dir()
+}
+
+#[cfg(not(test))]
+mod discovery_env {
+    pub(super) fn var(name: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(name)
+    }
+
+    pub(super) fn current_dir() -> std::io::Result<std::path::PathBuf> {
+        std::env::current_dir()
+    }
+}
+
+/// Under test, the thread holding `tests::ENV_LOCK` sees the environment and
+/// working directory as it sets them; every other thread sees them as they
+/// were when the lock was taken.
+#[cfg(test)]
+mod discovery_env {
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, PoisonError};
+    use std::thread::ThreadId;
+
+    struct Snapshot {
+        owner: ThreadId,
+        vars: HashMap<OsString, OsString>,
+        cwd: Option<PathBuf>,
+    }
+
+    static HELD: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+    /// The snapshot another thread's lock left, if one is held.
+    fn read<R>(f: impl FnOnce(Option<&Snapshot>) -> R) -> R {
+        let held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        let me = std::thread::current().id();
+        f(held.as_ref().filter(|s| s.owner != me))
+    }
+
+    pub(super) fn var(name: &str) -> Option<OsString> {
+        read(|s| match s {
+            Some(s) => s.vars.get(OsStr::new(name)).cloned(),
+            None => std::env::var_os(name),
+        })
+    }
+
+    pub(super) fn current_dir() -> std::io::Result<PathBuf> {
+        read(|s| match s {
+            Some(s) => s
+                .cwd
+                .clone()
+                .ok_or_else(|| std::io::Error::other("no working directory")),
+            None => std::env::current_dir(),
+        })
+    }
+
+    pub(super) fn take() {
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Snapshot {
+            owner: std::thread::current().id(),
+            vars: std::env::vars_os().collect(),
+            cwd: std::env::current_dir().ok(),
+        });
+    }
+
+    pub(super) fn release() {
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// Where `fluxor sync` and `fluxor update` stage the published
+/// [`CATALOG_SOURCE`], under a project root.
+pub const SYNCED_CATALOG: &str = concat!("target/fluxor/", catalog_source!());
 
 fn has_install_markers(path: &Path) -> bool {
     path.is_dir() && path.join("stacks").is_dir() && path.join("targets").is_dir()
@@ -279,17 +388,15 @@ pub fn linux_runtime(project_root: &Path) -> PathBuf {
 /// lets `fluxor run` resolve modules/binaries the same way no matter where it
 /// is invoked from.
 pub fn root_for_config(config_path: &Path) -> PathBuf {
-    if let Ok(value) = std::env::var(ENV_PROJECT_ROOT) {
+    if let Some(value) = env_var(ENV_PROJECT_ROOT) {
         let p = PathBuf::from(&value);
         if p.is_dir() {
             return p.canonicalize().unwrap_or(p);
         }
     }
-    let absolute = config_path.canonicalize().unwrap_or_else(|_| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(config_path)
-    });
+    let absolute = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| current_dir().unwrap_or_default().join(config_path));
     if let Some(found) = absolute.parent().and_then(discover_from) {
         return found.path;
     }
@@ -510,8 +617,8 @@ fn read_fluxor_toml(project_root: &Path) -> Result<Option<FluxorTomlParse>, Stri
 
 /// Discover the project root with provenance. See [`ProjectRoot`].
 pub fn discover() -> ProjectRoot {
-    let env_var_value = std::env::var(ENV_PROJECT_ROOT).ok();
-    let starting_cwd = std::env::current_dir().unwrap_or_default();
+    let env_var_value = env_var(ENV_PROJECT_ROOT).and_then(|v| v.into_string().ok());
+    let starting_cwd = current_dir().unwrap_or_default();
 
     // 1. Explicit env override.
     if let Some(ref s) = env_var_value {
@@ -664,13 +771,43 @@ pub(crate) mod tests {
     use super::*;
     use std::fs;
 
-    /// Locking helper: env-var mutations and `set_current_dir` are
-    /// process-global, so the tests serialise on a shared mutex.
-    /// `Mutex<()>` rather than `RwLock` because read/write semantics
-    /// don't help when env vars are involved.
-    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The one lock every test that changes the process environment or
+    /// working directory holds while it does. Env-var mutations and
+    /// `set_current_dir` are process-global; while a test holds the lock,
+    /// every other test thread reads them, through [`env_var`] and
+    /// [`current_dir`], as they were when the lock was taken.
+    pub(crate) struct EnvLock(std::sync::Mutex<()>);
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Held while a test may change the environment or working directory.
+    pub(crate) struct EnvLockGuard {
+        _held: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        pub(crate) fn lock(&'static self) -> std::sync::LockResult<EnvLockGuard> {
+            let (held, poisoned) = match self.0.lock() {
+                Ok(g) => (g, false),
+                Err(p) => (p.into_inner(), true),
+            };
+            super::discovery_env::take();
+            let guard = EnvLockGuard { _held: held };
+            if poisoned {
+                Err(std::sync::PoisonError::new(guard))
+            } else {
+                Ok(guard)
+            }
+        }
+    }
+
+    impl Drop for EnvLockGuard {
+        fn drop(&mut self) {
+            super::discovery_env::release();
+        }
+    }
+
+    pub(crate) static ENV_LOCK: EnvLock = EnvLock(std::sync::Mutex::new(()));
+
+    fn lock() -> EnvLockGuard {
         match ENV_LOCK.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -913,41 +1050,85 @@ pub(crate) mod tests {
         (member, path)
     }
 
-    fn write_workspace_toml(members: &[&Path]) -> tempfile::NamedTempFile {
-        let mut body = String::from("[workspace]\nmembers = [\n");
-        for m in members {
-            body.push_str(&format!("  \"{}\",\n", m.display()));
-        }
-        body.push_str("]\n");
+    /// A workspace file listing `members`, of which `live` are live trees.
+    fn write_workspace_toml(members: &[&Path], live: &[&Path]) -> tempfile::NamedTempFile {
+        let list = |paths: &[&Path]| {
+            paths
+                .iter()
+                .map(|m| format!("  \"{}\",\n", m.display()))
+                .collect::<String>()
+        };
+        let body = format!(
+            "[workspace]\nmembers = [\n{}]\nlive_trees = [\n{}]\n",
+            list(members),
+            list(live)
+        );
         let file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         fs::write(file.path(), body).unwrap();
         file
     }
 
     #[test]
-    fn install_root_resolves_to_workspace_member_when_marker_present() {
+    fn install_root_resolves_to_a_live_tree_when_marker_present() {
         let _g = lock();
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
         let (_member_guard, member_path) = build_workspace_member("fluxor");
-        let ws_file = write_workspace_toml(&[&member_path]);
+        let ws_file = write_workspace_toml(&[&member_path], &[&member_path]);
         unsafe {
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
         }
         let found = install_root();
         restore_workspace_env();
-        let install = found.expect("workspace member with markers must resolve");
+        let install = found.expect("a live tree with markers must resolve");
         assert_eq!(
             install.path.canonicalize().unwrap(),
             member_path.canonicalize().unwrap(),
         );
         assert_eq!(
             install.source,
-            InstallDiscoverySource::WorkspaceMember {
+            InstallDiscoverySource::LiveTree {
                 project_name: "fluxor".into(),
             },
         );
+    }
+
+    /// A member that is not a live tree is used through what it
+    /// published: its checkout's catalog is never read, and the project's
+    /// synced catalog is.
+    #[test]
+    fn install_root_reads_a_members_catalog_only_from_a_live_tree() {
+        let _g = lock();
+        unsafe {
+            std::env::remove_var(ENV_INSTALL_ROOT);
+        }
+        let (_member_guard, member_path) = build_workspace_member("fluxor");
+        let ws_file = write_workspace_toml(&[&member_path], &[]);
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join(".fluxor"), b"").unwrap();
+        unsafe {
+            std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
+            std::env::set_var(ENV_PROJECT_ROOT, project.path());
+        }
+        let unsynced = install_root();
+        let synced = project.path().join(SYNCED_CATALOG);
+        fs::create_dir_all(synced.join("stacks")).unwrap();
+        fs::create_dir_all(synced.join("targets")).unwrap();
+        let found = install_root();
+        unsafe {
+            std::env::remove_var(ENV_PROJECT_ROOT);
+        }
+        restore_workspace_env();
+        assert!(
+            unsynced
+                .as_ref()
+                .is_none_or(|r| r.path.canonicalize().ok() != member_path.canonicalize().ok()),
+            "a member that is not a live tree must not be the install root, got {unsynced:?}"
+        );
+        let install = found.expect("the synced catalog resolves");
+        assert_eq!(install.source, InstallDiscoverySource::SyncedCatalog);
+        assert_eq!(install.path, synced.canonicalize().unwrap());
     }
 
     #[test]
@@ -955,7 +1136,7 @@ pub(crate) mod tests {
         // Both branches would resolve; env var must win.
         let _g = lock();
         let (_member_guard, member_path) = build_workspace_member("fluxor");
-        let ws_file = write_workspace_toml(&[&member_path]);
+        let ws_file = write_workspace_toml(&[&member_path], &[&member_path]);
         let env_target = tempfile::tempdir().unwrap();
         fs::create_dir(env_target.path().join("stacks")).unwrap();
         fs::create_dir(env_target.path().join("targets")).unwrap();
@@ -991,7 +1172,7 @@ pub(crate) mod tests {
             "[project]\nname = \"downstream\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        let ws_file = write_workspace_toml(&[downstream.path()]);
+        let ws_file = write_workspace_toml(&[downstream.path()], &[downstream.path()]);
         unsafe {
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
         }

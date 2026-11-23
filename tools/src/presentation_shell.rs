@@ -111,11 +111,18 @@ pub const MODALITIES: &[&str] = &[
     "physical_buttons",
 ];
 
-/// Validate `config.presentation.shell` / `.browser_overlay` if present.
+/// Validate `config.presentation.shell` / `.browser_overlay` if present, and
+/// the device pixel ratio a panel authority declares.
 /// `module_names` is the set of declared module instance names, used to
 /// resolve `presentation.surfaces[].module`. Returns the violation
 /// message on failure.
 pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
+    // The surface a shell is placed on is its authority's: a panel that
+    // declares a device pixel ratio it cannot report is refused with or
+    // without a `presentation` block.
+    if let Some(why) = crate::presentation_resolver::panel_dpr_refusal(config) {
+        return Err(why);
+    }
     let presentation = match config.get("presentation") {
         Some(p) => p,
         None => return Ok(()),

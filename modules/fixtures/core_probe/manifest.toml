@@ -1,0 +1,29 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "linux"]
+# `flash` erases and programs through the platform's raw flash ops.
+grants = ["flash"]
+
+# Fixture for a domain placed on a core of its own. One of two jobs, by
+# `mode`:
+#
+#   count  steps and reports, about once a second,
+#            [core_probe] <tag> steps=<n> gap_us=<longest wait between steps>
+#          so a reader can tell the module kept stepping while another core
+#          did something that parks this one. With `busy: 1` it asks to be
+#          stepped again at once, as a module with work always pending does,
+#          which keeps a `poll` domain's loop spinning.
+#   flash  programs one page of the flash sector at `sector` every
+#          `period_ms`, `count` times, erasing the sector before its first
+#          page and each time it fills, erases it once more at the end, and
+#          reports each answer and the total:
+#            [core_probe] <tag> flash n=<k> erase=<rc> program=<rc>
+#            [core_probe] <tag> flashes ok=<n> failed=<n>
+#          The sector must be one the platform lets a module write.
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[observability]
+exempt = "placement fixture; its '[core_probe]' lines are the observable, consumed by the rig scenarios' rules"

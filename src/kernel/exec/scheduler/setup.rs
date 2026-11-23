@@ -731,8 +731,8 @@ fn collect_isr_bridges_for_module(
 
 /// How [`register_isr_module`] registered a module.
 pub(crate) enum IsrRegistration {
-    /// a `timer` slot, stepped by the timer of this period.
-    Timer { period_us: u32 },
+    /// a `timer` slot, stepped by the timer of this period on this core.
+    Timer { period_us: u32, core: u8 },
     /// an `irq` slot, its IRQ bound to the domain's core.
     Irq,
 }
@@ -804,15 +804,13 @@ pub(crate) fn register_isr_module(
             crate::kernel::sys::hal::irq_mask(irq as u32, false);
             return Some(IsrRegistration::Irq);
         }
-        // The IRQ goes to the core that runs this domain's loop (domain id
-        // == core id on the multi-core platform); single-core and no-IRQ
-        // platforms ignore the target, and a HAL without an interrupt
-        // controller binds nothing.
+        // The IRQ goes to the core that runs this domain's loop; a HAL
+        // without an interrupt controller binds nothing.
         let bind_rc = crate::kernel::sys::hal::irq_bind(
             irq as u32,
             irq::IRQ_MODULE_EVENT,
             crate::kernel::sys::hal::IrqAck::None,
-            domain as u8,
+            crate::kernel::exec::domains::domain_core(domain) as u8,
         );
         if bind_rc < 0 {
             log::warn!(
@@ -838,10 +836,12 @@ pub(crate) fn register_isr_module(
             ModuleSlot::Native(m) => (m.vtable().step, m.state_ptr()),
             ModuleSlot::Empty => return None,
         };
+    let core = crate::kernel::exec::domains::domain_core(domain) as u8;
     let rc = timer::register_module(
         step_fn,
         state_ptr,
         module_idx as ModuleId,
+        core,
         budget,
         in_bridges,
         out_bridges,
@@ -850,7 +850,7 @@ pub(crate) fn register_isr_module(
         log::error!("[isr] failed to register timer-domain module {module_idx} (domain {domain})");
         return None;
     }
-    Some(IsrRegistration::Timer { period_us })
+    Some(IsrRegistration::Timer { period_us, core })
 }
 
 /// Log the arenas the node's graph and its workloads drew: the one-line

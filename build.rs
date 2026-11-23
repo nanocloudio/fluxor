@@ -10,6 +10,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// The domain-to-core map's rules, shared with the kernel and the graph
+/// builder.
+use fluxor_contracts::core_map;
+
+/// The RP timer ownership rules, shared with the kernel's host tests.
+#[path = "src/platform/rp/timer_ledger.rs"]
+#[allow(
+    dead_code,
+    reason = "the kernel's file, mounted whole; only an RP build's ledger reaches every item"
+)]
+mod timer_ledger;
+
 // ============================================================================
 // TOML schema (only the [kernel] section)
 // ============================================================================
@@ -20,6 +32,30 @@ struct SiliconToml {
     peripherals: Option<PeripheralConfig>,
     memory: Option<MemoryToml>,
     isolation: Option<IsolationToml>,
+}
+
+/// `[smp]`: the cores that run a domain loop and the core of each domain.
+#[derive(Deserialize)]
+struct SmpToml {
+    cores: u8,
+    domain_cores: Vec<u8>,
+    secondary_stack: Option<SecondaryStackToml>,
+}
+
+/// The second core's stack: its base, its size and the kernel's share of it
+/// under a module.
+#[derive(Deserialize)]
+struct SecondaryStackToml {
+    base: String,
+    size_kb: u32,
+    reserve_kb: u32,
+}
+
+/// Only `[smp]`, for the targets whose other sections the kernel build does
+/// not read.
+#[derive(Deserialize)]
+struct SmpOnly {
+    smp: Option<SmpToml>,
 }
 
 /// The `[isolation]` facts the RP protection backend compiles against. The
@@ -240,6 +276,10 @@ struct TimerLedger {
     provider_alarms: Vec<u8>,
     foreign_instance: String,
     foreign_alarms: Vec<u8>,
+    /// A second core's own instance, where the die runs a domain on one.
+    secondary: Option<String>,
+    secondary_base: Option<String>,
+    secondary_alarms: Option<Vec<TimerAlarm>>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +346,35 @@ fn linker_ram_bytes(script: &[u8]) -> Option<u32> {
         },
     };
     digits.trim().parse::<u32>().ok().map(|n| n * scale)
+}
+
+/// The `(ORIGIN, LENGTH)` of region `name` in a linker memory map.
+fn linker_region(script: &[u8], name: &str) -> Option<(u32, u32)> {
+    let text = std::str::from_utf8(script).ok()?;
+    let line = text.lines().map(str::trim).find(|l| {
+        l.strip_prefix(name)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })?;
+    let origin = line
+        .split("ORIGIN")
+        .nth(1)?
+        .trim_start_matches([' ', '='])
+        .split(',')
+        .next()?
+        .trim();
+    let len = line
+        .split("LENGTH")
+        .nth(1)?
+        .trim_start_matches([' ', '='])
+        .trim();
+    let (digits, scale) = match len.strip_suffix('K') {
+        Some(d) => (d, 1024),
+        None => (len, 1),
+    };
+    Some((
+        parse_hex(origin),
+        digits.trim().parse::<u32>().ok()? * scale,
+    ))
 }
 
 fn emit_const(gen: &mut String, name: &str, ty: &str, val: &str) {
@@ -530,6 +599,95 @@ fn generate_chip_rs(
                 "IRQ {} is shared by '{}' and '{}'; each alarm owner needs its own line",
                 a.irq, prev, a.owner
             );
+        }
+    }
+
+    // A second core's instance joins the same ledger: its alarms are checked
+    // with the monotonic instance's as one set, so an alarm, a reserved
+    // alarm or an NVIC line claimed on both sides is refused here.
+    let secondary_alarms = t.secondary_alarms.as_deref().unwrap_or(&[]);
+    if let Some(secondary) = &t.secondary {
+        assert!(
+            *secondary != t.monotonic,
+            "[kernel.timers] secondary is the monotonic instance {secondary}; a second core \
+             needs a timer of its own"
+        );
+        assert!(
+            t.secondary_base.is_some() && !secondary_alarms.is_empty(),
+            "[kernel.timers] secondary = {secondary} needs secondary_base and secondary_alarms"
+        );
+    } else {
+        assert!(
+            t.secondary_base.is_none() && secondary_alarms.is_empty(),
+            "[kernel.timers] secondary_base and secondary_alarms need `secondary`"
+        );
+    }
+    // Instance numbers for the shared rules: 0 the monotonic instance, 1 the
+    // secondary, 2 a foreign instance that is neither.
+    let instance_of = |name: &str| -> u8 {
+        if name == t.monotonic {
+            0
+        } else if t.secondary.as_deref() == Some(name) {
+            1
+        } else {
+            2
+        }
+    };
+    let claims: Vec<(timer_ledger::Claim, String)> = t
+        .alarms
+        .iter()
+        .map(|a| (0u8, t.monotonic.as_str(), a))
+        .chain(
+            secondary_alarms
+                .iter()
+                .map(|a| (1u8, t.secondary.as_deref().unwrap_or(""), a)),
+        )
+        .map(|(instance, name, a)| {
+            (
+                timer_ledger::Claim {
+                    instance,
+                    alarm: a.index,
+                    irq: a.irq,
+                },
+                format!("{name} alarm {} ('{}', IRQ {})", a.index, a.owner, a.irq),
+            )
+        })
+        .collect();
+    let reserved: Vec<timer_ledger::Reserved> = t
+        .foreign_alarms
+        .iter()
+        .map(|&alarm| timer_ledger::Reserved {
+            instance: instance_of(&t.foreign_instance),
+            alarm,
+        })
+        .chain(
+            t.provider_alarms
+                .iter()
+                .map(|&alarm| timer_ledger::Reserved { instance: 0, alarm }),
+        )
+        .collect();
+    let only: Vec<timer_ledger::Claim> = claims.iter().map(|(c, _)| *c).collect();
+    if let Err(e) = timer_ledger::check(&only, &reserved) {
+        use timer_ledger::LedgerError as E;
+        match e {
+            E::AlarmOutOfRange { claim } => {
+                panic!(
+                    "{} is out of range: RP timers have 4 alarms (0-3)",
+                    claims[claim].1
+                )
+            }
+            E::AlarmClaimedTwice { first, second } => panic!(
+                "{} and {} claim one alarm",
+                claims[first].1, claims[second].1
+            ),
+            E::AlarmReserved { claim } => panic!(
+                "{} is reserved: the external time driver's or the timer provider's",
+                claims[claim].1
+            ),
+            E::IrqShared { first, second } => panic!(
+                "{} and {} share an NVIC line; each alarm owner needs its own",
+                claims[first].1, claims[second].1
+            ),
         }
     }
 
@@ -930,9 +1088,8 @@ fn generate_chip_rs(
     emit_hex_const(&mut g, "MONOTONIC_BASE", &t.monotonic_base);
     emit_hex_const(&mut g, "TIMER_INTR_OFFSET", &t.timer_intr_offset);
     emit_hex_const(&mut g, "TIMER_INTE_OFFSET", &t.timer_inte_offset);
-    // RP2040 has no TICKS block; its timer runs off the watchdog tick, which
-    // the clock init already enables. Absent rather than zero, so a caller
-    // cannot accidentally poke address 0.
+    // RP2040 has no TICKS block; its timer runs off the watchdog's own tick.
+    // Absent rather than zero, so a caller cannot accidentally poke address 0.
     if let Some(ticks) = &t.ticks_base {
         emit_hex_const(&mut g, "TICKS_BASE", ticks);
     }
@@ -950,6 +1107,31 @@ fn generate_chip_rs(
             "u16",
             &format!("{}", a.irq),
         );
+    }
+    if let (Some(secondary), Some(base)) = (&t.secondary, &t.secondary_base) {
+        emit_const(&mut g, "SECONDARY_TIMER", "&str", &format!("{secondary:?}"));
+        emit_hex_const(&mut g, "SECONDARY_TIMER_BASE", base);
+        for a in secondary_alarms {
+            let up = a.owner.to_uppercase();
+            emit_const(
+                &mut g,
+                &format!("SECONDARY_TIMER_ALARM_{up}"),
+                "u8",
+                &format!("{}", a.index),
+            );
+            emit_const(
+                &mut g,
+                &format!("SECONDARY_TIMER_IRQ_{up}"),
+                "u16",
+                &format!("{}", a.irq),
+            );
+        }
+        for owner in ["step_guard", "scheduler", "module_timer"] {
+            assert!(
+                secondary_alarms.iter().any(|a| a.owner == owner),
+                "[kernel.timers] secondary_alarms names no '{owner}' alarm"
+            );
+        }
     }
     g.push('\n');
 
@@ -1162,12 +1344,72 @@ fn main() {
         // Hosted targets: kernel capacity comes from `kernel::config` (per
         // platform, selected by the platform feature). No linker script, no
         // chip_generated.rs.
-        Platform::HostLinux | Platform::HostWasm => {}
-        Platform::HostUefi => emit_uefi(out),
-        Platform::Bcm2712 => emit_bcm2712(out),
+        Platform::HostLinux => {
+            emit_smp(out, "targets/host/linux.toml");
+        }
+        Platform::HostWasm => {
+            emit_smp(out, "targets/host/wasm.toml");
+        }
+        Platform::HostUefi => {
+            emit_smp(out, "targets/host/uefi.toml");
+            emit_uefi(out)
+        }
+        Platform::Bcm2712 => {
+            emit_smp(out, "targets/silicon/bcm2712.toml");
+            emit_bcm2712(out)
+        }
         Platform::Rp2040 => emit_rp(out, Rp::Rp2040),
         Platform::Rp2350 => emit_rp(out, Rp::Rp2350),
     }
+}
+
+/// `[smp]` of `toml_path` as `smp_generated.rs`: the cores that run a domain
+/// loop and the core of each domain, checked against the map's rules. Every
+/// platform's `chip` includes it. Returns the section for a caller that
+/// reads more of it.
+fn emit_smp(out: &Path, toml_path: &str) -> SmpToml {
+    let text = fs::read_to_string(toml_path).unwrap_or_else(|e| panic!("{toml_path}: {e}"));
+    let smp = toml::from_str::<SmpOnly>(&text)
+        .unwrap_or_else(|e| panic!("{toml_path}: {e}"))
+        .smp
+        .unwrap_or_else(|| panic!("{toml_path} has no [smp] section"));
+    if let Err(e) = core_map::validate(&smp.domain_cores, smp.cores) {
+        use core_map::MapError as E;
+        let why = match e {
+            E::Length => format!(
+                "names {} domains; a map covers exactly {}",
+                smp.domain_cores.len(),
+                core_map::DOMAINS
+            ),
+            E::NoCores => "runs no core".to_owned(),
+            E::PrimaryNotOnBootCore => "puts domain 0 off core 0, the core that boots".to_owned(),
+            E::CoreOutOfRange { domain } => format!(
+                "puts domain {domain} on core {}, but the target runs {} core(s)",
+                smp.domain_cores[domain], smp.cores
+            ),
+            E::SecondaryShared { core } => format!(
+                "gives core {core} more than one domain; a core other than 0 runs one domain's loop"
+            ),
+        };
+        panic!(
+            "{toml_path}: [smp] domain_cores {:?} {why}",
+            smp.domain_cores
+        );
+    }
+    let g = format!(
+        "// Auto-generated by build.rs from {toml_path} [smp] — do not edit.\n\
+         /// Cores that run a domain loop.\n\
+         pub const SMP_CORES: usize = {};\n\
+         /// The core that runs each execution domain.\n\
+         pub const DOMAIN_CORES: [u8; {}] = {:?};\n",
+        smp.cores,
+        core_map::DOMAINS,
+        smp.domain_cores
+    );
+    fs::write(out.join("smp_generated.rs"), g).unwrap();
+    println!("cargo:rerun-if-changed={toml_path}");
+    println!("cargo:rerun-if-changed=contracts/src/core_map.rs");
+    smp
 }
 
 fn emit_uefi(out: &Path) {
@@ -1377,6 +1619,59 @@ fn emit_rp(out: &Path, family: Rp) {
          ({ram_bytes:#x}), which is where the kernel's statics and stack live"
     );
     let mut generated = generate_chip_rs(&kernel, is_rp2040, &peripherals, ram_bytes);
+    // The domain-to-core map, and the second core's stack and timer where
+    // the map runs a domain there.
+    let smp = emit_smp(out, toml_path);
+    let runs_secondary = smp.domain_cores.iter().any(|&c| c != 0);
+    assert!(
+        runs_secondary == smp.secondary_stack.is_some(),
+        "{toml_path}: [smp] secondary_stack is declared exactly when domain_cores runs a \
+         domain off core 0"
+    );
+    assert!(
+        runs_secondary == kernel.timers.secondary.is_some(),
+        "{toml_path}: [kernel.timers] secondary is declared exactly when [smp] domain_cores \
+         runs a domain off core 0"
+    );
+    if let Some(stack) = &smp.secondary_stack {
+        let base = parse_hex(&stack.base);
+        let size = stack.size_kb * 1024;
+        let reserve = stack.reserve_kb * 1024;
+        let bank = |name: &str| {
+            linker_region(linker_script, name)
+                .unwrap_or_else(|| panic!("no {name} region in the {toml_path} linker map"))
+        };
+        let (low_base, low_len) = bank("SRAM8");
+        let (high_base, high_len) = bank("SRAM9");
+        assert!(
+            base == low_base && high_base == low_base + low_len && size == low_len + high_len,
+            "{toml_path}: [smp] secondary_stack ({base:#x}, {size} B) is not the linker's \
+             SRAM8 and SRAM9 regions ({low_base:#x}, {} B)",
+            low_len + high_len
+        );
+        assert!(
+            reserve < size,
+            "{toml_path}: [smp] secondary_stack reserve_kb leaves no stack for a module"
+        );
+        emit_const(
+            &mut generated,
+            "SECONDARY_STACK_BASE",
+            "usize",
+            &format!("{base:#x}"),
+        );
+        emit_const(
+            &mut generated,
+            "SECONDARY_STACK_SIZE",
+            "usize",
+            &format!("{size}"),
+        );
+        emit_const(
+            &mut generated,
+            "SECONDARY_STACK_RESERVE",
+            "usize",
+            &format!("{reserve}"),
+        );
+    }
     // Isolation facts. A silicon with no [isolation] section compiles no
     // backend in, so these default to "no protection unit".
     let (model, regions) = match &silicon.isolation {

@@ -24,7 +24,7 @@ const BOARD: &str = r#"
 
 struct Bench {
     _guards: (
-        std::sync::MutexGuard<'static, ()>,
+        crate::project::tests::EnvLockGuard,
         std::sync::MutexGuard<'static, ()>,
     ),
     home: crate::rig::test_utils::UniqueTmpDir,

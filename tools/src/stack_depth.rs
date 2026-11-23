@@ -97,10 +97,21 @@ pub fn entry_points(asm: &str) -> Vec<String> {
 ///
 /// `roots` are the functions the kernel calls: every exported `module_*`
 /// symbol. A function whose address the module takes is a root as well, since
-/// the usual reason to take one is to hand it to the kernel as a callback.
-pub fn worst_case(asm: &str, isa: Isa, roots: &[&str]) -> Result<Depth, String> {
+/// the usual reason to take one is to hand it to the kernel as a callback —
+/// when `linked` says the module's link kept it. `asm` is the module and the
+/// crates it links, whole; a function of a crate the link discarded is not in
+/// the module, and neither is what it calls.
+pub fn worst_case(
+    asm: &str,
+    isa: Isa,
+    roots: &[&str],
+    linked: &dyn Fn(&str) -> bool,
+) -> Result<Depth, String> {
     let functions = parse(asm, isa);
-    let mut taken: Vec<String> = address_taken(asm, isa, &functions).into_iter().collect();
+    let mut taken: Vec<String> = address_taken(asm, isa, &functions)
+        .into_iter()
+        .filter(|f| linked(f))
+        .collect();
     taken.sort();
     let none = Depth {
         bytes: 0,

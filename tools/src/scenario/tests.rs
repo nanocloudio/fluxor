@@ -891,7 +891,7 @@ bindings:
     /// nothing else: a change made under `project`'s lock would still move the
     /// directory out from under a test here, and that surfaced as a merged YAML
     /// written into a temporary root another test had just removed.
-    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn cwd_lock() -> crate::project::tests::EnvLockGuard {
         crate::project::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

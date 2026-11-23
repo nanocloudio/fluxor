@@ -21,10 +21,10 @@ state_bytes_64 = 1
 # leaf. The shim asks lazily, on the first pull, because a permission prompt
 # at boot is a prompt with no context.
 #
-# The frame format is the one every present backend already speaks: RGB565-LE
-# behind an `SRF1` header (`sector/modules/common/sector_raster.rs`), so
-# `capture.pixels -> display.pixels` resolves against `linux_display`,
-# `st7701s`, and `wasm_browser_canvas` without a converter.
+# Each captured frame is one `VideoRaster` record: a region header
+# (`abi::contracts::video_raster`) covering the whole shared surface, then its
+# RGB565 pixels. `capture.pixels -> display.pixels` resolves against any
+# raster display that takes RGB565 without a converter.
 
 # `video.raster` is the surface it carries. `display.capture` is the role: it
 # produces frames of a display that exists somewhere else. Nothing in the
@@ -38,11 +38,15 @@ name = "pixels"
 direction = "output"
 content_type = "VideoRaster"
 required = true
+# What a capture sends: RGB565, every frame the whole surface in one region.
+[ports.facts]
+formats = ["rgb565"]
+regions = ["bands"]
 
 # Backing size, not the shared size. The person choosing what to share is the
 # one who decides the geometry, and they may change it mid-session by picking
-# a different window; these bound the buffer, and the per-frame SRF1 header
-# carries what actually arrived.
+# a different window; these bound the buffer, and each frame's region header
+# carries the extent that actually arrived.
 [[params]]
 name = "width"
 tag = 10
@@ -55,24 +59,14 @@ tag = 11
 type = "u16"
 required = true
 
-# Defaults to 1, the opposite of `wasm_browser_canvas`: a capture source
-# cannot promise the configured geometry, so the stream has to describe
-# itself. Set to 0 only when the consumer has no header mode and the
-# capture is known to be fixed-size.
-[[params]]
-name = "header"
-tag = 12
-type = "u16"
-default = 1
-range = [0, 1]
-
 # Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples, not a measurable on-device byte stream"
 
 [capacities]
 # The module heap the kernel seats for an instance, from the state arena:
-# its instance, and 2 bytes per pixel of `width` x `height`. `fluxor abi-regen` emits it as
+# its instance, a region header, and 2 bytes per pixel of `width` x `height`.
+# `fluxor abi-regen` emits it as
 # `HEAP_SEAT`, which the kernel seats by and the build charges by
 # (`fluxor_contracts::state_arena::heap_seat_bytes`).
 heap_seat = 290

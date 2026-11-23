@@ -1,10 +1,6 @@
 //! The processor as a set of cores: which one is running, how a core
-//! number maps to an MPIDR, and the drop from EL2 to EL1 at entry.
-//!
-//! Some firmware hands a core over at EL2 (the Pi 5's Trusted Firmware),
-//! some at EL1 (a hypervisor's guest). Each entry path — the boot core's
-//! `_start`, a secondary core arriving from PSCI — runs the same drop, so
-//! it is one piece of assembly, [`drop_to_el1`], not two copies.
+//! number maps to an MPIDR, and the exception level a core entered at (the
+//! drop from EL2 to EL1 itself is `arch::el2_drop`).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -45,15 +41,6 @@ pub fn mpidr_for_core(core_id: u8) -> u64 {
     (core_id as u64) << core_id_shift()
 }
 
-/// The EL2 → EL1h drop as assembly text for an entry path: if the core is
-/// at EL2, disable the EL2 MMU and caches (`SCTLR_EL2.{M,C,I}`), make EL1
-/// AArch64 (`HCR_EL2.RW`), give EL1 the physical counter and timer
-/// (`CNTHCTL_EL2.{EL1PCTEN,EL1PCEN}`, with `CNTVOFF_EL2` zero so the
-/// virtual counter equals the physical one), and `eret` to the label with
-/// DAIF masked on SP_EL1; if it is already at EL1, branch to the same label. The two scratch
-/// registers and the label are the caller's, so the macro fits whatever
-/// the surrounding code has free. `$label` is a local-label reference such
-/// as `"2f"`; the caller places `"2:"` right after the expansion.
 /// Make this core's earlier stores visible to the other cores, then wake
 /// every core waiting in [`wait_for_event`].
 #[inline(always)]
@@ -76,93 +63,14 @@ pub fn wait_for_interrupt() {
     unsafe { core::arch::asm!("wfi", options(nostack)) };
 }
 
-#[macro_export]
-macro_rules! drop_to_el1 {
-    ($t0:literal, $t1:literal, $label:literal) => {
-        concat!(
-            "mrs ",
-            $t0,
-            ", CurrentEL\n",
-            "cmp ",
-            $t0,
-            ", #(2 << 2)\n",
-            "b.ne ",
-            $label,
-            "\n",
-            // At EL2: disable EL2 MMU/caches and prepare an eret to EL1h.
-            "mrs ",
-            $t0,
-            ", sctlr_el2\n",
-            "bic ",
-            $t0,
-            ", ",
-            $t0,
-            ", #(1 << 0)\n",
-            "bic ",
-            $t0,
-            ", ",
-            $t0,
-            ", #(1 << 2)\n",
-            "bic ",
-            $t0,
-            ", ",
-            $t0,
-            ", #(1 << 12)\n",
-            "msr sctlr_el2, ",
-            $t0,
-            "\n",
-            "isb\n",
-            // HCR_EL2.RW = 1: EL1 is AArch64.
-            "mrs ",
-            $t0,
-            ", hcr_el2\n",
-            "mov ",
-            $t1,
-            ", #(1 << 31)\n",
-            "orr ",
-            $t0,
-            ", ",
-            $t0,
-            ", ",
-            $t1,
-            "\n",
-            "msr hcr_el2, ",
-            $t0,
-            "\n",
-            // CNTHCTL_EL2: EL1 may use the physical timer and counter.
-            "mrs ",
-            $t0,
-            ", cnthctl_el2\n",
-            "orr ",
-            $t0,
-            ", ",
-            $t0,
-            ", #(1 << 0)\n",
-            "orr ",
-            $t0,
-            ", ",
-            $t0,
-            ", #(1 << 1)\n",
-            "msr cnthctl_el2, ",
-            $t0,
-            "\n",
-            "msr cntvoff_el2, xzr\n",
-            // Return state: DAIF masked, EL1h (SP_EL1).
-            "mov ",
-            $t0,
-            ", #0x3c5\n",
-            "msr spsr_el2, ",
-            $t0,
-            "\n",
-            "adr ",
-            $t0,
-            ", ",
-            $label,
-            "\n",
-            "msr elr_el2, ",
-            $t0,
-            "\n",
-            "eret",
-        )
-    };
+/// Whether this core entered the kernel at EL2 (the entry level the drop
+/// recorded, `arch::el2_drop`), so the kernel itself set what EL2 traps
+/// from EL1 on the way down. A core entered at EL1 runs under something the
+/// kernel cannot ask: a hypervisor, or firmware that kept EL2.
+#[inline(always)]
+pub fn entered_at_el2() -> bool {
+    let entry: u64;
+    // SAFETY: an EL1 software register with no side effects.
+    unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) entry, options(nomem, nostack)) };
+    entry == crate::arch::el2_drop::ENTRY_EL2
 }
