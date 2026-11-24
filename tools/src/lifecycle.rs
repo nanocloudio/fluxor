@@ -109,6 +109,11 @@ impl Shape {
     /// builds in (residue from running cargo by hand there), the OCI store
     /// (shared across projects — `store gc`'s business, and sweeping it would
     /// destroy sibling projects' pins), and deploy staging.
+    ///
+    /// The root comes last. Its target dir holds the SDK crates `fluxor sync`
+    /// stages (`target/fluxor/fluxor-abi`, ...), which the other workspaces
+    /// depend on by path; cargo cannot load, and so cannot clean, a workspace
+    /// whose path dependencies are gone.
     fn cargo_clean_sites(&self) -> Vec<PathBuf> {
         let mut sites: Vec<PathBuf> = Vec::new();
         let add = |sites: &mut Vec<PathBuf>, dir: PathBuf| {
@@ -116,10 +121,6 @@ impl Shape {
                 sites.push(dir);
             }
         };
-
-        if self.has_cargo {
-            add(&mut sites, self.project_root.clone());
-        }
 
         // A host-tools crate that is a member of the root workspace shares the
         // root's target dir and is already covered; one that stands alone (no
@@ -154,6 +155,10 @@ impl Shape {
         // clean cannot reach it, and it is the largest target dir in the tree.
         if self.has_harness_crate {
             add(&mut sites, self.project_root.join("tests/harness"));
+        }
+
+        if self.has_cargo {
+            add(&mut sites, self.project_root.clone());
         }
 
         sites
@@ -1117,8 +1122,9 @@ mod tests {
         let sites = s.cargo_clean_sites();
         assert_eq!(
             sites,
-            vec![dir.clone(), dir.join("tests/harness")],
-            "the root and the sub-workspace, and not the member crate"
+            vec![dir.join("tests/harness"), dir.clone()],
+            "the sub-workspace, then the root whose target dir holds the staged \
+             SDK crates the sub-workspace depends on, and not the member crate"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

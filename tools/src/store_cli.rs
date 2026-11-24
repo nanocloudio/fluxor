@@ -18,12 +18,10 @@ use crate::error::{Error, Result};
 // Bin-root helper (cli/commands_c.rs, flat `include!` scope).
 use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
-    self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, ImageManifest, OciStore,
-    PackageArtifact, StackArtifact, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL,
-    PROVENANCE_PUBLISHED,
+    self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, OciStore, PackageArtifact,
+    StackArtifact, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL, PROVENANCE_PUBLISHED,
 };
 use fluxor_tools::store_remote;
-use fluxor_tools::store_resolve;
 
 // ── Args ──────────────────────────────────────────────────────────────
 
@@ -163,33 +161,100 @@ fn provenance_flag(published: bool) -> &'static str {
     }
 }
 
-// ── fluxor publish package ────────────────────────────────────────────
+// ── fluxor publish package | stack ────────────────────────────────────
 
-/// `fluxor publish package <dir | workload.toml>`.
-///
-/// A source manifest is checked where the sweep finds it
-/// (`packaging/<service|applet>/<name>/workload.toml`) and emitted first.
-/// The package directory may be an
-/// emitted root (`target/fluxor/<name>/`, documents under its target
-/// subdir), a flat target dir, or a materialised package (documents plus
-/// `modules/`). The module bytes come from the package's own `modules/` when
-/// it has one, else from the publishing project's built modules; either way
-/// each must hash to the digest `workload.json` pins. The package is
-/// published under its project (`[project]` of the tree it lives in) and
-/// joins that project's index in one transaction.
-pub fn cmd_package_publish(
+/// A lib error as the bin's, without a second `Config error:` prefix.
+fn lift_error(e: fluxor_tools::error::Error) -> Error {
+    match e {
+        fluxor_tools::error::Error::Config(m) => Error::Config(m),
+        other => Error::Config(other.to_string()),
+    }
+}
+
+/// One shippable a publish stages: its prepared artefact, the reference it
+/// publishes under, and how many module artefacts it carries.
+pub struct Staged {
+    pub prepared: oci_store::Prepared,
+    pub reference: String,
+    pub modules: usize,
+}
+
+/// The metadata every artefact of the project at `project_root` carries.
+fn shippable_meta(
+    project_root: &Path,
+    published: bool,
+) -> Result<(
+    crate::project::ProjectIdentity,
+    String,
+    Option<String>,
+    &'static str,
+)> {
+    let identity = crate::project::project_identity(project_root)
+        .map_err(Error::Config)?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no [project] table in {}/fluxor.toml — a package or stack is published under \
+                 its project",
+                project_root.display()
+            ))
+        })?;
+    let epoch_hex: String = crate::hash::abi_surface_digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((
+        identity,
+        epoch_hex,
+        git_source_rev(project_root),
+        provenance_flag(published),
+    ))
+}
+
+/// A package's publish, staged: a source manifest
+/// (`packaging/<service|applet>/<name>/workload.toml`) is checked and emitted
+/// — its graph built, its module artefacts resolved as the build resolves
+/// them — and its documents validated. A package directory given instead
+/// (an emitted root, a flat target dir, or a materialised package with its
+/// `modules/`) carries its documents, and its module bytes come from its
+/// `modules/` or the project's shelf; either way each must hash to the
+/// digest `workload.json` pins.
+pub fn stage_package(
     package: &Path,
-    store_dir: Option<&Path>,
+    own: &fluxor_tools::stack::OwnModules,
+    store: &OciStore,
     tag: Option<&str>,
     published: bool,
     verbose: bool,
-) -> Result<()> {
-    let dir = if crate::workload_src::is_source_manifest(package) {
+) -> Result<Staged> {
+    let (dir, emitted) = if crate::workload_src::is_source_manifest(package) {
         let project_root = crate::project::root_for_config(package);
         fluxor_tools::packaging::check_package(package, &project_root).map_err(Error::Config)?;
-        crate::workload_src::emit_package(package, None, verbose)?
+        let e = crate::workload_src::emit_package(package, None, verbose)?;
+        // A consumer pins a package's modules from where they are
+        // published: each of the project's own the package ships must be a
+        // published artefact carrying these bytes — staged by this publish,
+        // or already in the store.
+        let unpublished: Vec<String> = e
+            .modules
+            .iter()
+            .filter(|(name, _)| e.own.contains(name))
+            .map(|(name, bytes)| (name, sha256_hex_prefixed(bytes)))
+            .filter(|(name, digest)| !own.holds(name, &e.abi, digest))
+            .map(|(name, digest)| format!("{name} ({digest})"))
+            .collect();
+        if !unpublished.is_empty() {
+            return Err(Error::Config(format!(
+                "package {} ships this project's module(s) {} for {}, which no published \
+                 artefact carries: publish its modules with it (`fluxor publish --only fmod \
+                 --only package`)",
+                package.display(),
+                unpublished.join(", "),
+                e.abi
+            )));
+        }
+        (e.root, Some(e.modules))
     } else {
-        package.to_path_buf()
+        (package.to_path_buf(), None)
     };
     let docs = if dir.join("graph.yaml").is_file() {
         dir.clone()
@@ -213,23 +278,58 @@ pub fn cmd_package_publish(
             report.errors.join("; ")
         )));
     }
-
     let project_root = crate::project::root_for_config(&docs.join("workload.json"));
-    let identity = crate::project::project_identity(&project_root)
-        .map_err(Error::Config)?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "no [project] table in {}/fluxor.toml — a package is published under its project",
-                project_root.display()
-            ))
-        })?;
+    let modules = match emitted {
+        Some(m) => m,
+        None => package_dir_modules(&docs, &project_root, &manifest)?,
+    };
+    let reference = match tag {
+        Some(t) => t.to_string(),
+        None => format!("{}:{}", manifest.name, manifest.version),
+    };
+    let (identity, epoch_hex, source_rev, provenance) = shippable_meta(&project_root, published)?;
+    let meta = ArtifactMeta {
+        project: &identity.name,
+        provenance,
+        source_rev: source_rev.as_deref(),
+        abi_surface_hex: &epoch_hex,
+        input_digest_hex: None,
+        ci_digest_hex: None,
+    };
+    let prepared = store
+        .prepare_package(
+            &PackageArtifact {
+                workload_json: &workload_json,
+                resources_json: &resources_json,
+                graph_yaml: &graph_yaml,
+                modules: &modules,
+                ref_name: &reference,
+            },
+            &meta,
+        )
+        .map_err(|e| Error::Config(e.to_string()))?;
+    Ok(Staged {
+        prepared,
+        reference,
+        modules: modules.len(),
+    })
+}
 
+/// The module bytes of an already-emitted package directory, by the names
+/// its `workload.json` pins: from its `modules/`, else the project's shelf.
+/// The pinned digests are checked when the package is prepared, so these
+/// are content-addressed reads.
+fn package_dir_modules(
+    docs: &Path,
+    project_root: &Path,
+    manifest: &fluxor_tools::workload::WorkloadManifest,
+) -> Result<Vec<(String, Vec<u8>)>> {
     let modules_dir = if docs.join("modules").is_dir() {
         docs.join("modules")
     } else {
         crate::modules_build::module_root(
             None,
-            &project_root,
+            project_root,
             &project_root.join("target/fluxor"),
             "linux",
         )?
@@ -251,161 +351,88 @@ pub fn cmd_package_publish(
             modules.push((m.name.clone(), bytes));
         }
     }
-
-    let ref_name = match tag {
-        Some(t) => t.to_string(),
-        None => format!("{}:{}", manifest.name, manifest.version),
-    };
-    let epoch_hex: String = crate::hash::abi_surface_digest()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let source_rev = git_source_rev(&project_root);
-    let meta = ArtifactMeta {
-        project: &identity.name,
-        provenance: provenance_flag(published),
-        source_rev: source_rev.as_deref(),
-        abi_surface_hex: &epoch_hex,
-        input_digest_hex: None,
-        ci_digest_hex: None,
-    };
-    let deps = crate::project::dependencies(&project_root)
-        .unwrap_or_default()
-        .iter()
-        .map(|d| d.name.clone())
-        .collect::<Vec<_>>()
-        .join(",");
-    let deps = (!deps.is_empty()).then_some(deps);
-
-    let store = open_store(store_dir)?;
-    let txn = store
-        .begin_publish()
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let prepared = store
-        .prepare_package(
-            &PackageArtifact {
-                workload_json: &workload_json,
-                resources_json: &resources_json,
-                graph_yaml: &graph_yaml,
-                modules: &modules,
-                ref_name: &ref_name,
-            },
-            &meta,
-        )
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let version = identity.version.clone();
-    let prepared = vec![prepared];
-    let (committed, report) = store
-        .read_index()
-        .and_then(|index| {
-            store.plan_publish(
-                &index,
-                &identity.name,
-                &version,
-                &prepared,
-                deps.as_deref(),
-                &[],
-            )
-        })
-        .and_then(|plan| store.commit_plan(&txn, plan, prepared, Some(&project_root)))
-        .map_err(|e| Error::Config(e.to_string()))?;
-    if !report.is_empty() {
-        eprint!(
-            "\npublish package {ref_name} — displacement report{}",
-            oci_store::render_displacement(&report)
-        );
-    }
-    let digest = committed
-        .iter()
-        .find(|d| d.annotations.get(ANN_REF_NAME) == Some(&ref_name))
-        .map(|d| d.digest.clone())
-        .unwrap_or_default();
-    println!(
-        "{ref_name} -> {digest} ({} module(s), project {})",
-        modules.len(),
-        identity.name
-    );
-    Ok(())
+    Ok(modules)
 }
 
-// ── fluxor publish stack ───────────────────────────────────────────
-
-/// A lib error as the bin's, without a second `Config error:` prefix.
-fn lift_error(e: fluxor_tools::error::Error) -> Error {
-    match e {
-        fluxor_tools::error::Error::Config(m) => Error::Config(m),
-        other => Error::Config(other.to_string()),
-    }
-}
-
-/// `fluxor publish stack <file>`.
-///
-/// The document is checked first: it is the project's
-/// `packaging/stack/<name>.yaml`, parses, names a version, and renders with
-/// its defaults and examples. Its module references are resolved
-/// through the publishing project — its own published modules, then its
-/// `fluxor.lock` module pins — and published beside it, so a consumer that
-/// references the stack pins exactly the modules it was composed against. The
-/// stack joins the project's index in one transaction.
-pub fn cmd_stack_publish(
+/// A stack's publish, staged: the document checked (the project's
+/// `packaging/stack/<name>.yaml`, parsing, versioned, rendering with its
+/// defaults and examples), and each module it composes resolved by the
+/// publishing project's resolver — its own modules referenced through
+/// `own`, its pinned ones through their pins — and recorded beside it, so a
+/// consumer that references the stack pins exactly the modules it was
+/// composed against.
+pub fn stage_stack(
     path: &Path,
-    store_dir: Option<&Path>,
+    own: &[fluxor_tools::store_resolve::Artifact],
     tag: Option<&str>,
     published: bool,
-) -> Result<()> {
+    store: &OciStore,
+) -> Result<Staged> {
     use fluxor_tools::stack;
     let project_root = crate::project::root_for_config(path);
     stack::check_publishable(path, &project_root).map_err(lift_error)?;
     let (doc, bytes) = stack::read_for_publish(path).map_err(lift_error)?;
-    let identity = crate::project::project_identity(&project_root)
-        .map_err(Error::Config)?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "no [project] table in {}/fluxor.toml — a stack is published under its \
-                 project",
-                project_root.display()
-            ))
-        })?;
-    let store = open_store(store_dir)?;
-    let modules = stack::module_references(&doc, &project_root, &identity.name, &store)
-        .map_err(lift_error)?;
+    let r = fluxor_tools::module_resolver::ModuleResolver::for_project(
+        &project_root,
+        fluxor_tools::module_resolver::Abi::Unplaced,
+        None,
+    )
+    .map_err(lift_error)?;
+    let modules = stack::module_references(&doc, &r, own).map_err(lift_error)?;
     let modules_json = serde_json::to_vec_pretty(&modules)
         .map_err(|e| Error::Config(format!("modules.json: {e}")))?;
-    let ref_name = stack::publish_ref(&doc, tag).map_err(lift_error)?;
-    let epoch_hex: String = crate::hash::abi_surface_digest()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let source_rev = git_source_rev(&project_root);
+    let reference = stack::publish_ref(&doc, tag).map_err(lift_error)?;
+    let (identity, epoch_hex, source_rev, provenance) = shippable_meta(&project_root, published)?;
     let meta = ArtifactMeta {
         project: &identity.name,
-        provenance: provenance_flag(published),
+        provenance,
         source_rev: source_rev.as_deref(),
         abi_surface_hex: &epoch_hex,
         input_digest_hex: None,
         ci_digest_hex: None,
     };
-    let deps = crate::project::dependencies(&project_root)
-        .unwrap_or_default()
-        .iter()
-        .map(|d| d.name.clone())
-        .collect::<Vec<_>>()
-        .join(",");
-    let deps = (!deps.is_empty()).then_some(deps);
-    let txn = store
-        .begin_publish()
-        .map_err(|e| Error::Config(e.to_string()))?;
     let prepared = store
         .prepare_stack(
             &StackArtifact {
                 stack_yaml: &bytes,
                 modules_json: &modules_json,
-                ref_name: &ref_name,
+                ref_name: &reference,
             },
             &meta,
         )
         .map_err(|e| Error::Config(e.to_string()))?;
-    let prepared = vec![prepared];
+    Ok(Staged {
+        prepared,
+        reference,
+        modules: modules.len(),
+    })
+}
+
+/// Commit one staged shippable into its project's index, in one
+/// transaction, and say what was published.
+fn commit_shippable(
+    store: &OciStore,
+    project_root: &Path,
+    kind: &str,
+    staged: Staged,
+) -> Result<()> {
+    let identity = crate::project::project_identity(project_root)
+        .map_err(Error::Config)?
+        .ok_or_else(|| {
+            Error::Config(format!("no [project] table in {}", project_root.display()))
+        })?;
+    let deps = crate::project::dependencies(project_root)
+        .unwrap_or_default()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let deps = (!deps.is_empty()).then_some(deps);
+    let txn = store
+        .begin_publish()
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let reference = staged.reference;
+    let prepared = vec![staged.prepared];
     let (committed, report) = store
         .read_index()
         .and_then(|index| {
@@ -418,25 +445,65 @@ pub fn cmd_stack_publish(
                 &[],
             )
         })
-        .and_then(|plan| store.commit_plan(&txn, plan, prepared, Some(&project_root)))
+        .and_then(|plan| store.commit_plan(&txn, plan, prepared, Some(project_root)))
         .map_err(|e| Error::Config(e.to_string()))?;
     if !report.is_empty() {
         eprint!(
-            "\npublish stack {ref_name} — displacement report{}",
+            "\npublish {kind} {reference} — displacement report{}",
             oci_store::render_displacement(&report)
         );
     }
     let digest = committed
         .iter()
-        .find(|d| d.annotations.get(ANN_REF_NAME) == Some(&ref_name))
+        .find(|d| d.annotations.get(ANN_REF_NAME) == Some(&reference))
         .map(|d| d.digest.clone())
         .unwrap_or_default();
     println!(
-        "{ref_name} -> {digest} ({} module reference(s), project {})",
-        modules.len(),
-        identity.name
+        "{reference} -> {digest} ({} module(s), project {})",
+        staged.modules, identity.name
     );
     Ok(())
+}
+
+/// `fluxor publish package <dir | workload.toml>`.
+pub fn cmd_package_publish(
+    package: &Path,
+    store_dir: Option<&Path>,
+    tag: Option<&str>,
+    published: bool,
+    verbose: bool,
+) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let project_root = crate::project::root_for_config(package);
+    let own = match crate::project::project_identity(&project_root).map_err(Error::Config)? {
+        Some(id) => fluxor_tools::stack::OwnModules::published(&store, &id.name),
+        None => fluxor_tools::stack::OwnModules::default(),
+    };
+    let staged = stage_package(package, &own, &store, tag, published, verbose)?;
+    commit_shippable(&store, &project_root, "package", staged)
+}
+
+/// `fluxor publish stack <file>`: its own modules referenced as the project
+/// has published them.
+pub fn cmd_stack_publish(
+    path: &Path,
+    store_dir: Option<&Path>,
+    tag: Option<&str>,
+    published: bool,
+) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let project_root = crate::project::root_for_config(path);
+    let identity = crate::project::project_identity(&project_root)
+        .map_err(Error::Config)?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no [project] table in {}/fluxor.toml — a stack is published under its project",
+                project_root.display()
+            ))
+        })?;
+    let own = fluxor_tools::stack::published_modules(&store, &identity.name);
+    let staged = stage_stack(path, &own, tag, published, &store)?;
+    commit_shippable(&store, &project_root, "stack", staged)
 }
 
 // ── fluxor publish node|firmware ──────────────────────────────────────
@@ -871,272 +938,6 @@ fn cmd_store_rm(reference: &str, store_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-// ── fluxor.lock pinning + consume-side resolution ────────────────────
-
-/// Owned form of `modules::StoreFallback` — what `lock_store_resolver`
-/// hands to the packaging call sites.
-pub type BoxedStoreFallback = Box<dyn Fn(&str) -> crate::modules::StorePin>;
-
-/// Owned resolver from a module name to its pinned `manifest.toml` bytes —
-/// the manifest-loader counterpart of `BoxedStoreFallback`.
-pub type BoxedManifestResolver = Box<dyn Fn(&str) -> crate::modules::ManifestPin>;
-
-/// One module pin from the `[[artifact]]` lockfile, in the shape the
-/// resolvers below key on. A module pin always carries its silicon
-/// target (`materialize` errors on one that doesn't; here it simply
-/// never matches).
-struct ModulePin {
-    name: String,
-    target: Option<String>,
-    digest: String,
-    reference: String,
-}
-
-/// Read the project's `[[artifact]]` module pins. `Ok(None)` when the
-/// lockfile is absent or pins no modules; `Err` when it exists but is
-/// unreadable — which names are pinned is then unknowable,
-/// and guessing "none" would let packaging silently consume unpinned
-/// bytes.
-fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
-    let Some(lock) =
-        store_resolve::read_store_lock(project_root).map_err(|e| Error::Config(e.to_string()))?
-    else {
-        return Ok(None);
-    };
-    // Reading pins registers nothing with the store's ledger: a
-    // checkout is a root by the lockfile it wrote, and a copy of that
-    // lockfile run elsewhere — a test sandbox — holds nothing.
-    store_resolve::check_module_pin_targets(&lock.artifacts)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let pins: Vec<ModulePin> = lock
-        .artifacts
-        .into_iter()
-        .filter(|a| a.kind == "module")
-        .map(|a| ModulePin {
-            name: a.name,
-            target: a.target,
-            digest: a.digest,
-            reference: a.reference,
-        })
-        .collect();
-    if pins.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(pins))
-}
-
-/// Build the `fluxor.lock`-pinned OCI-store fallback used by module
-/// resolution. `None` when the project has no lockfile,
-/// no pins for this target, or the store can't be opened — resolution then
-/// behaves exactly as before (on-disk dirs only). The returned closure
-/// verifies the `.fmod` bytes against the pinned layer digest before
-/// handing the path out; a corrupt blob is skipped with a warning rather
-/// than silently packaged.
-pub fn lock_store_resolver(
-    project_root: &Path,
-    target: &str,
-    store_dir: Option<&Path>,
-) -> Option<BoxedStoreFallback> {
-    use crate::modules::StorePin;
-
-    // An unreadable/corrupt lockfile is a hard error for EVERY module
-    // resolution: which names are pinned is unknowable, and guessing
-    // "none" would let packaging silently consume unpinned bytes.
-    let pins = match read_module_pins(project_root) {
-        Ok(p) => p?,
-        Err(e) => {
-            let why = format!("fluxor.lock unreadable: {e}");
-            return Some(Box::new(move |_name: &str| StorePin::Failed(why.clone())));
-        }
-    };
-    let pins: Vec<ModulePin> = pins
-        .into_iter()
-        .filter(|m| m.target.as_deref() == Some(target))
-        .collect();
-    if pins.is_empty() {
-        return None;
-    }
-    // Pins exist but the store won't open → every pinned name must fail
-    // loudly; unpinned names still resolve from disk.
-    let store = match open_store(store_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            let why = format!("cannot open OCI store: {e}");
-            return Some(Box::new(move |name: &str| {
-                if pins.iter().any(|p| p.name == name) {
-                    StorePin::Failed(why.clone())
-                } else {
-                    StorePin::NotPinned
-                }
-            }));
-        }
-    };
-    Some(Box::new(move |name: &str| {
-        let Some(pin) = pins.iter().find(|p| p.name == name) else {
-            return StorePin::NotPinned;
-        };
-        let manifest_bytes = match store.read_blob(&pin.digest) {
-            Ok(b) => b,
-            Err(e) => return StorePin::Failed(e.to_string()),
-        };
-        let manifest: ImageManifest = match serde_json::from_slice(&manifest_bytes) {
-            Ok(m) => m,
-            Err(e) => return StorePin::Failed(format!("corrupt manifest: {e}")),
-        };
-        match store.module_fmod_blob(&manifest) {
-            Ok((digest, path)) => {
-                let fmod = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => return StorePin::Failed(format!("read blob: {e}")),
-                };
-                if sha256_hex_prefixed(&fmod) != digest {
-                    return StorePin::Failed(format!(
-                        "store blob {digest} failed integrity verification"
-                    ));
-                }
-                StorePin::Resolved(path)
-            }
-            Err(e) => StorePin::Failed(e.to_string()),
-        }
-    }))
-}
-
-/// Manifest counterpart of `lock_store_resolver`: resolve a module name to
-/// the verified `manifest.toml` text its pinned `[[artifact]]` module
-/// entry ships, so wiring/port validation sees the SAME surface the pinned
-/// `.fmod` was built with. Returns `None` when the project pins no
-/// modules (the common case — zero store I/O).
-///
-/// Pin selection is silicon-aware. Manifest *content* is largely
-/// target-independent, but pin *selection* is not: the same name can be
-/// pinned at different digests for two targets, and binding wiring to the
-/// wrong one validates a port surface the packaged `.fmod` doesn't have.
-///   1. a pin whose target equals `silicon` wins. Pins are tagged with
-///      the module-silicon id at publish time, so this is a plain string
-///      match;
-///   2. otherwise fall back to a name match, but only when it is
-///      unambiguous — every pin for that name shares one digest;
-///   3. differing digests and no match for a HOST target (`linux`,
-///      `wasm`) is `NotPinned`. A pin binds the target it names, and a
-///      host graph loads modules built from source into its node image,
-///      never store bytes — so no pin here binds anything, and the
-///      on-disk manifest is authoritative;
-///   4. differing digests and no match for a SILICON is `Failed`:
-///      firmware for that silicon needs the artifact for it, so the
-///      right port surface is missing rather than unguessable.
-///
-/// UTF-8 and integrity are strict. `read_blob` hashes the bytes against the
-/// layer digest; non-UTF-8 in a digest-verified artifact is corruption
-/// (`Failed`), never lossily repaired.
-///
-/// An artifact carrying no `manifest.toml` layer yields `NotPinned`, so an
-/// on-disk source manifest fills in. A pinned module with neither a
-/// manifest layer nor an on-disk source therefore drops out of wiring
-/// validation, as any manifest-less module does.
-pub fn lock_store_manifest_resolver(
-    project_root: &Path,
-    abi: Option<&str>,
-    store_dir: Option<&Path>,
-) -> Option<BoxedManifestResolver> {
-    use crate::modules::ManifestPin;
-
-    let pins = match read_module_pins(project_root) {
-        Ok(p) => p?,
-        Err(e) => {
-            let why = format!("fluxor.lock unreadable: {e}");
-            return Some(Box::new(move |_name: &str| {
-                ManifestPin::Failed(why.clone())
-            }));
-        }
-    };
-    let abi = abi.map(|s| s.to_string());
-    let store = match open_store(store_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            let why = format!("cannot open OCI store: {e}");
-            return Some(Box::new(move |name: &str| {
-                if pins.iter().any(|p| p.name == name) {
-                    ManifestPin::Failed(why.clone())
-                } else {
-                    ManifestPin::NotPinned
-                }
-            }));
-        }
-    };
-    Some(Box::new(move |name: &str| {
-        let named: Vec<&ModulePin> = pins.iter().filter(|p| p.name == name).collect();
-        if named.is_empty() {
-            return ManifestPin::NotPinned;
-        }
-        let abi_match = abi
-            .as_deref()
-            .and_then(|want| named.iter().find(|p| p.target.as_deref() == Some(want)));
-        let unambiguous = named.iter().all(|p| p.digest == named[0].digest);
-        match abi_match {
-            Some(p) => manifest_text(&store, p),
-            // One digest across every ABI: the artifact is ABI-agnostic,
-            // so any pin is the right pin.
-            None if unambiguous => manifest_text(&store, named[0]),
-            // No ABI asked (a member placed on another node is resolved for
-            // its capabilities and facts only): the pins are one module
-            // built for several ABIs, and they answer alike when their
-            // manifests do. Differing manifests are not one answer.
-            None if abi.is_none() => {
-                let first = manifest_text(&store, named[0]);
-                let ManifestPin::Resolved(text) = &first else {
-                    return first;
-                };
-                for p in &named[1..] {
-                    match manifest_text(&store, p) {
-                        ManifestPin::Resolved(t) if t == *text => {}
-                        ManifestPin::Resolved(_) => {
-                            return ManifestPin::Failed(format!(
-                                "module '{name}' is pinned for several targets with differing \
-                                 manifests; name the target to resolve it"
-                            ))
-                        }
-                        other => return other,
-                    }
-                }
-                first
-            }
-            // The ABI needs the artifact built for it, so the right one is
-            // missing rather than ambiguous. Falling through would validate
-            // against another ABI's surface.
-            None => ManifestPin::Failed(format!(
-                "module '{name}' is pinned for several targets at differing digests \
-                 and none matches {}; pin it for this target",
-                abi.as_deref().unwrap_or("the requested target")
-            )),
-        }
-    }))
-}
-
-/// The `manifest.toml` a pinned module artifact carries, read from `store`.
-fn manifest_text(store: &OciStore, pin: &ModulePin) -> crate::modules::ManifestPin {
-    use crate::modules::ManifestPin;
-    let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
-    let manifest_bytes = match store.read_blob(&pin.digest) {
-        Ok(b) => b,
-        Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
-    };
-    let manifest: ImageManifest = match serde_json::from_slice(&manifest_bytes) {
-        Ok(m) => m,
-        Err(e) => return ManifestPin::Failed(format!("{pin_id}: corrupt manifest: {e}")),
-    };
-    match store.module_manifest_toml_blob(&manifest) {
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(text) => ManifestPin::Resolved(text),
-            Err(e) => ManifestPin::Failed(format!(
-                "{pin_id}: manifest.toml layer is not valid UTF-8 (corrupt artifact): {e}"
-            )),
-        },
-        // No manifest.toml layer — let an on-disk source manifest resolve it.
-        Ok(None) => ManifestPin::NotPinned,
-        Err(e) => ManifestPin::Failed(format!("{pin_id}: {e}")),
-    }
-}
-
 /// `fluxor store snapshot <name>` — freeze the current resolved set.
 fn cmd_store_snapshot(name: &str, store_dir: Option<&Path>) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains(':') {
@@ -1169,7 +970,6 @@ fn cmd_store_snapshot(name: &str, store_dir: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxor_tools::oci_store::{publish_module, ModulePublish, PROVENANCE_LOCAL};
 
     /// `workload-image.json`'s `env` becomes the image config's bindings;
     /// none listed is none bound; an entry that would tell a puller less
@@ -1197,384 +997,5 @@ mod tests {
         ] {
             assert!(workload_image_env(&bad).is_err(), "{bad}");
         }
-    }
-
-    /// Keep every unit test in this binary out of the developer's real
-    /// store.
-    ///
-    /// Writing a lock registers the checkout it just pinned into the
-    /// store's pin ledger, and it resolves the store from
-    /// `$FLUXOR_STORE` — not from the `--store` flag these tests pass.
-    /// Unset, that is `~/.local/share/fluxor/store`, so a test pinning
-    /// in a tempdir leaves a permanent ledger entry naming a directory
-    /// that no longer exists, which `fluxor store fsck` then correctly
-    /// reports as a dead pin. One throwaway store for the whole test
-    /// binary, pointed at for the length of each pin under the crate's
-    /// one environment lock, so no other test reads it mid-change.
-    fn scratch_store() -> std::path::PathBuf {
-        use std::sync::OnceLock;
-        static SCRATCH: OnceLock<tempfile::TempDir> = OnceLock::new();
-        let dir = SCRATCH.get_or_init(|| tempfile::tempdir().expect("scratch store"));
-        dir.path().join("ledger-only")
-    }
-
-    /// `FLUXOR_STORE` pointed at a path until dropped, then restored —
-    /// including when the pin between panics.
-    struct StoreScope(Option<std::ffi::OsString>);
-
-    impl StoreScope {
-        fn point_at(path: &Path) -> Self {
-            let old = std::env::var_os("FLUXOR_STORE");
-            std::env::set_var("FLUXOR_STORE", path);
-            StoreScope(old)
-        }
-    }
-
-    impl Drop for StoreScope {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var("FLUXOR_STORE", v),
-                None => std::env::remove_var("FLUXOR_STORE"),
-            }
-        }
-    }
-
-    /// Upsert one `[[artifact]]` module pin, as `fluxor update` writes one.
-    fn pin_module(proj: &Path, name: &str, target: &str, digest: &str, reference: &str) {
-        let _env = crate::project::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _scope = StoreScope::point_at(&scratch_store());
-        let mut entries = store_resolve::read_store_lock(proj)
-            .expect("lock")
-            .map(|l| l.artifacts)
-            .unwrap_or_default();
-        entries.retain(|e| !(e.name == name && e.target.as_deref() == Some(target)));
-        entries.push(store_resolve::Artifact {
-            kind: "module".into(),
-            name: name.into(),
-            project: "testproj".into(),
-            target: Some(target.into()),
-            digest: digest.into(),
-            reference: reference.into(),
-            content: None,
-        });
-        store_resolve::write_store_lock(proj, &entries).expect("pin");
-    }
-
-    fn store_with_module(dir: &Path) -> (OciStore, String) {
-        let store = OciStore::open(dir.join("store")).expect("open store");
-        let desc = publish_module(
-            &store,
-            &ModulePublish {
-                name: "codec",
-                target: "aarch64",
-                fmod_bytes: b"fake-fmod-bytes",
-                manifest_toml: None,
-                provenance: PROVENANCE_LOCAL,
-                source_rev: None,
-                ref_name: "aarch64/codec:1.0.0",
-            },
-        )
-        .expect("publish");
-        (store, desc.digest)
-    }
-
-    #[test]
-    fn pin_roundtrip_resolves_fmod_from_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let (_store, digest) = store_with_module(tmp.path());
-
-        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
-        // Re-pin with the same key replaces, not duplicates.
-        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
-        let lock = store_resolve::read_store_lock(&proj).unwrap().unwrap();
-        assert_eq!(lock.artifacts.len(), 1);
-
-        let store_dir = tmp.path().join("store");
-        let resolver =
-            lock_store_resolver(&proj, "aarch64", Some(&store_dir)).expect("resolver present");
-        let crate::modules::StorePin::Resolved(path) = resolver("codec") else {
-            panic!("codec must resolve from store");
-        };
-        assert_eq!(std::fs::read(&path).unwrap(), b"fake-fmod-bytes");
-        assert!(matches!(
-            resolver("unpinned"),
-            crate::modules::StorePin::NotPinned
-        ));
-        // Wrong target -> no resolver.
-        assert!(lock_store_resolver(&proj, "thumbv8m", Some(&store_dir)).is_none());
-    }
-
-    #[test]
-    fn corrupt_blob_fails_integrity_and_is_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let (store, digest) = store_with_module(tmp.path());
-
-        // Corrupt the .fmod blob in place.
-        let fmod_digest = sha256_hex_prefixed(b"fake-fmod-bytes");
-        std::fs::write(store.blob_path(&fmod_digest).unwrap(), b"tampered").unwrap();
-
-        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
-        let store_dir = tmp.path().join("store");
-        let resolver = lock_store_resolver(&proj, "aarch64", Some(&store_dir)).unwrap();
-        assert!(
-            matches!(resolver("codec"), crate::modules::StorePin::Failed(_)),
-            "tampered blob must be a hard failure, not a silent fall-through"
-        );
-    }
-
-    fn publish_with_manifest(
-        store: &OciStore,
-        name: &str,
-        target: &str,
-        fmod: &[u8],
-        toml: &str,
-    ) -> String {
-        publish_module(
-            store,
-            &ModulePublish {
-                name,
-                target,
-                fmod_bytes: fmod,
-                manifest_toml: Some(toml),
-                provenance: PROVENANCE_LOCAL,
-                source_rev: None,
-                ref_name: &format!("{target}/{name}:0.1.0"),
-            },
-        )
-        .expect("publish")
-        .digest
-    }
-
-    #[test]
-    fn pin_resolves_manifest_toml_silicon_aware() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-
-        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
-        let digest = publish_with_manifest(&store, "redis_client", "aarch64", b"fmodA", toml);
-        pin_module(
-            &proj,
-            "redis_client",
-            "aarch64",
-            &digest,
-            "aarch64/redis_client:0.1.0",
-        );
-
-        let store_dir = tmp.path().join("store");
-
-        // Exact silicon match resolves the pinned manifest as UTF-8 text.
-        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
-            .expect("resolver present");
-        match r("redis_client") {
-            ManifestPin::Resolved(text) => assert_eq!(text, toml),
-            other => panic!("expected Resolved, got {other:?}"),
-        }
-        assert!(matches!(r("unpinned"), ManifestPin::NotPinned));
-
-        // Callers pass the module-silicon id (a pi5 graph resolves to
-        // `bcm2712` before pin lookup), so the pin matches by string.
-        let r_bcm = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
-            .expect("resolver present");
-        match r_bcm("redis_client") {
-            ManifestPin::Resolved(text) => assert_eq!(text, toml),
-            other => panic!("bcm2712 must match the bcm2712 pin, got {other:?}"),
-        }
-
-        // No silicon requested: the lone pin is unambiguous.
-        let r_any =
-            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
-        assert!(matches!(r_any("redis_client"), ManifestPin::Resolved(_)));
-    }
-
-    #[test]
-    fn silicon_selects_between_same_name_pins_at_different_targets() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-
-        let bcm = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n\
-                   [[ports]]\nname = \"big\"\ndirection = \"out\"\n";
-        let rp = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n\
-                  [[ports]]\nname = \"small\"\ndirection = \"out\"\n";
-        let d_bcm = publish_with_manifest(&store, "mqtt_client", "aarch64", b"fmodA", bcm);
-        let d_rp = publish_with_manifest(&store, "mqtt_client", "thumbv8m", b"fmodB", rp);
-        assert_ne!(d_bcm, d_rp);
-        pin_module(
-            &proj,
-            "mqtt_client",
-            "aarch64",
-            &d_bcm,
-            "aarch64/mqtt_client:0.1.0",
-        );
-        pin_module(
-            &proj,
-            "mqtt_client",
-            "thumbv8m",
-            &d_rp,
-            "thumbv8m/mqtt_client:0.1.0",
-        );
-
-        let store_dir = tmp.path().join("store");
-        for (silicon, want) in [("thumbv8m", rp), ("aarch64", bcm)] {
-            let r = lock_store_manifest_resolver(&proj, Some(silicon), Some(&store_dir))
-                .expect("resolver present");
-            match r("mqtt_client") {
-                ManifestPin::Resolved(text) => assert_eq!(text, want, "silicon {silicon}"),
-                other => panic!("silicon {silicon}: expected Resolved, got {other:?}"),
-            }
-        }
-
-        // No silicon asked: these pins carry differing manifests, so there is
-        // no one answer and the resolver says so.
-        let r_any =
-            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
-        assert!(matches!(r_any("mqtt_client"), ManifestPin::Failed(_)));
-    }
-
-    /// A module built for several targets from one `manifest.toml` resolves
-    /// with no target asked (a member placed on another node): its pins
-    /// differ, its manifest does not.
-    #[test]
-    fn one_manifest_pinned_for_several_targets_resolves_without_a_target() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
-        let d_a = publish_with_manifest(&store, "stand_in", "aarch64", b"fmodA", toml);
-        let d_t = publish_with_manifest(&store, "stand_in", "thumbv8m", b"fmodB", toml);
-        assert_ne!(d_a, d_t);
-        pin_module(&proj, "stand_in", "aarch64", &d_a, "aarch64/stand_in:0.1.0");
-        pin_module(
-            &proj,
-            "stand_in",
-            "thumbv8m",
-            &d_t,
-            "thumbv8m/stand_in:0.1.0",
-        );
-        let store_dir = tmp.path().join("store");
-        let r_any =
-            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
-        match r_any("stand_in") {
-            ManifestPin::Resolved(text) => assert_eq!(text, toml),
-            other => panic!("expected Resolved, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn corrupt_manifest_layer_is_a_hard_failure() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-
-        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
-        let digest = publish_with_manifest(&store, "redis_client", "aarch64", b"fmodA", toml);
-        pin_module(
-            &proj,
-            "redis_client",
-            "aarch64",
-            &digest,
-            "aarch64/redis_client:0.1.0",
-        );
-
-        // Tamper with the manifest.toml blob: the digest no longer matches,
-        // and the payload isn't UTF-8 either.
-        let toml_digest = sha256_hex_prefixed(toml.as_bytes());
-        std::fs::write(store.blob_path(&toml_digest).unwrap(), [0xffu8, 0xfe, 0x00]).unwrap();
-
-        let store_dir = tmp.path().join("store");
-        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
-            .expect("resolver present");
-        let why = match r("redis_client") {
-            ManifestPin::Failed(why) => why,
-            other => panic!("corrupt manifest layer must fail hard, got {other:?}"),
-        };
-        assert!(
-            why.contains("aarch64/redis_client:0.1.0"),
-            "failure must name the pin: {why}"
-        );
-    }
-
-    #[test]
-    fn ambiguous_multi_target_pins_refuse_without_abi_match() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-
-        // Same name pinned for two silicons at different digests.
-        let d1 = publish_with_manifest(
-            &store,
-            "amqp_client",
-            "aarch64",
-            b"fmodA",
-            "version=\"1\"\n",
-        );
-        let d2 = publish_with_manifest(
-            &store,
-            "amqp_client",
-            "thumbv8m",
-            b"fmodB",
-            "version=\"2\"\n",
-        );
-        assert_ne!(d1, d2);
-        pin_module(
-            &proj,
-            "amqp_client",
-            "aarch64",
-            &d1,
-            "aarch64/amqp_client:0.1.0",
-        );
-        pin_module(
-            &proj,
-            "amqp_client",
-            "thumbv8m",
-            &d2,
-            "thumbv8m/amqp_client:0.1.0",
-        );
-
-        let store_dir = tmp.path().join("store");
-        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir)).unwrap();
-        // The requested ABI matches one pin -> its manifest. Every runtime on
-        // that ABI (bcm2712 and the linux host) resolves the same pin.
-        match r("amqp_client") {
-            ManifestPin::Resolved(text) => assert_eq!(text, "version=\"1\"\n"),
-            other => panic!("expected Resolved aarch64, got {other:?}"),
-        }
-        // An ABI with NO matching pin and divergent digests -> refuse.
-        let r_other =
-            lock_store_manifest_resolver(&proj, Some("x86_64"), Some(&store_dir)).unwrap();
-        assert!(matches!(r_other("amqp_client"), ManifestPin::Failed(_)));
-    }
-
-    #[test]
-    fn pin_without_manifest_layer_falls_through_to_disk() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        // Published with manifest_toml: None — no metadata layer.
-        let (_store, digest) = store_with_module(tmp.path());
-        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
-        let store_dir = tmp.path().join("store");
-        let resolver = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
-            .expect("resolver present");
-        // No manifest layer => NotPinned so an on-disk source manifest can fill in.
-        assert!(matches!(resolver("codec"), ManifestPin::NotPinned));
     }
 }

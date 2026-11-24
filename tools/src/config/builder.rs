@@ -404,11 +404,11 @@ fn module_param_u64(m: &Value, key: &str) -> Option<u64> {
 /// (domain `d` on core `d`): the SMP kernels, bcm2712 and uefi. Every other
 /// target (rp, Linux, wasm) and an unresolved one runs all domains' loops on
 /// one thread.
-fn domains_have_own_cores(target: Option<&str>) -> bool {
+fn domains_have_own_cores(target: Option<&str>, project: &Path) -> bool {
     let Some(name) = target else {
         return false;
     };
-    crate::target::load_target(&name.to_ascii_lowercase(), &crate::project::root())
+    crate::target::load_target(&name.to_ascii_lowercase(), project)
         .is_ok_and(|desc| matches!(desc.id.as_str(), "bcm2712" | "uefi"))
 }
 
@@ -424,8 +424,8 @@ fn validate_adaptive_tick(
     domain_names: &[String],
     domain_tick_us: &[u16],
     manifests: &HashMap<String, Manifest>,
-    extra_module_dirs: &[&std::path::Path],
     resolved_target: Option<&str>,
+    project: &Path,
 ) -> Result<()> {
     // Read RAW u64 values (not `as u16`/`as u8`) so out-of-range inputs are
     // caught BEFORE the wire cast silently wraps them (e.g. tick_max_us=200000
@@ -448,6 +448,7 @@ fn validate_adaptive_tick(
     // Two domains whose bitmasks overlap share a core.
     let own_cores = domains_have_own_cores(
         resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
+        project,
     );
     let mut core_mask = [0u64; MAX_DOMAINS];
     // Per-domain "hosts a timing-strict module" (Guaranteed WCET, replicated
@@ -569,7 +570,7 @@ fn validate_adaptive_tick(
     // Registry-resolved: bcm2712 silicon (pi5, qemu-virt, raw bcm2712),
     // NOT the linux host (event-driven, exempt) — no substring matching.
     let is_bcm = silicon
-        .and_then(|s| crate::target::load_target(s, &crate::project::root()).ok())
+        .and_then(|s| crate::target::load_target(s, project).ok())
         .is_some_and(|d| !d.is_host() && d.id == "bcm2712");
     let any_idle = (0..MAX_DOMAINS).any(|d| flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0);
     if is_bcm && any_idle {
@@ -624,10 +625,8 @@ fn validate_adaptive_tick(
         // Timer-class attestation: a module that counts scheduler ticks as
         // time (`tick_counted`) or needs a fixed-cadence WCET
         // (`guaranteed`) cannot run on an adaptive-tick domain — a variable
-        // cadence warps its timers / breaks its real-time guarantee. We read from
-        // the RESOLVED manifest map (`load_module_manifests_with_extra`, keyed by
-        // instance name, incl. extra_module_dirs) — NOT the narrower
-        // `from_source_tree`, which would miss external/project modules.
+        // cadence warps its timers / breaks its real-time guarantee. Read from
+        // the graph's resolved manifests, keyed by instance name.
         //
         // The policy is SCOPED TO THE MECHANISM:
         //  * Mechanism (b) (variable cadence): every admitted module must
@@ -759,47 +758,6 @@ fn validate_adaptive_tick(
                     man.timer_class.as_str(),
                 )));
             }
-        } else if let Some(root) = resolve_module_root(mtype, extra_module_dirs) {
-            // Not in the parsed map: either a malformed manifest (omitted by the
-            // loader's warn-and-skip) or genuinely manifest-less.
-            let manifest_path = root.join("manifest.toml");
-            if manifest_path.exists() {
-                // A malformed manifest is a hard error on ANY adaptive domain — its
-                // timer_class can't be verified, so fail closed (a typo must not
-                // downgrade to "no manifest" and pass).
-                if let Err(e) = Manifest::from_toml(&manifest_path) {
-                    return Err(Error::Config(format!(
-                        "module '{mname}' is placed on adaptive-tick domain '{}' but \
-                         its manifest {} failed to parse, so its timer_class cannot \
-                         be verified: {e}. Fix the manifest — a malformed \
-                         timer_class must not silently downgrade to 'no manifest' \
-                         and pass adaptive admission.",
-                        label(d),
-                        manifest_path.display(),
-                    )));
-                }
-                // Parses but absent from the map (shouldn't happen) — leave it;
-                // the lenient/strict checks above only apply via the map.
-            } else if cadence {
-                // Genuinely manifest-less on a mechanism-(b) domain: unattested ⇒
-                // blocked. On an (a)-only domain it is still admitted (lenient).
-                return Err(Error::Config(format!(
-                    "module '{mname}' has no manifest, so it cannot attest a \
-                     timer_class, and an unattested module cannot run on \
-                     mechanism-(b) (variable-cadence) domain '{}'. Add a manifest \
-                     declaring `timer_class = \"wall_clock\"` or `\"agnostic\"`, or \
-                     move it to a fixed-cadence domain.",
-                    label(d),
-                )));
-            }
-        } else if cadence {
-            // Module root unresolvable AND on a (b) domain ⇒ cannot attest ⇒ block.
-            return Err(Error::Config(format!(
-                "module '{mname}' could not be resolved to a manifest, so its \
-                 timer_class cannot be verified; an unattested module cannot run on \
-                 mechanism-(b) domain '{}'.",
-                label(d),
-            )));
         }
 
         // Burst-at-floor: for a (b) domain, the burst deadline must fit the
@@ -970,8 +928,8 @@ fn validate_adaptive_tick(
 fn validate_interrupt_admission(
     config: &Value,
     module_list: &[Value],
-    modules_dir: &std::path::Path,
-    extra_module_dirs: &[&std::path::Path],
+    manifests: &HashMap<String, Manifest>,
+    exports_isr_entry: &dyn Fn(&str) -> Result<bool>,
     resolved_target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
@@ -990,15 +948,6 @@ fn validate_interrupt_admission(
     // `irq::register_module`). Rules 1/3 below require every `irq`
     // module to declare `interrupt_safe = true`, an `irq:` field, and an
     // actual `module_isr_entry` export in its source.
-
-    // Resolved for the graph's own target, as config generation resolves
-    // them: a module pinned per silicon binds that target's pin.
-    let manifests = load_module_manifests_with_extra_for_target(
-        &Value::Array(module_list.to_vec()),
-        extra_module_dirs,
-        resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
-        project_root,
-    );
 
     // ── Rule 0: `irq` line range (structural, target-specific) ──────────
     // Validate the declared `irq:` against the resolved silicon's interrupt
@@ -1031,7 +980,7 @@ fn validate_interrupt_admission(
             .map(|s| s.to_ascii_lowercase());
         // (max_valid_intid, controller_label) for the resolved silicon, if known.
         let irq_bound: Option<(u64, &str)> = target_name.as_deref().and_then(|t| {
-            let desc = crate::target::load_target(t, &crate::project::root()).ok()?;
+            let desc = crate::target::load_target(t, project_root).ok()?;
             if desc.is_host() {
                 return None;
             }
@@ -1123,47 +1072,19 @@ fn validate_interrupt_admission(
         if let Some(why) = crate::board::isr_grant_refusal(name, exec_mode.name(), manifest) {
             return Err(Error::Config(why));
         }
-        // The lookup goes through `resolve_module_root` so the search order
-        // is identical to the manifest loader's: an explicit YAML
-        // `module_search_paths:` entry shadowing a bundled module wins for
-        // both `interrupt_safe` and the export check, instead of one reader
-        // trusting the bundled copy and the other trusting the override.
+        // `irq` modules are dispatched from hardware-IRQ context through
+        // their `module_isr_entry` export, NOT the cooperative `module_step`.
+        // The loader refuses one without it at runtime; this is the
+        // build-time mirror, read from the resolved artefact: its packed
+        // header's export bit when built, else its source.
         let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-        if let Some(root) = resolve_module_root(module_type, extra_module_dirs) {
-            // `irq` modules are dispatched from hardware-IRQ
-            // context through their `module_isr_entry` export, NOT the
-            // cooperative `module_step`. The authoritative gate is the
-            // packer (ELF symtab → `.fmod` isr_module bit) + the loader
-            // (`isr_entry_fn = None` → admission fail-closes at runtime).
-            // This source-static check is the early, build-time mirror
-            // so an `irq` module missing the entry point fails the graph
-            // build instead of getting refused on the rig. (A `timer`
-            // module's cooperative step is dispatched from the timer and
-            // needs no ISR entry; `irq` construction goes through the
-            // normal cooperative `module_new`, as `timer` does.)
-            if exec_mode == ExecMode::Irq {
-                if let Err(e) = crate::manifest::check_module_exports_isr_entry(&root) {
-                    return Err(Error::Config(format!(
-                        "module '{name}' (type '{module_type}') is assigned to domain \
-                         '{domain_label}' (exec: {mode}) but {e}. An `irq` module must \
-                         export `module_isr_entry` (an `extern \"C\" fn(*mut u8) -> i32`) \
-                         — the hardware IRQ dispatches into it, not the cooperative \
-                         `module_step`.",
-                        mode = exec_mode.name()
-                    )));
-                }
-            }
-        } else if exec_mode == ExecMode::Irq {
-            // No resolvable source root for an `irq` module means we
-            // can't certify the ISR entry export exists. The manifest
-            // check (Rule 1, above) already hard-errors an `irq` module
-            // with no manifest, so reaching here implies a manifest with
-            // no co-located `src/` tree — still unsafe to admit.
+        if exec_mode == ExecMode::Irq && !exports_isr_entry(name)? {
             return Err(Error::Config(format!(
-                "module '{name}' (type '{module_type}') is assigned to an \
-                 `exec: irq` domain but its source tree could not be resolved to \
-                 verify the required `module_isr_entry` export. Place the module's \
-                 `src/` tree alongside its manifest, or move it to a cooperative domain."
+                "module '{name}' (type '{module_type}') is assigned to domain \
+                 '{domain_label}' (exec: {mode}) but it does not export `module_isr_entry`. \
+                 An `irq` module must export it (an `extern \"C\" fn(*mut u8) -> i32`) — the \
+                 hardware IRQ dispatches into it, not the cooperative `module_step`.",
+                mode = exec_mode.name()
             )));
         }
     }
@@ -1311,7 +1232,6 @@ fn validate_interrupt_admission(
         );
     }
 
-    let _ = modules_dir; // reserved for future use (per-domain budget files)
     Ok(())
 }
 
@@ -1325,20 +1245,9 @@ fn validate_interrupt_admission(
 fn validate_pre_pass_admission(
     config: &Value,
     module_list: &[Value],
-    extra_module_dirs: &[&std::path::Path],
-    resolved_target: Option<&str>,
-    project_root: &std::path::Path,
+    manifests: &HashMap<String, Manifest>,
 ) -> Result<()> {
     let domains = parse_domain_execs(config)?;
-
-    // Resolved for the graph's own target, as config generation resolves
-    // them: a module pinned per silicon binds that target's pin.
-    let manifests = load_module_manifests_with_extra_for_target(
-        &Value::Array(module_list.to_vec()),
-        extra_module_dirs,
-        resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
-        project_root,
-    );
 
     for module in module_list {
         let name = match module.get("name").and_then(|n| n.as_str()) {
@@ -1551,22 +1460,6 @@ pub(crate) fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
     )))
 }
 
-/// Load a native module's manifest from the source tree and
-/// synthesize a `ParamSchema` from its `[[params]]` declarations: the
-/// empty schema for one that declares none. Returns `None` when the
-/// manifest doesn't exist or isn't marked native module. Repeated
-/// lookups share a per-process cache via `Manifest::from_source_tree`.
-fn load_native_param_schema(
-    module_type: &str,
-) -> Option<(crate::manifest::Manifest, schema::ParamSchema)> {
-    let m = crate::manifest::Manifest::from_source_tree(module_type).ok()??;
-    if !m.builtin {
-        return None;
-    }
-    let s = schema::ParamSchema::from_manifest(&m);
-    Some((m, s))
-}
-
 /// Any YAML key on a native module entry that the schema does not know
 /// is rejected: a PIC module ignores a key it does not know, so the
 /// manifest is the contract and a typo would otherwise silently use the
@@ -1580,9 +1473,8 @@ fn load_native_param_schema(
 const NON_PARAM_KEYS: &[&str] = &[
     "name",
     "type",
-    // `[[variant]]` selection — consumed by fmod resolution
-    // (`parse_modules_from_config_multi`) and the manifest loader,
-    // never a wire param.
+    // `[[variant]]` selection — consumed by module resolution
+    // (`module_resolver`), never a wire param.
     "variant",
     // Program blobs the module instance owns: packed into the image's
     // program section (`modules::collect_programs`), never a wire param.
@@ -2761,7 +2653,7 @@ fn build_module_entry(
     id: u16,
     data_section: Option<&Value>,
     config: &Value,
-    loc: schema::ModuleLocation<'_>,
+    r: &ModuleResolver,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
@@ -2781,7 +2673,7 @@ fn build_module_entry(
             id,
             data_section,
             config,
-            loc,
+            r,
             manifests,
             max_modules,
             isolation,
@@ -2824,7 +2716,7 @@ fn build_module_entry_in(
     id: u16,
     data_section: Option<&Value>,
     config: &Value,
-    loc: schema::ModuleLocation<'_>,
+    r: &ModuleResolver,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
@@ -2840,11 +2732,9 @@ fn build_module_entry_in(
     // multiple instances: name: seq_kick, type: sequencer
     let name_hash = fnv1a_hash(type_name.as_bytes());
     let domain = resolve_domain_id(module, config)?;
-    // `manifests` was populated by `load_module_manifests_with_extra`
-    // against the same resolver chain that admission validation uses
-    // (project root, install root, caller-supplied extras), so a module
-    // admission finds — an installed driver among them — carries its
-    // `pre_pass` flag here too. It rides the module record (not the
+    // `manifests` are the graph's resolved manifests, the ones admission
+    // validated, so a module's `pre_pass` flag is the one admission read.
+    // It rides the module record (not the
     // .fmod manifest) so the kernel reads it during `prepare_graph` without
     // a second loader pass.
     let pre_pass = manifests.get(name).is_some_and(|m| m.pre_pass);
@@ -2857,15 +2747,18 @@ fn build_module_entry_in(
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
     // PIC modules embed their schema in the `.fmod`; native modules declare
-    // it in `modules/platform/<platform>/<name>/manifest.toml`. Both
-    // paths produce a `ParamSchema` and feed the same TLV packer, so
-    // the wire format is identical at the kernel boundary.
-    //
-    // `?` propagates only the pinned-but-unresolvable case, which is a hard
-    // error (sibling of `assert_module_manifests_resolvable`). "No `.fmod`
-    // schema" stays `Ok(None)` and falls through to the native path — a
-    // native module is never pinned and has no `.fmod`.
-    let pic_schema = schema::load_schema_for_entry(module, type_name, loc)?;
+    // it in their manifest's `[[params]]`. Both feed the same TLV packer, so
+    // the wire format is identical at the kernel boundary; a native module's
+    // params also take its manifest's defaults, ranges and requirements.
+    let resolved = crate::module_resolver::entry_identity(module)
+        .map(|(_, ty, variant)| r.resolve(ty, variant))
+        .transpose()?
+        .flatten();
+    let native = resolved.as_ref().filter(|a| a.is_native());
+    let pic_schema = match &resolved {
+        Some(a) if !a.is_native() => schema::param_schema(a)?,
+        _ => None,
+    };
     // On a module whose schema declares `trust` (tls, quic) the key is a
     // trust-anchor source spec: validated against the schema with the
     // other keys, then lifted out, since its value is resolved to an anchor bundle
@@ -2911,15 +2804,17 @@ fn build_module_entry_in(
             )
             .map_err(|e| out_of_room_or(out_of_room, e))?
         };
-    } else if let Some((manifest, param_schema)) = load_native_param_schema(type_name) {
+    } else if let Some(native) = native {
+        let manifest = &native.manifest;
+        let param_schema = schema::ParamSchema::from_manifest(manifest);
         validate_yaml_params(module, &param_schema, type_name)?;
-        validate_param_ranges(module, &manifest, type_name)?;
-        validate_required_params(module, &manifest, type_name)?;
+        validate_param_ranges(module, manifest, type_name)?;
+        validate_required_params(module, manifest, type_name)?;
         // Inject manifest defaults into a YAML clone so every declared
         // param produces a TLV entry. The native module's step function
         // reads values straight off the wire, with no defaults
         // duplicated in Rust.
-        let module_with_defaults = inject_manifest_defaults(packed_module, &manifest);
+        let module_with_defaults = inject_manifest_defaults(packed_module, manifest);
         params_len = if param_schema.params.is_empty() {
             0
         } else {
@@ -3496,7 +3391,7 @@ pub(crate) fn parse_modules_map(
     modules: &Value,
     data_section: Option<&Value>,
     config: &Value,
-    loc: schema::ModuleLocation<'_>,
+    r: &ModuleResolver,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
@@ -3602,7 +3497,7 @@ pub(crate) fn parse_modules_map(
             id,
             data_section,
             config,
-            loc,
+            r,
             manifests,
             max_modules,
             isolation,
@@ -3772,7 +3667,15 @@ mod tests {
     /// negative or non-numeric value is refused.
     #[test]
     fn a_ranged_param_is_checked_at_its_whole_value() {
-        let (manifest, _) = load_native_param_schema("linux_net").expect("linux_net manifest");
+        let fluxor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let r = ModuleResolver::for_project(&fluxor, crate::module_resolver::Abi::Unplaced, None)
+            .expect("fluxor's resolver");
+        let manifest = r
+            .resolve("linux_net", None)
+            .expect("linux_net resolves")
+            .expect("linux_net is a module of fluxor")
+            .manifest
+            .clone();
         let check =
             |v: Value| validate_param_ranges(&json!({ "max_conns": v }), &manifest, "linux_net");
         for ok in [json!(2), json!(65535), json!("128"), json!("0x80")] {

@@ -59,20 +59,23 @@ pub fn buffer_arena_bytes(target: &TargetDescriptor) -> Option<u64> {
         .or_else(|| target.buffer_arena_kb.map(|kb| kb as u64 * 1024))
 }
 
-/// What the platform `target` runs adds to graph preparation.
+/// What the platform `target` runs adds to graph preparation: its kernel's
+/// mailbox groups, and the core each of its domains steps on.
 pub fn platform(target: &TargetDescriptor) -> RingPlatform {
     RingPlatform {
+        buffer_groups: ring_size::buffer_groups(crate::capacity::kernel_max_edges(
+            target.runtime(),
+        )),
         domain_cores: target.smp.domain_cores,
-        ..platform_of(target.runtime())
     }
 }
 
-/// What the kernel of `runtime` adds to graph preparation: its mailbox
-/// groups, and the core each of its domains steps on.
-pub fn platform_of(runtime: &str) -> RingPlatform {
+/// What the kernel of `runtime`, as `project` resolves it, adds to graph
+/// preparation.
+pub fn platform_of(runtime: &str, project: &std::path::Path) -> RingPlatform {
     RingPlatform {
         buffer_groups: ring_size::buffer_groups(crate::capacity::kernel_max_edges(runtime)),
-        domain_cores: crate::target::smp_of(runtime).domain_cores,
+        domain_cores: crate::target::smp_of(runtime, project).domain_cores,
     }
 }
 
@@ -803,7 +806,10 @@ mod tests {
             modules: 6,
             edges: 3,
             crossings: crate::capacity::crossing_count(
-                &crate::target::smp_of(target),
+                &crate::target::smp_of(
+                    target,
+                    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")),
+                ),
                 (0..3).map(|_| (Some(0), Some(1), false)),
             ),
             ..Default::default()
@@ -824,7 +830,13 @@ mod tests {
     #[test]
     fn crossings_are_counted_by_core() {
         let count = |target: &str, edges: &[(Option<u8>, Option<u8>, bool)]| {
-            crate::capacity::crossing_count(&crate::target::smp_of(target), edges.iter().copied())
+            crate::capacity::crossing_count(
+                &crate::target::smp_of(
+                    target,
+                    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")),
+                ),
+                edges.iter().copied(),
+            )
         };
         let d = |from: u8, to: u8| (Some(from), Some(to), false);
         assert_eq!(count("rp2350", &[d(0, 1), d(1, 0), d(1, 3)]), 3);

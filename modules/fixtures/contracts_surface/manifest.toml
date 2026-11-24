@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
+
+# Links every alloc-free entry point of `fluxor-contracts` a module can
+# call, with inputs the compiler cannot see through, so the module build's
+# as-linked position-independence check holds each of them on every module
+# ABI: a contracts function a module reaches carries no panic location and
+# no table of pointers. Building it is the check; it is never run.
+#
+# The name vocabulary (`vocabulary`, `CONTENT_TYPES`, the attribute keys
+# `observability::is_valid_attribute_key` checks, and the `name`/`as_str`/
+# `kind` renderings) is the composer's and the tools': tables of names a
+# module never links.
+
+[observability]
+exempt = "build-time surface fixture; it is never run"

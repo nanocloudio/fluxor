@@ -1254,19 +1254,25 @@ pub enum ProviderCaller {
 }
 
 /// Where a graph's modules call their providers from: the target's runtime
-/// (`None` when it is not known) and whose modules they are.
+/// (`None` when it is not known), whose modules they are, and the project
+/// whose target registry names the runtime.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderReach<'a> {
     pub runtime: Option<&'a str>,
     pub caller: ProviderCaller,
+    pub project: &'a Path,
 }
 
 /// The contracts `runtime`'s platform answers a call from `caller`'s modules,
 /// from the target's `[providers]` table (`targets/{silicon,host}/<runtime>.toml`).
 /// `None` for a runtime the target registry does not know, whose platform is
 /// then not checked.
-fn platform_contracts(runtime: &str, caller: ProviderCaller) -> Option<Vec<String>> {
-    let target = crate::target::load_target(runtime, &crate::project::root()).ok()?;
+fn platform_contracts(
+    runtime: &str,
+    caller: ProviderCaller,
+    project: &Path,
+) -> Option<Vec<String>> {
+    let target = crate::target::load_target(runtime, project).ok()?;
     Some(match caller {
         ProviderCaller::Node => target.providers.node,
         ProviderCaller::Workload => target.providers.workload,
@@ -1301,7 +1307,7 @@ pub fn required_contract_refusals(
     let Some(runtime) = reach.runtime else {
         return Vec::new();
     };
-    let Some(platform) = platform_contracts(runtime, reach.caller) else {
+    let Some(platform) = platform_contracts(runtime, reach.caller, reach.project) else {
         return Vec::new();
     };
     let provided: std::collections::BTreeSet<&str> = module_names
@@ -1718,7 +1724,7 @@ pub fn validate_single_provider(
     }
     let platform = reach
         .runtime
-        .and_then(|r| platform_contracts(r, reach.caller).map(|c| (r, c)));
+        .and_then(|r| platform_contracts(r, reach.caller, reach.project).map(|c| (r, c)));
     let whose = match reach.caller {
         ProviderCaller::Node => "the node's own modules",
         ProviderCaller::Workload => "a workload's modules",

@@ -389,11 +389,21 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ── Decode ──────────────────────────────────────────────────────────────────
 
 fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
+    u16::from_le_bytes(field(b, at))
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    u32::from_le_bytes(field(b, at))
+}
+
+/// The `N` bytes at `at`, zeros past the end: every read is of a blob the
+/// decoder has bounded already, and none can panic (a module links these).
+fn field<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (o, v) in out.iter_mut().zip(b.iter().skip(at)) {
+        *o = *v;
+    }
+    out
 }
 
 const fn padded(len: usize) -> usize {
@@ -473,7 +483,7 @@ impl<'a> Graph<'a> {
 
     /// The domain records, in domain-id order.
     pub fn domains(&self) -> impl ExactSizeIterator<Item = DomainRecord> + 'a {
-        self.domains.chunks_exact(DOMAIN_LEN).map(read_domain)
+        crate::records::<DOMAIN_LEN>(self.domains).map(|r| read_domain(r))
     }
 
     /// The composed graph: modules, edges and stepping order.
@@ -517,13 +527,16 @@ impl<'a> Workloads<'a> {
     pub fn iter(&self) -> impl ExactSizeIterator<Item = WorkloadRecord<'a>> + 'a {
         let mut bytes = self.records;
         (0..self.count).map(move |_| {
+            // The records were bounded at decode; the reads stay checked
+            // all the same, so none can panic.
             let len = le32(bytes, 0) as usize;
-            let flags = bytes[4];
-            let (rec, rest) = bytes.split_at(WORKLOAD_HEAD_LEN + len);
-            bytes = rest;
+            let flags = bytes.get(4).copied().unwrap_or(0);
+            let end = (WORKLOAD_HEAD_LEN + len).min(bytes.len());
+            let blob = bytes.get(WORKLOAD_HEAD_LEN..end).unwrap_or(&[]);
+            bytes = bytes.get(end..).unwrap_or(&[]);
             WorkloadRecord {
                 idle_safe: flags & WORKLOAD_FLAG_IDLE_SAFE != 0,
-                blob: &rec[WORKLOAD_HEAD_LEN..],
+                blob,
             }
         })
     }
@@ -547,12 +560,10 @@ impl<'a> PoolEntries<'a> {
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = PoolEntry> + 'a {
-        self.records
-            .chunks_exact(POOL_ENTRY_LEN)
-            .map(|r| PoolEntry {
-                pool: le16(r, 0),
-                n: le32(r, 2),
-            })
+        crate::records::<POOL_ENTRY_LEN>(self.records).map(|r| PoolEntry {
+            pool: le16(r, 0),
+            n: le32(r, 2),
+        })
     }
 }
 

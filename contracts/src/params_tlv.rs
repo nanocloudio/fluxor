@@ -38,22 +38,22 @@ pub fn terminator_at(blob: &[u8], len: usize) -> Option<usize> {
 /// [`FIRST_RESERVED_TAG`]) of a v1 params blob, in order, up to the
 /// terminator. No-op on a blob that is not one.
 pub fn walk_declared<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
-    if blob.len() < 4 || blob[0] != TLV_MAGIC || blob[1] != TLV_VERSION {
+    if blob.get(..2) != Some(&[TLV_MAGIC, TLV_VERSION][..]) || blob.len() < 4 {
         return;
     }
-    let end = blob.len();
     let mut off = 4usize;
-    while off + 2 <= end {
-        let tag = blob[off];
-        let elen = usize::from(blob[off + 1]);
-        off += 2;
-        if tag == TLV_END || off + elen > end {
+    while let (Some(&tag), Some(&elen)) = (blob.get(off), blob.get(off + 1)) {
+        let start = off + 2;
+        let Some(value) = blob.get(start..start + usize::from(elen)) else {
+            break;
+        };
+        if tag == TLV_END {
             break;
         }
         if tag < FIRST_RESERVED_TAG {
-            f(tag, &blob[off..off + elen]);
+            f(tag, value);
         }
-        off += elen;
+        off = start + value.len();
     }
 }
 
@@ -94,24 +94,25 @@ pub fn merge_overrides<'a, I>(buf: &mut [u8], len: usize, overrides: I) -> Merge
 where
     I: Iterator<Item = (u8, &'a [u8])> + Clone,
 {
+    // Every access below is checked (`get`, `get_mut`), never indexed: a
+    // module links this, and an indexing panic would carry a panic location
+    // into it.
     let mut len = len.min(buf.len());
-    if buf.len() < 4 {
-        return Merged {
-            len,
-            dropped: overrides.count(),
-        };
-    }
-    if len < 4 {
-        buf[0] = TLV_MAGIC;
-        buf[1] = TLV_VERSION;
-        buf[2] = 0;
-        buf[3] = 0;
-        len = 4;
-    } else if buf[0] != TLV_MAGIC || buf[1] != TLV_VERSION {
-        return Merged {
-            len,
-            dropped: overrides.count(),
-        };
+    let refuse = |len: usize, overrides: I| Merged {
+        len,
+        dropped: overrides.count(),
+    };
+    match buf.get_mut(..4) {
+        None => return refuse(len, overrides),
+        Some([magic, version, lo, hi]) if len < 4 => {
+            *magic = TLV_MAGIC;
+            *version = TLV_VERSION;
+            *lo = 0;
+            *hi = 0;
+            len = 4;
+        }
+        Some([magic, version, ..]) if *magic == TLV_MAGIC && *version == TLV_VERSION => {}
+        Some(_) => return refuse(len, overrides),
     }
     // Insert before the terminator; with none, append and terminate.
     let (at, need_end) = match terminator_at(buf, len) {
@@ -132,28 +133,44 @@ where
             dropped += 1;
         }
     }
-    // Move the terminator and everything after it up by `add`.
-    buf.copy_within(at..len, at + add);
+    // Move the terminator and everything after it up by `add`, from the end.
+    for i in (at..len).rev() {
+        if let Some(b) = buf.get(i).copied() {
+            if let Some(d) = buf.get_mut(i + add) {
+                *d = b;
+            }
+        }
+    }
     let mut w = at;
     for (tag, v) in overrides.take(taken) {
-        buf[w] = tag;
-        buf[w + 1] = v.len() as u8;
-        buf[w + 2..w + 2 + v.len()].copy_from_slice(v);
+        put(buf, w, tag);
+        put(buf, w + 1, v.len() as u8);
+        for (k, b) in v.iter().enumerate() {
+            put(buf, w + 2 + k, *b);
+        }
         w += 2 + v.len();
     }
     let mut new_len = len + add;
     if need_end != 0 {
-        buf[new_len] = TLV_END;
-        buf[new_len + 1] = 0x00;
+        put(buf, new_len, TLV_END);
+        put(buf, new_len + 1, 0x00);
         new_len += 2;
     }
     // Advisory: the basic section runs to the byte after its terminator.
     let basic = (at + add + 2).saturating_sub(4);
-    let field = u16::try_from(basic).unwrap_or(u16::MAX).to_le_bytes();
-    buf[2] = field[0];
-    buf[3] = field[1];
+    let [lo, hi] = u16::try_from(basic).unwrap_or(u16::MAX).to_le_bytes();
+    put(buf, 2, lo);
+    put(buf, 3, hi);
     Merged {
         len: new_len,
         dropped,
+    }
+}
+
+/// `buf[at] = b`, where `at` lies inside `buf` (the merge sized every
+/// write against `buf.len()` first).
+fn put(buf: &mut [u8], at: usize, b: u8) {
+    if let Some(d) = buf.get_mut(at) {
+        *d = b;
     }
 }

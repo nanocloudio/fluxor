@@ -600,10 +600,6 @@ enum Commands {
         /// Output path (defaults to stdout).
         #[arg(long, short)]
         out: Option<PathBuf>,
-        /// Extra module-tree roots to resolve types against, searched after
-        /// the project's `modules/` (e.g. a sibling fluxor checkout's).
-        #[arg(long)]
-        modules_dir: Vec<PathBuf>,
     },
 
     /// Live-workspace policy surface (`~/.fluxor/workspace.toml`).

@@ -47,6 +47,7 @@ mod hash;
 mod hygiene;
 mod identity_key;
 mod manifest;
+mod module_resolver;
 mod modules;
 mod modules_build;
 mod monitor;
@@ -73,6 +74,7 @@ pub(crate) use fluxor_tools::presentation_resolver;
 pub(crate) use fluxor_tools::limit_register;
 // The `irq-neon-free` phase `ci.rs` runs.
 pub(crate) use fluxor_tools::irq_neon_free;
+pub(crate) use fluxor_tools::oci_store;
 pub(crate) use fluxor_tools::protection;
 pub(crate) use fluxor_tools::stack_depth;
 pub(crate) use fluxor_tools::store_resolve;
@@ -125,7 +127,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{decode_config, generate_config_ext, ConfigBuilder, ModuleCaps};
 use crate::error::{Error, Result};
-use crate::modules::{pack_fmod, parse_modules_from_config_multi};
+use crate::modules::pack_fmod;
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
@@ -495,11 +497,7 @@ fn main() {
             WorkspaceAction::Rm { path } => workspace::cmd_workspace_rm(&path),
         },
         Commands::Store(args) => store_cli::dispatch_store(args),
-        Commands::IdTable {
-            config,
-            out,
-            modules_dir,
-        } => cmd_id_table(&config, out.as_deref(), &modules_dir),
+        Commands::IdTable { config, out } => cmd_id_table(&config, out.as_deref()),
     };
 
     if let Err(e) = result {
@@ -679,14 +677,15 @@ fn cmd_publish(
     publish_sweep(&pr, &kinds, store, verbose, mode)
 }
 
-/// The publish sweep over `kinds` (empty = everything), in dependency
-/// order: sources, fmods and runtimes in one transaction; then each stack
-/// under `packaging/stack/`, whose module references resolve through the
-/// modules just published; then each package under `packaging/service/` and
-/// `packaging/applet/`, whose graph may include those stacks. What it
-/// publishes is [`fluxor_tools::packaging::discover`]'s, the list `fluxor ci`
-/// checks. Every stack and package is checked before anything is written, so
-/// one that cannot be published fails the sweep rather than being skipped.
+/// The publish sweep over `kinds` (empty = everything): sources, fmods and
+/// runtimes, each stack under `packaging/stack/` (its own-module references
+/// taken from the modules the same sweep stages) and each package under
+/// `packaging/service/` and `packaging/applet/` (its graph built, its module
+/// artefacts resolved), all staged into one plan before anything is written
+/// and committed together. What it publishes is
+/// [`fluxor_tools::packaging::discover`]'s, the list `fluxor ci` checks. A
+/// dry run stages the same plan and stops before the commit, so every check
+/// the publish runs, it runs.
 fn publish_sweep(
     pr: &Path,
     kinds: &[&str],
@@ -695,89 +694,67 @@ fn publish_sweep(
     mode: fluxor_tools::store_publish::PublishMode,
 ) -> Result<()> {
     let want = |k: &str| kinds.is_empty() || kinds.contains(&k);
-    let project_kinds: Vec<&str> = kinds
-        .iter()
-        .copied()
-        .filter(|k| !matches!(*k, "stack" | "package"))
-        .collect();
-    let sweep_project = kinds.is_empty() || !project_kinds.is_empty();
     let rel = |p: &Path| p.strip_prefix(pr).unwrap_or(p).display().to_string();
-
-    // Checked up front, so a broken stack or package refuses the whole
-    // sweep before its modules are published.
     let shippables = fluxor_tools::packaging::discover(pr);
-    let mut stacks: Vec<(PathBuf, String)> = Vec::new();
-    if want("stack") {
+    let staged_refs = std::cell::RefCell::new(Vec::new());
+    let stage = |store: &fluxor_tools::oci_store::OciStore,
+                 own: &fluxor_tools::stack::OwnModules|
+     -> fluxor_tools::error::Result<Vec<fluxor_tools::oci_store::Prepared>> {
+        let mut prepared = Vec::new();
         let mut errors = Vec::new();
-        for path in shippables.stacks {
-            match fluxor_tools::stack::check_publishable(&path, pr) {
-                Ok(reference) => stacks.push((path, reference)),
-                Err(e) => errors.push(format!("stack {}: {}", rel(&path), lib_message(e))),
+        if want("stack") {
+            for path in &shippables.stacks {
+                match store_cli::stage_stack(path, &own.artifacts, None, false, store) {
+                    Ok(s) => {
+                        staged_refs.borrow_mut().push(format!(
+                            "stack {} ({})",
+                            s.reference,
+                            rel(path)
+                        ));
+                        prepared.push(s.prepared);
+                    }
+                    Err(e) => errors.push(format!("stack {}: {}", rel(path), bare(e))),
+                }
+            }
+        }
+        if want("package") {
+            for (_, manifest) in &shippables.packages {
+                match store_cli::stage_package(manifest, own, store, None, false, verbose) {
+                    Ok(s) => {
+                        staged_refs.borrow_mut().push(format!(
+                            "package {} ({})",
+                            s.reference,
+                            rel(manifest)
+                        ));
+                        prepared.push(s.prepared);
+                    }
+                    Err(e) => errors.push(format!("package {}: {}", rel(manifest), bare(e))),
+                }
             }
         }
         if !errors.is_empty() {
-            return Err(Error::Config(format!(
-                "publish refused: {} stack(s) cannot be published, and nothing was written:\n  {}",
+            return Err(fluxor_tools::error::Error::Config(format!(
+                "publish refused: {} stack(s) or package(s) cannot be published, and nothing \
+                 was written:\n  {}",
                 errors.len(),
                 errors.join("\n  ")
             )));
         }
-    }
-    let mut packages: Vec<(PathBuf, String)> = Vec::new();
-    if want("package") {
-        let mut errors = Vec::new();
-        for (_, manifest) in shippables.packages {
-            match fluxor_tools::packaging::check_package(&manifest, pr)
-                .and_then(|_| fluxor_tools::packaging::read_package(&manifest).map(|s| s.name))
-            {
-                Ok(name) => packages.push((manifest, name)),
-                Err(e) => errors.push(format!("package {}: {e}", rel(&manifest))),
-            }
-        }
-        if !errors.is_empty() {
-            return Err(Error::Config(format!(
-                "publish refused: {} package(s) cannot be published, and nothing was written:\n  {}",
-                errors.len(),
-                errors.join("\n  ")
-            )));
-        }
-    }
-
-    if sweep_project {
-        let tags = fluxor_tools::store_publish::publish_project_into(
-            pr,
-            &project_kinds,
-            verbose,
-            mode,
-            store,
-        )
-        .map_err(|e| Error::Config(e.to_string()))?;
-        if !mode.dry_run {
-            for tag in &tags {
-                println!("{tag}");
-            }
-            println!("published {} tag(s)", tags.len());
-        }
-    }
-
+        Ok(prepared)
+    };
+    let tags =
+        fluxor_tools::store_publish::publish_project_into(pr, kinds, verbose, mode, store, &stage)
+            .map_err(|e| Error::Config(lib_message(e)))?;
     if mode.dry_run {
-        for (path, reference) in &stacks {
-            println!("would publish stack {reference} ({})", rel(path));
-        }
-        for (manifest, name) in &packages {
-            println!("would publish package {name} ({})", rel(manifest));
+        for r in staged_refs.borrow().iter() {
+            println!("would publish {r}");
         }
         println!("\ndry run: nothing was written.");
-        return Ok(());
-    }
-    for (path, _) in &stacks {
-        store_cli::cmd_stack_publish(path, store, None, false)
-            .map_err(|e| Error::Config(format!("publish stack {}: {}", rel(path), bare(e))))?;
-    }
-    for (manifest, _) in &packages {
-        store_cli::cmd_package_publish(manifest, store, None, false, verbose).map_err(|e| {
-            Error::Config(format!("publish package {}: {}", rel(manifest), bare(e)))
-        })?;
+    } else {
+        for tag in &tags {
+            println!("{tag}");
+        }
+        println!("published {} tag(s)", tags.len());
     }
     Ok(())
 }

@@ -340,7 +340,7 @@ pub fn load_graph(config_path: &std::path::Path, project_root: &std::path::Path)
     // names the file a build step would write; it never runs one.
     crate::graph_assets::refuse_written_asset_params(&config, config_path)?;
     if crate::graph_assets::names_an_asset(&config) {
-        let family = crate::resolve_target(&config, None)?.family;
+        let family = crate::resolve_target(&config, None, project_root)?.family;
         crate::graph_assets::resolve_placeholders(&mut config, config_path, &family, project_root)?;
     }
     Ok(config)
@@ -357,8 +357,9 @@ pub fn load_graph(config_path: &std::path::Path, project_root: &std::path::Path)
 pub fn expand_platform_stacks(
     config: &mut Value,
     target: &TargetDescriptor,
-    project_root: &std::path::Path,
+    r: &crate::module_resolver::ModuleResolver,
 ) -> Result<Vec<String>> {
+    let project_root = r.project_root();
     let mut auto_added = Vec::new();
 
     // Members placed on another node (`modules[].node`) are lifted out of
@@ -475,14 +476,47 @@ pub fn expand_platform_stacks(
     // instantiation order) from the project's own `modules/` tree — the same
     // default the `fluxor id-table` exporter uses. An explicit user
     // `table_digest` wins.
-    inject_id_table_digest(config, project_root);
+    inject_id_table_digest(config, r)?;
 
     Ok(auto_added)
 }
 
-/// See the call site in [`expand_platform_stacks`]. Separate so the walkdir
-/// cost is paid only when an `otel` entry exists.
-fn inject_id_table_digest(config: &mut Value, project_root: &std::path::Path) {
+/// Each module's `[observability]` table, from the artefact `r` resolves for
+/// it: the lookup the build's digest injection and the `fluxor id-table`
+/// exporter share. The table is the library's, so the lookup resolves with
+/// the library's copy of the resolver over `r`'s places.
+pub fn id_table_rows(
+    r: &crate::module_resolver::ModuleResolver,
+) -> Result<impl Fn(&str, Option<&str>) -> Option<fluxor_tools::manifest::Observability>> {
+    use fluxor_tools::module_resolver as lib;
+    let s = r.spec();
+    let lib_r = lib::ModuleResolver::new(lib::ResolverSpec {
+        project_root: s.project_root.clone(),
+        abi: match &s.abi {
+            crate::module_resolver::Abi::Module(a) => lib::Abi::Module(a.clone()),
+            crate::module_resolver::Abi::Unplaced => lib::Abi::Unplaced,
+        },
+        shelf: s.shelf.clone(),
+        search_paths: s.search_paths.clone(),
+        install_root: s.install_root.clone(),
+        store_dir: s.store_dir.clone(),
+    })
+    .map_err(|e| Error::Config(e.to_string()))?;
+    Ok(move |ty: &str, variant: Option<&str>| {
+        lib_r
+            .resolve(ty, variant)
+            .ok()
+            .flatten()
+            .map(|a| a.manifest.observability.clone())
+    })
+}
+
+/// See the call site in [`expand_platform_stacks`]. Separate so the table
+/// is built only when an `otel` entry exists.
+fn inject_id_table_digest(
+    config: &mut Value,
+    r: &crate::module_resolver::ModuleResolver,
+) -> Result<()> {
     let has_otel = |entry: &Value| -> bool {
         let name = entry
             .as_str()
@@ -496,12 +530,9 @@ fn inject_id_table_digest(config: &mut Value, project_root: &std::path::Path) {
         .and_then(|m| m.as_array())
         .is_some_and(|a| a.iter().any(has_otel));
     if !any {
-        return;
+        return Ok(());
     }
-    let table = crate::observability::id_table_for_expanded_config(
-        config,
-        &crate::observability::id_table_roots(project_root),
-    );
+    let table = crate::observability::id_table_for_expanded_config(config, &id_table_rows(r)?);
     let digest = table.digest();
     let bounds_hex = table.bounds_blob_hex();
     if let Some(arr) = config["modules"].as_array_mut() {
@@ -523,6 +554,7 @@ fn inject_id_table_digest(config: &mut Value, project_root: &std::path::Path) {
             }
         }
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -558,7 +590,7 @@ fn load_stack(name: &str, project_root: &std::path::Path) -> Result<StackFile> {
     let project_path = project_root.join("stacks").join(format!("{name}.toml"));
     let path = if project_path.exists() {
         project_path
-    } else if let Some(install) = crate::project::install_root() {
+    } else if let Some(install) = crate::project::install_root(project_root) {
         let install_path = install.path.join("stacks").join(format!("{name}.toml"));
         if install_path.exists() {
             install_path
@@ -581,7 +613,7 @@ fn load_stack(name: &str, project_root: &std::path::Path) -> Result<StackFile> {
         // bundled stack still surfaces the bundled name as a
         // suggestion.
         let mut available = list_available_stack_names(project_root);
-        if let Some(install) = crate::project::install_root() {
+        if let Some(install) = crate::project::install_root(project_root) {
             if install.path != project_root {
                 for n in list_available_stack_names(&install.path) {
                     if !available.contains(&n) {
@@ -1920,12 +1952,21 @@ wiring = []
     fn otel_entries_get_table_digest_injected() {
         let tmp = std::env::temp_dir().join(format!("fx_digest_{}", std::process::id()));
         let _ = std::fs::create_dir_all(tmp.join("modules"));
+        let r = crate::module_resolver::ModuleResolver::new(crate::module_resolver::ResolverSpec {
+            project_root: tmp.clone(),
+            abi: crate::module_resolver::Abi::Unplaced,
+            shelf: None,
+            search_paths: Vec::new(),
+            install_root: None,
+            store_dir: Some(tmp.join("store")),
+        })
+        .unwrap();
 
         let mut with_otel = json!({ "modules": [
             { "name": "ip" },
             { "name": "otel", "flush_ms": 500 },
         ]});
-        inject_id_table_digest(&mut with_otel, &tmp);
+        inject_id_table_digest(&mut with_otel, &r).unwrap();
         let d = with_otel["modules"][1]["table_digest"]
             .as_u64()
             .expect("digest injected");
@@ -1940,19 +1981,19 @@ wiring = []
             { "name": "ip" },
             { "name": "otel", "flush_ms": 500 },
         ]});
-        inject_id_table_digest(&mut again, &tmp);
+        inject_id_table_digest(&mut again, &r).unwrap();
         assert_eq!(again["modules"][1]["table_digest"].as_u64(), Some(d));
 
         // Explicit user value wins.
         let mut explicit = json!({ "modules": [
             { "name": "otel", "table_digest": 7 },
         ]});
-        inject_id_table_digest(&mut explicit, &tmp);
+        inject_id_table_digest(&mut explicit, &r).unwrap();
         assert_eq!(explicit["modules"][0]["table_digest"].as_u64(), Some(7));
 
         // No otel → untouched.
         let mut none = json!({ "modules": [ { "name": "ip" } ]});
-        inject_id_table_digest(&mut none, &tmp);
+        inject_id_table_digest(&mut none, &r).unwrap();
         assert!(none["modules"][0].get("table_digest").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);

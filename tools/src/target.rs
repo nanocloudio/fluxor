@@ -162,10 +162,10 @@ impl SmpFacts {
 }
 
 /// The `[smp]` facts of the target named `target` (a silicon, host or board
-/// name), as the project resolves it. A name no registry knows is one core
+/// name), as `project` resolves it. A name no registry knows is one core
 /// running every domain.
-pub fn smp_of(target: &str) -> SmpFacts {
-    load_target(target, &crate::project::root())
+pub fn smp_of(target: &str, project: &Path) -> SmpFacts {
+    load_target(target, project)
         .map(|d| d.smp)
         .unwrap_or_default()
 }
@@ -925,7 +925,7 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
         return Ok(desc);
     }
     // Then install root, if discovered.
-    if let Some(install) = crate::project::install_root() {
+    if let Some(install) = crate::project::install_root(project_root) {
         if install.path != project_root {
             let found =
                 try_load_target_under(name, &install.path).map_err(|e| match &install.source {
@@ -951,7 +951,7 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
     } else {
         available.join(", ")
     };
-    let discovery = if crate::project::install_root().is_none() {
+    let discovery = if crate::project::install_root(project_root).is_none() {
         format!(
             " No target catalog beyond the project's own `targets/`: no \
              ${} directory, no workspace `live_trees` checkout with `stacks/` and \
@@ -1016,7 +1016,7 @@ pub fn list_targets(project_root: &Path) -> Vec<String> {
     collect_target_names_under(project_root, &mut names);
 
     // Merge install-root entries that aren't already present.
-    if let Some(install) = crate::project::install_root() {
+    if let Some(install) = crate::project::install_root(project_root) {
         if install.path != project_root {
             collect_target_names_under(&install.path, &mut names);
         }

@@ -215,7 +215,13 @@ impl<'a> RegionList<'a> {
             (true, true) => {
                 let next_len = self.slots[at].len;
                 self.slots[at - 1].len += (end - base) + next_len;
-                self.slots.copy_within(at + 1..self.len, at);
+                for i in at + 1..self.len {
+                    if let Some(&r) = self.slots.get(i) {
+                        if let Some(d) = self.slots.get_mut(i - 1) {
+                            *d = r;
+                        }
+                    }
+                }
                 self.len -= 1;
             }
             (true, false) => self.slots[at - 1].len += end - base,
@@ -229,7 +235,13 @@ impl<'a> RegionList<'a> {
                     self.dropped += 1;
                     return;
                 }
-                self.slots.copy_within(at..self.len, at + 1);
+                for i in (at..self.len).rev() {
+                    if let Some(&r) = self.slots.get(i) {
+                        if let Some(d) = self.slots.get_mut(i + 1) {
+                            *d = r;
+                        }
+                    }
+                }
                 self.slots[at] = MemRegion {
                     base,
                     len: end - base,

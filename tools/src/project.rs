@@ -14,12 +14,12 @@
 //!    directory. Explicit override for tooling that knows where the
 //!    tree lives (CI, install scripts, IDE integrations).
 //! 2. **Walk up from CWD** looking for a directory that carries a
-//!    project marker. Two markers are recognised:
-//!    - A `.fluxor` file (user-facing opt-in marker for external
-//!      projects).
-//!    - Co-located `targets/` and `stacks/` directories (matches the
-//!      Fluxor source tree without requiring it to ship a `.fluxor`
-//!      file).
+//!    project marker. Three markers are recognised:
+//!    - A `fluxor.toml` (the project's identity and dependencies).
+//!    - A `.fluxor` file (opt-in marker for a project with no
+//!      `fluxor.toml`).
+//!    - Co-located `targets/` and `stacks/` directories (the Fluxor
+//!      source tree layout).
 //!
 //!    The first match wins; the walk stops at the filesystem root.
 //! 3. **CWD as a fallback** — for callers that don't care where the
@@ -29,9 +29,8 @@
 //!
 //! The surface this implements, which the rest of the CLI relies on:
 //!
-//! - A project declares itself on disk. Either the operator opts in
-//!   with a `.fluxor` marker file, or the tree is self-evidently a
-//!   fluxor project because it carries both `targets/` and `stacks/`.
+//! - A project declares itself on disk: a `fluxor.toml`, a `.fluxor`
+//!   marker file, or both `targets/` and `stacks/`.
 //!   Nothing is inferred from a name, a parent directory, or an
 //!   assumption about where the operator is standing.
 //! - The project root and the install root are two different things.
@@ -46,9 +45,8 @@
 //!   operator which tree a build is actually reading, instead of
 //!   leaving a wrong-directory build to fail further downstream.
 //! - `fluxor.toml` at the project root carries the project's identity
-//!   and its declared dependencies; it is read lazily and its absence
-//!   is not an error, because a project root is defined by its
-//!   directory layout, not by that file.
+//!   and its declared dependencies, and marks the root. It is read
+//!   lazily; a root marked another way may have none.
 
 use std::path::{Path, PathBuf};
 
@@ -104,9 +102,11 @@ pub struct InstallRoot {
 /// 2. **A `~/.fluxor/workspace.toml` `live_trees` checkout** that
 ///    carries the install markers: a project building against Fluxor
 ///    work not yet published names fluxor's checkout there.
-/// 3. **The synced catalog**: the `fluxor-catalog` source the current
-///    project's `fluxor sync` staged from published Fluxor, at
-///    `target/fluxor/fluxor-catalog/`. A workspace member that is not a
+/// 3. **The synced catalog**: the `fluxor-catalog` source `project`'s
+///    `fluxor sync` staged from published Fluxor, at
+///    `target/fluxor/fluxor-catalog/`. `project` is the root of the
+///    project being built (`root_for_config` for a graph), never the
+///    working directory's, so one graph reads one catalog. A workspace member that is not a
 ///    live tree is used through this, never its working tree.
 /// 4. **Walk from `std::env::current_exe()`** looking for
 ///    - `<prefix>/share/fluxor/{stacks,targets}` (matches the
@@ -118,7 +118,7 @@ pub struct InstallRoot {
 ///    root walk-up already finds the source tree's
 ///    `stacks/+targets/`, so the install root being `None` is a
 ///    no-op fallback.
-pub fn install_root() -> Option<InstallRoot> {
+pub fn install_root(project: &Path) -> Option<InstallRoot> {
     // 1. Env override.
     if let Some(p) = env_var(ENV_INSTALL_ROOT) {
         let path = PathBuf::from(&p);
@@ -158,7 +158,7 @@ pub fn install_root() -> Option<InstallRoot> {
     }
 
     // 3. The catalog synced from published Fluxor into this project.
-    let synced = discover().path.join(SYNCED_CATALOG);
+    let synced = project.join(SYNCED_CATALOG);
     if has_install_markers(&synced) {
         return Some(InstallRoot {
             path: synced.canonicalize().unwrap_or(synced),
@@ -316,7 +316,7 @@ pub fn find_resource(relative: &Path) -> Option<PathBuf> {
     if candidate.is_file() {
         return Some(candidate);
     }
-    if let Some(install) = install_root() {
+    if let Some(install) = install_root(&project) {
         let candidate = install.path.join(relative);
         if candidate.is_file() {
             return Some(candidate);
@@ -330,6 +330,8 @@ pub fn find_resource(relative: &Path) -> Option<PathBuf> {
 pub enum DiscoverySource {
     /// `$FLUXOR_PROJECT_ROOT` env var pointed at a usable directory.
     EnvVar,
+    /// Walked up from CWD and found a `fluxor.toml`.
+    FluxorToml,
     /// Walked up from CWD and found a `.fluxor` file.
     DotFluxorMarker,
     /// Walked up from CWD and found `targets/` + `stacks/` together.
@@ -750,9 +752,12 @@ pub fn tracked_files(
 }
 
 /// Which marker (if any) identifies `path` as a fluxor project
-/// root. Order matters: `.fluxor` (explicit user opt-in) wins over
-/// the source-tree heuristic if both somehow co-exist.
+/// root, in order: `fluxor.toml`, `.fluxor`, then `targets/` with
+/// `stacks/`.
 fn marker_at(path: &Path) -> Option<DiscoverySource> {
+    if path.join("fluxor.toml").is_file() {
+        return Some(DiscoverySource::FluxorToml);
+    }
     if path.join(".fluxor").is_file() {
         return Some(DiscoverySource::DotFluxorMarker);
     }
@@ -901,6 +906,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// A sibling project carries only a `fluxor.toml`. Its graph resolves
+    /// against that project wherever the command runs, including from
+    /// inside another project; a project nested in it resolves to itself.
+    #[test]
+    fn root_for_config_finds_a_project_marked_by_its_fluxor_toml() {
+        let _g = lock();
+        // SAFETY: env mutation serialised by `ENV_LOCK`.
+        unsafe {
+            std::env::remove_var(ENV_PROJECT_ROOT);
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sibling = tmp.path().join("sibling");
+        let nested = sibling.join("examples/inner");
+        fs::create_dir_all(sibling.join("tests/graphs")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            sibling.join("fluxor.toml"),
+            b"[project]\nname = \"sibling\"\n",
+        )
+        .unwrap();
+        fs::write(nested.join("fluxor.toml"), b"[project]\nname = \"inner\"\n").unwrap();
+        let graph = sibling.join("tests/graphs/a.yaml");
+        let inner_graph = nested.join("b.yaml");
+        fs::write(&graph, b"target: linux\n").unwrap();
+        fs::write(&inner_graph, b"target: linux\n").unwrap();
+
+        assert_eq!(marker_at(&sibling), Some(DiscoverySource::FluxorToml));
+        // The test process stands in Fluxor's own tree, another project.
+        assert_eq!(root_for_config(&graph), sibling.canonicalize().unwrap());
+        assert_eq!(
+            root_for_config(&inner_graph),
+            nested.canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn discover_from_returns_none_when_no_marker_anywhere() {
         // Pick a deep, marker-less subdirectory. Some ancestor of the
@@ -980,7 +1020,7 @@ pub(crate) mod tests {
         unsafe {
             std::env::set_var(ENV_INSTALL_ROOT, tmp.path());
         }
-        let found = install_root();
+        let found = install_root(&root());
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
@@ -1006,7 +1046,7 @@ pub(crate) mod tests {
         // current_exe branch. In a test binary current_exe lives
         // under `target/debug/deps/`, where no `share/fluxor` or
         // flat markers exist — so the final result should be None.
-        let found = install_root();
+        let found = install_root(&root());
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
@@ -1028,7 +1068,7 @@ pub(crate) mod tests {
         // Test binary's current_exe is under target/debug/deps/;
         // walking up doesn't hit a `share/fluxor/` or flat install
         // layout. Result should be None.
-        let found = install_root();
+        let found = install_root(&root());
         restore_workspace_env();
         assert!(found.is_none());
     }
@@ -1079,7 +1119,7 @@ pub(crate) mod tests {
         unsafe {
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
         }
-        let found = install_root();
+        let found = install_root(&root());
         restore_workspace_env();
         let install = found.expect("a live tree with markers must resolve");
         assert_eq!(
@@ -1111,11 +1151,11 @@ pub(crate) mod tests {
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
             std::env::set_var(ENV_PROJECT_ROOT, project.path());
         }
-        let unsynced = install_root();
+        let unsynced = install_root(&root());
         let synced = project.path().join(SYNCED_CATALOG);
         fs::create_dir_all(synced.join("stacks")).unwrap();
         fs::create_dir_all(synced.join("targets")).unwrap();
-        let found = install_root();
+        let found = install_root(&root());
         unsafe {
             std::env::remove_var(ENV_PROJECT_ROOT);
         }
@@ -1144,7 +1184,7 @@ pub(crate) mod tests {
             std::env::set_var(ENV_INSTALL_ROOT, env_target.path());
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
         }
-        let found = install_root();
+        let found = install_root(&root());
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
@@ -1176,7 +1216,7 @@ pub(crate) mod tests {
         unsafe {
             std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
         }
-        let found = install_root();
+        let found = install_root(&root());
         restore_workspace_env();
         assert!(
             found.is_none(),

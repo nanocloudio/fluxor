@@ -59,46 +59,20 @@ fn parse_source_manifest(text: &str) -> Result<SourceManifest> {
 // Graph facts (derived, never declared)
 // ============================================================================
 
-/// The graph facts a package derives rather than declares: module types in
-/// declaration order and the module/edge counts that seed the resource
-/// profile. Platform-stack modules are NOT counted — they are node substrate,
-/// not workload footprint.
+/// The graph facts a package derives rather than declares: its module
+/// entries, its first module's type, and the module/edge counts that seed
+/// the resource profile. Platform-stack modules are NOT counted — they are
+/// node substrate, not workload footprint.
 struct GraphFacts {
-    module_types: Vec<String>,
+    entries: Vec<serde_json::Value>,
     first_module: Option<String>,
     modules: u16,
     edges: u16,
 }
 
-/// Sum the resident state the graph's modules declare in their packed
-/// manifests. Returns `(bytes, modules_without_a_figure)`.
-///
-/// The per-module figure is recorded at pack time from the SDK's
-/// `module_facts!` static, in 64-byte units, so it is a
-/// measurement of the built artefact rather than an author's estimate. A module
-/// with no figure contributes nothing and is COUNTED, so a partial sum is never
-/// presented as a total.
-fn sum_module_state_bytes(modules_dir: &Path, module_types: &[String]) -> (u64, usize) {
-    let mut total = 0u64;
-    let mut unknown = 0usize;
-    for ty in module_types {
-        let fmod = modules_dir.join(format!("{ty}.fmod"));
-        match crate::modules::ModuleInfo::from_file(&fmod) {
-            Ok(info) if info.manifest.state_bytes_64 > 0 => {
-                total += info.manifest.state_bytes_64 as u64 * 64;
-            }
-            // Unreadable counts as unknown, not as zero: the module loop below
-            // reports a missing artefact with a better message than this would.
-            _ => unknown += 1,
-        }
-    }
-    (total, unknown)
-}
-
 /// The facts of a package graph. The graph is the expanded one
 /// ([`package_graph`]): facts read from a graph that still includes stacks
-/// would miss their modules, so one is refused. `module_types` leaves out
-/// native modules, which every runtime carries and no package pins.
+/// would miss their modules, so one is refused.
 fn graph_facts(template: &str) -> Result<GraphFacts> {
     let doc = params::parse_graph(template).map_err(Error::Config)?.doc;
     if includes_stacks(&doc) {
@@ -113,33 +87,18 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
         .and_then(|m| m.as_sequence())
         .cloned()
         .unwrap_or_default();
-    let mut first_module = None;
-    let mut module_types: Vec<String> = Vec::new();
-    for m in &modules {
-        // `type:` overrides; `name:` is the fallback (the common single-
-        // instance spelling).
-        let ty = m
-            .get("type")
-            .and_then(|v| v.as_str())
-            .or_else(|| m.get("name").and_then(|v| v.as_str()))
-            .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
-        if first_module.is_none() {
-            first_module = Some(ty.to_string());
-        }
-        if crate::modules::is_native_module(ty) {
-            continue;
-        }
-        // The artifact, not the type: a non-default variant builds as
-        // `<type>-<variant>.fmod` (see `modules::artifact_name`), and two
-        // instances of one artifact pin it once.
-        let artifact = match m.get("variant").and_then(|v| v.as_str()) {
-            Some(v) => format!("{ty}-{v}"),
-            None => ty.to_string(),
-        };
-        if !module_types.contains(&artifact) {
-            module_types.push(artifact);
-        }
-    }
+    let entries: Vec<serde_json::Value> = modules
+        .iter()
+        .map(|m| serde_json::to_value(m).map_err(|e| Error::Config(e.to_string())))
+        .collect::<Result<_>>()?;
+    let first_module = entries
+        .first()
+        .map(|e| {
+            crate::module_resolver::entry_identity(e)
+                .map(|(_, ty, _)| ty.to_string())
+                .ok_or_else(|| Error::Config("graph module without name/type".into()))
+        })
+        .transpose()?;
     let edges = doc
         .get("wiring")
         .and_then(|w| w.as_sequence())
@@ -148,8 +107,67 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
     Ok(GraphFacts {
         modules: modules.len() as u16,
         first_module,
-        module_types,
+        entries,
         edges: edges as u16,
+    })
+}
+
+/// What a package pins of its graph's modules.
+struct PackageModules {
+    /// Each artefact's name and bytes, in declaration order.
+    artefacts: Vec<(String, Vec<u8>)>,
+    /// The resident state they record, in bytes.
+    state: u64,
+    /// How many record none.
+    unknown: usize,
+    /// The artefacts that are the project's own modules.
+    own: Vec<String>,
+}
+
+/// The module artefacts a package pins for `facts`, each resolved as the
+/// build of its graph resolves it: name and bytes, in declaration order, two
+/// instances of one artefact once. A native module, which every runtime
+/// carries, is pinned by none. Returns the artefacts and the resident state
+/// they record (`module_facts!`, read at pack time), with the number that
+/// record none.
+fn package_modules(
+    facts: &GraphFacts,
+    r: &crate::module_resolver::ModuleResolver,
+) -> Result<PackageModules> {
+    let fixtures = r.project_root().join("modules/fixtures");
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut own: Vec<String> = Vec::new();
+    let (mut state, mut unknown) = (0u64, 0usize);
+    for entry in &facts.entries {
+        let (name, ty, variant) = crate::module_resolver::entry_identity(entry)
+            .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
+        let a = r.require(name, ty, variant)?;
+        if a.is_native() || out.iter().any(|(n, _)| *n == a.artifact) {
+            continue;
+        }
+        // fixtures/ modules are test instruments, never part of a shipped
+        // workload package.
+        if a.source_dir().is_some_and(|d| d.starts_with(&fixtures)) {
+            return Err(Error::Config(format!(
+                "module '{ty}' is a fixtures-layer test instrument and cannot be referenced \
+                 by a workload package"
+            )));
+        }
+        let info = a.module_info()?.expect("a PIC module");
+        match info.manifest.state_bytes_64 {
+            0 => unknown += 1,
+            n => state += n as u64 * 64,
+        }
+        if matches!(a.origin, crate::module_resolver::Origin::Tree { .. }) {
+            own.push(a.artifact.clone());
+        }
+        out.push((a.artifact.clone(), info.data.clone()));
+    }
+    Ok(PackageModules {
+        artefacts: out,
+        state,
+        unknown,
+        own,
     })
 }
 
@@ -228,13 +246,25 @@ fn sha256_ref(bytes: &[u8]) -> String {
 // Emission
 // ============================================================================
 
+/// An emitted package: its root (`target/fluxor/<name>/`) and the bytes of
+/// every module artefact its `workload.json` pins.
+pub struct EmittedPackage {
+    pub root: PathBuf,
+    pub modules: Vec<(String, Vec<u8>)>,
+    /// The module artefacts that are the producing project's own, which
+    /// its publish must publish beside the package.
+    pub own: Vec<String>,
+    /// The module ABI the package's modules are built for.
+    pub abi: String,
+}
+
 /// Emit the committed package (+ per-target blobs) from a thin source
-/// manifest. Returns the package root (`target/fluxor/<name>/`).
+/// manifest.
 pub fn emit_package(
     manifest_path: &Path,
     module_root: Option<&Path>,
     verbose: bool,
-) -> Result<PathBuf> {
+) -> Result<EmittedPackage> {
     let text = std::fs::read_to_string(manifest_path)
         .map_err(|e| Error::Config(format!("read {}: {e}", manifest_path.display())))?;
     let src = parse_source_manifest(&text)?;
@@ -255,6 +285,9 @@ pub fn emit_package(
     let mut implementations = Vec::new();
     let mut first_module_for_health: Option<String> = None;
     let mut emitted_targets: Vec<(String, PathBuf)> = Vec::new();
+    let mut package_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut package_own: Vec<String> = Vec::new();
+    let linux = crate::target::load_target("linux", &project_root)?;
 
     // graph.yaml: the graph file as written, its includes expanded — its
     // bytes are the digest the agent verifies at commit. For a graph with
@@ -299,6 +332,13 @@ pub fn emit_package(
         std::fs::create_dir_all(&target_dir)?;
 
         std::fs::write(target_dir.join("graph.yaml"), &graph_bytes)?;
+        let r = crate::module_resolver::ModuleResolver::for_graph(
+            &serde_json::to_value(params::parse_graph(&template).map_err(Error::Config)?.doc)
+                .map_err(|e| Error::Config(e.to_string()))?,
+            &graph_path,
+            Some(&linux),
+            module_root,
+        )?;
 
         // State arena demand, derived from the modules the graph names: each
         // `.fmod` records its own resident state (`module_facts!`,
@@ -308,15 +348,22 @@ pub fn emit_package(
         // a workload that reserves headroom for a module that grows under
         // load. Modules that publish no figure contribute 0 and are counted,
         // so a partial sum is visible as such.
-        let (derived_state, unknown_state_modules) = sum_module_state_bytes(
-            &linux_module_dir(&project_root, module_root)?,
-            &facts.module_types,
-        );
+        let PackageModules {
+            artefacts: modules,
+            state: derived_state,
+            unknown: unknown_state_modules,
+            own,
+        } = package_modules(&facts, &r)?;
+        for name in own {
+            if !package_own.contains(&name) {
+                package_own.push(name);
+            }
+        }
         if unknown_state_modules > 0 {
             eprintln!(
                 "  note: {unknown_state_modules} of {} module(s) do not publish a state size; \
                  the derived state_bytes ({derived_state}) is a partial sum",
-                facts.module_types.len()
+                modules.len()
             );
         }
 
@@ -383,35 +430,18 @@ pub fn emit_package(
             })?;
         }
 
-        // Module refs pin the built artifacts: each .fmod is read from the
-        // modules directory `build_one` loaded them from.
-        let modules_dir = linux_module_dir(&project_root, module_root)?;
-        let mut module_refs = Vec::new();
-        for ty in &facts.module_types {
-            // fixtures/ modules are test instruments, never part of a
-            // shipped workload package.
-            if project_root
-                .join("modules/fixtures")
-                .join(ty.as_str())
-                .join("manifest.toml")
-                .is_file()
-            {
-                return Err(Error::Config(format!(
-                    "module '{ty}' is a fixtures-layer test instrument and cannot be \
-                     referenced by a workload package"
-                )));
+        // Module refs pin the artefacts the graph's build resolved.
+        let module_refs: Vec<ModuleRef> = modules
+            .iter()
+            .map(|(name, bytes)| ModuleRef {
+                name: name.clone(),
+                digest: sha256_ref(bytes),
+            })
+            .collect();
+        for m in modules {
+            if !package_bytes.iter().any(|(n, _)| *n == m.0) {
+                package_bytes.push(m);
             }
-            let fmod = modules_dir.join(format!("{ty}.fmod"));
-            let bytes = std::fs::read(&fmod).map_err(|e| {
-                Error::Config(format!(
-                    "module '{ty}' has no built artifact at {} ({e}); run `fluxor modules build --target linux`",
-                    fmod.display()
-                ))
-            })?;
-            module_refs.push(ModuleRef {
-                name: ty.clone(),
-                digest: sha256_ref(&bytes),
-            });
         }
 
         let mut export_bindings = BTreeMap::new();
@@ -527,7 +557,12 @@ pub fn emit_package(
         emitted_targets.len(),
         package_root.display()
     );
-    Ok(package_root)
+    Ok(EmittedPackage {
+        root: package_root,
+        modules: package_bytes,
+        own: package_own,
+        abi: linux.module_abi().to_string(),
+    })
 }
 
 // ============================================================================
@@ -968,7 +1003,7 @@ fn launch_package(
     let dir = if path.extension().is_some_and(|e| e == "toml") {
         let (name, schema) = source_params(path)?;
         params.resolve(&name, &schema)?;
-        emit_package(path, params.module_root.as_deref(), verbose)?
+        emit_package(path, params.module_root.as_deref(), verbose)?.root
     } else {
         path.to_path_buf()
     };
@@ -1062,17 +1097,25 @@ fn launch_package(
             // graph may load nothing else: a value substituted into a module
             // name would otherwise pull in an unverified artefact.
             let facts = graph_facts(&rendered)?;
-            if let Some(ty) = facts
-                .module_types
-                .iter()
-                .find(|ty| !imp.modules.iter().any(|m| &m.name == *ty))
-            {
-                return Err(Error::Config(format!(
-                    "the rendered graph loads module '{ty}', which package '{}' does not pin",
-                    manifest.name
-                )));
-            }
             let graph = run_dir.join("graph.yaml");
+            let r = crate::module_resolver::ModuleResolver::for_graph(
+                &serde_json::to_value(params::parse_graph(&rendered).map_err(Error::Config)?.doc)
+                    .map_err(|e| Error::Config(e.to_string()))?,
+                &graph,
+                Some(&crate::target::load_target("linux", &project_root)?),
+                Some(&module_root),
+            )?;
+            for entry in &facts.entries {
+                let (name, ty, variant) = crate::module_resolver::entry_identity(entry)
+                    .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
+                let a = r.require(name, ty, variant)?;
+                if !a.is_native() && !imp.modules.iter().any(|m| m.name == a.artifact) {
+                    return Err(Error::Config(format!(
+                        "the rendered graph loads module '{}', which package '{}' does not pin",
+                        a.artifact, manifest.name
+                    )));
+                }
+            }
             std::fs::write(&graph, rendered)?;
             crate::build_one_from(
                 &graph,
@@ -1289,7 +1332,7 @@ pub fn install_applet(
     verbose: bool,
 ) -> Result<()> {
     let dir = if package.extension().is_some_and(|e| e == "toml") {
-        emit_package(package, None, verbose)?
+        emit_package(package, None, verbose)?.root
     } else if !package.exists() {
         // Not a path: a name. The project's own package is emitted from its
         // packaging/; a sibling's CLI is consumed as the published artifact
@@ -1297,7 +1340,7 @@ pub fn install_applet(
         // applet cache.
         let name = package.to_string_lossy();
         match fluxor_tools::packaging::package_path(&crate::project::root(), &name) {
-            Some(own) => emit_package(&own, None, verbose)?,
+            Some(own) => emit_package(&own, None, verbose)?.root,
             None => materialize_pinned_package(&name, verbose)?,
         }
     } else {
@@ -1595,28 +1638,14 @@ buffer_bytes = 32768
     }
 
     #[test]
-    fn graph_facts_leave_native_modules_unpinned() {
+    fn graph_facts_carry_every_module_entry() {
         let f = graph_facts(
             "target: linux\nmodules:\n  - name: cli_in\n  - name: tool\n  - name: cli_out\n",
         )
         .unwrap();
         assert_eq!(f.modules, 3);
         assert_eq!(f.first_module.as_deref(), Some("cli_in"));
-        assert_eq!(f.module_types, vec!["tool".to_string()]);
-    }
-
-    #[test]
-    fn graph_facts_pin_variant_artifacts_once() {
-        let f = graph_facts(
-            "target: linux\nmodules:\n  - name: a\n    type: http\n    variant: exchange\n  \
-             - name: b\n    type: http\n    variant: exchange\n  - name: tls\n",
-        )
-        .unwrap();
-        assert_eq!(f.modules, 3);
-        assert_eq!(
-            f.module_types,
-            vec!["http-exchange".to_string(), "tls".to_string()]
-        );
+        assert_eq!(f.entries.len(), 3);
     }
 
     #[test]
@@ -1657,7 +1686,7 @@ buffer_bytes = 32768
         .unwrap();
         // The platform stack's linux_net is substrate, not footprint.
         assert_eq!(f.modules, 1);
-        assert_eq!(f.module_types, vec!["dns".to_string()]);
+        assert_eq!(f.entries.len(), 1);
         assert_eq!(f.edges, 2);
     }
 

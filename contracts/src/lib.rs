@@ -232,6 +232,42 @@ pub const CONTENT_TYPES: &[&str] = &[
     "AccessibilityActions",
 ];
 
+/// The `LEN`-byte records of `bytes`, in order: an exact-size iterator whose
+/// length divides by the constant `LEN`, never by a runtime value, and whose
+/// reads are checked — so a module that links it carries no panic.
+pub(crate) fn records<const LEN: usize>(
+    bytes: &[u8],
+) -> impl ExactSizeIterator<Item = &[u8; LEN]> + Clone + '_ {
+    (0..bytes.len() / LEN).map(move |i| {
+        bytes
+            .get(i * LEN..)
+            .and_then(<[u8]>::first_chunk::<LEN>)
+            .unwrap_or(&[0; LEN])
+    })
+}
+
+/// The wire byte of content type `name`, for a compile-time constant: a name
+/// the table does not hold fails the build.
+#[must_use]
+pub const fn content_type_byte(name: &str) -> u8 {
+    let want = name.as_bytes();
+    let mut i = 0;
+    while i < CONTENT_TYPES.len() {
+        let have = CONTENT_TYPES[i].as_bytes();
+        if have.len() == want.len() {
+            let mut k = 0;
+            while k < have.len() && have[k] == want[k] {
+                k += 1;
+            }
+            if k == have.len() {
+                return i as u8;
+            }
+        }
+        i += 1;
+    }
+    panic!("not a content type")
+}
+
 // ── Rate classes ────────────────────────────────────────────────────────────
 
 /// Sustained-throughput class of a stream. Attached to content types

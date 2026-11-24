@@ -1867,88 +1867,39 @@ fn build_check_detail(o: &std::process::Output) -> String {
         .to_string()
 }
 
-/// Hold every shippable to what its publish requires
-/// ([`crate::packaging`]): each stack is checked as `fluxor publish` checks
-/// it ([`crate::stack::check_publishable`]), and each package's linux graphs,
-/// read with their includes expanded and rendered with their params'
-/// defaults and examples ([`crate::packaging::check_package`]), pass
-/// `fluxor build --check`. A rendered graph is written under the project's
-/// `target/fluxor/ci-packaging/` so it resolves against this project.
+/// Hold every shippable to what its publish requires: `fluxor publish --only
+/// fmod --only stack --only package --dry-run`, which stages the project's
+/// modules, every stack (its module references resolved against the staged
+/// modules) and every package (its graph built, its module artefacts
+/// resolved) exactly as the publish would, and writes nothing to the store.
+/// One check for ci, a dry run and the publish.
 fn run_packaging(
     project_root: &Path,
     shippables: &crate::packaging::Shippables,
 ) -> std::result::Result<(), String> {
-    let rel = |p: &Path| {
-        p.strip_prefix(project_root)
-            .unwrap_or(p)
-            .display()
-            .to_string()
-    };
-    let mut failures = Vec::new();
-    for stack in &shippables.stacks {
-        if let Err(e) = crate::stack::check_publishable(stack, project_root) {
-            failures.push(format!("{}: {e}", rel(stack)));
-        }
+    if shippables.stacks.is_empty() && shippables.packages.is_empty() {
+        return Ok(());
     }
-    let mut checked = 0usize;
-    for (_, manifest) in &shippables.packages {
-        let graphs = match crate::packaging::check_package(manifest, project_root) {
-            Ok(g) => g,
-            Err(e) => {
-                failures.push(e);
-                continue;
-            }
-        };
-        checked += 1;
-        let name = manifest
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for (i, (graph, rendered)) in graphs.iter().enumerate() {
-            let dir = project_root
-                .join("target/fluxor/ci-packaging")
-                .join(format!("{name}-{i}"));
-            let out = dir.join("graph.yaml");
-            if let Err(e) =
-                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&out, rendered))
-            {
-                failures.push(format!("{}: {e}", out.display()));
-                continue;
-            }
-            match self_invoke()
-                .arg("build")
-                .arg("--check")
-                .arg(&out)
-                .current_dir(project_root)
-                .output()
-            {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => failures.push(format!(
-                    "{} rendered with defaults and examples: {}",
-                    rel(graph),
-                    build_check_detail(&o)
-                )),
-                Err(e) => failures.push(format!(
-                    "{}: could not run build --check: {e}",
-                    rel(manifest)
-                )),
-            }
-        }
-    }
-    if failures.is_empty() {
-        return vacuity(
-            "packaging",
-            checked,
-            shippables.packages.len(),
-            "package source manifest(s) were found",
-            "no manifest reached its graphs",
-        );
+    let out = self_invoke()
+        .args([
+            "publish",
+            "--only",
+            "fmod",
+            "--only",
+            "stack",
+            "--only",
+            "package",
+            "--dry-run",
+        ])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("could not run publish --dry-run: {e}"))?;
+    if out.status.success() {
+        return Ok(());
     }
     Err(format!(
-        "{} shippable(s) fail:\n  {}",
-        failures.len(),
-        failures.join("\n  ")
+        "publish --dry-run refuses this project's shippables:\n{}",
+        String::from_utf8_lossy(&out.stderr).trim_end()
     ))
 }
 
@@ -2427,7 +2378,7 @@ fn check_catalog_drift(project_root: &Path) -> std::result::Result<(), String> {
     let Some(stamped) = lock.catalog else {
         return Ok(());
     };
-    let Some(root) = crate::project::install_root() else {
+    let Some(root) = crate::project::install_root(project_root) else {
         return Ok(());
     };
     let Some(live) = crate::store_resolve::catalog_digest(&root.path) else {

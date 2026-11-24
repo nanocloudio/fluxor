@@ -379,17 +379,29 @@ pub fn publish_project_with_mode(
     verbose: bool,
     mode: PublishMode,
 ) -> Result<Vec<String>> {
-    publish_project_into(project_root, only, verbose, mode, None)
+    publish_project_into(project_root, only, verbose, mode, None, &|_, _| {
+        Ok(Vec::new())
+    })
 }
 
+/// What a publish stages beside the project's own artefacts: its stacks and
+/// packages, each prepared against the store and the project's module
+/// artefacts as they will stand after the publish (`own`). Staged before
+/// anything is written, so one that cannot be published refuses the whole
+/// publish.
+pub type Shippables<'a> = &'a dyn Fn(&OciStore, &crate::stack::OwnModules) -> Result<Vec<Prepared>>;
+
 /// `publish_project_with_mode` into the store at `store_dir`, or the
-/// default store (`$FLUXOR_STORE`, else the XDG data dir) when `None`.
+/// default store (`$FLUXOR_STORE`, else the XDG data dir) when `None`, with
+/// the `shippables` it stages joining the same plan: one plan, one commit,
+/// and a dry run that stages exactly what the publish would.
 pub fn publish_project_into(
     project_root: &Path,
     only: &[&str],
     verbose: bool,
     mode: PublishMode,
     store_dir: Option<&Path>,
+    shippables: Shippables<'_>,
 ) -> Result<Vec<String>> {
     let pr = project_root.to_path_buf();
     let identity = require_project_identity(&pr)?;
@@ -450,7 +462,6 @@ pub fn publish_project_into(
         std::collections::BTreeSet::new()
     };
 
-    let txn = store.begin_publish()?;
     let retire = if want("fmod") {
         modules_to_retire(&store, &pr, &identity.name, &withheld, &declared)?
     } else {
@@ -762,6 +773,35 @@ pub fn publish_project_into(
         println!("  {line}");
     }
 
+    // The project's module artefacts as they will stand after this
+    // publish: the staged ones when it publishes modules, else the
+    // published ones. Stacks take their own-module references from them.
+    let retire_refs: Vec<String> = retire.iter().map(|(r, _)| r.clone()).collect();
+    let own = if want("fmod") {
+        let plan = store.plan_publish(
+            &store.read_index()?,
+            &identity.name,
+            &identity.version,
+            &prepared,
+            None,
+            &retire_refs,
+        )?;
+        let artifacts = plan
+            .new_descs
+            .iter()
+            .filter_map(|d| {
+                crate::store_resolve::artifact_from_descriptor(d)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|a| a.kind == "module" && a.project == identity.name)
+            .collect();
+        crate::stack::OwnModules::new(&store, artifacts, &plan.manifest_blobs)
+    } else {
+        crate::stack::OwnModules::published(&store, &identity.name)
+    };
+    prepared.extend(shippables(&store, &own)?);
+
     // A project with no publishable artifacts still gets its project
     // index: `<name>/meta:latest` over an empty child set. Vacuous
     // truth — downstream consumers (the ci live-staleness gate, sync)
@@ -782,7 +822,11 @@ pub fn publish_project_into(
     // One plan, made before anything is written: the dry run, the strict
     // gate and the commit all read it, so none can describe a publish other
     // than the one that follows, and a refusal leaves the store untouched.
-    let retire_refs: Vec<String> = retire.iter().map(|(r, _)| r.clone()).collect();
+    // The index lock is taken here, once everything is staged: staging a
+    // stack or package resolves modules through the store, which takes the
+    // same lock to open it. The plan is made under the lock, so no other
+    // publish lands between it and the commit.
+    let txn = store.begin_publish()?;
     let plan = store.plan_publish(
         &store.read_index()?,
         &identity.name,

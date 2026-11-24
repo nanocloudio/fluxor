@@ -477,81 +477,17 @@ pub fn lint_with_exemptions(root: &Path, toml_exemptions: &[TomlExemption]) -> O
 /// Build the id-table for a STACK-EXPANDED graph config: module index =
 /// position in `modules:` — the scheduler instantiates in declaration order,
 /// which is why stack expansion PREPENDS its modules before this runs — and
-/// each entry's type resolves to its source `[observability]` table by
-/// locating `<root>/**/<type>/manifest.toml` across `roots` in order. A type
-/// with no locatable manifest (a native module, or a dependency shipped only as an
-/// .fmod) still consumes its index with an empty row, so later modules keep
-/// the index the kernel stamps.
+/// each entry's `[observability]` table is `lookup(type, variant)`: the
+/// manifest of the artefact the graph's module resolver resolves. A module
+/// with no table still consumes its index with an empty row, so later
+/// modules keep the index the kernel stamps.
 ///
-/// Determinism note: the digest of the resulting table covers exactly what
-/// these `roots` can see, so the exporter (`fluxor id-table`) and the builder
-/// injection (`stack_expand`) must use the same roots or the collector will
-/// refuse the mismatch — which is the correct outcome for two genuinely
-/// different tables.
-/// The manifest-lookup roots BOTH the id-table exporter and the build-time
-/// digest/bounds injection resolve against for `project_root`: the project's
-/// own `modules/` plus any `[observability] id_table_dirs` rows from its
-/// `fluxor.toml` (paths relative to the project root — a consumer repo lists
-/// its dependency checkouts here so store-resolved foundation modules get
-/// name-complete rows). One function so the two sides CANNOT diverge — a
-/// digest computed over different roots than the export is exactly the
-/// mismatch the handshake refuses.
-pub fn id_table_roots(project_root: &Path) -> Vec<std::path::PathBuf> {
-    let mut roots = vec![project_root.join("modules")];
-    if let Ok(text) = std::fs::read_to_string(project_root.join("fluxor.toml")) {
-        if let Ok(v) = toml::from_str::<toml::Value>(&text) {
-            if let Some(dirs) = v
-                .get("observability")
-                .and_then(|o| o.get("id_table_dirs"))
-                .and_then(|d| d.as_array())
-            {
-                for d in dirs {
-                    if let Some(rel) = d.as_str() {
-                        roots.push(project_root.join(rel));
-                    }
-                }
-            }
-        }
-    }
-    roots
-}
-
+/// The exporter (`fluxor id-table`) and the build's digest injection build
+/// `lookup` from the same graph resolver, so their tables cannot differ.
 pub fn id_table_for_expanded_config(
     config: &serde_json::Value,
-    roots: &[std::path::PathBuf],
+    lookup: &dyn Fn(&str, Option<&str>) -> Option<Observability>,
 ) -> IdTable {
-    let mut obs_cache: BTreeMap<String, Option<Observability>> = BTreeMap::new();
-    let mut lookup = |ty: &str| -> Option<Observability> {
-        if let Some(hit) = obs_cache.get(ty) {
-            return hit.clone();
-        }
-        let mut found = None;
-        'roots: for root in roots {
-            for entry in walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if entry.file_name() != "manifest.toml" {
-                    continue;
-                }
-                let parent_is_type = entry
-                    .path()
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .is_some_and(|n| n == ty);
-                if !parent_is_type {
-                    continue;
-                }
-                if let Ok(m) = Manifest::from_toml(entry.path()) {
-                    found = Some(m.observability);
-                    break 'roots;
-                }
-            }
-        }
-        obs_cache.insert(ty.to_string(), found.clone());
-        found
-    };
-
     let mut owned: Vec<(String, Observability)> = Vec::new();
     if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
         for entry in modules {
@@ -560,7 +496,8 @@ pub fn id_table_for_expanded_config(
                 .or_else(|| entry.get("name").and_then(|v| v.as_str()))
                 .unwrap_or("<unnamed>");
             let ty = entry.get("type").and_then(|v| v.as_str()).unwrap_or(name);
-            owned.push((name.to_string(), lookup(ty).unwrap_or_default()));
+            let variant = entry.get("variant").and_then(|v| v.as_str());
+            owned.push((name.to_string(), lookup(ty, variant).unwrap_or_default()));
         }
     }
     let rows: Vec<ModuleInstruments<'_>> = owned
@@ -777,30 +714,6 @@ mod tests {
         assert_eq!(rows[0].module, "foundation/widget");
         assert_eq!(rows[0].reason, "vendored");
     }
-    /// `id_table_roots` is the single source both the exporter and the
-    /// build-time injection resolve manifests from; the `fluxor.toml`
-    /// `[observability] id_table_dirs` rows extend it project-relative.
-    #[test]
-    fn id_table_roots_reads_project_dirs() {
-        let tmp = std::env::temp_dir().join(format!("fx_roots_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        std::fs::write(
-            tmp.join("fluxor.toml"),
-            "[observability]\nid_table_dirs = [\"../dep_a/modules\", \"../dep_b/modules\"]\n",
-        )
-        .unwrap();
-        let roots = id_table_roots(&tmp);
-        assert_eq!(roots[0], tmp.join("modules"));
-        assert_eq!(roots[1], tmp.join("../dep_a/modules"));
-        assert_eq!(roots[2], tmp.join("../dep_b/modules"));
-        // No fluxor.toml (or no key) → the project tree alone.
-        let bare = std::env::temp_dir().join(format!("fx_roots_bare_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&bare);
-        assert_eq!(id_table_roots(&bare), vec![bare.join("modules")]);
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&bare);
-    }
-
     /// The on-device bounds blob layout is a wire contract with otel's
     /// `parse_bounds_blob` (param tag 6): `[count u8]` then per row
     /// `[module u16][id u16][nbounds u8][bound_us u32 × n]`, all LE, hex text.

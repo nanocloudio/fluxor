@@ -5,7 +5,6 @@
 //! at runtime by the scheduler.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde_json::Value;
 
@@ -227,18 +226,26 @@ fn extract_identities(config: &Value) -> Vec<ModuleIdentity> {
     identities
 }
 
-/// Check if a module binary is drain-capable by checking the .fmod header flag.
-fn is_drain_capable(module_name: &str, modules_dir: &Path) -> bool {
-    let fmod_path = modules_dir.join(format!("{module_name}.fmod"));
-    if !fmod_path.exists() {
+/// Whether the instance `name` of `config` is drain-capable: the header flag
+/// of the built artefact its type resolves to.
+fn is_drain_capable(
+    name: &str,
+    config: &Value,
+    r: &crate::module_resolver::ModuleResolver,
+) -> bool {
+    let entry = config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .find(|m| crate::module_resolver::entry_identity(m).is_some_and(|(n, _, _)| n == name));
+    let Some((_, ty, variant)) = entry.and_then(crate::module_resolver::entry_identity) else {
         return false;
-    }
-
-    match std::fs::read(&fmod_path) {
-        Ok(data) => fluxor_abi::wire::fmod::header::Header::read(&data)
-            .is_some_and(|h| h.flags & fluxor_abi::wire::fmod::header::flag::DRAIN != 0),
-        Err(_) => false,
-    }
+    };
+    let Ok(Some(a)) = r.resolve(ty, variant) else {
+        return false;
+    };
+    matches!(a.module_info(), Ok(Some(info)) if info.drain_capable)
 }
 
 // ============================================================================
@@ -291,7 +298,7 @@ fn parse_module_drain_policy(module: &Value) -> Option<&str> {
 pub fn compute_transition_plan(
     old_config: &Value,
     new_config: &Value,
-    modules_dir: &Path,
+    r: &crate::module_resolver::ModuleResolver,
 ) -> TransitionPlan {
     let old_ids = extract_identities(old_config);
     let new_ids = extract_identities(new_config);
@@ -338,7 +345,7 @@ pub fn compute_transition_plan(
                 });
             } else {
                 // Module changed — check if drain-capable
-                let drain_capable = is_drain_capable(&new_mod.name, modules_dir);
+                let drain_capable = is_drain_capable(&new_mod.name, new_config, r);
                 let policy = new_module_by_id
                     .get(&new_mod.id)
                     .and_then(|m| parse_module_drain_policy(m));
@@ -379,7 +386,7 @@ pub fn compute_transition_plan(
     // Process removed modules (in old but not in new)
     for old_mod in &old_ids {
         if !new_by_id.contains_key(&old_mod.id) {
-            let drain_capable = is_drain_capable(&old_mod.name, modules_dir);
+            let drain_capable = is_drain_capable(&old_mod.name, old_config, r);
 
             entries.push(ModulePlanEntry {
                 name: old_mod.name.clone(),

@@ -16,6 +16,7 @@ use fluxor_contracts::graph::{self, plan};
 use crate::add_subgraph::FaultPolicy;
 use crate::hash::fnv1a_hash;
 use crate::manifest::{self, Manifest, TimerClass};
+use crate::module_resolver::ModuleResolver;
 use crate::schema;
 
 const MAX_HW_SPI: usize = 2;

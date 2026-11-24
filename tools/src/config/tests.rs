@@ -1,12 +1,56 @@
-/// A module location with no silicon and no pins, for tests that read
-/// artefacts from `dir` alone.
+/// A resolver over the throwaway project `project`, its modules on `search`
+/// (each inside it), with no module ABI, no catalog and an empty store.
 #[cfg(test)]
-fn test_loc(dir: &std::path::Path) -> crate::schema::ModuleLocation<'_> {
-    crate::schema::ModuleLocation {
-        dir,
-        abi: "",
-        project_root: std::path::Path::new("/nonexistent"),
+fn test_resolver(
+    project: &std::path::Path,
+    search: &[&std::path::Path],
+) -> crate::module_resolver::ModuleResolver {
+    crate::module_resolver::ModuleResolver::new(crate::module_resolver::ResolverSpec {
+        project_root: project.to_path_buf(),
+        abi: crate::module_resolver::Abi::Unplaced,
+        shelf: None,
+        search_paths: search.iter().map(|p| p.to_path_buf()).collect(),
+        install_root: None,
+        store_dir: Some(project.join("store")),
+    })
+    .expect("test resolver")
+}
+
+/// Fluxor's own project, whose target registry names every target.
+#[cfg(test)]
+fn fluxor_root() -> &'static std::path::Path {
+    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+}
+
+/// Fluxor's own modules, resolved with no module ABI: their manifests, and
+/// no builds.
+#[cfg(test)]
+fn fluxor_resolver() -> crate::module_resolver::ModuleResolver {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    crate::module_resolver::ModuleResolver::for_project(
+        &root,
+        crate::module_resolver::Abi::Unplaced,
+        None,
+    )
+    .expect("fluxor's resolver")
+}
+
+/// A throwaway project whose tree holds `types` as plain PIC modules (a
+/// version and the hosts they place on), and its resolver.
+#[cfg(test)]
+fn stub_resolver(types: &[&str]) -> (tempfile::TempDir, crate::module_resolver::ModuleResolver) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for ty in types {
+        let m = dir.path().join("modules/app").join(ty);
+        std::fs::create_dir_all(&m).expect("mkdir");
+        std::fs::write(
+            m.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\", \"linux\"]\n",
+        )
+        .expect("write manifest");
     }
+    let r = test_resolver(dir.path(), &[]);
+    (dir, r)
 }
 
 /// Shared test helpers for env-mutating tests.
@@ -133,9 +177,17 @@ mod scheduler_validation_tests {
         let manifests = std::collections::HashMap::new();
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("multi-node raft on an adaptive domain must be rejected");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("multi-node raft on an adaptive domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("multi-node") && msg.contains("raft_engine"),
@@ -143,44 +195,29 @@ mod scheduler_validation_tests {
         );
     }
 
-    // ---- A malformed manifest fails closed on an adaptive domain ----
+    // ---- A malformed manifest is refused before any gate reads it ----
 
     #[test]
-    fn malformed_manifest_fails_closed_on_adaptive_domain() {
-        // `load_module_manifests_with_extra` only warns and OMITS a manifest that
-        // fails to parse, so a typo in `timer_class` would downgrade to "no
-        // manifest" and fail OPEN through the gate's `Some(man)` check. A
-        // malformed manifest on an adaptive domain must instead fail CLOSED — we
-        // cannot verify its timer_class.
+    fn a_malformed_manifest_is_refused_before_any_gate_reads_it() {
+        // A typo in `timer_class` must never read as "no manifest" and pass
+        // the adaptive gate: the graph's modules resolve strictly, and a
+        // manifest that does not parse refuses the graph, naming the module.
         let dir = tempfile::tempdir().expect("tempdir");
         let mod_dir = dir.path().join("typo_mod");
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
-        // Otherwise-valid manifest with an INVALID timer_class value → from_toml
-        // errors → the loader would warn + omit it from the parsed map.
         std::fs::write(
             mod_dir.join("manifest.toml"),
             "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ntimer_class = \"tikc_counted\"\n",
         )
         .expect("write manifest");
-
-        let cfg = json!({"execution": {"domains": [
-            {"name": "main", "adaptive_flags": 1,
-             "tick_min_us": 100, "tick_max_us": 8000}
-        ]}});
         let modules = vec![json!({"name": "typo_mod", "type": "typo_mod"})];
-        // Empty parsed map simulates the loader's warn-and-omit of the bad file.
-        let manifests = std::collections::HashMap::new();
-        let names = vec!["main".to_string()];
-        let ticks = vec![100u16];
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_adaptive_tick(
-            &cfg, &modules, 100, &names, &ticks, &manifests, &extras, None,
-        )
-        .expect_err("a malformed manifest on an adaptive domain must fail closed");
-        let msg = format!("{err:?}");
+        let err = match test_resolver(dir.path(), &[dir.path()]).graph_modules(&modules) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a malformed manifest must refuse the graph"),
+        };
         assert!(
-            msg.contains("failed to parse") && msg.contains("typo_mod"),
-            "expected fail-closed parse diagnostic naming the module, got: {msg}"
+            err.contains("typo_mod") && err.contains("rejected") && err.contains("tikc_counted"),
+            "expected the refusal naming the module and its cause, got: {err}"
         );
     }
 
@@ -200,77 +237,33 @@ mod scheduler_validation_tests {
              content_type = \"NetProto\"\n",
         )
         .expect("write manifest");
-        let modules = json!([{"name": "uplink", "type": "net_driver"}]);
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-
-        let err = assert_module_manifests_resolvable(&modules, &extras, None, dir.path())
-            .expect_err("a found but rejected manifest refuses the graph");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("module 'uplink' (type 'net_driver') was found at")
-                && msg.contains(&manifest.display().to_string())
-                && msg.contains("max_record")
-                && !msg.contains("no manifest found"),
-            "{msg}"
-        );
-
-        // A module found nowhere is left to the checks that name it.
-        let absent = json!([{"name": "elsewhere", "type": "not_on_any_path"}]);
-        assert_module_manifests_resolvable(&absent, &extras, None, dir.path())
-            .expect("an absent manifest is not a rejected one");
-    }
-
-    /// One resolution for every graph: a module's pin is authoritative and
-    /// carries its port names with no source tree present; an unpinned
-    /// module falls back to the search paths; a pin the store cannot serve
-    /// is refused, never replaced by a copy on disk.
-    #[test]
-    fn a_module_type_resolves_from_its_pin_before_any_tree() {
-        let pinned = "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\n\
-                      [[ports]]\nname = \"pinned_in\"\ndirection = \"input\"\n\
-                      content_type = \"OctetStream\"\n";
-        let on_disk = "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\n\
-                       [[ports]]\nname = \"disk_in\"\ndirection = \"input\"\n\
-                       content_type = \"OctetStream\"\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        for ty in ["anchor", "local_only"] {
-            std::fs::create_dir_all(dir.path().join(ty)).unwrap();
-            std::fs::write(dir.path().join(ty).join("manifest.toml"), on_disk).unwrap();
-        }
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let toml = pinned.to_string();
-        let pins: crate::store_cli::BoxedManifestResolver = Box::new(move |ty: &str| match ty {
-            "anchor" | "pinned_only" => crate::modules::ManifestPin::Resolved(toml.clone()),
-            "broken" => crate::modules::ManifestPin::Failed("blob missing".into()),
-            _ => crate::modules::ManifestPin::NotPinned,
-        });
-        let port = |ty: &str| match type_manifest(ty, ty, None, &extras, None, Some(&pins)) {
-            TypeManifest::Found(m) => m.ports.iter().filter_map(|p| p.name.clone()).collect(),
-            TypeManifest::Rejected(why) => vec![format!("rejected: {why}")],
-            TypeManifest::Absent => vec!["absent".to_string()],
+        let r = test_resolver(dir.path(), &[dir.path()]);
+        let err = match r.graph_modules(&[json!({"name": "uplink", "type": "net_driver"})]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a found but rejected manifest refuses the graph"),
         };
-        assert_eq!(port("pinned_only"), ["pinned_in"], "a pin needs no source tree");
-        assert_eq!(port("anchor"), ["pinned_in"], "a pin wins over a copy on disk");
-        assert_eq!(port("local_only"), ["disk_in"], "an unpinned module reads its tree");
-        assert_eq!(port("nowhere"), ["absent"]);
-        let broken = port("broken");
         assert!(
-            broken[0].starts_with("rejected:") && broken[0].contains("blob missing"),
-            "{broken:?}"
+            err.contains("module 'uplink' (type 'net_driver')")
+                && err.contains("was found at")
+                && err.contains(&mod_dir.display().to_string())
+                && err.contains("max_record")
+                && !err.contains("no manifest found"),
+            "{err}"
         );
+
+        // A module found nowhere is refused too, naming where it was sought.
+        let absent = r
+            .graph_modules(&[json!({"name": "elsewhere", "type": "not_on_any_path"})])
+            .err()
+            .expect("an absent module refuses the graph")
+            .to_string();
+        assert!(absent.contains("resolves nowhere"), "{absent}");
     }
 
     #[test]
-    fn wiring_a_declared_module_with_no_manifest_offers_no_misspelling() {
+    fn a_misspelled_module_in_wiring_offers_the_declared_name() {
         let names = vec!["linux_net".to_string(), "ip".to_string()];
         let manifests = std::collections::HashMap::new();
-        let msg = resolve_port_spec("linux_net.net_out", true, &manifests, &names).unwrap_err();
-        assert!(
-            msg.contains("module 'linux_net' is declared but no manifest was found")
-                && !msg.contains("Did you mean")
-                && !msg.contains("the module name is misspelled"),
-            "{msg}"
-        );
         let typo = resolve_port_spec("linux_nte.net_out", true, &manifests, &names).unwrap_err();
         assert!(typo.contains("Did you mean 'linux_net'?"), "{typo}");
     }
@@ -278,41 +271,20 @@ mod scheduler_validation_tests {
     // ---- High-1: timer-class admission is fail-closed for mechanism (b) ----
 
     #[test]
-    fn manifestless_module_passes_on_idle_a_domain_but_blocks_on_cadence_b() {
-        // (a)-only domain (flags=1): a genuinely manifest-less module is ADMITTED
-        // — the lenient gate, since idle-relax alone doesn't warp a running module
-        // (the per-timer-class gates below cover (a)'s hazards). (b) domain
-        // (flags=3): the SAME module is BLOCKED — a module with no attested
-        // timer class defaults to step_counted, which (b) would warp.
+    fn a_module_with_no_manifest_is_refused_on_every_domain() {
+        // A module directory with no manifest.toml attests nothing — no
+        // timer class, no ports — so the graph's modules refuse it before any
+        // domain's gate is consulted, naming where it was looked for.
         let dir = tempfile::tempdir().expect("tempdir");
-        // A resolvable module DIRECTORY with NO manifest.toml — the realistic
-        // "genuinely manifest-less" case.
         std::fs::create_dir_all(dir.path().join("no_manifest_mod")).expect("mkdir");
         let modules = vec![json!({"name": "no_manifest_mod", "type": "no_manifest_mod"})];
-        let manifests = std::collections::HashMap::new();
-        let names = vec!["main".to_string()];
-        let ticks = vec![100u16];
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-
-        let cfg_a = json!({"execution": {"domains": [
-            {"name": "main", "adaptive_flags": 1,
-             "tick_min_us": 100, "tick_max_us": 8000}]}});
-        validate_adaptive_tick(
-            &cfg_a, &modules, 100, &names, &ticks, &manifests, &extras, None,
-        )
-        .expect("manifest-less module must pass on a mechanism-(a)-only domain");
-
-        let cfg_b = json!({"execution": {"domains": [
-            {"name": "main", "adaptive_flags": 3,
-             "tick_min_us": 100, "tick_max_us": 8000}]}});
-        let err = validate_adaptive_tick(
-            &cfg_b, &modules, 100, &names, &ticks, &manifests, &extras, None,
-        )
-        .expect_err("manifest-less (unattested) module must be blocked on a (b) domain");
-        let msg = format!("{err:?}");
+        let err = match test_resolver(dir.path(), &[dir.path()]).graph_modules(&modules) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a module with no manifest must refuse the graph"),
+        };
         assert!(
-            msg.contains("no manifest") && msg.contains("no_manifest_mod"),
-            "expected unattested-block diagnostic, got: {msg}"
+            err.contains("no_manifest_mod") && err.contains("resolves nowhere"),
+            "expected the absence refusal, got: {err}"
         );
     }
 
@@ -328,9 +300,17 @@ mod scheduler_validation_tests {
         let modules = vec![json!({"name": "plain", "type": "plain"})];
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("an unattested manifest must be blocked on a (b) domain");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("an unattested manifest must be blocked on a (b) domain");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("positively attest") && msg.contains("plain"),
@@ -361,8 +341,17 @@ mod scheduler_validation_tests {
         );
         let names = vec!["main".to_string()];
         let ticks = vec![3500u16];
-        validate_adaptive_tick(&cfg, &modules, 3500, &names, &ticks, &manifests, &[], None)
-            .expect("explicit burst deadline should govern adaptive floor admission");
+        validate_adaptive_tick(
+            &cfg,
+            &modules,
+            3500,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect("explicit burst deadline should govern adaptive floor admission");
     }
 
     #[test]
@@ -381,10 +370,17 @@ mod scheduler_validation_tests {
             };
             let mut manifests = std::collections::HashMap::new();
             manifests.insert("ok".to_string(), man);
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .unwrap_or_else(|e| {
-                    panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str())
-                });
+            validate_adaptive_tick(
+                &cfg,
+                &modules,
+                100,
+                &names,
+                &ticks,
+                &manifests,
+                None,
+                fluxor_root(),
+            )
+            .unwrap_or_else(|e| panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str()));
         }
     }
 
@@ -408,9 +404,17 @@ mod scheduler_validation_tests {
         };
         let mut m_blocked = std::collections::HashMap::new();
         m_blocked.insert("periodic".to_string(), blocked);
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_blocked, &[], None)
-                .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &m_blocked,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
         assert!(
             format!("{err:?}").contains("step_period_ticks"),
             "expected step_period_ticks diagnostic, got: {err:?}"
@@ -424,8 +428,17 @@ mod scheduler_validation_tests {
         };
         let mut m_ok = std::collections::HashMap::new();
         m_ok.insert("periodic".to_string(), ok);
-        validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_ok, &[], None)
-            .expect("a wall_clock step-period module must pass on a (b) domain");
+        validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &m_ok,
+            None,
+            fluxor_root(),
+        )
+        .expect("a wall_clock step-period module must pass on a (b) domain");
     }
 
     #[test]
@@ -448,9 +461,17 @@ mod scheduler_validation_tests {
              "tick_min_us": 100, "tick_max_us": 8000}]}});
         let mut manifests = std::collections::HashMap::new();
         manifests.insert("ttl".to_string(), man.clone());
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("replicated_clock on (b) must be blocked without replica agreement");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("replicated_clock on (b) must be blocked without replica agreement");
         assert!(
             format!("{err:?}").contains("replicated_clock")
                 && format!("{err:?}").contains("replica_agreed_cadence"),
@@ -469,8 +490,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             None,
+            fluxor_root(),
         )
         .expect("replicated_clock on (b) must pass once replica agreement is asserted");
     }
@@ -491,9 +512,17 @@ mod scheduler_validation_tests {
              "tick_min_us": 100, "tick_max_us": 8000, "replica_agreed_cadence": true}]}});
         let mut manifests = std::collections::HashMap::new();
         manifests.insert("ttl".to_string(), man);
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("replicated_clock on (b) multi-node must be blocked");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("replicated_clock on (b) multi-node must be blocked");
         assert!(
             format!("{err:?}").contains("multi-node"),
             "expected multi-node diagnostic, got: {err:?}"
@@ -523,8 +552,17 @@ mod scheduler_validation_tests {
             let cfg = json!({"execution": {"domains": [domain]}, "workloads": workloads.clone()});
             // resolved_target None ⇒ event-driven (Linux): the bcm wake-policy
             // gate does not apply.
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect("forty resident workloads need no pacer-table admission");
+            validate_adaptive_tick(
+                &cfg,
+                &modules,
+                100,
+                &names,
+                &ticks,
+                &manifests,
+                None,
+                fluxor_root(),
+            )
+            .expect("forty resident workloads need no pacer-table admission");
         }
     }
 
@@ -533,7 +571,7 @@ mod scheduler_validation_tests {
         // A workload module placed in an interrupt-mode domain must be rejected
         // at emit time — a workload's graph carries no ISR metadata and workload admission
         // runs after ISR registration, so it would never execute.
-        let tmp = std::env::temp_dir();
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
         // Domain 1 is `exec: timer`; domain 0 is `exec: tick`.
         let cfg_isr = json!({
             "execution": {"domains": [
@@ -542,7 +580,7 @@ mod scheduler_validation_tests {
             ]},
             "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "isrd"}]}]
         });
-        let err = build_workload_section(&cfg_isr, test_loc(&tmp), &[])
+        let err = build_workload_section(&cfg_isr, &r)
             .expect_err("an interrupt-mode workload placement must be rejected");
         assert!(
             format!("{err:?}").contains("`exec: timer` domain"),
@@ -557,7 +595,7 @@ mod scheduler_validation_tests {
             ]},
             "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "coop"}]}]
         });
-        build_workload_section(&cfg_ok, test_loc(&tmp), &[])
+        build_workload_section(&cfg_ok, &r)
             .expect("a cooperative-domain workload placement must be accepted");
     }
 
@@ -565,7 +603,7 @@ mod scheduler_validation_tests {
     fn multi_graph_duplicate_workload_local_name_rejected() {
         // Two modules sharing a workload-local name would silently overwrite the
         // wiring map (`name_to_local`) and mis-route edges. Must be rejected.
-        let tmp = std::env::temp_dir();
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
         let cfg = json!({
             "execution": {"domains": [{"name": "coop"}]},
             "workloads": [{"modules": [
@@ -573,7 +611,7 @@ mod scheduler_validation_tests {
                 {"name": "dup", "type": "workload_pic_mod2", "domain": "coop"}
             ]}]
         });
-        let err = build_workload_section(&cfg, test_loc(&tmp), &[])
+        let err = build_workload_section(&cfg, &r)
             .expect_err("duplicate workload-local module names must be rejected");
         assert!(
             format!("{err:?}").contains("duplicate module name"),
@@ -584,7 +622,7 @@ mod scheduler_validation_tests {
     /// A workload module's YAML step budget reaches its module record.
     #[test]
     fn workload_module_step_budget_rides_the_module_record() {
-        let tmp = std::env::temp_dir();
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
         let cfg = json!({
             "execution": {"domains": [{"name": "coop", "tick_us": 1000}]},
             "workloads": [{"modules": [
@@ -594,8 +632,7 @@ mod scheduler_validation_tests {
                 {"name": "plain", "type": "workload_pic_mod2", "domain": "coop"}
             ]}]
         });
-        let w =
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux").expect("admitted budget builds");
+        let w = build_workloads(&cfg, &r, "linux").expect("admitted budget builds");
         let m = &w[0].graph.modules;
         assert_eq!(
             m[0].budget,
@@ -618,7 +655,7 @@ mod scheduler_validation_tests {
     /// providers, as a graph's are against its own.
     #[test]
     fn workload_claims_are_checked_against_the_workloads_providers() {
-        let tmp = std::env::temp_dir();
+        let r = fluxor_resolver();
         let build = |volume: Value| {
             let cfg = json!({"workloads": [{
                 "modules": [
@@ -627,7 +664,7 @@ mod scheduler_validation_tests {
                 ],
                 "wiring": [{"from": "disk", "to": "fs"}],
             }]});
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+            build_workloads(&cfg, &r, "linux")
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         };
@@ -648,7 +685,7 @@ mod scheduler_validation_tests {
     /// A workload's `mount` table names volumes of the workload's own.
     #[test]
     fn a_workload_mount_table_names_the_workloads_volumes() {
-        let tmp = std::env::temp_dir();
+        let r = fluxor_resolver();
         let build = |mounts: &str| {
             let cfg = json!({"workloads": [{
                 "modules": [
@@ -656,7 +693,7 @@ mod scheduler_validation_tests {
                     {"name": "mount", "type": "mount", "mounts": mounts},
                 ],
             }]});
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+            build_workloads(&cfg, &r, "linux")
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         };
@@ -674,17 +711,18 @@ mod scheduler_validation_tests {
         modules: Value,
         wiring: Value,
     ) -> std::result::Result<Vec<graph::EdgeRecord>, String> {
-        let tmp = std::env::temp_dir();
+        let r = fluxor_resolver();
         let cfg = json!({"workloads": [{"modules": modules, "wiring": wiring}]});
-        build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+        build_workloads(&cfg, &r, "linux")
             .map(|mut w| w.remove(0).graph.edges)
             .map_err(|e| e.to_string())
     }
 
     fn port_index(module: &str, port: &str) -> u8 {
-        crate::manifest::Manifest::from_source_tree(module)
+        fluxor_resolver()
+            .require(module, module, None)
             .unwrap()
-            .unwrap()
+            .manifest
             .find_port_by_name(port)
             .unwrap_or_else(|| panic!("{module}.{port}"))
             .1
@@ -868,7 +906,7 @@ mod scheduler_validation_tests {
     fn a_workload_builds_up_to_the_subgraph_caps_fans_included() {
         use crate::add_subgraph::{encode_workload, MAX_ADD_EDGES, MAX_ADD_MODULES};
         assert_eq!((MAX_ADD_MODULES, MAX_ADD_EDGES), (64, 192));
-        let tmp = std::env::temp_dir();
+        let r = fluxor_resolver();
         let dag = |prefix: &str, n: usize, again: &[(usize, usize)]| -> (Vec<Value>, Vec<Value>) {
             let modules = (0..n)
                 .map(|i| json!({"name": format!("{prefix}{i}"), "type": "churn_probe"}))
@@ -886,11 +924,14 @@ mod scheduler_validation_tests {
             let modules: Vec<Value> = parts.iter().flat_map(|p| p.0.clone()).collect();
             let wiring: Vec<Value> = parts.iter().flat_map(|p| p.1.clone()).collect();
             let cfg = json!({"workloads": [{"modules": modules, "wiring": wiring}]});
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux").map_err(|e| e.to_string())
+            build_workloads(&cfg, &r, "linux").map_err(|e| e.to_string())
         };
         let fits = build(&[dag("a", 17, &[])]).expect("the workload resolves");
         let g = &fits[0].graph;
-        assert_eq!((g.modules.len(), g.fans.len(), g.edges.len()), (47, 30, 166));
+        assert_eq!(
+            (g.modules.len(), g.fans.len(), g.edges.len()),
+            (47, 30, 166)
+        );
         let blob = encode_workload(&fits[0]).expect("166 edges encode");
         // The composed header's counts: modules at byte 6, edges at 8.
         assert_eq!(u16::from_le_bytes([blob[6], blob[7]]), 47);
@@ -901,10 +942,15 @@ mod scheduler_validation_tests {
         ])
         .expect("the workload resolves");
         let g = &over[0].graph;
-        assert_eq!((g.modules.len(), g.fans.len(), g.edges.len()), (61, 38, 193));
+        assert_eq!(
+            (g.modules.len(), g.fans.len(), g.edges.len()),
+            (61, 38, 193)
+        );
         let e = encode_workload(&over[0]).unwrap_err();
         assert!(
-            e.contains("workload has 193 edges (38 of them joining fans), exceeds MAX_ADD_EDGES (192)"),
+            e.contains(
+                "workload has 193 edges (38 of them joining fans), exceeds MAX_ADD_EDGES (192)"
+            ),
             "{e}"
         );
         let e = build(&[dag("a", 18, &[])]).unwrap_err();
@@ -918,13 +964,13 @@ mod scheduler_validation_tests {
     /// domain's shortest tick.
     #[test]
     fn workload_module_step_budget_refusals() {
-        let tmp = std::env::temp_dir();
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
         let build = |module: Value, domain: Value| {
             let cfg = json!({
                 "execution": {"domains": [domain]},
                 "workloads": [{"modules": [module]}]
             });
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+            build_workloads(&cfg, &r, "linux")
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         };
@@ -987,7 +1033,7 @@ mod scheduler_validation_tests {
     /// tag; the heap flags and its step budget stay available.
     #[test]
     fn workload_module_node_keys_refused() {
-        let tmp = std::env::temp_dir();
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
         let build = |extra: Value| {
             let mut m = json!({"name": "kv", "type": "workload_pic_mod", "domain": "coop"});
             for (k, v) in extra.as_object().unwrap() {
@@ -997,7 +1043,7 @@ mod scheduler_validation_tests {
                 "execution": {"domains": [{"name": "coop"}]},
                 "workloads": [{"modules": [m]}]
             });
-            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+            build_workloads(&cfg, &r, "linux")
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         };
@@ -1032,24 +1078,21 @@ mod scheduler_validation_tests {
         let m = json!({"heap": {"zero_on_free": true, "alloc_failure_policy": "fault",
                                 "canary_enabled": true}});
         // No schema params: a TLV of their own.
-        let p =
-            insert_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
+        let p = insert_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 11, 0, 0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1, 0xFF, 0x00]
         );
         // Schema params: the flags go before the end marker, the length grows.
         let schema_tlv = vec![0xFE, 0x01, 5, 0, 1, 1, 7, 0xFF, 0x00];
-        let p =
-            insert_heap_tags(schema_tlv, &m, "kv", None, &HeapPlan::default()).unwrap();
+        let p = insert_heap_tags(schema_tlv, &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(&p[..7], &[0xFE, 0x01, 14, 0, 1, 1, 7]);
         assert_eq!(&p[7..16], &[0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1]);
         assert_eq!(&p[16..], &[0xFF, 0x00]);
         assert_eq!(crate::add_subgraph::params_node_tag(&p), None);
         // No heap key: untouched.
         let p =
-            insert_heap_tags(vec![1, 2, 3], &json!({}), "kv", None, &HeapPlan::default())
-                .unwrap();
+            insert_heap_tags(vec![1, 2, 3], &json!({}), "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(p, vec![1, 2, 3]);
     }
 
@@ -1059,8 +1102,7 @@ mod scheduler_validation_tests {
     fn heap_arena_bytes_packs_as_tag_0xef() {
         // Workload path.
         let m = json!({"heap": {"arena_bytes": 2 * 1024 * 1024}});
-        let p =
-            insert_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
+        let p = insert_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x00, 0x20, 0x00, 0xFF, 0x00]
@@ -1078,7 +1120,7 @@ mod scheduler_validation_tests {
             0,
             None,
             &json!({}),
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -1145,9 +1187,17 @@ mod scheduler_validation_tests {
         let cfg = json!({"execution": {"domains": [
             {"name": "main", "adaptive_flags": 1,
              "tick_min_us": 100, "tick_max_us": 50000}]}});
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("idle widen past the emission interval must be blocked");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("idle widen past the emission interval must be blocked");
         assert!(
             format!("{err:?}").contains("emission interval"),
             "expected emission-interval clamp diagnostic, got: {err:?}"
@@ -1164,8 +1214,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             None,
+            fluxor_root(),
         )
         .expect("idle within the emission interval must pass");
     }
@@ -1189,9 +1239,17 @@ mod scheduler_validation_tests {
         let cfg = json!({"execution": {"domains": [
             {"name": "main", "adaptive_flags": 2,
              "tick_min_us": 1000, "tick_max_us": 8000}]}});
-        let err =
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("guaranteed on (b) must be blocked without WCET re-validation");
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            None,
+            fluxor_root(),
+        )
+        .expect_err("guaranteed on (b) must be blocked without WCET re-validation");
         assert!(
             format!("{err:?}").contains("guaranteed_wcet_revalidated"),
             "expected the WCET re-validation diagnostic, got: {err:?}"
@@ -1208,8 +1266,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             None,
+            fluxor_root(),
         )
         .expect("guaranteed on (b) must pass once WCET re-validation is asserted");
     }
@@ -1239,8 +1297,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             Some("bcm2712"),
+            fluxor_root(),
         )
         .expect("unbounded domain-0 adaptive in a multi-domain bcm2712 config is accepted");
         validate_adaptive_tick(
@@ -1250,8 +1308,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             Some("linux"),
+            fluxor_root(),
         )
         .expect("unbounded domain-0 adaptive in a multi-domain linux config is accepted");
 
@@ -1269,8 +1327,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             Some("bcm2712"),
+            fluxor_root(),
         )
         .expect("bounded domain-0 adaptive must pass");
 
@@ -1285,8 +1343,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             Some("rp2350"),
+            fluxor_root(),
         )
         .expect("rp2350 accepts unbounded domain-0 adaptive");
     }
@@ -1309,7 +1367,14 @@ mod scheduler_validation_tests {
         // One core for both domains → reject, on rp and with no target.
         for target in [Some("rp2350"), None] {
             let err = validate_adaptive_tick(
-                &cfg, &modules, 100, &names, &ticks, &manifests, &[], target,
+                &cfg,
+                &modules,
+                100,
+                &names,
+                &ticks,
+                &manifests,
+                target,
+                fluxor_root(),
             )
             .expect_err("adaptive + strict on the same core must be rejected");
             assert!(
@@ -1326,8 +1391,8 @@ mod scheduler_validation_tests {
             &names,
             &ticks,
             &manifests,
-            &[],
             Some("bcm2712"),
+            fluxor_root(),
         )
         .expect("strict domain on its own core must pass");
     }
@@ -1519,7 +1584,10 @@ mod scheduler_validation_tests {
     fn cores_is_an_unknown_domain_key() {
         for dom in [json!({"cores": [1]}), json!({"exec": "poll", "cores": []})] {
             let e = format!("{}", exec_of(dom).unwrap_err());
-            assert!(e.contains("unknown key `cores`") && e.contains("core d"), "{e}");
+            assert!(
+                e.contains("unknown key `cores`") && e.contains("core d"),
+                "{e}"
+            );
         }
     }
 
@@ -1589,11 +1657,14 @@ mod scheduler_validation_tests {
             "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\npre_pass = true\n",
         )
         .expect("write manifest");
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
         let modules = vec![json!({"name": "drainer", "type": "drainer", "domain": "d"})];
+        let manifests = test_resolver(dir.path(), &[dir.path()])
+            .graph_modules(&modules)
+            .expect("resolves")
+            .manifests();
         let run = |dom: serde_json::Value| {
             let cfg = json!({"execution": {"domains": [dom]}});
-            validate_pre_pass_admission(&cfg, &modules, &extras, None, dir.path())
+            validate_pre_pass_admission(&cfg, &modules, &manifests)
         };
         run(json!({"name": "d"})).expect("a tick domain admits a pre-pass module");
         run(json!({"name": "d", "exec": "tick", "tick_us": 250}))
@@ -1640,17 +1711,14 @@ mod scheduler_validation_tests {
             "modules": [],
             "wiring": []
         });
-        let root = std::path::Path::new("/nonexistent/modules");
         let blob = generate_config_ext(
             &config,
             &ConfigBuilder::new(),
             &[],
-            root,
-            &[],
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             0,
             0,
             None,
-            root,
         )
         .expect("generates");
         let v = decode_config(&blob).expect("decodes");
@@ -1669,18 +1737,48 @@ mod scheduler_validation_tests {
     // require a populated modules tree; the validator's contract is
     // narrow enough to test in isolation.
 
+    /// Interrupt-mode admission of `modules`, each resolved in the project
+    /// at `project` (else the first of `extras`) with `extras` as its
+    /// search paths: a module resolved nowhere reaches the validator with no
+    /// manifest.
+    fn admit(
+        config: &serde_json::Value,
+        modules: &[serde_json::Value],
+        project: Option<&std::path::Path>,
+        extras: &[&std::path::Path],
+    ) -> Result<()> {
+        let root = project
+            .or_else(|| extras.first().copied())
+            .unwrap_or(std::path::Path::new("/nonexistent"));
+        let r = test_resolver(root, extras);
+        let mut manifests = HashMap::new();
+        let mut found = HashMap::new();
+        for m in modules {
+            let Some((name, ty, variant)) = crate::module_resolver::entry_identity(m) else {
+                continue;
+            };
+            if let Some(a) = r.resolve(ty, variant)? {
+                manifests.insert(name.to_string(), a.manifest.clone());
+                found.insert(name.to_string(), a);
+            }
+        }
+        validate_interrupt_admission(
+            config,
+            modules,
+            &manifests,
+            &|name| found.get(name).map_or(Ok(false), |a| a.exports_isr_entry()),
+            None,
+            r.project_root(),
+        )
+    }
+
     fn run_admission(config: serde_json::Value, modules: Vec<serde_json::Value>) -> Result<()> {
-        // Use a path that surely doesn't exist so `load_module_
-        // manifests_with_extra` finds nothing. The validator handles
-        // the missing-manifest case by skipping the interrupt_safe check
-        // (the wiring/manifest validator surfaces missing-manifest
-        // errors separately), so for the unknown-key-and-typed-edge
-        // tests we don't need a real manifest. The cases that DO
-        // need a manifest plant fake ones via an `extra_module_dirs`
-        // tempdir — see the dedicated tests below.
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
-        let extras: Vec<&std::path::Path> = Vec::new();
-        validate_interrupt_admission(&config, &modules, modules_dir, &extras, None, modules_dir)
+        // Resolved in Fluxor's own project, which holds none of these
+        // modules' types: each reaches the validator with no manifest, and
+        // the target's interrupt controller comes from Fluxor's targets.
+        // The cases that need a manifest plant one in a tempdir (`admit`).
+        let fluxor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        admit(&config, &modules, Some(&fluxor), &[])
     }
 
     #[test]
@@ -1818,11 +1916,9 @@ mod scheduler_validation_tests {
         });
         let modules =
             vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("unflagged module in `timer` domain must be rejected");
+        let err = admit(&cfg, &modules, None, &extras)
+            .expect_err("unflagged module in `timer` domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("interrupt_safe = true") && msg.contains("unflagged"),
@@ -1852,11 +1948,9 @@ mod scheduler_validation_tests {
             "type": "definitely_not_a_real_module_type_xyz",
             "domain": "audio_isr",
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("`timer` module with no resolvable manifest must be rejected");
+        let err = admit(&cfg, &modules, None, &extras)
+            .expect_err("`timer` module with no resolvable manifest must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("ghost_module") && msg.contains("manifest"),
@@ -1865,54 +1959,30 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_priority_module_search_paths_extra_dir_shadows_standard_tree() {
-        // `extract_module_search_paths` returns a *priority-ordered*
-        // list with explicit YAML `module_search_paths:` entries
-        // first, and the manifest loader
-        // (`load_module_manifests_with_extra`) and the ISR source checks
-        // must both honour that order. Were either to search
-        // `standard_module_dirs()` first, a config-declared override
-        // colliding with a bundled module of the same `type:` would
-        // have ISR admission read `interrupt_safe` and check source from the
-        // bundled copy — silently admitting a module the operator had
-        // explicitly redirected to a vetted vendor tree.
-        //
-        // This test plants the *same* type name twice:
-        //   - standard tree (`<project>/modules/foundation/coll/`)
-        //     declares `interrupt_safe = true` and exports `module_isr_entry`.
-        //   - extra dir (`<override>/coll/`) declares `interrupt_safe = true`
-        //     but exports no ISR entry.
-        //
-        // If standard wins, admission passes (wrong). If the
-        // extra dir wins, the `irq` export check fires.
+    fn a_type_in_a_layer_and_on_a_search_path_is_refused_naming_both() {
+        // Two sources of one type in one project: a module layer
+        // (`modules/foundation/coll`, exporting `module_isr_entry`) and a
+        // `module_search_paths` entry (`override/coll`, exporting none).
+        // `fluxor modules build` shelves the layer's alone, so no order
+        // between them can pair one copy's manifest with the bytes that
+        // load: the type is refused as ambiguous, naming both.
         let project = tempfile::tempdir().expect("tempdir-project");
-        let extra = tempfile::tempdir().expect("tempdir-extra");
-        let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
-
+        let manifest =
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n";
         let std_dir = project.path().join("modules/foundation/coll");
-        let std_src = std_dir.join("src");
-        std::fs::create_dir_all(&std_src).expect("mkdir std");
+        std::fs::create_dir_all(std_dir.join("src")).expect("mkdir std");
+        std::fs::write(std_dir.join("manifest.toml"), manifest).expect("write std manifest");
         std::fs::write(
-            std_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
-        )
-        .expect("write std manifest");
-        std::fs::write(
-            std_src.join("lib.rs"),
+            std_dir.join("src/lib.rs"),
             "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
         )
         .expect("write std src");
-
-        let ovr_dir = extra.path().join("coll");
-        let ovr_src = ovr_dir.join("src");
-        std::fs::create_dir_all(&ovr_src).expect("mkdir override");
+        let override_root = project.path().join("override");
+        let ovr_dir = override_root.join("coll");
+        std::fs::create_dir_all(ovr_dir.join("src")).expect("mkdir override");
+        std::fs::write(ovr_dir.join("manifest.toml"), manifest).expect("write override manifest");
         std::fs::write(
-            ovr_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
-        )
-        .expect("write override manifest");
-        std::fs::write(
-            ovr_src.join("lib.rs"),
+            ovr_dir.join("src/lib.rs"),
             "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
         )
         .expect("write override src");
@@ -1926,15 +1996,19 @@ mod scheduler_validation_tests {
             "domain": "irq_owner",
             "irq": 42,
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
-        let extras: Vec<&std::path::Path> = vec![extra.path()];
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("extras-first lookup must surface the entry-less override");
+        let err = admit(
+            &cfg,
+            &modules,
+            Some(project.path()),
+            &[override_root.as_path()],
+        )
+        .expect_err("a type with two sources in one project is ambiguous");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("module_isr_entry") && msg.contains("coll"),
-            "extras must shadow the standard tree — the export check should fire on the override, got: {msg}"
+            msg.contains("ambiguous")
+                && msg.contains("modules/foundation/coll")
+                && msg.contains("override/coll"),
+            "the refusal names both sources, got: {msg}"
         );
     }
 
@@ -1967,9 +2041,8 @@ mod scheduler_validation_tests {
             "domain": "irq_owner",
             "irq": 42,
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+        admit(&cfg, &modules, None, &extras)
             .expect("`irq` module exporting module_isr_entry must be admitted");
     }
 
@@ -2004,11 +2077,9 @@ mod scheduler_validation_tests {
             "domain": "irq_owner",
             "irq": 42,
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("`irq` module without module_isr_entry must be rejected");
+        let err = admit(&cfg, &modules, None, &extras)
+            .expect_err("`irq` module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("module_isr_entry") && msg.contains("irq_driver"),
@@ -2043,11 +2114,9 @@ mod scheduler_validation_tests {
             "type": "irq_driver",
             "domain": "irq_owner",
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("`irq` module without irq: must be rejected");
+        let err = admit(&cfg, &modules, None, &extras)
+            .expect_err("`irq` module without irq: must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("irq") && msg.contains("irq_driver"),
@@ -2094,13 +2163,9 @@ mod scheduler_validation_tests {
             "domain": "irq_owner",
             "irq": 42,
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err(
-                    "a standard-tree `irq` module without module_isr_entry must be rejected",
-                );
+        let err = admit(&cfg, &modules, Some(project.path()), &extras)
+            .expect_err("a standard-tree `irq` module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("module_isr_entry") && msg.contains("entryless_isr_module"),
@@ -2112,17 +2177,10 @@ mod scheduler_validation_tests {
 
     #[test]
     fn build_module_entry_emits_pre_pass_bit_from_extra_dir_manifest() {
-        // `build_module_entry` must read the manifest it was given,
-        // not re-find one. Resolving through `Manifest::from_source_tree`
-        // — which searches a hard-coded `SOURCE_DIRS` list relative to
-        // the process cwd — would let a manifest living in
-        // `extra_module_dirs` (an installed driver, say) pass validation
-        // and still emit a module record with its pre-pass flag clear, silently
-        // demoting the module out of `domain_pre_pass_order`.
-        //
-        // This test plants a `pre_pass = true` manifest in a
-        // tempdir, feeds the dir as an extra, and asserts the bit
-        // lands in the emitted module entry.
+        // `build_module_entry` reads the manifest the graph's resolver
+        // resolved, so a module on a `module_search_paths` entry carries its
+        // pre-pass flag into its record, and stays in
+        // `domain_pre_pass_order`.
         let dir = tempfile::tempdir().expect("tempdir");
         let mod_dir = dir.path().join("ext_drainer");
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
@@ -2137,23 +2195,25 @@ mod scheduler_validation_tests {
             "name": "ext_drainer",
             "type": "ext_drainer",
         }]);
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let manifests = load_module_manifests_with_extra(&modules_value, &extras, dir.path());
+        let r = test_resolver(dir.path(), &[dir.path()]);
+        let manifests = r
+            .graph_modules(modules_value.as_array().unwrap())
+            .expect("resolves")
+            .manifests();
         assert!(
             manifests.get("ext_drainer").is_some_and(|m| m.pre_pass),
-            "loader must find the extra-dir manifest with pre_pass = true"
+            "the search-path manifest resolves with pre_pass = true"
         );
 
         let config = json!({});
         let module = json!({"name": "ext_drainer", "type": "ext_drainer"});
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let entry = build_module_entry(
             "ext_drainer",
             &module,
             0,
             None,
             &config,
-            test_loc(modules_dir),
+            &r,
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -2188,14 +2248,35 @@ mod scheduler_validation_tests {
         // The registry resolves each target to its module ABI: bcm2712 and
         // the linux host both load the aarch64 value.
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let modules = json!([{"name": "sized_stream", "type": "sized_stream"}]);
-        let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let default_manifest = load_module_manifests_with_extra(&modules, &extras, dir.path());
-        assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
+        let resolver = |abi: crate::module_resolver::Abi| {
+            crate::module_resolver::ModuleResolver::new(crate::module_resolver::ResolverSpec {
+                project_root: dir.path().to_path_buf(),
+                abi,
+                shelf: None,
+                search_paths: vec![dir.path().to_path_buf()],
+                install_root: None,
+                store_dir: Some(dir.path().join("store")),
+            })
+            .unwrap()
+        };
+        let size = |r: crate::module_resolver::ModuleResolver| {
+            r.require("sized_stream", "sized_stream", None)
+                .unwrap()
+                .manifest
+                .ports[0]
+                .buffer_size
+        };
+        assert_eq!(size(resolver(crate::module_resolver::Abi::Unplaced)), 2048);
         for target in ["bcm2712", "linux"] {
-            let m =
-                load_module_manifests_with_extra_for_target(&modules, &extras, Some(target), &repo);
-            assert_eq!(m["sized_stream"].ports[0].buffer_size, 8192, "{target}");
+            let abi = crate::target::load_target(target, &repo)
+                .unwrap()
+                .module_abi()
+                .to_string();
+            assert_eq!(
+                size(resolver(crate::module_resolver::Abi::Module(abi))),
+                8192,
+                "{target}"
+            );
         }
     }
 
@@ -2221,9 +2302,8 @@ mod scheduler_validation_tests {
             "type": "attested_isr",
             "domain": "audio_isr",
         })];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+        admit(&cfg, &modules, None, &extras)
             .expect("interrupt_safe = true module in `timer` domain must be admitted");
     }
 
@@ -2277,11 +2357,9 @@ mod scheduler_validation_tests {
                 "domain": "audio_isr",
             }),
         ];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err =
-            validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("untagged edge into `timer` module must still be rejected");
+        let err = admit(&cfg, &modules, None, &extras)
+            .expect_err("untagged edge into `timer` module must still be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("interrupt-mode endpoint")
@@ -2328,9 +2406,8 @@ mod scheduler_validation_tests {
             json!({"name": "plain_producer", "type": "plain_producer", "domain": "main"}),
             json!({"name": "attested_isr", "type": "attested_isr", "domain": "audio_isr"}),
         ];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+        admit(&cfg, &modules, None, &extras)
             .expect_err("dma_owned edge into `timer` module rejected (subsumed by ISR-edge rule)");
     }
 
@@ -2353,9 +2430,8 @@ mod scheduler_validation_tests {
             "execution": {"domains": [{"name": "main", "exec": "tick", "tick_us": 250}]}
         });
         let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
-        let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_interrupt_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+        admit(&cfg, &modules, None, &extras)
             .expect("cooperative mode with interrupt_safe=false on its modules is fine");
     }
 
@@ -2373,148 +2449,6 @@ mod scheduler_validation_tests {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::undocumented_unsafe_blocks,
-    reason = "test scaffolding wraps std::env::{set_var, remove_var} which became `unsafe fn` in Rust 2024; safety is identical at every call site — the tests serialise on the module-level mutex"
-)]
-mod module_discovery_tests {
-    //! Tests for the dual-root module manifest discovery added on
-    //! top of the project/install root resolver. Verifies that
-    //! `load_module_manifests_with_extra` finds modules under the
-    //! install root when the project root lacks them (the
-    //! "external user project pulls bundled modules" path), and
-    //! that the project root wins on duplicate names (the "user
-    //! overrides bundled" path).
-
-    use super::*;
-
-    /// Shared env-var lock — the project resolver reads
-    /// `$FLUXOR_PROJECT_ROOT` / `$FLUXOR_INSTALL_ROOT` and these
-    /// tests mutate both. The lock itself lives at file scope (see
-    /// `super::test_env`) so the sibling `scheduler_validation_tests`
-    /// module — which also mutates `$FLUXOR_PROJECT_ROOT` — shares
-    /// the same mutex and we do not race across modules.
-    fn env_lock() -> crate::project::tests::EnvLockGuard {
-        super::test_env::lock()
-    }
-
-    /// Set up a tree under `root` with a manifest at
-    /// `root/modules/foundation/<name>/manifest.toml`. Used to
-    /// synthesise both project and install roots for these tests
-    /// without depending on the real source tree.
-    fn plant_manifest(root: &std::path::Path, name: &str, interrupt_safe: bool) {
-        let dir = root.join("modules/foundation").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        let body = format!(
-            "name = \"{name}\"\nversion = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\ninterrupt_safe = {interrupt_safe}\n",
-        );
-        std::fs::write(dir.join("manifest.toml"), body).unwrap();
-    }
-
-    /// Install the `.fluxor` marker + a stub `targets/` + `stacks/`
-    /// so `discover()` and `install_root()` accept the path.
-    fn mark_project(root: &std::path::Path) {
-        std::fs::write(root.join(".fluxor"), b"").unwrap();
-    }
-
-    fn mark_install(root: &std::path::Path) {
-        std::fs::create_dir_all(root.join("stacks")).unwrap();
-        std::fs::create_dir_all(root.join("targets")).unwrap();
-    }
-
-    #[test]
-    fn finds_module_in_install_root_when_project_lacks_it() {
-        let _g = env_lock();
-        let project = tempfile::tempdir().unwrap();
-        let install = tempfile::tempdir().unwrap();
-        mark_project(project.path());
-        mark_install(install.path());
-        // Only the install root has the manifest.
-        plant_manifest(install.path(), "bundled_mod", true);
-
-        unsafe {
-            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
-            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
-        }
-        let modules = json!([{"name": "bundled_mod", "type": "bundled_mod"}]);
-        let manifests = load_module_manifests_with_extra(&modules, &[], install.path());
-        unsafe {
-            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
-            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
-        }
-        let m = manifests
-            .get("bundled_mod")
-            .expect("install-root manifest must be discoverable");
-        assert!(m.interrupt_safe, "manifest content round-trips");
-    }
-
-    #[test]
-    fn project_root_module_shadows_install_root_module() {
-        // Both roots carry the manifest under the same name. The
-        // project root's version must win — `interrupt_safe = true` in
-        // project, `false` in install. After loading, the result
-        // must reflect the project version.
-        let _g = env_lock();
-        let project = tempfile::tempdir().unwrap();
-        let install = tempfile::tempdir().unwrap();
-        mark_project(project.path());
-        mark_install(install.path());
-        plant_manifest(project.path(), "shared_mod", true);
-        plant_manifest(install.path(), "shared_mod", false);
-
-        unsafe {
-            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
-            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
-        }
-        let modules = json!([{"name": "shared_mod", "type": "shared_mod"}]);
-        let manifests = load_module_manifests_with_extra(&modules, &[], install.path());
-        unsafe {
-            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
-            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
-        }
-        let m = manifests.get("shared_mod").expect("must find shared_mod");
-        assert!(
-            m.interrupt_safe,
-            "expected project-root manifest (interrupt_safe=true) to shadow install-root manifest, got interrupt_safe=false"
-        );
-    }
-
-    #[test]
-    fn extract_module_search_paths_includes_install_root_modules() {
-        let _g = env_lock();
-        let project = tempfile::tempdir().unwrap();
-        let install = tempfile::tempdir().unwrap();
-        mark_project(project.path());
-        mark_install(install.path());
-        // Create a `modules/` dir in install so the returned path
-        // canonicalises to an existing location.
-        std::fs::create_dir_all(install.path().join("modules")).unwrap();
-
-        unsafe {
-            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
-            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
-        }
-        // Place the config inside the project tree so the
-        // <config-parent>/../modules default doesn't accidentally
-        // land at a path that masks the install/modules entry.
-        let cfg_path = project.path().join("cfg/dummy.yaml");
-        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        let cfg = json!({});
-        let paths = extract_module_search_paths(&cfg, &cfg_path);
-        unsafe {
-            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
-            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
-        }
-
-        let install_modules = install.path().join("modules").canonicalize().unwrap();
-        assert!(
-            paths.contains(&install_modules),
-            "install-root modules dir must appear in the search-paths surface; got {paths:?}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod continuity_tests {
     //! Tests for the `continuity` block validator: continuity classes as
     //! a validated graph property.
@@ -2523,10 +2457,13 @@ mod continuity_tests {
     use crate::manifest::{ClaimSelector, ResourceClaim};
 
     /// The node's own modules on a Linux host, whose platform answers `fs`.
-    const LINUX: ProviderReach<'static> = ProviderReach {
-        runtime: Some("linux"),
-        caller: ProviderCaller::Node,
-    };
+    fn linux() -> ProviderReach<'static> {
+        ProviderReach {
+            runtime: Some("linux"),
+            caller: ProviderCaller::Node,
+            project: fluxor_root(),
+        }
+    }
 
     fn man(caps: &[&str]) -> Manifest {
         Manifest {
@@ -2722,6 +2659,7 @@ mod continuity_tests {
             ProviderReach {
                 runtime: Some(target),
                 caller: ProviderCaller::Node,
+                project: fluxor_root(),
             },
         );
         found.into_iter().map(|r| r.message).collect()
@@ -2889,7 +2827,9 @@ mod continuity_tests {
     #[test]
     fn claim_variants_and_when_parse() {
         let head = "version = \"0.1.0\"\n[[variant]]\nname = \"disk\"\nfeatures = []\ndefault = true\n[[variant]]\nname = \"volatile\"\nfeatures = [\"volatile\"]\n";
-        let ok = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"disk\"]\nwhen = {{ persist = \"fs\" }}\n");
+        let ok = format!(
+            "{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"disk\"]\nwhen = {{ persist = \"fs\" }}\n"
+        );
         let m = Manifest::from_toml_str_for_target(&ok, None).unwrap();
         assert_eq!(m.resources[0].variants, names(&["disk"]));
         assert_eq!(
@@ -2897,7 +2837,9 @@ mod continuity_tests {
             vec![("persist".to_string(), names(&["fs"]))]
         );
         assert_eq!(m.selected_variant.as_deref(), Some("disk"));
-        let bad = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"dsk\"]\n");
+        let bad = format!(
+            "{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"dsk\"]\n"
+        );
         let e = Manifest::from_toml_str_for_target(&bad, None)
             .unwrap_err()
             .to_string();
@@ -2929,6 +2871,7 @@ mod continuity_tests {
             ProviderReach {
                 runtime: Some("bcm2712"),
                 caller: ProviderCaller::Workload,
+                project: fluxor_root(),
             },
         );
         assert!(
@@ -3102,7 +3045,7 @@ mod continuity_tests {
         // A graph with no `provides` anywhere is unaffected.
         let mut m = HashMap::new();
         m.insert("a".to_string(), man(&[]));
-        validate_single_provider(&json!({}), &names(&["a"]), &m, LINUX).unwrap();
+        validate_single_provider(&json!({}), &names(&["a"]), &m, linux()).unwrap();
 
         // Two modules providing DIFFERENT surfaces coexist: a block
         // driver under a filesystem is the normal storage stack.
@@ -3112,7 +3055,7 @@ mod continuity_tests {
             "fat32".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m, LINUX).unwrap();
+        validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m, linux()).unwrap();
     }
 
     #[test]
@@ -3129,7 +3072,7 @@ mod continuity_tests {
             "fat32_b".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        let e = validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m, LINUX)
+        let e = validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m, linux())
             .unwrap_err();
         let s = format!("{e:?}");
         assert!(
@@ -3150,7 +3093,7 @@ mod continuity_tests {
         let mut m = HashMap::new();
         m.insert("sd".to_string(), prov(&["storage.block"]));
         m.insert("nvme".to_string(), prov(&["storage.block"]));
-        validate_single_provider(&json!({}), &names(&["sd", "nvme"]), &m, LINUX).unwrap();
+        validate_single_provider(&json!({}), &names(&["sd", "nvme"]), &m, linux()).unwrap();
     }
 
     #[test]
@@ -3159,7 +3102,7 @@ mod continuity_tests {
         // duplicate against itself.
         let mut m = HashMap::new();
         m.insert("fat32".to_string(), prov(&["file.data", "file.data"]));
-        validate_single_provider(&json!({}), &names(&["fat32"]), &m, LINUX).unwrap();
+        validate_single_provider(&json!({}), &names(&["fat32"]), &m, linux()).unwrap();
     }
 
     #[test]
@@ -3188,7 +3131,7 @@ mod continuity_tests {
             &cfg,
             &names(&["mount", "fat32_boot", "fat32_data"]),
             &m,
-            LINUX,
+            linux(),
         )
         .unwrap();
     }
@@ -3203,7 +3146,7 @@ mod continuity_tests {
             {"name": "a", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "b", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["a", "b"]), &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["a", "b"]), &m, linux()).unwrap_err();
         let s = format!("{e:?}");
         assert!(s.contains("nvme0") && s.contains("collide"), "got: {s}");
     }
@@ -3240,7 +3183,7 @@ mod continuity_tests {
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "app", "type": "fs_tap"},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["boot", "data", "app"]), &m, LINUX)
+        let e = validate_single_provider(&cfg, &names(&["boot", "data", "app"]), &m, linux())
             .unwrap_err();
         let s = format!("{e:?}");
         assert!(
@@ -3263,7 +3206,7 @@ mod continuity_tests {
             {"name": "only", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "app", "type": "fs_tap"},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["only", "app"]), &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["only", "app"]), &m, linux()).unwrap_err();
         assert!(
             format!("{e:?}").contains("every provider of `fs` in the graph is instance-keyed"),
             "got: {e:?}"
@@ -3280,7 +3223,8 @@ mod continuity_tests {
             {"name": "boot", "type": "fat32", "params": {"volume": "sd0"}},
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
-        validate_single_provider(&cfg, &names(&["boot", "data"]), &m, LINUX).expect("no consumer");
+        validate_single_provider(&cfg, &names(&["boot", "data"]), &m, linux())
+            .expect("no consumer");
     }
 
     #[test]
@@ -3294,7 +3238,7 @@ mod continuity_tests {
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "relop", "type": "relop"},
         ]});
-        validate_single_provider(&cfg, &names(&["data", "relop"]), &m, LINUX).expect("runtime");
+        validate_single_provider(&cfg, &names(&["data", "relop"]), &m, linux()).expect("runtime");
     }
 
     #[test]
@@ -3309,13 +3253,13 @@ mod continuity_tests {
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "app", "type": "fs_tap"},
         ]});
-        validate_single_provider(&cfg, &names(&["data", "app"]), &m, LINUX).expect("declared");
+        validate_single_provider(&cfg, &names(&["data", "app"]), &m, linux()).expect("declared");
 
         m.insert(
             "app".to_string(),
             fs_consumer(ClaimSelector::Fixed("sd0".into())),
         );
-        let e = validate_single_provider(&cfg, &names(&["data", "app"]), &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["data", "app"]), &m, linux()).unwrap_err();
         let s = format!("{e:?}");
         assert!(
             s.contains("`app`'s `fs` claim names volume `sd0` (`selector`), which no provider")
@@ -3344,7 +3288,7 @@ mod continuity_tests {
             &keyed_only(json!({"name": "img", "type": "file_block", "params": {"volume": ""}})),
             &names(&["data", "img"]),
             &m,
-            LINUX,
+            linux(),
         )
         .unwrap_err();
         assert!(format!("{e:?}").contains("`img`'s `fs` claim leaves its `volume` param"));
@@ -3352,7 +3296,7 @@ mod continuity_tests {
             &keyed_only(json!({"name": "img", "type": "file_block"})),
             &names(&["data", "img"]),
             &m,
-            LINUX,
+            linux(),
         )
         .unwrap_err();
         assert!(format!("{e:?}").contains("`img`'s `fs` claim leaves its `volume` param"));
@@ -3362,14 +3306,14 @@ mod continuity_tests {
             ),
             &names(&["data", "img"]),
             &m,
-            LINUX,
+            linux(),
         )
         .expect("a set volume");
         validate_single_provider(
             &keyed_only(json!({"name": "img", "type": "file_block", "volume": "platform"})),
             &names(&["data", "img"]),
             &m,
-            LINUX,
+            linux(),
         )
         .expect("platform is the target's own provider");
     }
@@ -3383,7 +3327,7 @@ mod continuity_tests {
         router.resources = fs_consumer(ClaimSelector::Param("volume".into())).resources;
         m.insert("router".to_string(), router);
         let cfg = json!({"modules": [{"name": "router", "type": "mount"}]});
-        let e = validate_single_provider(&cfg, &names(&["router"]), &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["router"]), &m, linux()).unwrap_err();
         assert!(
             e.to_string()
                 .contains("names the volume it reaches with `selector_param = \"volume\"`"),
@@ -3401,9 +3345,9 @@ mod continuity_tests {
                 {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
             ]})
         };
-        validate_single_provider(&graph("nvme0"), &names(&["cache", "data"]), &m, LINUX)
+        validate_single_provider(&graph("nvme0"), &names(&["cache", "data"]), &m, linux())
             .expect("a declared backend");
-        let e = validate_single_provider(&graph("sd0"), &names(&["cache", "data"]), &m, LINUX)
+        let e = validate_single_provider(&graph("sd0"), &names(&["cache", "data"]), &m, linux())
             .unwrap_err();
         assert!(
             e.to_string()
@@ -3428,8 +3372,8 @@ mod continuity_tests {
         };
         let check =
             |mounts: &str, reach| validate_single_provider(&graph(mounts), &names, &m, reach);
-        check("/data=nvme0;/host=platform;", LINUX).expect("both provided on Linux");
-        let e = check("/data=nvme0;/logs=nvme1", LINUX)
+        check("/data=nvme0;/host=platform;", linux()).expect("both provided on Linux");
+        let e = check("/data=nvme0;/logs=nvme1", linux())
             .unwrap_err()
             .to_string();
         assert!(
@@ -3440,10 +3384,11 @@ mod continuity_tests {
         let pi5 = ProviderReach {
             runtime: Some("bcm2712"),
             caller: ProviderCaller::Node,
+            project: fluxor_root(),
         };
         let e = check("/host=platform", pi5).unwrap_err().to_string();
         assert!(e.contains("mounts `/host` on volume `platform`"), "{e}");
-        let e = check("/data=nvme0;/boot", LINUX).unwrap_err().to_string();
+        let e = check("/data=nvme0;/boot", linux()).unwrap_err().to_string();
         assert!(
             e.contains("`mount`'s `mounts` entry `/boot` is not `prefix=volume`"),
             "{e}"
@@ -3465,7 +3410,7 @@ mod continuity_tests {
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "img", "type": "file_block", "volume": "nvme0", "params": {"volume": "sd0"}},
         ]});
-        validate_single_provider(&cfg, &names, &m, LINUX).expect("the bare key wins");
+        validate_single_provider(&cfg, &names, &m, linux()).expect("the bare key wins");
         let cfg = json!({
             "data": {"disk": {"content": "nvme0"}},
             "modules": [
@@ -3473,7 +3418,7 @@ mod continuity_tests {
                 {"name": "img", "type": "file_block", "volume": "disk"},
             ]
         });
-        validate_single_provider(&cfg, &names, &m, LINUX).expect("both resolve through data:");
+        validate_single_provider(&cfg, &names, &m, linux()).expect("both resolve through data:");
     }
 
     #[test]
@@ -3489,9 +3434,10 @@ mod continuity_tests {
         let reach = |runtime, caller| ProviderReach {
             runtime: Some(runtime),
             caller,
+            project: fluxor_root(),
         };
         let check = |r| validate_single_provider(&cfg, &names(&["img"]), &m, r);
-        check(LINUX).expect("Linux answers fs from the host");
+        check(linux()).expect("Linux answers fs from the host");
         check(reach("bcm2712", ProviderCaller::Workload)).expect("bcm2712 roots a workload");
         let e = check(reach("bcm2712", ProviderCaller::Node)).unwrap_err();
         assert!(
@@ -3503,6 +3449,7 @@ mod continuity_tests {
         check(ProviderReach {
             runtime: None,
             caller: ProviderCaller::Node,
+            project: fluxor_root(),
         })
         .expect("an unknown target is not checked");
     }
@@ -3532,13 +3479,13 @@ mod continuity_tests {
             })
         };
         let names = names(&["disk", "seal", "fs"]);
-        let e = validate_single_provider(&graph(Value::Null), &names, &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&graph(Value::Null), &names, &m, linux()).unwrap_err();
         assert!(
             e.to_string()
                 .contains("which it feeds (`disk` → `seal` → `fs`)"),
             "{e}"
         );
-        validate_single_provider(&graph(json!("platform")), &names, &m, LINUX)
+        validate_single_provider(&graph(json!("platform")), &names, &m, linux())
             .expect("the image on the host's filesystem");
     }
 
@@ -3606,14 +3553,14 @@ mod continuity_tests {
             &graph("store.commands"),
             &mods,
             &manifests(store(false), None),
-            LINUX,
+            linux(),
         )
         .expect("the store answers whatever its command input has carried");
         let e = validate_single_provider(
             &graph("store.commands"),
             &mods,
             &manifests(store(true), None),
-            LINUX,
+            linux(),
         )
         .unwrap_err()
         .to_string();
@@ -3628,7 +3575,7 @@ mod continuity_tests {
                 &graph(into),
                 &mods,
                 &manifests(store(false), None),
-                LINUX,
+                linux(),
             )
             .unwrap_err()
             .to_string();
@@ -3656,7 +3603,7 @@ mod continuity_tests {
             &through,
             &names3,
             &manifests(store(false), Some(mid.clone())),
-            LINUX,
+            linux(),
         )
         .unwrap_err()
         .to_string();
@@ -3671,7 +3618,7 @@ mod continuity_tests {
             &through,
             &names3,
             &manifests(store(false), Some(mid)),
-            LINUX,
+            linux(),
         )
         .expect("no provider on the path waits on what it hears");
     }
@@ -3700,15 +3647,15 @@ mod continuity_tests {
             })
         };
         let names = names(&["disk", "fs"]);
-        validate_single_provider(&graph(json!({})), &names, &m, LINUX)
+        validate_single_provider(&graph(json!({})), &names, &m, linux())
             .expect("no table param set: the claim is never exercised");
-        validate_single_provider(&graph(json!({"routes_prefix": ""})), &names, &m, LINUX)
+        validate_single_provider(&graph(json!({"routes_prefix": ""})), &names, &m, linux())
             .expect("an empty value sets nothing");
         for set in [
             json!({"routes_prefix": "/dataplane/edge/"}),
             json!({"params": {"sessions_prefix": "/s/"}}),
         ] {
-            let e = validate_single_provider(&graph(set.clone()), &names, &m, LINUX)
+            let e = validate_single_provider(&graph(set.clone()), &names, &m, linux())
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("which it feeds (`disk` → `fs`)"), "{set}: {e}");
@@ -3716,9 +3663,9 @@ mod continuity_tests {
         // A param resolved through `data:` counts by its content.
         let mut g = graph(json!({"routes_prefix": "routes"}));
         g["data"] = json!({"routes": {"content": ""}});
-        validate_single_provider(&g, &names, &m, LINUX).expect("data entry with empty content");
+        validate_single_provider(&g, &names, &m, linux()).expect("data entry with empty content");
         g["data"] = json!({"routes": {"content": "/r/"}});
-        assert!(validate_single_provider(&g, &names, &m, LINUX).is_err());
+        assert!(validate_single_provider(&g, &names, &m, linux()).is_err());
     }
 
     /// The domain rule follows the same claims: a caller in another domain
@@ -3835,7 +3782,7 @@ mod continuity_tests {
             ]
         });
         let names = names(&["front", "link", "fs"]);
-        validate_single_provider(&graph, &names, &m, LINUX)
+        validate_single_provider(&graph, &names, &m, linux())
             .expect("two connections through one net provider are not a data path");
 
         // The same front wired to the provider directly does feed it.
@@ -3844,7 +3791,7 @@ mod continuity_tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"from": "front.net_out", "to": "fs.blocks"}));
-        let e = validate_single_provider(&direct, &names, &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&direct, &names, &m, linux()).unwrap_err();
         assert!(
             e.to_string().contains("which it feeds (`front` → `fs`)"),
             "{e}"
@@ -3863,7 +3810,7 @@ mod continuity_tests {
             {"name": "mount", "type": "mount"},
             {"name": "vol", "type": "fat32", "params": {"volume": "platform"}},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["mount", "vol"]), &m, LINUX).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["mount", "vol"]), &m, linux()).unwrap_err();
         let s = format!("{e:?}");
         assert!(s.contains("`vol`") && s.contains("reserved"), "got: {s}");
 
@@ -3876,7 +3823,7 @@ mod continuity_tests {
             {"name": "file_block", "params": {"volume": "platform"}},
             {"name": "fat32"},
         ]});
-        validate_single_provider(&cfg, &names(&["file_block", "fat32"]), &m, LINUX).unwrap();
+        validate_single_provider(&cfg, &names(&["file_block", "fat32"]), &m, linux()).unwrap();
     }
 
     #[test]
@@ -5174,7 +5121,7 @@ mod dynamic_capacity_tests {
             0,
             None,
             &json!({}),
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -5315,7 +5262,7 @@ mod dynamic_capacity_tests {
             3000,
             None,
             &config,
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &HashMap::new(),
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -5342,7 +5289,12 @@ mod dynamic_capacity_tests {
         })
         .expect("encodes");
         let cfg = boot_config::decode(&blob).expect("decodes");
-        let m = cfg.graph().composed().modules().nth(3000).expect("module 3000");
+        let m = cfg
+            .graph()
+            .composed()
+            .modules()
+            .nth(3000)
+            .expect("module 3000");
         assert_eq!((m.name_hash, m.domain), (fnv1a_hash(b"m"), 1));
         assert_eq!(m.params, &entry.params[..]);
     }
@@ -5360,7 +5312,7 @@ mod dynamic_capacity_tests {
             0,
             None,
             &json!({}),
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &HashMap::new(),
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -5384,13 +5336,19 @@ mod dynamic_capacity_tests {
             tags.push(p[at]);
             at += 2 + usize::from(p[at + 1]);
         }
-        assert!(tags.contains(&0xF2), "the restart count stays a tag: {tags:x?}");
+        assert!(
+            tags.contains(&0xF2),
+            "the restart count stays a tag: {tags:x?}"
+        );
         for gone in [0xF0, 0xF1, 0xF6] {
             assert!(!tags.contains(&gone), "tag {gone:#x} in {tags:x?}");
         }
         // `restart_graph` names no policy.
         let e = yaml_step_budget(&json!({"fault_policy": "restart_graph"}), "m").unwrap_err();
-        assert!(e.to_string().contains("'restart_graph' is not a policy"), "{e}");
+        assert!(
+            e.to_string().contains("'restart_graph' is not a policy"),
+            "{e}"
+        );
     }
 
     /// `heap.raw_arena` (or the type's `[capacities] raw_arena`) is params
@@ -5404,7 +5362,7 @@ mod dynamic_capacity_tests {
             0,
             None,
             &json!({}),
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &HashMap::new(),
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -5426,7 +5384,7 @@ mod dynamic_capacity_tests {
             0,
             None,
             &json!({}),
-            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &test_resolver(std::path::Path::new("/nonexistent"), &[]),
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -5843,8 +5801,14 @@ mod asset_param_tests {
         // Without the built schema the manifest's word stands.
         check_asset_params(&entry, "v", "view", Some(&m), None).unwrap();
         // An entry that names no asset asks nothing.
-        check_asset_params(&json!({"name": "v", "fonts": "/a/path"}), "v", "view", None, None)
-            .unwrap();
+        check_asset_params(
+            &json!({"name": "v", "fonts": "/a/path"}),
+            "v",
+            "view",
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     /// On every family: the value is a URL, a path or a program reference,
@@ -5869,7 +5833,9 @@ mod asset_param_tests {
 
     #[test]
     fn a_declared_asset_param_the_module_does_not_have_as_a_string_is_refused() {
-        let m = pic("[[params]]\nname = \"scale\"\nasset = true\n\n[[params]]\nname = \"gone\"\nasset = true\n");
+        let m = pic(
+            "[[params]]\nname = \"scale\"\nasset = true\n\n[[params]]\nname = \"gone\"\nasset = true\n",
+        );
         for param in ["scale", "gone"] {
             let entry = json!({"name": "v", "asset_params": [param]});
             let e = check_asset_params(&entry, "v", "view", Some(&m), Some(&schema()))
@@ -5902,7 +5868,10 @@ mod asset_param_tests {
             "builtin = true\n[[params]]\nname = \"rate\"\ntag = 11\ntype = \"u32\"\nasset = true\n"
         )
         .contains("marks a `str` param"));
-        assert!(bad("builtin = true\n[[params]]\nname = \"rate\"\ntag = 11\n").contains("missing `type`"));
+        assert!(
+            bad("builtin = true\n[[params]]\nname = \"rate\"\ntag = 11\n")
+                .contains("missing `type`")
+        );
     }
 }
 
@@ -5924,17 +5893,12 @@ mod secondary_core_tests {
     fn compose(config: &Value) -> Result<Vec<u8>> {
         let root = root();
         let dir = root.join("target/fluxor/thumbv8m/modules");
-        generate_config_ext(
-            config,
-            &ConfigBuilder::new(),
-            &[],
-            &dir,
-            &[],
-            0,
-            0,
-            Some("pico2w"),
+        let r = crate::module_resolver::ModuleResolver::for_project(
             &root,
-        )
+            crate::module_resolver::Abi::Module("thumbv8m".into()),
+            Some(dir),
+        )?;
+        generate_config_ext(config, &ConfigBuilder::new(), &[], &r, 0, 0, Some("pico2w"))
     }
 
     /// The flash driver and a module writing flash, both on core 1: the
@@ -6112,18 +6076,36 @@ mod port_fact_tests {
         let e = edge_of("VideoDraw", "band_rows = 32", retains_nothing)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("producer declares 32") && e.contains("consumer declares 16"), "{e}");
+        assert!(
+            e.contains("producer declares 32") && e.contains("consumer declares 16"),
+            "{e}"
+        );
         // Bands within it; the producer's frame size is not held to a
         // consumer that retains none.
-        edge_of("VideoDraw", "band_rows = 16\nframe_bytes = 4096", retains_nothing).unwrap();
+        edge_of(
+            "VideoDraw",
+            "band_rows = 16\nframe_bytes = 4096",
+            retains_nothing,
+        )
+        .unwrap();
         edge_of("VideoDraw", "band_rows = 8", retains_nothing).unwrap();
         // A consumer that retains nothing and states no band height takes
         // any banded stream.
         edge_of("VideoDraw", "band_rows = 64", "frame_bytes = 0").unwrap();
         // A consumer that retains frames bands for itself: any stream, and
         // its own `band_rows` is no ceiling on the producer's.
-        edge_of("VideoDraw", "band_rows = 64", "frame_bytes = 8192\nband_rows = 16").unwrap();
-        edge_of("VideoDraw", "max_depth = 4", "frame_bytes = 8192\nband_rows = 16").unwrap();
+        edge_of(
+            "VideoDraw",
+            "band_rows = 64",
+            "frame_bytes = 8192\nband_rows = 16",
+        )
+        .unwrap();
+        edge_of(
+            "VideoDraw",
+            "max_depth = 4",
+            "frame_bytes = 8192\nband_rows = 16",
+        )
+        .unwrap();
         edge_of("VideoDraw", "band_rows = 64", "band_rows = 16").unwrap();
     }
 
@@ -6131,12 +6113,32 @@ mod port_fact_tests {
     /// content type.
     #[test]
     fn fan_in_onto_any_record_stream_input_is_refused() {
-        for ct in ["VideoDraw", "VideoRaster", "TextEvents", "AccessibilityTree"] {
+        for ct in [
+            "VideoDraw",
+            "VideoRaster",
+            "TextEvents",
+            "AccessibilityTree",
+        ] {
             let (cfg, m) = graph(
                 &[
-                    ("a", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"))),
-                    ("b", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"))),
-                    ("rx", manifest(&format!("[[ports]]\nname = \"p\"\ndirection = \"input\"\ncontent_type = \"{ct}\"\n"))),
+                    (
+                        "a",
+                        manifest(&format!(
+                            "[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"
+                        )),
+                    ),
+                    (
+                        "b",
+                        manifest(&format!(
+                            "[[ports]]\nname = \"p\"\ndirection = \"output\"\ncontent_type = \"{ct}\"\n"
+                        )),
+                    ),
+                    (
+                        "rx",
+                        manifest(&format!(
+                            "[[ports]]\nname = \"p\"\ndirection = \"input\"\ncontent_type = \"{ct}\"\n"
+                        )),
+                    ),
                 ],
                 json!([{"from": "a.p", "to": "rx.p"}, {"from": "b.p", "to": "rx.p"}]),
             );
@@ -6163,7 +6165,10 @@ mod port_fact_tests {
             "refresh_mhz = { param = \"refresh_mhz\" }",
         );
         assert_eq!(
-            panel.ports[0].fact_params.get("refresh_mhz").map(String::as_str),
+            panel.ports[0]
+                .fact_params
+                .get("refresh_mhz")
+                .map(String::as_str),
             Some("refresh_mhz")
         );
         assert!(!panel.ports[0].facts.contains_key("refresh_mhz"));
@@ -6183,8 +6188,9 @@ mod port_fact_tests {
                 enums: HashMap::new(),
             },
         ]);
-        let param_of =
-            |entry: &Value, param: &str| -> Result<BoundParam> { Ok(bound_param_in(entry, &schema, param)) };
+        let param_of = |entry: &Value, param: &str| -> Result<BoundParam> {
+            Ok(bound_param_in(entry, &schema, param))
+        };
         let run = |modules: Value| {
             let m: HashMap<String, Manifest> = [
                 ("src", port("output", "VideoDraw", "refresh_mhz = 45000")),
@@ -6282,8 +6288,9 @@ mod port_fact_tests {
             default: 5000,
             enums: HashMap::new(),
         }]);
-        let param_of =
-            |entry: &Value, param: &str| -> Result<BoundParam> { Ok(bound_param_in(entry, &schema, param)) };
+        let param_of = |entry: &Value, param: &str| -> Result<BoundParam> {
+            Ok(bound_param_in(entry, &schema, param))
+        };
         let modules = vec![
             json!({"name": "fast", "type": "temp_sensor", "interval_ms": 1000}),
             json!({"name": "set", "type": "temp_sensor", "params": {"interval_ms": 250}}),
@@ -6307,7 +6314,10 @@ mod port_fact_tests {
         let e = bind_capability_facts(&modules, &mut m, &none)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("fact `period_ms` is bound to param `interval_ms`"), "{e}");
+        assert!(
+            e.contains("fact `period_ms` is bound to param `interval_ms`"),
+            "{e}"
+        );
     }
 
     /// Only a numeric fact binds to a param, and the table names the param
@@ -6333,7 +6343,10 @@ mod port_fact_tests {
         assert!(bad("ops = { param = \"a\" }", "VideoDraw").contains("string"));
         // Every numeric port fact binds the same way.
         let m = port("output", "VideoRaster", "width = { param = \"w\" }");
-        assert_eq!(m.ports[0].fact_params.get("width").map(String::as_str), Some("w"));
+        assert_eq!(
+            m.ports[0].fact_params.get("width").map(String::as_str),
+            Some("w")
+        );
     }
 
     #[test]
@@ -6359,7 +6372,9 @@ mod port_fact_tests {
             ],
             json!([{"from": "demux.media_out", "to": "dec.media_in"}]),
         );
-        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("mp3") && e.contains("demux.media_out"), "{e}");
     }
 
@@ -6413,7 +6428,9 @@ mod port_fact_tests {
             ],
             json!([{"from": "a.media_out", "to": "rx.media_in"}, {"from": "b.media_out", "to": "rx.media_in"}]),
         );
-        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params)
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("rx.media_in") && e.contains("2 producers"),
             "{e}"
@@ -6497,7 +6514,9 @@ mod port_fact_tests {
             ],
             edge.clone(),
         );
-        let e = validate_port_facts(&cfg, &m, &no_bound_params).unwrap_err().to_string();
+        let e = validate_port_facts(&cfg, &m, &no_bound_params)
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("http") && e.contains("req.request_out") && e.contains("binding"),
             "{e}"
@@ -7043,7 +7062,11 @@ mod config_decode_tests {
         // length check is what refuses it.
         let mut d = blob();
         let at = 16 + 8 + 8 + 8 + 40;
-        assert_eq!(u16::from_le_bytes([d[at], d[at + 1]]), 23, "the first record's length");
+        assert_eq!(
+            u16::from_le_bytes([d[at], d[at + 1]]),
+            23,
+            "the first record's length"
+        );
         d[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
         let crc = fluxor_contracts::boot_config::crc32(&d[12..]);
         d[8..12].copy_from_slice(&crc.to_le_bytes());
@@ -7147,8 +7170,7 @@ mod heap_from_params_tests {
             Some(want)
         );
         // Without the rule, nothing is derived.
-        let p =
-            insert_heap_tags(params, &module, "http", None, &HeapPlan::default()).unwrap();
+        let p = insert_heap_tags(params, &module, "http", None, &HeapPlan::default()).unwrap();
         assert_eq!(tag_0xef(&p), None);
     }
 
@@ -7175,8 +7197,15 @@ mod heap_from_params_tests {
             )
             .unwrap();
             assert_eq!(tag_0xef(&p), None, "{len} B: no cap tag");
-            assert_eq!(p.len(), params.len() + 3, "{len} B: only the 0xEE mark joined");
-            assert!(p.windows(3).any(|w| w == [0xEE, 1, 1]), "{len} B: marked 0xEE");
+            assert_eq!(
+                p.len(),
+                params.len() + 3,
+                "{len} B: only the 0xEE mark joined"
+            );
+            assert!(
+                p.windows(3).any(|w| w == [0xEE, 1, 1]),
+                "{len} B: marked 0xEE"
+            );
         }
     }
 
@@ -7530,7 +7559,10 @@ mod check_mode_file_tests {
         let undeclared = json!({"trust": "platform"});
         let (_, packed, sources) =
             lift_credential_sources("isr", undeclared.clone(), |_| false).unwrap();
-        assert_eq!((packed, sources), (undeclared, CredentialSources::default()));
+        assert_eq!(
+            (packed, sources),
+            (undeclared, CredentialSources::default())
+        );
 
         for (bad, says) in [
             (json!({"cert_file": "certs/server.pem"}), "absolute path"),
@@ -7575,10 +7607,18 @@ mod check_mode_file_tests {
         }
         let system = json!({"name": "srv", "type": "tls", "trust": "system"});
         refuse_credential_forms(&system, Some("rp2350"), false, "srv").expect("no file");
-        assert!(fs_reachable("linux", ProviderCaller::Node));
-        assert!(fs_reachable("bcm2712", ProviderCaller::Workload));
-        assert!(!fs_reachable("bcm2712", ProviderCaller::Node));
-        assert!(!fs_reachable("rp2350", ProviderCaller::Node));
+        assert!(fs_reachable("linux", ProviderCaller::Node, fluxor_root()));
+        assert!(fs_reachable(
+            "bcm2712",
+            ProviderCaller::Workload,
+            fluxor_root()
+        ));
+        assert!(!fs_reachable(
+            "bcm2712",
+            ProviderCaller::Node,
+            fluxor_root()
+        ));
+        assert!(!fs_reachable("rp2350", ProviderCaller::Node, fluxor_root()));
     }
 
     /// tls's peer names as its schema declares them (tags 24..=26).
@@ -7962,17 +8002,12 @@ mod boot_composition_tests {
     fn generate(config: &Value) -> Result<Vec<u8>> {
         let root = root();
         let dir = root.join("target/fluxor/aarch64/modules");
-        generate_config_ext(
-            config,
-            &ConfigBuilder::new(),
-            &[],
-            &dir,
-            &[],
-            0,
-            0,
-            Some("linux"),
+        let r = crate::module_resolver::ModuleResolver::for_project(
             &root,
-        )
+            crate::module_resolver::Abi::Module("aarch64".into()),
+            Some(dir),
+        )?;
+        generate_config_ext(config, &ConfigBuilder::new(), &[], &r, 0, 0, Some("linux"))
     }
 
     fn probes(names: &[&str]) -> Value {
@@ -8007,9 +8042,15 @@ mod boot_composition_tests {
         fluxor_contracts::params_tlv::walk_declared(modules[3].params, |tag, v| {
             tags.insert(tag, v.to_vec());
         });
-        assert_eq!(tags[&plan::fan_param::FRAME_KIND], [plan::FrameKind::Stream as u8]);
+        assert_eq!(
+            tags[&plan::fan_param::FRAME_KIND],
+            [plan::FrameKind::Stream as u8]
+        );
         assert_eq!(tags[&plan::fan_param::FRAMES_PER_STEP], 64u16.to_le_bytes());
-        assert_eq!(tags[&plan::fan_param::SCRATCH_BYTES], 16384u32.to_le_bytes());
+        assert_eq!(
+            tags[&plan::fan_param::SCRATCH_BYTES],
+            16384u32.to_le_bytes()
+        );
         // The tee's `heap_per_param`: base 64 + one byte per scratch byte.
         assert_eq!(tags[&0xEF], (64u32 + 16384).to_le_bytes());
         let edges: Vec<_> = g.edges().collect();
@@ -8065,5 +8106,179 @@ mod boot_composition_tests {
         config["modules"][0]["fault_policy"] = json!("restart_graph");
         let e = generate(&config).unwrap_err().to_string();
         assert!(e.contains("'restart_graph' is not a policy"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod pinned_variant_tests {
+    //! A project that pins a module only under its variant's artefact name
+    //! (`http-exchange`, as a stack binding wave's `http` pins it) builds a
+    //! graph naming that variant: its manifest, its schema and its bytes all
+    //! come from the one pin.
+    use super::*;
+    use fluxor_abi::wire::fmod::header::{Header, NAME_LEN};
+
+    const VARIANTS: &str = "version = \"0.1.0\"\nhardware_targets = [\"linux\"]\n\n\
+        [[ports]]\nname = \"request_in\"\ndirection = \"input\"\ncontent_type = \"OctetStream\"\n\n\
+        [[ports]]\nname = \"full_only\"\ndirection = \"input\"\ncontent_type = \"OctetStream\"\n\n\
+        [[variant]]\nname = \"full\"\ndefault = true\nfeatures = []\n\n\
+        [[variant]]\nname = \"exchange\"\nfeatures = []\nomit_ports = [\"full_only\"]\n";
+    const FEEDER: &str = "version = \"0.1.0\"\nhardware_targets = [\"linux\"]\n\n\
+        [[ports]]\nname = \"data_out\"\ndirection = \"output\"\ncontent_type = \"OctetStream\"\n";
+
+    /// A packed module with no code and `schema` as its params schema.
+    fn fmod(name: &str, schema: &[u8]) -> Vec<u8> {
+        let mut n = [0u8; NAME_LEN];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        let h = Header {
+            magic: crate::modules::MODULE_MAGIC,
+            version: 1,
+            abi_version: 1,
+            module_type: 0,
+            flags: 0,
+            code_size: 0,
+            data_size: 0,
+            export_count: 0,
+            schema_size: schema.len() as u16,
+            manifest_size: 0,
+            step_period: 0,
+            step_phase: 0,
+            name: n,
+        };
+        let mut out = h.to_bytes().to_vec();
+        out.extend_from_slice(schema);
+        out
+    }
+
+    /// The project at `<dir>/project`, pinning `http-exchange` and `feeder`
+    /// from a store at `<dir>/store`, and its resolver.
+    fn project() -> (tempfile::TempDir, crate::module_resolver::ModuleResolver) {
+        use fluxor_tools::oci_store::{publish_module, ModulePublish, OciStore, PROVENANCE_LOCAL};
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = OciStore::open(dir.path().join("store")).unwrap();
+        // One U16 param, tag 1, `port`, default 80.
+        let schema = [
+            0x53, 0x50, 1, 1, 1, 1, 80, 0, 0, 0, 4, b'p', b'o', b'r', b't', 0,
+        ];
+        let mut lock = String::new();
+        for (name, toml, bytes) in [
+            ("http-exchange", VARIANTS, fmod("http", &schema)),
+            ("feeder", FEEDER, fmod("feeder", &[])),
+        ] {
+            let reference = format!("aarch64/{name}:0.0.1");
+            let d = publish_module(
+                &store,
+                &ModulePublish {
+                    name,
+                    target: "aarch64",
+                    fmod_bytes: &bytes,
+                    manifest_toml: Some(toml),
+                    provenance: PROVENANCE_LOCAL,
+                    source_rev: None,
+                    ref_name: &reference,
+                },
+            )
+            .unwrap();
+            lock.push_str(&format!(
+                "[[artifact]]\nkind = \"module\"\nname = \"{name}\"\nproject = \"wave\"\n\
+                 target = \"aarch64\"\ndigest = \"{}\"\nreference = \"{reference}\"\n\n",
+                d.digest
+            ));
+        }
+        std::fs::write(project.join("fluxor.lock"), lock).unwrap();
+        let r = ModuleResolver::new(crate::module_resolver::ResolverSpec {
+            project_root: project,
+            abi: crate::module_resolver::Abi::Module("aarch64".into()),
+            shelf: None,
+            search_paths: Vec::new(),
+            install_root: None,
+            store_dir: Some(dir.path().join("store")),
+        })
+        .unwrap();
+        (dir, r)
+    }
+
+    /// The graph builds, its wire to the variant's port resolves, and the
+    /// instance's params pack against the pinned schema.
+    fn builds_whole(config: &Value, r: &ModuleResolver, instance: &str) {
+        generate_config_ext(config, &ConfigBuilder::new(), &[], r, 0, 0, None)
+            .expect("the graph builds against the pinned variant");
+        let entry = config["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == instance)
+            .unwrap();
+        let built = build_module_entry(
+            instance,
+            entry,
+            0,
+            None,
+            config,
+            r,
+            &HashMap::new(),
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
+        )
+        .unwrap();
+        assert!(
+            built.params.windows(4).any(|w| w == [1, 2, 0x90, 0x1F]),
+            "port 8080 packed from the pinned schema: {:?}",
+            built.params
+        );
+    }
+
+    #[test]
+    fn a_variant_pinned_only_under_its_artefact_name_resolves_whole() {
+        let (_dir, r) = project();
+        let config = json!({
+            "modules": [
+                {"name": "feeder"},
+                {"name": "http", "variant": "exchange", "port": 8080},
+            ],
+            "wiring": [{"from": "feeder.data_out", "to": "http.request_in"}],
+        });
+        builds_whole(&config, &r, "http");
+        let table = r
+            .graph_modules(config["modules"].as_array().unwrap())
+            .unwrap()
+            .artifacts()
+            .iter()
+            .map(|a| a.artifact.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(table, ["feeder", "http-exchange"]);
+    }
+
+    #[test]
+    fn a_variant_pinned_only_under_its_artefact_name_resolves_whole_through_a_stack() {
+        let (dir, r) = project();
+        let project = dir.path().join("project");
+        std::fs::write(
+            project.join("http_client.yaml"),
+            "stack: http_client\nversion: 0.1.0\nexports:\n  request_in: http.request_in\n\
+             modules:\n  - name: http\n    type: http\n    variant: exchange\n    port: 8080\n",
+        )
+        .unwrap();
+        let graph = project.join("graph.yaml");
+        std::fs::write(
+            &graph,
+            "modules:\n  - name: feeder\ninclude:\n  - stack: http_client.yaml\n    as: http_tls\n\
+             wiring:\n  - from: feeder.data_out\n    to: http_tls.request_in\n",
+        )
+        .unwrap();
+        let config = crate::stack_expand::load_graph(&graph, &project).expect("expands");
+        let instance = config["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["type"] == "http")
+            .and_then(|m| m["name"].as_str())
+            .expect("the stack's http instance")
+            .to_string();
+        assert_ne!(instance, "http", "the include renames the instance");
+        builds_whole(&config, &r, &instance);
     }
 }

@@ -317,6 +317,16 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| Error::Module(format!("unreadable module dir: {}", dir.display())))?
                 .to_string();
+            // `-` separates a type from its variant in an artefact name
+            // (`<type>-<variant>`), so a type name never carries one: that is
+            // what lets a pin named `T-<v>` be read as a variant of `T` alone.
+            if name.contains('-') {
+                return Err(Error::Module(format!(
+                    "{}: module directory '{name}' names a type with `-`, which separates a \
+                     type from its variant in artefact names; rename it (`_` is allowed)",
+                    dir.display()
+                )));
+            }
             let raw_text = std::fs::read_to_string(&manifest).map_err(Error::from)?;
             let raw: ManifestRaw = toml::from_str(&raw_text)
                 .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
@@ -384,11 +394,10 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                     all.sort();
                     all.dedup();
                     for v in &variants {
-                        let artifact = if v.default {
-                            name.clone()
-                        } else {
-                            format!("{name}-{}", v.name)
-                        };
+                        let artifact = crate::module_resolver::artifact_name(
+                            &name,
+                            (!v.default).then_some(v.name.as_str()),
+                        );
                         out.push(Candidate {
                             name: artifact,
                             embed_name: name.clone(),

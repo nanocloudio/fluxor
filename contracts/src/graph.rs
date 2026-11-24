@@ -322,11 +322,21 @@ impl core::fmt::Display for DecodeError {
 // ── Decode ──────────────────────────────────────────────────────────────────
 
 fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
+    u16::from_le_bytes(field(b, at))
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    u32::from_le_bytes(field(b, at))
+}
+
+/// The `N` bytes at `at`, zeros past the end: every read is of a blob the
+/// decoder has bounded already, and none can panic (a module links these).
+fn field<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (o, v) in out.iter_mut().zip(b.iter().skip(at)) {
+        *o = *v;
+    }
+    out
 }
 
 const fn aligned(len: usize) -> usize {
@@ -412,9 +422,7 @@ impl<'a> ComposedGraph<'a> {
 
     /// The stepping order: module indices, the first to step first.
     pub fn order(&self) -> impl ExactSizeIterator<Item = u16> + 'a {
-        self.order
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        crate::records::<2>(self.order).map(|b| le16(b, 0))
     }
 
     /// The module records, in index order.
@@ -428,7 +436,7 @@ impl<'a> ComposedGraph<'a> {
 
     /// The edge records, in blob order.
     pub fn edges(&self) -> impl ExactSizeIterator<Item = EdgeRecord> + 'a {
-        self.edges.chunks_exact(EDGE_LEN).map(read_edge)
+        crate::records::<EDGE_LEN>(self.edges).map(|r| read_edge(r))
     }
 
     /// Edge `i`, or `None` past the last.

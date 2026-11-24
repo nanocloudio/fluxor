@@ -533,28 +533,6 @@ impl Stack {
             .collect()
     }
 
-    /// Each module's artifact and type, deduplicated: the type for the
-    /// default variant, `<type>-<variant>` for a module that names one —
-    /// the artifact a build resolves for it (a named variant never falls
-    /// back to the bare type). `variant:` is an identity key, never a
-    /// param, so the artifacts are known without rendering.
-    pub fn module_artifacts(&self) -> BTreeSet<(String, String)> {
-        self.modules
-            .iter()
-            .filter_map(|m| {
-                let ty = m
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .or_else(|| m.get("name").and_then(|n| n.as_str()))?;
-                let artifact = match m.get("variant").and_then(|v| v.as_str()) {
-                    Some(v) => format!("{ty}-{v}"),
-                    None => ty.to_string(),
-                };
-                Some((artifact, ty.to_string()))
-            })
-            .collect()
-    }
-
     /// Render the stack with its defaults and examples, the values a
     /// check without a consumer uses. A file example names a sample
     /// relative to `dir`, the stack's own directory.
@@ -1460,72 +1438,144 @@ pub fn read_pinned(store: &OciStore, e: &Artifact) -> Result<PinnedStack> {
     Ok(PinnedStack { text, modules })
 }
 
-/// The module artifacts a stack composes, per target — each module's
-/// variant artifact when it names one ([`Stack::module_artifacts`]) —
-/// resolved through the publishing project: its own published modules
-/// first, then the module pins of its `fluxor.lock`. A native module has no artifact and
-/// is carried by every runtime. A module that resolves neither way is
-/// refused: the stack would name a module no consumer could find.
+/// The module artefacts a stack composes, per target, each module resolved
+/// by `r` — the publishing project's resolver, for no ABI — as a build of
+/// the stack's graph resolves it. A module of the publishing project takes
+/// its references from `own`, that project's module artefacts (staged by
+/// the same publish, or already published); a pinned module takes every pin
+/// of the artefact that resolved; a native module has none. A module that
+/// resolves nowhere, or whose references are missing, is refused: the stack
+/// would name a module no consumer could find.
 pub fn module_references(
     stack: &Stack,
-    project_root: &Path,
-    project: &str,
-    store: &OciStore,
+    r: &crate::module_resolver::ModuleResolver,
+    own: &[Artifact],
 ) -> Result<Vec<Artifact>> {
-    let own: Vec<Artifact> = store_resolve::resolve_dependency(store, project, None)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.kind == "module")
-        .collect();
-    let pins: Vec<Artifact> = store_resolve::read_store_lock(project_root)?
-        .map(|l| l.artifacts)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.kind == "module")
-        .collect();
-    let mut out = Vec::new();
-    let mut missing = Vec::new();
-    for (artifact, ty) in stack.module_artifacts() {
-        let mine: Vec<&Artifact> = own.iter().filter(|a| a.name == artifact).collect();
-        let found: Vec<&Artifact> = if mine.is_empty() {
-            pins.iter().filter(|a| a.name == artifact).collect()
-        } else {
-            mine
+    use crate::module_resolver::{entry_identity, Origin};
+    let mut out: Vec<Artifact> = Vec::new();
+    let mut errors = Vec::new();
+    for entry in &stack.modules {
+        let entry = serde_json::to_value(entry).unwrap_or_default();
+        let Some((name, ty, variant)) = entry_identity(&entry) else {
+            errors.push(format!("module entry {entry} names no module"));
+            continue;
         };
-        if found.is_empty() {
-            if !crate::modules::is_native_module(&ty) {
-                missing.push(artifact);
+        let a = match r.require(name, ty, variant) {
+            Ok(a) => a,
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
             }
+        };
+        if a.is_native() {
             continue;
         }
-        out.extend(found.into_iter().cloned());
+        let found: Vec<Artifact> = match &a.origin {
+            Origin::Pinned { .. } => r.pins_of(&a.artifact),
+            _ => own
+                .iter()
+                .filter(|o| o.name == a.artifact)
+                .cloned()
+                .collect(),
+        };
+        if found.is_empty() {
+            errors.push(format!(
+                "{} resolves to this project's artefact '{}', which it neither publishes in \
+                 this sweep nor has published — publish the project's modules (`fluxor \
+                 publish fmod`)",
+                a.label(),
+                a.artifact
+            ));
+        }
+        for f in found {
+            if !out.iter().any(|o| o.name == f.name && o.target == f.target) {
+                out.push(f);
+            }
+        }
     }
-    if !missing.is_empty() {
+    if !errors.is_empty() {
         return Err(Error::Config(format!(
-            "stack '{}' composes {} — neither published by project '{project}' nor pinned \
-             in its fluxor.lock. Publish the project's modules (`fluxor publish fmod`) or pin \
-             the module, then publish the stack",
+            "stack '{}': {}",
             stack.name,
-            missing.join(", ")
+            errors.join("\n")
         )));
     }
     store_resolve::sort_entries(&mut out);
     Ok(out)
 }
 
-/// The entries a stack reference pins: the stack and every module
-/// reference it carries, except the consumer's own modules (it builds those
-/// itself). A module the consumer already pins for the same target keeps
-/// the consumer's pin — it chose that module, and one image carries one
+/// A project's module artefacts as they will stand after a publish — staged
+/// by it, or already in the store — with the `.fmod` bytes (by digest) each
+/// one carries: what its stacks reference and what its packages may ship.
+#[derive(Debug, Clone, Default)]
+pub struct OwnModules {
+    pub artifacts: Vec<Artifact>,
+    /// `(name, target, .fmod layer digest)` of each.
+    fmods: Vec<(String, Option<String>, String)>,
+}
+
+impl OwnModules {
+    /// `artifacts`, each image manifest read from `staged` (the plan's
+    /// manifest blobs, by digest) or else from `store`.
+    pub fn new(store: &OciStore, artifacts: Vec<Artifact>, staged: &[(String, Vec<u8>)]) -> Self {
+        use crate::oci_store::{ImageManifest, MT_FLUXOR_MODULE};
+        let mut fmods = Vec::new();
+        for a in &artifacts {
+            let bytes = match staged.iter().find(|(d, _)| *d == a.digest) {
+                Some((_, b)) => Some(b.clone()),
+                None => store.read_blob(&a.digest).ok(),
+            };
+            let Some(image) = bytes.and_then(|b| serde_json::from_slice::<ImageManifest>(&b).ok())
+            else {
+                continue;
+            };
+            for l in image
+                .layers
+                .iter()
+                .filter(|l| l.media_type == MT_FLUXOR_MODULE)
+            {
+                fmods.push((a.name.clone(), a.target.clone(), l.digest.clone()));
+            }
+        }
+        OwnModules { artifacts, fmods }
+    }
+
+    /// What project `project` has published to `store`.
+    pub fn published(store: &OciStore, project: &str) -> Self {
+        Self::new(store, published_modules(store, project), &[])
+    }
+
+    /// Whether artefact `name` for `target` is published carrying the
+    /// `.fmod` whose digest is `digest`.
+    pub fn holds(&self, name: &str, target: &str, digest: &str) -> bool {
+        self.fmods
+            .iter()
+            .any(|(n, t, d)| n == name && t.as_deref() == Some(target) && d == digest)
+    }
+}
+
+/// The module artefacts project `project` has published to `store`.
+pub fn published_modules(store: &OciStore, project: &str) -> Vec<Artifact> {
+    store_resolve::resolve_dependency(store, project, None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.kind == "module")
+        .collect()
+}
+
+/// The entries a stack or package reference pins: the reference and every
+/// module reference it carries, except the consumer's own modules (it builds
+/// those itself). A module the consumer already pins for the same target
+/// keeps the consumer's pin — it chose that module, and one image carries one
 /// build of a type; each such case is returned as a note.
-fn merge_stack_pins(
+fn merge_derived_pins(
     entries: &mut Vec<Artifact>,
     stack: &Artifact,
     modules: &[Artifact],
     me: Option<&str>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
-    entries.retain(|e| !(e.kind == KIND && e.name == stack.name));
+    entries.retain(|e| !(e.kind == stack.kind && e.name == stack.name));
     entries.push(stack.clone());
     for m in modules {
         if Some(m.project.as_str()) == me {
@@ -1537,12 +1587,13 @@ fn merge_stack_pins(
         match held {
             Some(h) if h.digest == m.digest => {}
             Some(h) => notes.push(format!(
-                "note: module {} ({}) stays at this project's pin {} ({}); stack '{}' \
+                "note: module {} ({}) stays at this project's pin {} ({}); {} '{}' \
                  was published against {}",
                 m.name,
                 m.target.as_deref().unwrap_or("any target"),
                 h.reference,
                 h.digest,
+                stack.kind,
                 stack.name,
                 m.digest
             )),
@@ -1552,35 +1603,89 @@ fn merge_stack_pins(
     notes
 }
 
-/// The lock entries one stack reference pins: the stack, and the module
-/// references it carries.
+/// The lock entries one stack or package reference pins: the reference, and
+/// the module references it carries — a stack's as it recorded them, a
+/// package's found by the bytes it carries ([`package_module_pins`]).
 pub fn derived_pins(
     store: &OciStore,
-    stack: &Artifact,
+    reference: &Artifact,
     out: &mut Vec<Artifact>,
     me: Option<&str>,
 ) -> Result<()> {
-    let pinned = read_pinned(store, stack)?;
-    let doc = Stack::parse(&pinned.text).map_err(|e| {
-        Error::Config(format!(
-            "stack '{}' ({}) does not parse:\n{e}",
-            stack.name, stack.digest
-        ))
-    })?;
-    if doc.name != stack.name {
-        return Err(Error::Config(format!(
-            "'{}' ({}) holds stack '{}', not '{}'",
-            stack.reference, stack.digest, doc.name, stack.name
-        )));
-    }
-    let mut stack = stack.clone();
-    let mut modules = pinned.modules;
-    store_resolve::fill_content(store, std::slice::from_mut(&mut stack));
+    let mut modules = if reference.kind == KIND {
+        let pinned = read_pinned(store, reference)?;
+        let doc = Stack::parse(&pinned.text).map_err(|e| {
+            Error::Config(format!(
+                "stack '{}' ({}) does not parse:\n{e}",
+                reference.name, reference.digest
+            ))
+        })?;
+        if doc.name != reference.name {
+            return Err(Error::Config(format!(
+                "'{}' ({}) holds stack '{}', not '{}'",
+                reference.reference, reference.digest, doc.name, reference.name
+            )));
+        }
+        pinned.modules
+    } else {
+        package_module_pins(store, reference)?
+    };
+    let mut reference = reference.clone();
+    store_resolve::fill_content(store, std::slice::from_mut(&mut reference));
     store_resolve::fill_content(store, &mut modules);
-    for note in merge_stack_pins(out, &stack, &modules, me) {
+    for note in merge_derived_pins(out, &reference, &modules, me) {
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// The module artefacts a pinned package carries: for each `.fmod` layer, the
+/// published module artefact of that name whose `.fmod` is those bytes. A
+/// package's producer publishes the modules it ships, so each is found; one
+/// no project publishes is refused, naming it.
+fn package_module_pins(store: &OciStore, package: &Artifact) -> Result<Vec<Artifact>> {
+    use crate::oci_store::{ImageManifest, ANN_TITLE, MT_FLUXOR_MODULE};
+    let read = |digest: &str| -> Result<ImageManifest> {
+        serde_json::from_slice(&store.read_blob(digest)?)
+            .map_err(|e| Error::Config(format!("{digest}: corrupt manifest: {e}")))
+    };
+    let image = read(&package.digest)?;
+    let mut published: Vec<Artifact> = Vec::new();
+    for project in store.project_indexes()? {
+        published.extend(published_modules(store, &project));
+    }
+    let mut out = Vec::new();
+    for layer in image
+        .layers
+        .iter()
+        .filter(|l| l.media_type == MT_FLUXOR_MODULE)
+    {
+        let name = layer
+            .annotations
+            .get(ANN_TITLE)
+            .and_then(|t| t.strip_suffix(".fmod"))
+            .unwrap_or_default();
+        let found = published.iter().find(|m| {
+            m.name == name
+                && read(&m.digest).is_ok_and(|i| {
+                    i.layers
+                        .iter()
+                        .any(|l| l.media_type == MT_FLUXOR_MODULE && l.digest == layer.digest)
+                })
+        });
+        match found {
+            Some(m) => out.push(m.clone()),
+            None => {
+                return Err(Error::Config(format!(
+                    "package '{}' ({}) carries module '{name}' ({}), which no project in the \
+                     store publishes: the package's producer publishes the modules it ships",
+                    package.name, package.reference, layer.digest
+                )))
+            }
+        }
+    }
+    store_resolve::sort_entries(&mut out);
+    Ok(out)
 }
 
 /// The reference a stack publishes under: `stack/<name>:<version>`,
@@ -1633,11 +1738,9 @@ pub fn read_for_publish(path: &Path) -> Result<(Stack, Vec<u8>)> {
     Ok((stack, bytes))
 }
 
-/// What a publish sweep checks of a stack before it writes anything: the
-/// document, as [`read_for_publish`] checks it, and that every module type
-/// it composes will have a reference to record — a native module, a
-/// module of the publishing project (which the same sweep publishes first),
-/// or a module its `fluxor.lock` pins. Returns the reference the stack
+/// What a publish checks of a stack document before resolving its modules:
+/// the document, as [`read_for_publish`] checks it, published from the
+/// project's `packaging/stack/<name>.yaml`. Returns the reference the stack
 /// publishes under.
 pub fn check_publishable(path: &Path, project_root: &Path) -> Result<String> {
     let (stack, _) = read_for_publish(path)?;
@@ -1649,35 +1752,6 @@ pub fn check_publishable(path: &Path, project_root: &Path) -> Result<String> {
             path.display(),
             stack.name,
             at.display()
-        )));
-    }
-    let own: BTreeSet<String> = crate::modules_build::list(project_root)?
-        .into_iter()
-        .map(|m| m.name)
-        .collect();
-    let pinned: BTreeSet<String> = store_resolve::read_store_lock(project_root)?
-        .map(|l| l.artifacts)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.kind == "module")
-        .map(|a| a.name)
-        .collect();
-    let missing: Vec<String> = stack
-        .module_artifacts()
-        .into_iter()
-        .filter(|(artifact, ty)| !own.contains(ty) && !pinned.contains(artifact))
-        .filter(|(_, ty)| !crate::modules::is_native_module(ty))
-        .map(|(artifact, _)| artifact)
-        .collect();
-    if !missing.is_empty() {
-        return Err(Error::Config(format!(
-            "{}: stack '{}' composes {} — neither a module of this project, nor a kernel \
-             native module, nor pinned from a dependency in its fluxor.lock, so the stack would name \
-             a module no consumer could find. Declare the dependency that publishes it and run \
-             `fluxor update`, then publish",
-            path.display(),
-            stack.name,
-            missing.join(", ")
         )));
     }
     publish_ref(&stack, None)
@@ -2726,14 +2800,13 @@ wiring:
     fn the_check_render_uses_defaults_and_examples() {
         let s = Stack::parse(VOLUME).unwrap();
         s.check_render(Path::new(".")).unwrap();
-        let artifacts: Vec<String> = s.module_artifacts().into_iter().map(|(a, _)| a).collect();
-        assert_eq!(artifacts, ["crypt_block", "file_block"]);
     }
 
     /// A module that names a variant composes that variant's artifact,
     /// `<type>-<variant>`, and the stack records and pins that one: a
     /// consumer pinning only the bare type would build with whatever
-    /// variant happens to be on disk.
+    /// variant happens to be on disk. A variant no pin carries is refused,
+    /// naming the artefact it would be.
     #[test]
     fn a_variant_module_is_referenced_by_its_variant_artifact() {
         let s = Stack::parse(&VOLUME.replace(
@@ -2741,34 +2814,38 @@ wiring:
             "    type: crypt_block\n    variant: slim\n",
         ))
         .unwrap();
-        assert_eq!(
-            s.module_artifacts().into_iter().collect::<Vec<_>>(),
-            [
-                ("crypt_block-slim".to_string(), "crypt_block".to_string()),
-                ("file_block".to_string(), "file_block".to_string()),
-            ]
-        );
-
-        // Resolved through the publisher's pins: the variant artifact, not
-        // the bare type it is a variant of.
         let sb = Sandbox::new();
-        let store = OciStore::open(sb.path().join("store")).unwrap();
+        let store_root = sb.path().join("store");
+        let store = OciStore::open(store_root.clone()).unwrap();
+        let variants = "version = \"1.0.0\"\n\n[[variant]]\nname = \"full\"\ndefault = true\nfeatures = []\n\n\
+                        [[variant]]\nname = \"slim\"\nfeatures = []\n";
         let pins = vec![
-            module_ref(&store, "crypt_block", "storage"),
-            module_ref(&store, "crypt_block-slim", "storage"),
+            module_ref_with(&store, "crypt_block", "storage", variants),
+            module_ref_with(&store, "crypt_block-slim", "storage", variants),
             module_ref(&store, "file_block", "storage"),
         ];
+        let resolver = || {
+            crate::module_resolver::ModuleResolver::new(crate::module_resolver::ResolverSpec {
+                project_root: sb.path().to_path_buf(),
+                abi: crate::module_resolver::Abi::Unplaced,
+                shelf: None,
+                search_paths: Vec::new(),
+                install_root: None,
+                store_dir: Some(store_root.clone()),
+            })
+            .unwrap()
+        };
         store_resolve::write_store_lock(sb.path(), &pins).unwrap();
-        let refs = module_references(&s, sb.path(), "publisher", &store).unwrap();
+        let refs = module_references(&s, &resolver(), &[]).unwrap();
         let names: Vec<&str> = refs.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["crypt_block-slim", "file_block"]);
 
-        // A variant nobody publishes is named as the artifact it would be.
         store_resolve::write_store_lock(sb.path(), &pins[..1]).unwrap();
-        let e = module_references(&s, sb.path(), "publisher", &store)
+        let e = module_references(&s, &resolver(), &[])
             .unwrap_err()
             .to_string();
-        assert!(e.contains("composes crypt_block-slim, file_block"), "{e}");
+        assert!(e.contains("not as crypt_block-slim"), "{e}");
+        assert!(e.contains("file_block"), "{e}");
     }
 
     // ── store-pinned includes ──────────────────────────────────────────
@@ -2806,13 +2883,18 @@ wiring:
     }
 
     fn module_ref(store: &OciStore, name: &str, project: &str) -> Artifact {
+        module_ref_with(store, name, project, "version = \"1.0.0\"\n")
+    }
+
+    /// [`module_ref`] carrying `manifest` as its `manifest.toml`.
+    fn module_ref_with(store: &OciStore, name: &str, project: &str, manifest: &str) -> Artifact {
         let desc = crate::oci_store::publish_module(
             store,
             &crate::oci_store::ModulePublish {
                 name,
                 target: "aarch64",
                 fmod_bytes: name.as_bytes(),
-                manifest_toml: Some("version = \"1.0.0\"\n"),
+                manifest_toml: Some(manifest),
                 provenance: crate::oci_store::PROVENANCE_LOCAL,
                 source_rev: None,
                 ref_name: &format!("aarch64/{name}:0.1.0"),
@@ -3102,7 +3184,7 @@ wiring:
             project: "me".into(),
             ..entries[0].clone()
         };
-        let notes = merge_stack_pins(&mut entries, &stack, &[theirs, own], Some("me"));
+        let notes = merge_derived_pins(&mut entries, &stack, &[theirs, own], Some("me"));
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
             notes[0].contains("stays at this project's pin"),

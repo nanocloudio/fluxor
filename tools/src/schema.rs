@@ -4,11 +4,8 @@
 //! No module-specific knowledge — everything is driven by the schema.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde_json::Value;
-
-use crate::modules::ModuleInfo;
 
 /// Route `handler` ids, from the SDK that the serving module also compiles
 /// against. Deriving the byte here and switching on it there are two halves
@@ -1517,167 +1514,47 @@ fn pack_voice_inner(
     Ok(pos)
 }
 
-/// Load the param schema for a module type from its `.fmod`.
-///
-/// The schema is generated at build time from the module's `define_params!`
-/// and lives ONLY in the `.fmod` (not the manifest), so config generation must
-/// read the actual artifact to encode a module's params. When the `.fmod` is
-/// absent from `loc.dir` the module may be a store-pinned provider composed
-/// in from a sibling project: resolve it from the OCI store exactly as the
-/// module TABLE builder (`parse_modules_from_config_multi`) does, else the
-/// provider's params (e.g. a connector `authority`) silently drop and the
-/// module runs unconfigured. `loc.abi` is the build's
-/// `TargetDescriptor::module_abi()`, the ABI tag on the `fluxor.lock`
-/// pins consulted below.
-///
-/// Three outcomes, deliberately distinguishable:
-///   - `Ok(Some(schema))` — the module's `.fmod` was found: its schema, or
-///     [`ParamSchema::empty`] for a module declaring no params, so every key
-///     a graph sets on it is checked either way.
-///   - `Ok(None)` — no `.fmod` was found: a native module (schema lives in
-///     its `manifest.toml`), or an unpinned module whose `.fmod` simply isn't
-///     built (the module-table builder reports that one separately).
-///   - `Err` — the module IS pinned in `fluxor.lock` but its pinned artifact
-///     could not be resolved. Failing closed here mirrors
-///     `config::assert_module_manifests_resolvable` on the manifest half of the
-///     same pin: a pinned module that hard-fails port validation must not
-///     silently build with its params dropped.
-pub fn load_schema_for_module(
-    module_type: &str,
-    loc: ModuleLocation<'_>,
+/// The param schema of a resolved module: a native module's from its
+/// manifest's `[[params]]`; a built PIC module's from its `.fmod`
+/// ([`ParamSchema::empty`] when it declares none, so every key a graph sets
+/// is checked either way); `None` for a PIC module with no build at hand
+/// (`build --check` ahead of `fluxor modules build`), or one resolved with
+/// no module ABI.
+pub fn param_schema(
+    a: &crate::module_resolver::ModuleArtifact,
 ) -> crate::Result<Option<ParamSchema>> {
-    load_schema_for_artifact(module_type, module_type, loc)
-}
-
-/// The schema of the artefact a graph module entry loads: `<type>-<variant>`
-/// when the entry names a `variant:`, as the packer resolves it, else
-/// `<type>`. A project may hold only a variant's artefact (a stack that pins
-/// `http-exchange` and nothing else), and a lookup by the bare type then
-/// finds no schema and packs the instance with no params at all — it runs
-/// on its defaults without a word. The bare type is still tried after the
-/// variant, since every variant of a module is built from one params table.
-pub fn load_schema_for_entry(
-    entry: &serde_json::Value,
-    module_type: &str,
-    loc: ModuleLocation<'_>,
-) -> crate::Result<Option<ParamSchema>> {
-    if let Some(variant) = entry.get("variant").and_then(|v| v.as_str()) {
-        let artifact = format!("{module_type}-{variant}");
-        if let Some(schema) = load_schema_for_artifact(&artifact, module_type, loc)? {
-            return Ok(Some(schema));
-        }
+    if a.is_native() {
+        return Ok(Some(ParamSchema::from_manifest(&a.manifest)));
     }
-    load_schema_for_module(module_type, loc)
-}
-
-/// [`load_schema_for_module`] for one artefact name, which differs from the
-/// module type only for a non-default variant.
-fn load_schema_for_artifact(
-    artifact: &str,
-    module_type: &str,
-    loc: ModuleLocation<'_>,
-) -> crate::Result<Option<ParamSchema>> {
-    let fmod_path = loc.dir.join(format!("{artifact}.fmod"));
-    let info = if fmod_path.exists() {
-        match ModuleInfo::from_file(&fmod_path) {
-            Ok(i) => i,
-            Err(_) => return Ok(None),
-        }
-    } else {
-        // The lock pins a variant under its artefact name (`http-exchange`).
-        let Some(pinned) = resolve_pinned_fmod(artifact, loc)? else {
-            return Ok(None);
-        };
-        ModuleInfo::from_file(&pinned.path)
-            .map_err(|e| pinned_schema_error(module_type, &format!("{}: {e}", pinned.pin_label)))?
-    };
-    let Some(data) = info.schema.as_ref() else {
+    if !a.is_built() {
+        return Ok(None);
+    }
+    let Some(data) = a.schema_bytes()? else {
         return Ok(Some(ParamSchema::empty()));
     };
     ParamSchema::from_bytes(data).map(Some).ok_or_else(|| {
         crate::Error::Config(format!(
-            "module '{module_type}': the param schema in its artefact '{artifact}' is malformed"
+            "{}: the param schema in its artefact '{}' ({}) is malformed",
+            a.label(),
+            a.artifact,
+            a.from()
         ))
     })
 }
 
-/// Where one build reads module artefacts from, and what that location
-/// means: `dir` holds the `.fmod`s of `abi` (the abi tag on the
-/// `fluxor.lock` pins consulted when one is absent), for the project at
-/// `project_root`. The three are stated by the caller, never inferred from
-/// the directory's name or position: `--module-root` can name any path.
-#[derive(Debug, Clone, Copy)]
-pub struct ModuleLocation<'a> {
-    pub dir: &'a Path,
-    pub abi: &'a str,
-    pub project_root: &'a Path,
-}
-
-/// A pin that resolved to real bytes, carrying the label the error path
-/// quotes when those bytes turn out to be unreadable.
-struct PinnedFmod {
-    path: std::path::PathBuf,
-    pin_label: String,
-}
-
-/// `pin <reference> (<digest>)` for the `[[artifact]]` module entry
-/// covering `module_type` on `abi` — the same label the
-/// manifest-side resolver quotes, so a broken artifact reports one
-/// identity from both halves. Degrades to the abi alone when the
-/// lockfile can't be re-read.
-fn pin_label(project_root: &Path, module_type: &str, abi: &str) -> String {
-    let pin = fluxor_tools::store_resolve::read_store_lock(project_root)
-        .ok()
-        .flatten()
-        .and_then(|l| {
-            l.artifacts.into_iter().find(|a| {
-                a.kind == "module" && a.name == module_type && a.target.as_deref() == Some(abi)
-            })
-        });
-    match pin {
-        Some(p) => format!("pin {} ({})", p.reference, p.digest),
-        None => format!("pin target '{abi}'"),
-    }
-}
-
-/// Sibling wording of `assert_module_manifests_resolvable`'s error so the two
-/// halves of a broken pin — manifest and params — read as one failure class.
-fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
-    crate::Error::Config(format!(
-        "module '{module_type}' is pinned in fluxor.lock but its param schema could not be \
-         resolved from the OCI store: {why}"
-    ))
-}
-
-/// Resolve a module's `.fmod` path from the project's `[[artifact]]` module pins when
-/// it is absent on disk, for `loc.abi` in the project at `loc.project_root`.
-///
-/// `Ok(None)` means no pin covers this name (or the location names no
-/// abi); `Err` means one does and it is unresolvable (missing/corrupt
-/// blob, integrity failure, unreadable store or lockfile), which is a hard
-/// error rather than a silent drop to "no params".
-fn resolve_pinned_fmod(
-    module_type: &str,
-    loc: ModuleLocation<'_>,
-) -> crate::Result<Option<PinnedFmod>> {
-    if loc.abi.is_empty() {
-        return Ok(None);
-    }
-    let abi = loc.abi.to_string();
-    let project_root = loc.project_root.to_path_buf();
-    let Some(resolver) = crate::store_cli::lock_store_resolver(&project_root, &abi, None) else {
+/// The param schema of the module a graph entry names, as `r` resolves it.
+/// `None` for a module `r` finds nowhere (refused where the graph's modules
+/// are resolved) and as [`param_schema`].
+pub fn entry_schema(
+    entry: &serde_json::Value,
+    r: &crate::module_resolver::ModuleResolver,
+) -> crate::Result<Option<ParamSchema>> {
+    let Some((_, ty, variant)) = crate::module_resolver::entry_identity(entry) else {
         return Ok(None);
     };
-    match resolver(module_type) {
-        crate::modules::StorePin::Resolved(path) => Ok(Some(PinnedFmod {
-            path,
-            pin_label: pin_label(&project_root, module_type, &abi),
-        })),
-        crate::modules::StorePin::NotPinned => Ok(None),
-        crate::modules::StorePin::Failed(why) => Err(pinned_schema_error(
-            module_type,
-            &format!("{}: {why}", pin_label(&project_root, module_type, &abi)),
-        )),
+    match r.resolve(ty, variant)? {
+        Some(a) => param_schema(&a),
+        None => Ok(None),
     }
 }
 
@@ -2353,198 +2230,6 @@ mod tests {
             handler_of(serde_json::json!({"path": "/", "body": "hi"})),
             Some(0)
         );
-    }
-
-    /// Build a throwaway project root holding a `fluxor.lock` that pins
-    /// `pinned_conn` to a digest no store contains, plus an empty store the
-    /// resolver is pointed at. Returns (project, store, modules_dir).
-    fn pinned_but_missing_fixture() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
-        let project = tempfile::tempdir().expect("tempdir-project");
-        let store = tempfile::tempdir().expect("tempdir-store");
-        std::fs::write(project.path().join(".fluxor"), b"").expect("project marker");
-        std::fs::write(
-            project.path().join("fluxor.lock"),
-            "[[artifact]]\n\
-             kind = \"module\"\n\
-             name = \"pinned_conn\"\n\
-             project = \"local\"\n\
-             target = \"aarch64\"\n\
-             digest = \"sha256:\
-             0000000000000000000000000000000000000000000000000000000000000000\"\n\
-             reference = \"local/pinned_conn:1\"\n",
-        )
-        .expect("write lockfile");
-        let modules_dir = project
-            .path()
-            .join("target")
-            .join("fluxor")
-            .join("aarch64")
-            .join("modules");
-        std::fs::create_dir_all(&modules_dir).expect("modules dir");
-        (project, store, modules_dir)
-    }
-
-    /// A module pinned in `fluxor.lock` whose artifact the store cannot
-    /// produce must ABORT the build naming module, pin and cause — never
-    /// collapse to "this module has no params" and pack an empty TLV
-    /// section, which ships the module unconfigured (a connector with no
-    /// `endpoint`). Sibling of `config::assert_module_manifests_resolvable`,
-    /// which already fails closed on the manifest half of the same pin.
-    #[test]
-    fn pinned_module_with_unresolvable_store_is_a_hard_error() {
-        let (project, store, modules_dir) = pinned_but_missing_fixture();
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-
-        let loc = ModuleLocation {
-            dir: &modules_dir,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let err = load_schema_for_module("pinned_conn", loc)
-            .expect_err("pinned module with no store artifact must fail closed");
-        let msg = err.to_string();
-        assert!(msg.contains("pinned_conn"), "names the module: {msg}");
-        assert!(msg.contains("fluxor.lock"), "names the lockfile: {msg}");
-        assert!(
-            msg.contains("pin local/pinned_conn:1") && msg.contains("sha256:0000"),
-            "names the pin reference and digest: {msg}"
-        );
-        assert!(
-            msg.contains("could not be resolved from the OCI store"),
-            "reads as a sibling of the manifest failure: {msg}"
-        );
-    }
-
-    /// The other two outcomes stay `Ok(None)`: a module the pins don't cover
-    /// and whose `.fmod` isn't on disk is "no schema here" — the native module
-    /// lookup and the module-table builder handle that case, so turning it
-    /// into an error would break every native module.
-    #[test]
-    fn unpinned_module_without_fmod_reports_no_schema() {
-        let (project, store, modules_dir) = pinned_but_missing_fixture();
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-
-        let loc = ModuleLocation {
-            dir: &modules_dir,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let schema = load_schema_for_module("not_pinned_anywhere", loc).expect("not a hard error");
-        assert!(schema.is_none(), "no pin, no .fmod → no schema");
-    }
-
-    /// A module whose `.fmod` is found and carries no schema declares no
-    /// params: the empty schema, against which every key is checked, never
-    /// "no schema here", which would check none.
-    #[test]
-    fn a_found_module_without_a_schema_has_the_empty_schema() {
-        let (project, store, modules_dir) = pinned_but_missing_fixture();
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-        let header = fluxor_abi::wire::fmod::header::Header {
-            magic: crate::modules::MODULE_MAGIC,
-            version: 1,
-            abi_version: 1,
-            module_type: 1,
-            flags: 0,
-            code_size: 0,
-            data_size: 0,
-            export_count: 0,
-            schema_size: 0,
-            manifest_size: 0,
-            step_period: 0,
-            step_phase: 0,
-            name: [0u8; 32],
-        };
-        std::fs::write(modules_dir.join("bare.fmod"), header.to_bytes()).expect("write fmod");
-        let loc = ModuleLocation {
-            dir: &modules_dir,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let schema = load_schema_for_module("bare", loc)
-            .expect("a readable .fmod")
-            .expect("a found module has a schema");
-        assert!(schema.params.is_empty(), "it declares no params");
-    }
-
-    /// An entry naming a `variant:` reads the schema of the artefact the
-    /// packer loads, `<type>-<variant>`, which the lock pins under that name.
-    /// With only `pinned-exchange` pinned, the lookup must reach that pin (and
-    /// fail closed on it) rather than look for a bare `pinned` and pack the
-    /// instance with no params.
-    #[test]
-    fn a_variant_entry_reads_its_own_artifact_schema() {
-        let (project, store, modules_dir) = pinned_but_missing_fixture();
-        let lock = project.path().join("fluxor.lock");
-        let pinned = std::fs::read_to_string(&lock).expect("lockfile");
-        std::fs::write(&lock, pinned.replace("pinned_conn", "pinned-exchange")).expect("relock");
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-        let loc = ModuleLocation {
-            dir: &modules_dir,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let entry = serde_json::json!({ "name": "c", "type": "pinned", "variant": "exchange" });
-        let err = load_schema_for_entry(&entry, "pinned", loc)
-            .expect_err("the variant's pin is consulted, and its artefact is missing");
-        assert!(
-            err.to_string().contains("pin local/pinned-exchange:1"),
-            "{err}"
-        );
-        // Without the variant the same type finds nothing: no pin, no .fmod.
-        let bare = serde_json::json!({ "name": "c", "type": "pinned" });
-        assert!(load_schema_for_entry(&bare, "pinned", loc)
-            .expect("no error")
-            .is_none());
-    }
-
-    /// A variant with no artefact of its own falls back to the bare type's.
-    #[test]
-    fn a_variant_entry_falls_back_to_the_type_schema() {
-        let (project, store, modules_dir) = pinned_but_missing_fixture();
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-        let loc = ModuleLocation {
-            dir: &modules_dir,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let entry = serde_json::json!({ "name": "c", "type": "pinned_conn", "variant": "web" });
-        let err = load_schema_for_entry(&entry, "pinned_conn", loc)
-            .expect_err("falls back to the type's pin");
-        assert!(err.to_string().contains("pin local/pinned_conn:1"), "{err}");
-    }
-
-    /// The abi and project come from the caller, not from where the
-    /// directory sits: a `--module-root` named `anything` still resolves the
-    /// pin for the abi the build is for, and a location naming no
-    /// abi consults no pin.
-    #[test]
-    fn the_pin_abi_comes_from_the_caller_not_the_directory_name() {
-        let (project, store, _modules_dir) = pinned_but_missing_fixture();
-        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
-        let elsewhere = project.path().join("anything");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-
-        let loc = ModuleLocation {
-            dir: &elsewhere,
-            abi: "aarch64",
-            project_root: project.path(),
-        };
-        let err = load_schema_for_module("pinned_conn", loc)
-            .expect_err("the aarch64 pin applies wherever the directory is");
-        assert!(err.to_string().contains("pinned in fluxor.lock"), "{err}");
-
-        let other = ModuleLocation {
-            abi: "thumbv8m",
-            ..loc
-        };
-        assert!(load_schema_for_module("pinned_conn", other)
-            .unwrap()
-            .is_none());
-        let none = ModuleLocation { abi: "", ..loc };
-        assert!(load_schema_for_module("pinned_conn", none)
-            .unwrap()
-            .is_none());
     }
 }
 

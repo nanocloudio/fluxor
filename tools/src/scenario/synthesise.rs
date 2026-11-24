@@ -128,8 +128,7 @@ pub fn write_document_root(scenario: &Scenario, scenario_path: &Path) -> Result<
     let root = work_dir.join("root");
     // A link inside is removed as a link: its target is never touched.
     if root.symlink_metadata().is_ok() {
-        fs::remove_dir_all(&root)
-            .map_err(|e| at(format!("cannot clear {}", root.display()), e))?;
+        fs::remove_dir_all(&root).map_err(|e| at(format!("cannot clear {}", root.display()), e))?;
     }
     fs::create_dir_all(&root).map_err(|e| at(format!("cannot create {}", root.display()), e))?;
 
@@ -163,7 +162,10 @@ pub fn write_document_root(scenario: &Scenario, scenario_path: &Path) -> Result<
     let sites: Vec<(Option<&ServeBinding>, &str)> = if serves.is_empty() {
         vec![(None, "/")]
     } else {
-        serves.iter().map(|s| (Some(*s), s.prefix.as_str())).collect()
+        serves
+            .iter()
+            .map(|s| (Some(*s), s.prefix.as_str()))
+            .collect()
     };
     for (serve, prefix) in sites {
         let dir = place(&root, prefix, scenario_path)?;
@@ -808,26 +810,11 @@ pub fn write_component_yaml(
 /// Sharing a module ABI is not enough — bare-metal `["bcm2712"]` modules
 /// do not run under `linux`. Boards never appear in `hardware_targets` — a
 /// board id there is the level error this validator exists to catch.
-fn target_aliases(target: &str) -> Vec<String> {
-    match crate::target::load_target(target, &crate::project::root()) {
+fn target_aliases(target: &str, project_root: &Path) -> Vec<String> {
+    match crate::target::load_target(target, project_root) {
         Ok(desc) => vec![desc.runtime().to_string()],
         Err(_) => Vec::new(),
     }
-}
-
-/// Standard module-search directories: the one layer list
-/// (`manifest::MODULE_LAYERS`), so the scenario validator sees exactly
-/// the manifests the builder and config resolution see.
-const STANDARD_MANIFEST_DIRS: &[&str] = crate::manifest::MODULE_LAYERS;
-
-/// Slim toml schema for `validate_module_targets`. We re-parse the
-/// manifest here (rather than going through `tools::manifest::Manifest`)
-/// because the parsed `Manifest` struct lossy-encodes hardware_targets
-/// into a u16 RP-family mask — losing the original strings we need to
-/// cite back to the user.
-#[derive(Deserialize)]
-struct ManifestTargetsOnly {
-    hardware_targets: Option<Vec<String>>,
 }
 
 /// Walk every component's graph and check that each declared
@@ -841,7 +828,7 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
     let base = scenario_path
         .parent()
         .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
-    let project_root = crate::project::root();
+    let project_root = crate::project::root_for_config(scenario_path);
 
     for (comp_name, comp) in &scenario.components {
         let target = effective_target(scenario_path, comp);
@@ -863,7 +850,13 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
             Some(m) => m,
             None => continue,
         };
-        let aliases = target_aliases(&target);
+        let aliases = target_aliases(&target, &project_root);
+        // The graph's modules, as its build resolves them.
+        let Ok(r) =
+            crate::module_resolver::ModuleResolver::for_graph(&yaml, &graph_abs, None, None)
+        else {
+            continue; // the build path reports a resolver it cannot construct.
+        };
         for module in modules {
             let module_name = module
                 .get("name")
@@ -873,15 +866,16 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or(module_name);
-            let Some(manifest_path) = find_manifest_for(type_name, &project_root) else {
-                // A missing manifest is not this check's concern — the
-                // build path catches it with a clearer error.  Skip.
+            let variant = module.get("variant").and_then(|v| v.as_str());
+            let Ok(Some(resolved)) = r.resolve(type_name, variant) else {
+                // A module that does not resolve is not this check's
+                // concern — the build path refuses it with a clearer error.
                 continue;
             };
-            let manifest_targets = match read_manifest_hardware_targets(&manifest_path) {
-                Ok(v) => v,
-                Err(_) => continue, // unparseable manifest — build path will report.
-            };
+            let manifest_targets: Vec<&str> =
+                crate::runtime_abi::runtimes_in(resolved.manifest.hardware_targets)
+                    .map(|rt| rt.id)
+                    .collect();
             // Empty hardware_targets in the manifest is permissive
             // ("works everywhere"), which some native modules rely on.
             // Don't reject; the build path will catch any real
@@ -891,11 +885,11 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
             }
             if !manifest_targets
                 .iter()
-                .any(|m| aliases.iter().any(|a| a == m))
+                .any(|m| aliases.iter().any(|a| a.as_str() == *m))
             {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` uses module `{}` (type `{}`) — its \
-                     manifest at {} declares hardware_targets = {:?}, which does not \
+                     manifest ({}) declares hardware_targets = {:?}, which does not \
                      match the component's effective target `{}` (accepted aliases: {:?}). \
                      Either remove `runtime_override:`, or pick a different module type, \
                      or extend the manifest's hardware_targets list.",
@@ -903,7 +897,7 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
                     comp_name,
                     module_name,
                     type_name,
-                    manifest_path.display(),
+                    resolved.from(),
                     manifest_targets,
                     target,
                     aliases,
@@ -912,24 +906,6 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
         }
     }
     Ok(())
-}
-
-fn find_manifest_for(type_name: &str, project_root: &Path) -> Option<PathBuf> {
-    for dir in STANDARD_MANIFEST_DIRS {
-        let candidate = project_root.join(dir).join(type_name).join("manifest.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn read_manifest_hardware_targets(path: &Path) -> Result<Vec<String>> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| Error::Config(format!("read {}: {}", path.display(), e)))?;
-    let parsed: ManifestTargetsOnly = toml::from_str(&text)
-        .map_err(|e| Error::Config(format!("parse {}: {}", path.display(), e)))?;
-    Ok(parsed.hardware_targets.unwrap_or_default())
 }
 
 // ----------------------------------------------------------------------------

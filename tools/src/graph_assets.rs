@@ -907,6 +907,14 @@ pub fn build_all(config: &Value, graph: &Path, verbose: bool) -> Result<()> {
         return Ok(());
     }
     let project_root = crate::project::root_for_config(graph);
+    // Every step's binding names a stack before any step builds.
+    for asset in &assets {
+        if let Source::Build { binding, .. } = &asset.source {
+            crate::stack::resolve_binding(binding, &project_root).map_err(|e| {
+                Error::Config(format!("{}: {e}", step_label(graph, &asset.name, binding)))
+            })?;
+        }
+    }
     let files = asset_files(&assets, &project_root);
     for asset in &assets {
         let Source::Build {
@@ -945,6 +953,14 @@ pub fn build_all(config: &Value, graph: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// How a refusal names one build step.
+fn step_label(graph: &Path, name: &str, binding: &str) -> String {
+    format!(
+        "graph `{}`: asset '{name}' (`build: \"@{binding}\"`)",
+        graph.display()
+    )
+}
+
 /// One build step, its inputs resolved.
 struct BuildStep<'a> {
     name: &'a str,
@@ -971,10 +987,7 @@ fn build_one_asset(
         output: target,
         work_dir: dir,
     } = *step;
-    let what = format!(
-        "graph `{}`: asset '{name}' (`build: \"@{binding}\"`)",
-        graph.display()
-    );
+    let what = step_label(graph, name, binding);
     if !from.exists() {
         return Err(Error::Config(format!(
             "{what}: `from:` {} does not exist",

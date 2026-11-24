@@ -196,16 +196,16 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
 
     // Parse the YAML and walk modules. We don't reuse the full
     // generation pipeline — we just need module type + relevant fields.
-    let mut config: serde_json::Value =
-        stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
-    let target_desc = resolve_target(&config, None)?;
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
     let project_root = crate::project::root_for_config(yaml_path);
-    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let mut config = stack_expand::load_graph(yaml_path, &project_root)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        yaml_path,
+        Some(&target_desc),
+        None,
+    )?;
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
 
     let modules = match config.get("modules").and_then(|m| m.as_array()) {
         Some(m) => m,
@@ -1221,8 +1221,12 @@ fn cmd_run(
         .map_err(|e| Error::Config(e.to_string()))?;
 
     // A linux run builds its node image into a directory of its own.
-    let family =
-        resolve_target(&stack_expand::load_graph(config_path, &project_root)?, None)?.family;
+    let family = resolve_target(
+        &stack_expand::load_graph(config_path, &project_root)?,
+        None,
+        &project_root,
+    )?
+    .family;
     let images = if family == "linux" {
         Some(RunImages::new(&project_root)?)
     } else {
@@ -1255,7 +1259,8 @@ fn cmd_run(
             // the graph said.
             if let Some(pem) = ca {
                 let widened = out_dir.join("graph.operator.img");
-                let seed = crate::signing::seed(None, &crate::project::root_for_config(config_path))?;
+                let seed =
+                    crate::signing::seed(None, &crate::project::root_for_config(config_path))?;
                 workload_src::write_widened_image(&image, &widened, pem, seed.as_ref())?;
                 image = widened;
             }
@@ -1322,27 +1327,17 @@ fn cmd_run(
                 let config_blob = out_dir.join("config.bin");
                 let modules_blob = out_dir.join("modules.bin");
 
-                let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
-                let modules_dir = target_module_root(
-                    module_root,
-                    &crate::project::root_for_config(config_path),
-                    &target_desc,
-                )?;
-                if !modules_dir.exists() {
+                let (config, target_desc, r) =
+                    load_config_with_defaults(config_path, module_root, verbose)?;
+                if let Some(shelf) = r.spec().shelf.as_ref().filter(|d| !d.exists()) {
                     return Err(Error::Config(format!(
                         "Modules not found at {}. Run 'fluxor modules build --target {}' first.",
-                        modules_dir.display(),
+                        shelf.display(),
                         target_desc.id
                     )));
                 }
-                let (modules_data, config_data) = build_packaged_blobs(
-                    &config,
-                    modules_dir.as_path(),
-                    &[],
-                    &target_desc,
-                    verbose,
-                    &crate::project::root_for_config(config_path),
-                )?;
+                let (modules_data, config_data) =
+                    build_packaged_blobs(&config, &r, &target_desc, verbose)?;
                 let modules_data = modules_data.ok_or_else(|| {
                     Error::Config("QEMU bare-metal run requires at least one module blob".into())
                 })?;
@@ -2095,8 +2090,8 @@ fn cmd_image_root(action: ImageRootAction) -> Result<()> {
         ImageRootAction::Show { image } => (image, None),
         ImageRootAction::Set { image, root } => (image, Some(root.as_str())),
     };
-    let mut bytes = std::fs::read(path)
-        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    let mut bytes =
+        std::fs::read(path).map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
     if let Some(root) = set {
         let root = match root {
             "none" => None,
@@ -2107,7 +2102,10 @@ fn cmd_image_root(action: ImageRootAction) -> Result<()> {
             .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
     }
     let root = fluxor_abi::wire::image_root::read(&bytes).map_err(|e| {
-        Error::Config(format!("{}: no single signing-root item ({e:?})", path.display()))
+        Error::Config(format!(
+            "{}: no single signing-root item ({e:?})",
+            path.display()
+        ))
     })?;
     match root {
         Some(r) => println!("{}", fluxor_tools::hash::hex(&r)),
@@ -2410,29 +2408,23 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
 /// expansion the image build runs, so the exported indices are the indices
 /// the kernel stamps into records.
 ///
-/// NOTE: extra `--modules-dir` roots change the table and therefore the
-/// digest; the build's injected digest (stack_expand) uses the project's
-/// `modules/` only, so pass extras only when the build did the same.
-fn cmd_id_table(yaml_path: &Path, out: Option<&Path>, extra_roots: &[PathBuf]) -> Result<()> {
-    let mut config: serde_json::Value =
-        stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
-    let target_desc = resolve_target(&config, None)?;
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
+/// Module rows come from the artefacts the graph's resolver resolves, as
+/// the build's injected digest does, so the two tables are one.
+fn cmd_id_table(yaml_path: &Path, out: Option<&Path>) -> Result<()> {
     let project_root = fluxor_tools::project::root_for_config(yaml_path);
-    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
-
-    // Default roots = the SAME set the build's digest injection uses
-    // (project modules/ + fluxor.toml [observability] id_table_dirs), so the
-    // exported digest matches the injected one by construction. --modules-dir
-    // extras change both the table and the digest; use them only when the
-    // build did the same.
-    let mut roots = fluxor_tools::observability::id_table_roots(&project_root);
-    roots.extend(extra_roots.iter().cloned());
-    let table = fluxor_tools::observability::id_table_for_expanded_config(&config, &roots);
+    let mut config = stack_expand::load_graph(yaml_path, &project_root)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        yaml_path,
+        Some(&target_desc),
+        None,
+    )?;
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
+    let table = fluxor_tools::observability::id_table_for_expanded_config(
+        &config,
+        &stack_expand::id_table_rows(&r)?,
+    );
     let json = serde_json::to_string_pretty(&table.to_json()).unwrap_or_default();
     match out {
         Some(p) => {

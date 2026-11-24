@@ -118,16 +118,26 @@ bindings:
   - serve: viewer
 ",
         );
-        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
-        assert!(e.contains("a sequential scenario takes no `host:` block"), "{e}");
+        let e = validate(&parse(&path).unwrap(), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("a sequential scenario takes no `host:` block"),
+            "{e}"
+        );
 
         let (_tmp, path) = make_temp_tree(
             "seq_wasm",
             "kind: scenario\nname: viewer\nsequential: true\ncomponents:\n  viewer:\n    \
              graph: viewer/graph.yaml\n",
         );
-        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
-        assert!(e.contains("a sequential scenario takes no `host:` block"), "{e}");
+        let e = validate(&parse(&path).unwrap(), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("a sequential scenario takes no `host:` block"),
+            "{e}"
+        );
 
         let (_tmp, path) = make_temp_tree(
             "wasm_duration",
@@ -142,8 +152,13 @@ host:
   port: 9876
 ",
         );
-        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
-        assert!(e.contains("declares `duration:`, but it targets wasm"), "{e}");
+        let e = validate(&parse(&path).unwrap(), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("declares `duration:`, but it targets wasm"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -254,7 +269,10 @@ bindings:
             .canonicalize()
             .unwrap()
             .join("target/scenarios/viewer/root");
-        assert!(yaml.contains(&format!("root: {}", root.display())), "{yaml}");
+        assert!(
+            yaml.contains(&format!("root: {}", root.display())),
+            "{yaml}"
+        );
         // No module, route or listing handler of any provider's.
         for absent in ["http", "routes", "fs_list", "fs_path", "modules"] {
             assert!(!yaml.contains(absent), "`{absent}` in {yaml}");
@@ -527,10 +545,9 @@ bindings:
         assert_eq!(scenario["bundle"], "/fluxor.wasm");
         assert_eq!(scenario["playlist"]["source"], "/api/list");
         assert_eq!(scenario["playlist"]["filter"], "image");
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("fluxor-manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("fluxor-manifest.json")).unwrap())
+                .unwrap();
         let keys: Vec<&str> = manifest
             .as_array()
             .unwrap()
@@ -581,12 +598,14 @@ bindings:
         let root = write_document_root(&s, &path).unwrap();
         assert_eq!(
             fs::read_link(root.join("viewer/index.html")).unwrap(),
-            tmp.path().canonicalize().unwrap().join("viewer/viewer.html")
+            tmp.path()
+                .canonicalize()
+                .unwrap()
+                .join("viewer/viewer.html")
         );
-        let scenario: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("viewer/scenario.json")).unwrap(),
-        )
-        .unwrap();
+        let scenario: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("viewer/scenario.json")).unwrap())
+                .unwrap();
         assert_eq!(scenario["bundle"], "/viewer/fluxor.wasm");
         assert!(root.join("index.html").is_file());
 
@@ -693,7 +712,10 @@ bindings:
         let s = parse(&path).unwrap();
         validate(&s, &path).unwrap();
         let e = write_document_root(&s, &path).unwrap_err().to_string();
-        assert!(e.contains("lies inside a `list:` binding's directory"), "{e}");
+        assert!(
+            e.contains("lies inside a `list:` binding's directory"),
+            "{e}"
+        );
         assert!(!tmp.path().join("assets/inner").exists());
     }
 
@@ -709,8 +731,13 @@ components:
     graph: viewer/graph.yaml
 ",
         );
-        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
-        assert!(e.contains("declares a wasm component but no `host:`"), "{e}");
+        let e = validate(&parse(&path).unwrap(), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("declares a wasm component but no `host:`"),
+            "{e}"
+        );
 
         let (_tmp, path) = make_temp_tree(
             "wasm_port",
@@ -725,7 +752,9 @@ host:
   port: 9876
 ",
         );
-        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        let e = validate(&parse(&path).unwrap(), &path)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("declares `port:`, but it targets wasm"), "{e}");
     }
 
@@ -752,8 +781,10 @@ bindings:
         let s = parse(&path).unwrap();
         let e = revalidate_all(&s, &path).unwrap_err().to_string();
         assert!(
-            e.contains("include 'web' (`@file_server`): `file_server` is not bound — add \
-                        `file_server = \"<stack>\"` under [uses.stacks]"),
+            e.contains(
+                "include 'web' (`@file_server`): `file_server` is not bound — add \
+                        `file_server = \"<stack>\"` under [uses.stacks]"
+            ),
             "{e}"
         );
 
@@ -933,7 +964,8 @@ components:
 
     #[test]
     fn target_aliases_table_is_sensible() {
-        let aliases = |t: &str| target_aliases(t);
+        let fluxor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let aliases = |t: &str| target_aliases(t, &fluxor);
         // A target places exactly the modules that name its runtime: the
         // linux host shares bcm2712's module ABI, not its contracts, so a
         // bare-metal `["bcm2712"]` module is not placed under it.
@@ -947,25 +979,28 @@ components:
         // Unknown target → empty (no aliases means strict
         // never-matches; the build path will surface this with its
         // own error).
-        assert!(target_aliases("definitely-not-a-real-target").is_empty());
+        assert!(aliases("definitely-not-a-real-target").is_empty());
     }
 
     #[test]
-    fn read_manifest_hardware_targets_walks_real_manifests() {
-        // Sanity-check against an actual repo manifest so a refactor
-        // of `ManifestTargetsOnly` is caught early.
-        let _g = cwd_lock();
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("../modules/foundation/http/manifest.toml");
-        if !path.is_file() {
-            // Test runner cwd ≠ repo root in some environments;
-            // skip rather than fail.
-            eprintln!("skipping: {} not found", path.display());
-            return;
-        }
-        let targets = read_manifest_hardware_targets(&path).unwrap();
-        assert!(targets.iter().any(|t| t == "bcm2712" || t == "rp2350"));
+    fn a_resolved_manifest_names_the_runtimes_it_places_on() {
+        // The runtimes the check compares are the resolved artefact's,
+        // read from its manifest's `hardware_targets`.
+        let fluxor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let r = crate::module_resolver::ModuleResolver::for_project(
+            &fluxor,
+            crate::module_resolver::Abi::Unplaced,
+            None,
+        )
+        .unwrap();
+        let wifi = r.require("wifi", "wifi", None).unwrap();
+        let runtimes: Vec<&str> = crate::runtime_abi::runtimes_in(wifi.manifest.hardware_targets)
+            .map(|rt| rt.id)
+            .collect();
+        assert!(
+            !runtimes.is_empty() && !runtimes.contains(&"linux"),
+            "{runtimes:?}"
+        );
     }
 
     #[test]
@@ -993,8 +1028,8 @@ components:
         .unwrap();
         let s = parse(&scenario).unwrap();
 
-        // Must run from the repo root so find_manifest_for can locate
-        // wifi's manifest under modules/foundation/wifi/manifest.toml.
+        // Run from the repo root: a graph outside any project resolves its
+        // modules in the working directory's project.
         let _g = cwd_lock();
         let repo_root = std::env::current_dir().unwrap();
         let project_root = if repo_root.ends_with("tools") {
@@ -1002,7 +1037,7 @@ components:
         } else {
             repo_root.clone()
         };
-        // Swap CWD so find_manifest_for picks up the real tree.
+        // Swap CWD so the graph resolves in Fluxor's own project.
         std::env::set_current_dir(&project_root).unwrap();
         let res = validate_module_targets(&s, &scenario);
         std::env::set_current_dir(&repo_root).unwrap();

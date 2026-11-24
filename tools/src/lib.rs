@@ -65,6 +65,7 @@ pub mod node_agent;
 // `modules_build` calls into. Exposed here (rather than left
 // main-only) so the build orchestrator can reach it from the lib
 // surface.
+pub mod module_resolver;
 pub mod modules;
 pub mod modules_build;
 pub mod monitor;

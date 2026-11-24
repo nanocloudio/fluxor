@@ -411,22 +411,20 @@ fn generate_config_bytes(
     config_path: &Path,
     module_root: Option<&std::path::Path>,
 ) -> Result<Vec<u8>> {
-    let config: serde_json::Value =
-        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-
-    let mut config = config;
+    let project_root = crate::project::root_for_config(config_path);
+    let mut config = stack_expand::load_graph(config_path, &project_root)?;
     let yaml_dir = config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     inline_route_body_files(&mut config, yaml_dir)?;
-    let target_desc = resolve_target(&config, None)?;
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
-    let project_root = crate::project::root_for_config(config_path);
-    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        config_path,
+        Some(&target_desc),
+        module_root,
+    )?;
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
 
     let builder = ConfigBuilder::new();
     if let Some(ref defaults) = target_desc.hardware_defaults {
@@ -444,37 +442,19 @@ fn generate_config_bytes(
         }
         config["hardware"] = serde_json::Value::Object(merged);
     }
-    let modules_dir = target_module_root(module_root, &project_root, &target_desc)?;
-
-    // Manifest search paths: explicit `module_search_paths:` from the
-    // YAML plus the implicit <config-parent>/../modules default. See
-    // `config::extract_module_search_paths` for ordering.
-    let search_paths = config::extract_module_search_paths(&config, config_path);
-    let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-
     let binary_data = config::generate_config_ext(
         &config,
         &builder,
         &[],
-        &modules_dir,
-        &extra_dirs,
+        &r,
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
-        &crate::project::root_for_config(config_path),
     )?;
 
     // The hosted builds (Linux, wasm) compile their config here: admit it
     // against the target's arenas, as an image build does.
-    check_arenas_unbuilt(
-        &config,
-        &binary_data,
-        &modules_dir,
-        &extra_dirs,
-        &target_desc,
-        &project_root,
-        false,
-    )?;
+    check_arenas_unbuilt(&config, &binary_data, &r, &target_desc, false)?;
 
     Ok(binary_data)
 }
@@ -868,8 +848,7 @@ fn check_arenas(
     config_data: &[u8],
     modules: &[modules::ModuleInfo],
     target: &crate::target::TargetDescriptor,
-    extra_dirs: &[&std::path::Path],
-    project_root: &std::path::Path,
+    r: &crate::module_resolver::ModuleResolver,
 ) -> Result<()> {
     check_state_budget(modules, config, config_data, target)?;
     let facts: std::collections::HashMap<u32, crate::ring_demand::ModuleFacts<'_>> = modules
@@ -884,12 +863,11 @@ fn check_arenas(
             )
         })
         .collect();
-    let manifests = config::load_module_manifests_with_extra_for_target(
-        &config["modules"],
-        extra_dirs,
-        Some(target.id.as_str()),
-        project_root,
-    );
+    let list = config["modules"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let manifests = r.graph_modules(list)?.manifests();
     crate::ring_demand::check(config, config_data, &facts, &manifests, target)
 }
 
@@ -1314,23 +1292,20 @@ fn cmd_combine(
 ) -> Result<()> {
     // Read the graph as every build reads it: includes expanded, params
     // rendered.
-    let config: serde_json::Value =
-        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-
-    let mut config = config;
+    let project_root = crate::project::root_for_config(config_path);
+    let mut config = stack_expand::load_graph(config_path, &project_root)?;
     let yaml_dir = config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     inline_route_body_files(&mut config, yaml_dir)?;
-    let target_desc = resolve_target(&config, None)?;
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
-    let project_root = crate::project::root_for_config(config_path);
-    let stack_added =
-        stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        config_path,
+        Some(&target_desc),
+        module_root,
+    )?;
+    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
     if verbose && !stack_added.is_empty() {
         eprintln!("Auto-added from platform: {}", stack_added.join(", "));
     }
@@ -1429,29 +1404,9 @@ fn cmd_combine(
         ));
     }
 
-    // Parse modules first (needed for in_place_safe caps in config generation).
-    // External-app configs live outside fluxor's modules/ tree
-    // and either declare `module_search_paths:` or rely on the implicit
-    // `<config-parent>/../modules` default — same mechanism the linux build
-    // path uses (`cmd_generate`). Without this, fan modules like
-    // media_loader fail port-name resolution.
-    let modules_dir_path = target_module_root(module_root, &project_root, &target_desc)?;
-    let modules_dir = modules_dir_path.as_path();
-    let search_paths = config::extract_module_search_paths(&config, config_path);
-    let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-    // Config-anchored root so packaging reads the CONFIG's fluxor.lock pins,
-    // symmetric with the manifest resolver.
-    let store_fb = store_cli::lock_store_resolver(
-        &crate::project::root_for_config(config_path),
-        target_desc.module_abi(),
-        None,
-    );
-    let mut modules = parse_modules_from_config_multi(
-        &config,
-        modules_dir,
-        &extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
+    // The image's modules first: their capabilities feed config generation.
+    let mut graph = r.graph_modules(&crate::module_resolver::image_entries(&config)?)?;
+    let mut modules = graph.table()?;
 
     // Build module caps for buffer aliasing and manifest validation
     let caps: Vec<ModuleCaps> = modules
@@ -1470,30 +1425,16 @@ fn cmd_combine(
         &config,
         &builder,
         &caps,
-        modules_dir,
-        &extra_dirs,
+        &r,
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
-        &crate::project::root_for_config(config_path),
     )?;
-    crate::modules::add_fan_modules(
-        &mut modules,
-        &config::fan_types(&config_data)?,
-        modules_dir,
-        &extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
+    graph.add_types(&r, &config::fan_types(&config_data)?)?;
+    modules = graph.table()?;
 
     check_code_ceiling(&modules, &target_desc)?;
-    check_arenas(
-        &config,
-        &config_data,
-        &modules,
-        &target_desc,
-        &extra_dirs,
-        &crate::project::root_for_config(config_path),
-    )?;
+    check_arenas(&config, &config_data, &modules, &target_desc, &r)?;
     check_stack_budget(&modules, &config, &target_desc)?;
     check_gated_admission(&modules, &config, &target_desc)?;
     let programs = crate::modules::collect_programs(&config)?;
@@ -1673,28 +1614,30 @@ fn cmd_combine(
 
 fn load_config_with_defaults(
     config_path: &Path,
+    module_root: Option<&Path>,
     verbose: bool,
-) -> Result<(serde_json::Value, target::TargetDescriptor)> {
-    let config: serde_json::Value =
-        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-
-    let mut config = config;
+) -> Result<(
+    serde_json::Value,
+    target::TargetDescriptor,
+    crate::module_resolver::ModuleResolver,
+)> {
+    let project_root = crate::project::root_for_config(config_path);
+    let mut config = stack_expand::load_graph(config_path, &project_root)?;
 
     // Resolve target first — stack expansion needs board_id and family
-    let target_desc = resolve_target(&config, None)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
     if verbose {
         eprintln!("Target: {}", target_desc.display_name());
     }
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        config_path,
+        Some(&target_desc),
+        module_root,
+    )?;
 
     // Expand platform: stacks (TOML-driven)
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
-    let project_root = crate::project::root_for_config(config_path);
-    let stack_added =
-        stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
     if verbose && !stack_added.is_empty() {
         eprintln!("Auto-added from platform: {}", stack_added.join(", "));
     }
@@ -1728,26 +1671,17 @@ fn load_config_with_defaults(
         ));
     }
 
-    Ok((config, target_desc))
+    Ok((config, target_desc, r))
 }
 
 fn build_packaged_blobs(
     config: &serde_json::Value,
-    modules_dir: &std::path::Path,
-    extra_dirs: &[&std::path::Path],
+    r: &crate::module_resolver::ModuleResolver,
     target_desc: &crate::target::TargetDescriptor,
     verbose: bool,
-    project_root: &std::path::Path,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
-    // `project_root` is config-anchored by the caller: fmod packaging and
-    // pinned-manifest resolution must consult the same fluxor.lock.
-    let store_fb = store_cli::lock_store_resolver(project_root, target_desc.module_abi(), None);
-    let mut modules = parse_modules_from_config_multi(
-        config,
-        modules_dir,
-        extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
+    let mut graph = r.graph_modules(&crate::module_resolver::image_entries(config)?)?;
+    let mut modules = graph.table()?;
 
     let caps: Vec<ModuleCaps> = modules
         .iter()
@@ -1764,30 +1698,16 @@ fn build_packaged_blobs(
         config,
         &builder,
         &caps,
-        modules_dir,
-        &[],
+        r,
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
-        project_root,
     )?;
-    crate::modules::add_fan_modules(
-        &mut modules,
-        &config::fan_types(&config_data)?,
-        modules_dir,
-        extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
+    graph.add_types(r, &config::fan_types(&config_data)?)?;
+    modules = graph.table()?;
 
     check_code_ceiling(&modules, target_desc)?;
-    check_arenas(
-        config,
-        &config_data,
-        &modules,
-        target_desc,
-        extra_dirs,
-        project_root,
-    )?;
+    check_arenas(config, &config_data, &modules, target_desc, r)?;
     check_stack_budget(&modules, config, target_desc)?;
     check_gated_admission(&modules, config, target_desc)?;
     let programs = crate::modules::collect_programs(config)?;
@@ -1849,12 +1769,16 @@ pub fn cmd_workload_image(
     module_root: Option<&Path>,
     verbose: bool,
 ) -> error::Result<()> {
-    let mut config: serde_json::Value =
-        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-    let target_desc = resolve_target(&config, None)?;
     let project_root = crate::project::root_for_config(config_path);
-    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
-    let module_root = target_module_root(module_root, &project_root, &target_desc)?;
+    let mut config = stack_expand::load_graph(config_path, &project_root)?;
+    let target_desc = resolve_target(&config, None, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        config_path,
+        Some(&target_desc),
+        module_root,
+    )?;
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
     let abi = target_desc.module_abi();
 
     let workloads_yaml = config
@@ -1873,35 +1797,15 @@ pub fn cmd_workload_image(
     // workload's.
     let mut only = config.clone();
     only["modules"] = serde_json::Value::Array(Vec::new());
-    let loc = crate::schema::ModuleLocation {
-        dir: module_root.as_path(),
-        abi,
-        project_root: project_root.as_path(),
-    };
-    // The graph's `module_search_paths` reach its workload's modules as they
-    // reach a node graph's.
-    let search_paths = crate::config::extract_module_search_paths(&config, config_path);
-    let extra_dirs: Vec<&Path> = search_paths.iter().map(|p| p.as_path()).collect();
     let (workloads, env_binds) = crate::schema::with_env_binds(|| {
-        crate::config::build_workloads(&only, loc, &extra_dirs, &target_desc.id)
+        crate::config::build_workloads(&only, &r, &target_desc.id)
     });
     let workloads = workloads?;
     let graph =
         crate::add_subgraph::encode_workload(&workloads[0]).map_err(error::Error::Config)?;
-    let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
-    let mut modules = parse_modules_from_config_multi(
-        &only,
-        &module_root,
-        &extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
-    crate::modules::add_fan_modules(
-        &mut modules,
-        &workloads[0].graph.fan_types(),
-        &module_root,
-        &extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    )?;
+    let mut resolved = r.graph_modules(&crate::module_resolver::image_entries(&only)?)?;
+    resolved.add_types(&r, &workloads[0].graph.fan_types())?;
+    let modules = resolved.table()?;
     if modules.is_empty() {
         return Err(error::Error::Config(
             "a workload image needs at least one module".into(),
@@ -1995,17 +1899,16 @@ fn cmd_node_image(
     const RAM_IMAGE_SIZE: usize = 8 * 1024 * 1024;
 
     // Parse config (reusing the same path as cmd_combine).
-    let mut config: serde_json::Value =
-        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-
-    let target_desc = resolve_target(&config, target_override)?;
-    // Resolve from the CONFIG's location, not the cwd: the rig and
-    // cross-repo builds invoke this from another project's root, and a
-    // cwd-resolved root gave the id-table digest injection the wrong
-    // `[observability] id_table_dirs` (a digest the exporter can never
-    // match).
     let project_root = crate::project::root_for_config(config_path);
-    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let mut config = stack_expand::load_graph(config_path, &project_root)?;
+    let target_desc = resolve_target(&config, target_override, &project_root)?;
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &config,
+        config_path,
+        Some(&target_desc),
+        module_root,
+    )?;
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &r)?;
 
     if let Some(ref defaults) = target_desc.hardware_defaults {
         let hw = config
@@ -2033,16 +1936,7 @@ fn cmd_node_image(
         ));
     }
 
-    let modules_dir_path = target_module_root(module_root, &project_root, &target_desc)?;
-    let modules_dir = modules_dir_path.as_path();
-    let (modules_data, config_data) = build_packaged_blobs(
-        &config,
-        modules_dir,
-        &[],
-        &target_desc,
-        verbose,
-        &crate::project::root_for_config(config_path),
-    )?;
+    let (modules_data, config_data) = build_packaged_blobs(&config, &r, &target_desc, verbose)?;
     let modules_data = modules_data
         .ok_or_else(|| error::Error::Config("A node image requires at least one module".into()))?;
 
@@ -2836,13 +2730,14 @@ fn cmd_pack(
 /// (or from an external project directory with a `.fluxor` marker)
 /// still finds the same targets the build would see when run from
 /// the source-tree root.
+/// The target a graph builds for, from the project the graph belongs to.
 fn resolve_target(
     config: &serde_json::Value,
     cli_override: Option<&str>,
+    project_root: &Path,
 ) -> Result<target::TargetDescriptor> {
     let name = cli_override
         .or_else(|| config.get("target").and_then(|t| t.as_str()))
         .unwrap_or("pico2w");
-    let root = crate::project::root();
-    target::load_target(name, &root)
+    target::load_target(name, project_root)
 }

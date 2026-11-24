@@ -126,12 +126,12 @@ impl Region {
         if addr < self.base || addr >= self.base + self.size {
             return false;
         }
-        if self.srd == 0 {
-            return true;
+        // A region with disabled eighths is a PMSAv7 one, at least 256
+        // bytes; the division is checked all the same, so it cannot panic.
+        match (addr - self.base).checked_div(self.size / 8) {
+            Some(n) if self.srd != 0 => self.srd & (1 << n) == 0,
+            _ => true,
         }
-        let eighth = self.size / 8;
-        let n = (addr - self.base) / eighth;
-        self.srd & (1 << n) == 0
     }
 }
 
@@ -263,7 +263,12 @@ fn pmsav7_region(s: &Span) -> Option<Region> {
     while size <= 1 << 32 {
         let base = s.base & !(size - 1);
         if end <= base + size {
+            // `size` is at least 256, so an eighth is never 0; said here, so
+            // the divisions below carry no division-by-zero panic.
             let eighth = size / 8;
+            if eighth == 0 {
+                return None;
+            }
             if (s.base - base).is_multiple_of(eighth) && (end - base).is_multiple_of(eighth) {
                 let first = (s.base - base) / eighth;
                 let last = (end - base) / eighth; // exclusive
@@ -319,11 +324,13 @@ pub fn private_region_shape(len: u64, model: RegionModel) -> (u64, u64) {
             // eighths from its base, so the allocation is `len` rounded up to
             // an eighth of the smallest S that holds it, aligned to S.
             let mut size: u64 = 256;
-            while size < len {
+            while size < len && size < 1 << 63 {
                 size <<= 1;
             }
             let eighth = size / 8;
-            (len.div_ceil(eighth) * eighth, size)
+            let eighths = len.checked_div(eighth).unwrap_or(0)
+                + u64::from(len.checked_rem(eighth).unwrap_or(0) != 0);
+            (eighths * eighth, size)
         }
     }
 }

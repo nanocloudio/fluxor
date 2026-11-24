@@ -72,10 +72,15 @@ pub fn port_frame(content_type: u8, flags: u8) -> FrameKind {
     if framed || flags & PORT_FLAG_FRAMED != 0 {
         return FrameKind::Record;
     }
-    match crate::CONTENT_TYPES.get(usize::from(content_type)) {
-        Some(&"EthernetFrame") => FrameKind::Eth,
-        Some(&"NetProto") => FrameKind::Net,
-        Some(&"Telemetry") => FrameKind::Telemetry,
+    // By wire byte, never by name: the name table is a table of pointers,
+    // which a module cannot carry.
+    const ETH: u8 = crate::content_type_byte("EthernetFrame");
+    const NET: u8 = crate::content_type_byte("NetProto");
+    const TELEMETRY: u8 = crate::content_type_byte("Telemetry");
+    match content_type {
+        ETH => FrameKind::Eth,
+        NET => FrameKind::Net,
+        TELEMETRY => FrameKind::Telemetry,
         _ => FrameKind::Stream,
     }
 }

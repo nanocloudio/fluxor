@@ -236,7 +236,7 @@ pub fn sort_entries(entries: &mut Vec<Artifact>) {
 /// The catalog stamp is the digest of the discovered install root's
 /// catalog, or absent when no install root is found.
 pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<PathBuf> {
-    let catalog = crate::project::install_root()
+    let catalog = crate::project::install_root(project_root)
         .and_then(|r| catalog_digest(&r.path))
         .map(|digest| Catalog { digest });
     write_store_lock_stamped(project_root, entries, catalog)
@@ -729,9 +729,8 @@ fn pin_references(
         crate::stack::derived_pins(store, &stack, out, me.as_deref())?;
     }
     for name in &refs.packages {
-        let mut package = find_reference(&indexes, "package", name)?.clone();
-        fill_content(store, std::slice::from_mut(&mut package));
-        out.push(package);
+        let package = find_reference(&indexes, "package", name)?.clone();
+        crate::stack::derived_pins(store, &package, out, me.as_deref())?;
     }
     if refs.bound.is_empty() {
         return Ok(via);

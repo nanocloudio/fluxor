@@ -106,6 +106,7 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
     check_example_exemptions(project_root, &doc, &mut problems);
     check_unknown_keys(&doc, &mut problems);
     check_signing(&doc, &mut problems);
+    check_observability(&doc, &mut problems);
     if let Err(e) = crate::project::bound_stacks(project_root) {
         problems.push(e);
     }
@@ -119,6 +120,25 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
         "fluxor.toml does not conform to the schema:\n  {}",
         problems.join("\n  ")
     ))
+}
+
+// ── [observability] ────────────────────────────────────────────────────
+
+/// `[observability] id_table_dirs` is a key no phase reads: an id-table's
+/// rows come from each module's resolved artefact. Refused, as any key no
+/// phase reads.
+fn check_observability(doc: &Value, out: &mut Vec<String>) {
+    if doc
+        .get("observability")
+        .and_then(|o| o.get("id_table_dirs"))
+        .is_some()
+    {
+        out.push(
+            "`[observability] id_table_dirs`: id-table rows come from each module's resolved \
+             artefact, so no phase reads this key; remove it"
+                .to_string(),
+        );
+    }
 }
 
 // ── [signing] ───────────────────────────────────────────────────────────
@@ -574,6 +594,19 @@ mod tests {
     }
 
     const MODULE_MANIFEST: &str = "name = \"m\"\ntype = \"Foundation\"\n";
+
+    #[test]
+    fn observability_id_table_dirs_is_refused() {
+        let f = Fixture::new("id-table-dirs");
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"cue\"\nversion = \"0.0.1\"\n\n[observability]\n\
+             id_table_dirs = [\"../dep/modules\"]\n",
+        );
+        let e = f.err();
+        assert!(e.contains("id_table_dirs"), "{e}");
+        assert!(e.contains("resolved artefact"), "{e}");
+    }
 
     #[test]
     fn a_module_less_project_is_clean_without_targets() {

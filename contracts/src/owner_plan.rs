@@ -197,17 +197,25 @@ impl core::fmt::Display for PlanError {
 }
 
 fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
+    u16::from_le_bytes(field(b, at))
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    u32::from_le_bytes(field(b, at))
+}
+
+/// The `N` bytes at `at`, zeros past the end: every read is of a blob the
+/// decoder has bounded already, and none can panic (a module links these).
+fn field<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (o, v) in out.iter_mut().zip(b.iter().skip(at)) {
+        *o = *v;
+    }
+    out
 }
 
 fn le64(b: &[u8], at: usize) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&b[at..at + 8]);
-    u64::from_le_bytes(a)
+    u64::from_le_bytes(field(b, at))
 }
 
 /// A decoded, digest-verified plan.
@@ -224,25 +232,21 @@ pub struct Plan<'a> {
 impl<'a> Plan<'a> {
     /// The assignments, in plan order.
     pub fn assignments(&self) -> impl ExactSizeIterator<Item = Assignment> + Clone + 'a {
-        self.assignments
-            .chunks_exact(ASSIGNMENT_LEN)
-            .map(read_assignment)
+        crate::records::<ASSIGNMENT_LEN>(self.assignments).map(|r| read_assignment(r))
     }
 
     /// The revocations, in plan order.
     pub fn revocations(&self) -> impl ExactSizeIterator<Item = Revocation> + Clone + 'a {
-        self.revocations
-            .chunks_exact(REVOCATION_LEN)
-            .map(|r| Revocation {
-                assignment: read_assignment(&r[..ASSIGNMENT_LEN]),
-                grace_secs: le16(r, ASSIGNMENT_LEN),
-                deadline_unix: le64(r, ASSIGNMENT_LEN + 2),
-            })
+        crate::records::<REVOCATION_LEN>(self.revocations).map(|r| Revocation {
+            assignment: read_assignment(&r[..ASSIGNMENT_LEN]),
+            grace_secs: le16(r, ASSIGNMENT_LEN),
+            deadline_unix: le64(r, ASSIGNMENT_LEN + 2),
+        })
     }
 
     /// The lease grants, in plan order.
     pub fn leases(&self) -> impl ExactSizeIterator<Item = Lease> + Clone + 'a {
-        self.leases.chunks_exact(LEASE_LEN).map(|r| Lease {
+        crate::records::<LEASE_LEN>(self.leases).map(|r| Lease {
             slot: le16(r, 0),
             generation: le32(r, 2),
             protocol: r[6],

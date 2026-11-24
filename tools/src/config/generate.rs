@@ -18,49 +18,36 @@ pub struct ModuleCaps {
 /// target rather than a stale YAML default. `None` means fall back to
 /// the YAML's literal value, which is the documented opt-in behaviour
 /// for configs and fixtures that declare no target.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
-)]
 pub fn generate_config_ext(
     config: &Value,
     _template: &ConfigBuilder,
     module_caps: &[ModuleCaps],
-    modules_dir: &Path,
-    extra_module_dirs: &[&Path],
+    r: &ModuleResolver,
     max_gpio: u8,
     pio_count: u8,
     resolved_target: Option<&str>,
-    project_root: &Path,
 ) -> Result<Vec<u8>> {
     generate_config_impl(
         config,
         _template,
         module_caps,
-        modules_dir,
-        extra_module_dirs,
+        r,
         max_gpio,
         pio_count,
         resolved_target,
-        project_root,
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
-)]
 fn generate_config_impl(
     config: &Value,
     _template: &ConfigBuilder,
     module_caps: &[ModuleCaps],
-    modules_dir: &Path,
-    extra_module_dirs: &[&Path],
+    r: &ModuleResolver,
     max_gpio: u8,
     pio_count: u8,
     resolved_target: Option<&str>,
-    project_root: &Path,
 ) -> Result<Vec<u8>> {
+    let project_root = r.project_root();
     let modules = config
         .get("modules")
         .ok_or_else(|| Error::Config("modules section required".into()))?;
@@ -71,21 +58,6 @@ fn generate_config_impl(
                 .into(),
         ));
     }
-
-    // The module ABI `modules_dir` holds artefacts for, which tags the pins
-    // consulted when a `.fmod` is absent from it. Stated here from the
-    // target, never read off the directory: `--module-root` can name any
-    // path. A graph naming no resolvable target consults no pins.
-    let module_abi = resolved_target
-        .or_else(|| config.get("target").and_then(|t| t.as_str()))
-        .and_then(|t| crate::target::load_target(t, project_root).ok())
-        .map(|d| d.module_abi().to_string())
-        .unwrap_or_default();
-    let loc = schema::ModuleLocation {
-        dir: modules_dir,
-        abi: &module_abi,
-        project_root,
-    };
 
     // Parse graph-level sample_rate (top-level or under graph: key)
     let graph_sample_rate: u32 = config
@@ -193,9 +165,8 @@ fn generate_config_impl(
     // entries from `modules`, workloads from `build_workload_section`. With no `workloads:` the
     // augmented list is the base list (byte-identical validation).
     // Workload module local names are scoped to their workload, so two workloads (or a workload and
-    // the node graph) may legitimately reuse a name. The manifest map
-    // (`load_module_manifests_with_extra`) is keyed by `name` ALONE and silently
-    // overwrites on collision — so a flat base+workload list could resolve a module to
+    // the node graph) may legitimately reuse a name. The resolved manifest map
+    // is keyed by `name` ALONE and would overwrite on collision — so a flat base+workload list could resolve a module to
     // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_pass
     // metadata). Give every workload module a graph-scoped unique `name` for the
     // validation list while preserving its `type` (manifests resolve by type), so
@@ -248,18 +219,10 @@ fn generate_config_impl(
     };
     let validation_list: &[Value] = &validation_modules;
 
-    // Fail closed on a module whose manifest is found but rejected — a pin
-    // the store cannot serve, or a `manifest.toml` that does not parse or
-    // validate — ahead of every gate below that reads the manifest map. The
-    // map-building loader can only warn-and-omit, and an omitted manifest is
-    // indistinguishable from "module has no manifest": wiring would then
-    // report the module as never found.
-    crate::config::assert_module_manifests_resolvable(
-        &Value::Array(validation_modules.clone()),
-        extra_module_dirs,
-        resolved_target,
-        project_root,
-    )?;
+    // Every module of the graph and its workloads, resolved strictly: a
+    // module that resolves nowhere, or whose pin or manifest is refused, fails
+    // here, ahead of every gate that reads a manifest.
+    let graph = r.graph_modules(validation_list)?;
 
     // Budget validation: prove step_deadlines, burst budgets, and
     // per-domain tick budgets fit together before the kernel ever
@@ -275,22 +238,18 @@ fn generate_config_impl(
         &domain_names,
         &domain_tick_us,
     )?;
-    // NOTE: validate_adaptive_tick is deferred to AFTER the manifest map is
-    // built (below) — its timer-class gate must consult the SAME resolver
-    // (`load_module_manifests_with_extra`, incl. extra_module_dirs) the rest of
-    // config-gen uses, or an external/project tick_counted module would fail
-    // open on an adaptive domain.
 
     // Interrupt-mode admission: every module routed to a `timer`/`irq` domain
     // must declare `interrupt_safe = true` in its manifest, and the wiring
     // touching it cannot use an edge class incompatible with bridge
     // routing. This build-time gate is one half of the contract; the
     // runtime routing in `channel_open` is the other.
+    let graph_manifests = graph.manifests();
     validate_interrupt_admission(
         config,
         validation_list,
-        modules_dir,
-        extra_module_dirs,
+        &graph_manifests,
+        &|name| graph.get(name).map_or(Ok(false), |a| a.exports_isr_entry()),
         resolved_target,
         project_root,
     )?;
@@ -303,13 +262,7 @@ fn generate_config_impl(
     // Placement outside a `tick` domain is rejected here so the
     // misconfiguration surfaces at build time rather than as silent
     // misbehaviour at runtime.
-    validate_pre_pass_admission(
-        config,
-        validation_list,
-        extra_module_dirs,
-        resolved_target,
-        project_root,
-    )?;
+    validate_pre_pass_admission(config, validation_list, &graph_manifests)?;
 
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
@@ -328,25 +281,9 @@ fn generate_config_impl(
         modules
     };
 
-    // Load manifests FIRST (via the rich resolver — standard module
-    // dirs + project/install roots + caller-supplied extras) so that
-    // `parse_modules_map` / `build_module_entry` can read per-module
-    // flags like `pre_pass` from the resolved manifest instead
-    // of doing a second, narrower lookup that may miss modules
-    // outside the hard-coded `Manifest::from_source_tree` search
-    // list (e.g. modules in the install root or in extras).
-    // Manifests for the AUGMENTED set (node graph + workload modules) so the adaptive
-    // timer-class gate below resolves workload modules too; `parse_modules_map` (emit,
-    // node-graph-only) just ignores the extra workload entries keyed by type.
-    let manifest_src = Value::Array(validation_modules.clone());
-    let mut manifests = load_module_manifests_with_extra_for_target(
-        &manifest_src,
-        extra_module_dirs,
-        resolved_target,
-        project_root,
-    );
+    let mut manifests = graph_manifests;
     bind_capability_facts(&validation_modules, &mut manifests, &|entry, param| {
-        bound_param_value(entry, param, loc)
+        bound_param_value(entry, param, r)
     })?;
     let manifests = manifests;
 
@@ -364,9 +301,7 @@ fn generate_config_impl(
                 Ok((edges, ..)) => {
                     let mut list = list.clone();
                     let default_of = |entry: &Value, param: &str| -> Option<u64> {
-                        let name = entry.get("name").and_then(Value::as_str)?;
-                        let mtype = entry.get("type").and_then(Value::as_str).unwrap_or(name);
-                        let schema = schema::load_schema_for_entry(entry, mtype, loc).ok()??;
+                        let schema = schema::entry_schema(entry, r).ok()??;
                         let p = schema.params.iter().find(|p| p.name == param)?;
                         Some(u64::from(p.default))
                     };
@@ -383,10 +318,8 @@ fn generate_config_impl(
     // Get data section for preset resolution
     let data_section = config.get("data");
 
-    // Adaptive-tick validation (range checks + timer-class gate). Run here,
-    // after the full manifest map exists, so the timer-class gate resolves
-    // external/project modules via the same resolver (not the narrower
-    // from_source_tree) — closing the fail-open for non-bundled modules.
+    // Adaptive-tick validation (range checks + timer-class gate), against
+    // the resolved manifests.
     validate_adaptive_tick(
         config,
         validation_list,
@@ -394,8 +327,8 @@ fn generate_config_impl(
         &domain_names,
         &domain_tick_us,
         &manifests,
-        extra_module_dirs,
         resolved_target,
+        project_root,
     )?;
 
     // Module-count ceiling for the target's kernel profile
@@ -422,7 +355,7 @@ fn generate_config_impl(
         modules_ref,
         data_section,
         config,
-        loc,
+        r,
         &manifests,
         max_modules,
         &isolation,
@@ -433,16 +366,15 @@ fn generate_config_impl(
     // (`crate::runtime_abi`). Falls back to the raw token (which then fails
     // closed in `for_runtime`) when the registry doesn't know the name.
     let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
-    let target_desc =
-        target_opt.and_then(|t| crate::target::load_target(t, &crate::project::root()).ok());
+    let target_desc = target_opt.and_then(|t| crate::target::load_target(t, project_root).ok());
     let runtime_owned = target_opt.map(|t| {
         target_desc
             .as_ref()
             .map_or_else(|| t.to_string(), |d| d.runtime().to_string())
     });
     let (mut workloads, workload_demand, workload_heaps) =
-        build_workloads_counted(config, loc, extra_module_dirs, runtime_owned.as_deref())?;
-    let mut demand = base_demand(modules_ref, &module_entries, &module_names, &manifests, loc)?;
+        build_workloads_counted(config, r, runtime_owned.as_deref())?;
+    let mut demand = base_demand(modules_ref, &module_entries, &module_names, &manifests, r)?;
     refuse_restart_of_subscribers(modules_ref, &demand)?;
     demand.extend(workload_demand);
     let mut heaps = base_planned_heaps(modules_ref, &module_names, &manifests);
@@ -483,7 +415,7 @@ fn generate_config_impl(
             // A workload's modules are judged where its workload is built
             // (`build_workloads_counted`), against what serves a workload.
             if i < module_list.len() {
-                let fs_served = fs_reachable(runtime, ProviderCaller::Node)
+                let fs_served = fs_reachable(runtime, ProviderCaller::Node, project_root)
                     || manifests
                         .values()
                         .any(|mm| mm.provides.iter().any(|p| surface_contract(p) == "fs"));
@@ -532,8 +464,7 @@ fn generate_config_impl(
                 // so the check sees the posture the module will actually
                 // run under.
                 if !manifest.requires_when.is_empty() {
-                    let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-                    let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
+                    let param_schema = schema::entry_schema(m, r)?;
                     let facts = target_desc.as_ref().map_or_else(
                         || crate::target_facts::TargetFacts::for_runtime(runtime),
                         crate::target_facts::TargetFacts::for_target,
@@ -634,28 +565,20 @@ fn generate_config_impl(
     // another node count here and nowhere else: their manifests are
     // resolved for their capabilities and facts, against no target, since
     // the silicon they run on is their own graph's business.
-    let remote_list = Value::Array(remote_members(config));
-    let mut remote_manifests = load_module_manifests_with_extra_for_target(
-        &remote_list,
-        extra_module_dirs,
-        None,
-        project_root,
-    );
-    bind_capability_facts(
-        remote_list.as_array().map(Vec::as_slice).unwrap_or(&[]),
-        &mut remote_manifests,
-        &|entry, param| bound_param_value(entry, param, loc),
-    )?;
-    for name in remote_member_names(config) {
-        if !remote_manifests.contains_key(&name) {
-            let node = instance_node(config, &name).unwrap_or_default();
-            return Err(Error::Config(format!(
-                "module `{name}` is placed on node `{node}` but its manifest cannot be \
-                 resolved; a placed member is admitted on its manifest's capabilities and \
-                 facts, and a member with none is not evidence of anything"
-            )));
-        }
-    }
+    let remote_list = remote_members(config);
+    let mut remote_manifests = r
+        .unplaced()
+        .graph_modules(&remote_list)
+        .map_err(|e| {
+            Error::Config(format!(
+                "a member placed on another node is admitted on its manifest's capabilities \
+                 and facts: {e}"
+            ))
+        })?
+        .manifests();
+    bind_capability_facts(&remote_list, &mut remote_manifests, &|entry, param| {
+        bound_param_value(entry, param, r)
+    })?;
     validate_exchange_placement(config, &edges, &module_names, &manifests, &remote_manifests)?;
     let mut continuity_names = module_names.clone();
     continuity_names.extend(remote_member_names(config));
@@ -672,7 +595,7 @@ fn generate_config_impl(
     validate_execution_profile(config, &module_names, &manifests, resolved_target)?;
     validate_port_capabilities(config, &manifests)?;
     validate_port_facts(config, &manifests, &|entry, param| {
-        bound_param_value(entry, param, loc)
+        bound_param_value(entry, param, r)
     })?;
     validate_connector_addressing(config)?;
 
@@ -685,7 +608,7 @@ fn generate_config_impl(
             .map(Vec::as_slice)
             .unwrap_or(&[]),
         &manifests,
-        schema_param_is_one_of(loc),
+        schema_param_is_one_of(r),
     )?;
     validate_single_provider(
         config,
@@ -694,6 +617,7 @@ fn generate_config_impl(
         ProviderReach {
             runtime: runtime_owned.as_deref(),
             caller: ProviderCaller::Node,
+            project: project_root,
         },
     )?;
     enforce_required_contracts(
@@ -704,6 +628,7 @@ fn generate_config_impl(
             ProviderReach {
                 runtime: runtime_owned.as_deref(),
                 caller: ProviderCaller::Node,
+                project: project_root,
             },
         ),
         "",
@@ -931,12 +856,6 @@ fn generate_config_impl(
     // The composed graph: the declared modules are nodes `0..n` in config
     // order (a module's index is its id), its fans after them.
     let runtime = runtime_owned.as_deref().unwrap_or("linux");
-    let fan_manifests = load_module_manifests_with_extra_for_target(
-        &fan_entries(),
-        extra_module_dirs,
-        resolved_target,
-        project_root,
-    );
     let graph_modules: Vec<crate::add_subgraph::GraphModule> = module_entries
         .iter()
         .zip(&module_names)
@@ -946,13 +865,13 @@ fn generate_config_impl(
         &graph_modules,
         &edge_records,
         crate::add_subgraph::Placement {
-            platform: crate::ring_demand::platform_of(runtime),
+            platform: crate::ring_demand::platform_of(runtime, r.project_root()),
             accept_cycles,
             domain_names: &domain_names,
         },
         &crate::add_subgraph::Composer {
             describe: &|e| crate::ring_demand::refusal(e, &module_names, &manifests, runtime),
-            fan_params: &|fan, scratch| fan_module_params(fan, scratch, &fan_manifests),
+            fan_params: &|fan, scratch| fan_module_params(fan, scratch, r),
         },
     )
     .map_err(Error::Config)?;
@@ -1047,7 +966,7 @@ fn generate_config_impl(
     // The composed graph's shape: its fans are modules, their joining
     // edges edges.
     let composed_edges = composed_edge_tuples(&composition.edges);
-    let smp = crate::target::smp_of(target);
+    let smp = crate::target::smp_of(target, project_root);
     let crossings = crate::capacity::crossing_count(
         &smp,
         composition.edges.iter().map(|e| {
@@ -1098,12 +1017,6 @@ fn generate_config_impl(
     .map_err(|e| Error::Config(e.to_string()))
 }
 
-/// The fan module types as manifest entries, for the resolver every other
-/// module is resolved by.
-fn fan_entries() -> Value {
-    json!([{ "name": "tee" }, { "name": "merge" }])
-}
-
 /// A declared module as composition sees it: its record's fields, and what
 /// its manifest says of its ports. A module the node runs built in declares
 /// no ports to the composer (the kernel holds no manifest for it), and the
@@ -1123,7 +1036,9 @@ fn graph_module(
         pre_pass: entry.pre_pass,
         budget: entry.budget,
         params: entry.params.clone(),
-        ports: loaded.map(crate::add_subgraph::plan_ports).unwrap_or_default(),
+        ports: loaded
+            .map(crate::add_subgraph::plan_ports)
+            .unwrap_or_default(),
         mailbox_safe: loaded.is_some_and(|m| m.facts.mailbox_safe),
         multi_channel: crate::ring_demand::multi_channel(runtime, entry.name_hash),
     }
@@ -1132,23 +1047,24 @@ fn graph_module(
 /// A fan's params TLV: its frame kind, frames per step and scratch
 /// (`plan::fan_params`), with the heap cap its module type derives for that
 /// scratch (`[capacities] heap_per_param`, params tag 0xEF) as for any
-/// instance of the type. `manifests` holds the fan types' manifests by type.
+/// instance of the type, as `r` resolves the fan type.
 fn fan_module_params(
     fan: &plan::Fan,
     scratch: u32,
-    manifests: &HashMap<String, Manifest>,
+    r: &ModuleResolver,
 ) -> std::result::Result<Vec<u8>, String> {
     let ty = match fan.dir {
         plan::FanDir::Out => "tee",
         plan::FanDir::In => "merge",
     };
-    let manifest = manifests.get(ty).ok_or_else(|| {
+    let fan_module = r.require(ty, ty, None).map_err(|e| {
         format!(
-            "the graph wires one port to several, which a `{ty}` module joins, and no `{ty}` \
-             manifest resolves: `{ty}` is a Fluxor module — a project that depends on fluxor \
-             pins it (`fluxor update`), and Fluxor builds it (`fluxor modules build`)"
+            "the graph wires one port to several, which a `{ty}` module joins: {e} — `{ty}` \
+             is a Fluxor module: a project that depends on fluxor pins it (`fluxor update`), \
+             and Fluxor builds it (`fluxor modules build`)"
         )
     })?;
+    let manifest = &fan_module.manifest;
     let tlv = plan::fan_params(fan.kind, plan::FRAMES_PER_STEP_DEFAULT, scratch).to_vec();
     insert_heap_tags(tlv, &json!({}), ty, Some(manifest), &HeapPlan::default())
         .map_err(|e| e.to_string())
@@ -1434,13 +1350,13 @@ fn integer_params(schema: Option<&schema::ParamSchema>) -> Vec<(u8, u32)> {
 
 /// The node graph's per-instance demand: each module entry's params (its TLV
 /// from the entry header on) read with its YAML entry, its manifest and, for
-/// a type with a `demand_from_params` rule, its param schema from `loc`.
+/// a type with a `demand_from_params` rule, its param schema from `r`.
 fn base_demand(
     modules: &Value,
     entries: &[ModuleEntry],
     names: &[String],
     manifests: &HashMap<String, Manifest>,
-    loc: schema::ModuleLocation<'_>,
+    r: &ModuleResolver,
 ) -> Result<Vec<InstanceDemand>> {
     let list = modules.as_array().map(Vec::as_slice).unwrap_or(&[]);
     let mut out = Vec::new();
@@ -1448,8 +1364,7 @@ fn base_demand(
         let manifest = manifests.get(name);
         let tlv = entry.params.as_slice();
         let integers = if manifest.is_some_and(|m| !m.demand_from_params.is_empty()) {
-            let ty = module.get("type").and_then(Value::as_str).unwrap_or(name);
-            integer_params(schema::load_schema_for_entry(module, ty, loc)?.as_ref())
+            integer_params(schema::entry_schema(module, r)?.as_ref())
         } else {
             Vec::new()
         };
@@ -1683,12 +1598,8 @@ fn heap_per_demand_report(
 /// the node's network as `linux_net`, see [`workload_edges`]). Cross-workload
 /// edges are refused (strict isolation). Empty with no workloads.
 #[cfg(test)]
-fn build_workload_section(
-    config: &Value,
-    loc: schema::ModuleLocation<'_>,
-    extra_module_dirs: &[&Path],
-) -> Result<Vec<Vec<u8>>> {
-    build_workloads(config, loc, extra_module_dirs, "linux")?
+fn build_workload_section(config: &Value, r: &ModuleResolver) -> Result<Vec<Vec<u8>>> {
+    build_workloads(config, r, "linux")?
         .iter()
         .map(|w| crate::add_subgraph::encode_workload(w).map_err(Error::Config))
         .collect()
@@ -1764,10 +1675,10 @@ pub(crate) fn exercised_claims(
 
 /// [`exercised_claims`]'s value test against the module's built schema.
 fn schema_param_is_one_of(
-    loc: schema::ModuleLocation<'_>,
+    r: &ModuleResolver,
 ) -> impl Fn(&str, &Value, &str, &[String]) -> Result<Option<Option<bool>>> + '_ {
-    move |mtype, entry, param, values| {
-        Ok(schema::load_schema_for_entry(entry, mtype, loc)?
+    move |_mtype, entry, param, values| {
+        Ok(schema::entry_schema(entry, r)?
             .map(|ps| schema::param_is_one_of(entry, &ps, param, values)))
     }
 }
@@ -1775,18 +1686,11 @@ fn schema_param_is_one_of(
 /// The value of integer param `param` for the module instance `entry`:
 /// what the graph sets, or the schema default. The schema is the built
 /// artefact's, or a native module's manifest.
-fn bound_param_value(
-    entry: &Value,
-    param: &str,
-    loc: schema::ModuleLocation<'_>,
-) -> Result<BoundParam> {
-    let Some(name) = entry.get("name").and_then(Value::as_str) else {
+fn bound_param_value(entry: &Value, param: &str, r: &ModuleResolver) -> Result<BoundParam> {
+    if entry.get("name").and_then(Value::as_str).is_none() {
         return Ok(BoundParam::NoSchema);
-    };
-    let mtype = entry.get("type").and_then(Value::as_str).unwrap_or(name);
-    let Some(ps) = schema::load_schema_for_entry(entry, mtype, loc)?
-        .or_else(|| load_native_param_schema(mtype).map(|(_, s)| s))
-    else {
+    }
+    let Some(ps) = schema::entry_schema(entry, r)? else {
         return Ok(BoundParam::NoSchema);
     };
     Ok(bound_param_in(entry, &ps, param))
@@ -1815,23 +1719,21 @@ fn bound_param_in(entry: &Value, ps: &schema::ParamSchema, param: &str) -> Bound
 /// declared demand and `target`'s reserve, as a graph plans its own.
 pub fn build_workloads(
     config: &Value,
-    loc: schema::ModuleLocation<'_>,
-    extra_module_dirs: &[&Path],
+    r: &ModuleResolver,
     target: &str,
 ) -> Result<Vec<crate::add_subgraph::Workload>> {
-    let runtime = crate::target::load_target(target, loc.project_root)
+    let runtime = crate::target::load_target(target, r.project_root())
         .map(|d| d.runtime().to_string())
         .ok();
-    let (mut workloads, demand, heaps) =
-        build_workloads_counted(config, loc, extra_module_dirs, runtime.as_deref())?;
+    let (mut workloads, demand, heaps) = build_workloads_counted(config, r, runtime.as_deref())?;
     let plan = heap_plan(target, config, &demand);
     apply_heap_plan(&plan, &heaps, &mut [], &mut workloads)?;
     Ok(workloads)
 }
 
 /// Whether the platform of `runtime` answers `caller`'s `fs` calls.
-fn fs_reachable(runtime: &str, caller: ProviderCaller) -> bool {
-    platform_contracts(runtime, caller).is_some_and(|c| c.iter().any(|x| x == "fs"))
+fn fs_reachable(runtime: &str, caller: ProviderCaller, project: &Path) -> bool {
+    platform_contracts(runtime, caller, project).is_some_and(|c| c.iter().any(|x| x == "fs"))
 }
 
 /// Refuse a credential form the instance could not use where it runs.
@@ -1894,8 +1796,7 @@ pub(crate) fn refuse_credential_forms(
 /// workloads are counted in the graph's plan as its node-graph modules are.
 fn build_workloads_counted(
     config: &Value,
-    loc: schema::ModuleLocation<'_>,
-    extra_module_dirs: &[&Path],
+    r: &ModuleResolver,
     runtime: Option<&str>,
 ) -> Result<(
     Vec<crate::add_subgraph::Workload>,
@@ -1912,15 +1813,6 @@ fn build_workloads_counted(
         return Ok((Vec::new(), demand, heaps));
     }
     let data_section = config.get("data");
-    // Manifest search path for the pre_pass check: mirror the validators'
-    // resolution (extra_module_dirs first — they shadow bundled modules), then
-    // `modules_dir` as a fallback so an external/project module is found and
-    // checked rather than silently passing and losing its pre-pass semantics.
-    let manifest_search: Vec<&Path> = {
-        let mut v: Vec<&Path> = extra_module_dirs.to_vec();
-        v.push(loc.dir);
-        v
-    };
     // Per-domain execution mode, so workloads can be refused from interrupt-mode
     // domains. A workload's graph carries NO exec-mode / `interrupt_safe`
     // metadata, and workload admission runs AFTER the platform registers ISR
@@ -1931,23 +1823,6 @@ fn build_workloads_counted(
         .into_iter()
         .map(|(_, exec)| exec.mode)
         .collect();
-    // Every manifest a workload needs resolves as a node graph's do: its pin
-    // in the project's `fluxor.lock` first, then the search paths.
-    let workload_abi = (!loc.abi.is_empty()).then_some(loc.abi);
-    let pins =
-        crate::store_cli::lock_store_manifest_resolver(loc.project_root, workload_abi, None);
-    // The fan types, resolved as the workload's own modules are: a fan a
-    // workload's wiring needs runs as one of its modules.
-    let mut fan_manifests: HashMap<String, Manifest> = HashMap::new();
-    for ty in ["tee", "merge"] {
-        match type_manifest(ty, ty, None, &manifest_search, workload_abi, pins.as_ref()) {
-            TypeManifest::Found(man) => {
-                fan_manifests.insert(ty.to_string(), *man);
-            }
-            TypeManifest::Rejected(why) => return Err(Error::Config(why)),
-            TypeManifest::Absent => {}
-        }
-    }
     let mut workloads = Vec::new();
     for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
         let mods_yaml = workload_yaml
@@ -1981,12 +1856,19 @@ fn build_workloads_counted(
             refuse_credential_forms(
                 m,
                 runtime,
-                runtime.is_some_and(|r| fs_reachable(r, ProviderCaller::Workload)),
+                runtime
+                    .is_some_and(|rt| fs_reachable(rt, ProviderCaller::Workload, r.project_root())),
                 &format!("workload {pi} module '{mname}'"),
             )?;
+            // Resolved for the target's module ABI and the instance's
+            // variant, as node-graph modules are: the heap rule below reads
+            // per-ABI, per-variant figures.
+            let resolved = r
+                .require(mname, mtype, m.get("variant").and_then(Value::as_str))
+                .map_err(|e| Error::Config(format!("workload {pi}: {e}")))?;
             // PIC-only: a workload's modules are admitted via the loader by
             // name_hash; a native module has no .fmod for apply_add to load.
-            if crate::modules::is_native_module(mtype) {
+            if resolved.is_native() {
                 if WORKLOAD_NET_ENDS.contains(&mtype) {
                     return Err(Error::Config(format!(
                         "workload {pi} module '{mname}': `{mtype}` is the node's network, not a \
@@ -2031,23 +1913,7 @@ fn build_workloads_counted(
                     exec_mode.name()
                 )));
             }
-            // Resolved for the target's module ABI and the instance's
-            // variant, as node-graph manifests are: the heap rule below
-            // reads per-ABI, per-variant figures.
-            let manifest = match type_manifest(
-                mname,
-                mtype,
-                m.get("variant").and_then(Value::as_str),
-                &manifest_search,
-                workload_abi,
-                pins.as_ref(),
-            ) {
-                TypeManifest::Found(man) => Some(*man),
-                TypeManifest::Rejected(why) => {
-                    return Err(Error::Config(format!("workload {pi}: {why}")));
-                }
-                TypeManifest::Absent => None,
-            };
+            let manifest = Some(resolved.manifest.clone());
             let mut local = m.clone();
             if let Some(obj) = local.as_object_mut() {
                 obj.insert("name".to_string(), Value::String(mname.to_string()));
@@ -2071,7 +1937,7 @@ fn build_workloads_counted(
             }
             // Inline-TLV params — identical packing to node-graph modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
-            let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
+            let param_schema = schema::entry_schema(m, r)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
             validate_variant_key(m, mname)?;
             let integers = integer_params(param_schema.as_ref());
@@ -2129,11 +1995,8 @@ fn build_workloads_counted(
                 multi_channel: false,
             });
         }
-        let local_claims = exercised_claims(
-            &local_entries,
-            &local_manifests,
-            schema_param_is_one_of(loc),
-        )?;
+        let local_claims =
+            exercised_claims(&local_entries, &local_manifests, schema_param_is_one_of(r))?;
         validate_single_provider(
             &json!({
                 "modules": local_entries,
@@ -2145,6 +2008,7 @@ fn build_workloads_counted(
             ProviderReach {
                 runtime,
                 caller: ProviderCaller::Workload,
+                project: r.project_root(),
             },
         )
         .map_err(|e| match e {
@@ -2163,6 +2027,7 @@ fn build_workloads_counted(
                 ProviderReach {
                     runtime,
                     caller: ProviderCaller::Workload,
+                    project: r.project_root(),
                 },
             ),
             &format!("workload {pi}: "),
@@ -2238,7 +2103,10 @@ fn build_workloads_counted(
             &modules,
             &edges,
             crate::add_subgraph::Placement {
-                platform: crate::ring_demand::platform_of(runtime.unwrap_or("linux")),
+                platform: crate::ring_demand::platform_of(
+                    runtime.unwrap_or("linux"),
+                    r.project_root(),
+                ),
                 accept_cycles: true,
                 domain_names: &[],
             },
@@ -2251,7 +2119,7 @@ fn build_workloads_counted(
                         runtime.unwrap_or("linux"),
                     )
                 },
-                fan_params: &|fan, scratch| fan_module_params(fan, scratch, &fan_manifests),
+                fan_params: &|fan, scratch| fan_module_params(fan, scratch, r),
             },
         )
         .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
