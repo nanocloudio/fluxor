@@ -41,8 +41,9 @@ pub struct State {
     /// Runs of the loop between the two readings, and turns in a run.
     iterations: u32,
     turns: u32,
-    /// Cycles a turn costs on this core; 0 when the graph states none.
-    cycles_per_turn: u32,
+    /// Hundredths of a cycle a turn costs on this core; 0 when the graph
+    /// states none.
+    cycles_per_turn_x100: u32,
     period_ms: u32,
     delay_ms: u32,
     /// Cycles one read costs this module.
@@ -64,8 +65,8 @@ mod params_def {
             => |s, d, len| { s.iterations = p_u32(d, len, 0, 1000); };
         2, turns, u32, 32
             => |s, d, len| { s.turns = p_u32(d, len, 0, 32); };
-        3, cycles_per_turn, u32, 0
-            => |s, d, len| { s.cycles_per_turn = p_u32(d, len, 0, 0); };
+        3, cycles_per_turn_x100, u32, 0
+            => |s, d, len| { s.cycles_per_turn_x100 = p_u32(d, len, 0, 0); };
         4, period_ms, u32, 1000
             => |s, d, len| { s.period_ms = p_u32(d, len, 0, 1000); };
         5, delay, u32, 2000
@@ -202,7 +203,8 @@ unsafe fn measure(s: &mut State, sys: &SyscallTable, now: u64) -> StepReturn {
     };
     let e = counters::elapsed(&before, &after);
     let cycles = e.cycles.saturating_sub(s.read_cost);
-    let want = s.cycles_per_turn.saturating_mul(total);
+    let want = (u64::from(s.cycles_per_turn_x100) * u64::from(total) / 100).min(u64::from(u32::MAX))
+        as u32;
     let ok = if want == 0 {
         cycles != 0
     } else {

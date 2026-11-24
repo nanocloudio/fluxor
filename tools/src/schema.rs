@@ -303,6 +303,15 @@ pub struct ParamSchema {
 }
 
 impl ParamSchema {
+    /// The schema of a module that declares no params: every key a graph
+    /// sets on it, besides the module entry's own, is unknown.
+    pub fn empty() -> Self {
+        ParamSchema {
+            params: Vec::new(),
+            name_map: HashMap::new(),
+        }
+    }
+
     /// A schema of `params`, as a test states one.
     #[cfg(test)]
     pub(crate) fn from_params(params: Vec<SchemaParam>) -> Self {
@@ -401,19 +410,12 @@ impl ParamSchema {
         Some(ParamSchema { params, name_map })
     }
 
-    /// Parse schema from an .fmod file's ModuleInfo.
-    pub fn from_module_info(info: &ModuleInfo) -> Option<Self> {
-        info.schema.as_ref().and_then(|data| Self::from_bytes(data))
-    }
-
     /// Build a schema from a native module's `manifest.toml` `[[params]]`
     /// section. This lets the same TLV packer used for `.fmod` modules
     /// produce per-instance params for native modules (which have no
-    /// `.fmod` to embed schema bytes into).
-    pub fn from_manifest(m: &crate::manifest::Manifest) -> Option<Self> {
-        if m.params.is_empty() {
-            return None;
-        }
+    /// `.fmod` to embed schema bytes into). A manifest declaring no params
+    /// gives the empty schema.
+    pub fn from_manifest(m: &crate::manifest::Manifest) -> Self {
         let mut params = Vec::with_capacity(m.params.len());
         for mp in &m.params {
             let ptype = match mp.ptype {
@@ -441,7 +443,7 @@ impl ParamSchema {
         for (i, p) in params.iter().enumerate() {
             name_map.insert(p.name.clone(), i);
         }
-        Some(ParamSchema { params, name_map })
+        ParamSchema { params, name_map }
     }
 
     /// Two params on one tag: `(tag, first name, second name)`. The packer
@@ -1529,11 +1531,12 @@ fn pack_voice_inner(
 /// pins consulted below.
 ///
 /// Three outcomes, deliberately distinguishable:
-///   - `Ok(Some(schema))` — a schema was read.
-///   - `Ok(None)` — this module legitimately has no `.fmod`-borne schema: a
-///     native module (schema lives in its `manifest.toml`), a module declaring no
-///     params, or an unpinned module whose `.fmod` simply isn't built (the
-///     module-table builder reports that one separately).
+///   - `Ok(Some(schema))` — the module's `.fmod` was found: its schema, or
+///     [`ParamSchema::empty`] for a module declaring no params, so every key
+///     a graph sets on it is checked either way.
+///   - `Ok(None)` — no `.fmod` was found: a native module (schema lives in
+///     its `manifest.toml`), or an unpinned module whose `.fmod` simply isn't
+///     built (the module-table builder reports that one separately).
 ///   - `Err` — the module IS pinned in `fluxor.lock` but its pinned artifact
 ///     could not be resolved. Failing closed here mirrors
 ///     `config::assert_module_manifests_resolvable` on the manifest half of the
@@ -1588,7 +1591,14 @@ fn load_schema_for_artifact(
         ModuleInfo::from_file(&pinned.path)
             .map_err(|e| pinned_schema_error(module_type, &format!("{}: {e}", pinned.pin_label)))?
     };
-    Ok(ParamSchema::from_module_info(&info))
+    let Some(data) = info.schema.as_ref() else {
+        return Ok(Some(ParamSchema::empty()));
+    };
+    ParamSchema::from_bytes(data).map(Some).ok_or_else(|| {
+        crate::Error::Config(format!(
+            "module '{module_type}': the param schema in its artefact '{artifact}' is malformed"
+        ))
+    })
 }
 
 /// Where one build reads module artefacts from, and what that location
@@ -2423,6 +2433,40 @@ mod tests {
         assert!(schema.is_none(), "no pin, no .fmod → no schema");
     }
 
+    /// A module whose `.fmod` is found and carries no schema declares no
+    /// params: the empty schema, against which every key is checked, never
+    /// "no schema here", which would check none.
+    #[test]
+    fn a_found_module_without_a_schema_has_the_empty_schema() {
+        let (project, store, modules_dir) = pinned_but_missing_fixture();
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+        let header = fluxor_abi::wire::fmod::header::Header {
+            magic: crate::modules::MODULE_MAGIC,
+            version: 1,
+            abi_version: 1,
+            module_type: 1,
+            flags: 0,
+            code_size: 0,
+            data_size: 0,
+            export_count: 0,
+            schema_size: 0,
+            manifest_size: 0,
+            step_period: 0,
+            step_phase: 0,
+            name: [0u8; 32],
+        };
+        std::fs::write(modules_dir.join("bare.fmod"), header.to_bytes()).expect("write fmod");
+        let loc = ModuleLocation {
+            dir: &modules_dir,
+            abi: "aarch64",
+            project_root: project.path(),
+        };
+        let schema = load_schema_for_module("bare", loc)
+            .expect("a readable .fmod")
+            .expect("a found module has a schema");
+        assert!(schema.params.is_empty(), "it declares no params");
+    }
+
     /// An entry naming a `variant:` reads the schema of the artefact the
     /// packer loads, `<type>-<variant>`, which the lock pins under that name.
     /// With only `pinned-exchange` pinned, the lookup must reach that pin (and
@@ -2524,7 +2568,7 @@ mod requires_when_resolution {
             }],
             ..Manifest::default()
         };
-        ParamSchema::from_manifest(&m).expect("schema")
+        ParamSchema::from_manifest(&m)
     }
 
     fn yaml(s: &str) -> Value {

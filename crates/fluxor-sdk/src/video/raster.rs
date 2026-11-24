@@ -16,6 +16,9 @@
 //!   finished row to an output format.
 //! - `Input` holds one raster input a SURFACE record places: the regions
 //!   of a `VideoRaster` stream read into the consumer's two buffers.
+//! - `BandCache` keeps finished RGB565 bands of a picture shown for many
+//!   refreshes, encoded as runs and literals, and writes them back byte for
+//!   byte.
 //! - `coverage::corner` and `coverage::join` are the contract's reference
 //!   functions for rounded corners and border joins.
 //!
@@ -28,6 +31,7 @@
 #![deny(clippy::float_arithmetic)]
 
 pub mod band;
+pub mod band_cache;
 pub mod coverage;
 pub mod ingest;
 pub mod input;
@@ -53,6 +57,7 @@ fn shift_down(buf: &mut [u8], from: usize, len: usize, to: usize) {
 }
 
 pub use band::{Band, BAND_BPP};
+pub use band_cache::BandCache;
 pub use coverage::Shape;
 pub use ingest::{fault_text, Event, Ingest};
 pub use input::Input;

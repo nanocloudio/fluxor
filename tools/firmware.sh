@@ -248,23 +248,27 @@ case "$SILICON" in
     ;;
 esac
 
-# Bound the kernel's own depth on a second core's stack.
+# Bound the kernel's own depth on each core's stack.
 #
-# A second core that runs a domain steps on a small stack of its own, and a
-# frame that outgrows it is a fault of the whole node. The image's own call
-# tree says how deep the kernel goes there (`tools/img/kernel_stack_bound.py`
-# reads it; its header states the method), so the build refuses an image
-# where that is over what the target's `[smp] secondary_stack` leaves:
+# A frame that outgrows the stack a core steps its modules on is a fault of
+# the whole node, so the build bounds the kernel's share of each from the
+# image's own call tree (`tools/img/kernel_stack_bound.py` reads it; its
+# header states the method) and refuses an image over it:
 #
-#   - from the core's entry the kernel stays within the stack less
-#     KERNEL_HEADROOM;
-#   - under a module stepped there the kernel stays within `reserve_kb`, the
-#     share of the stack the composer keeps from an ungated module: what is
-#     in use where the pass engine calls the module, the deepest call the
-#     module can make back (every entry of the syscall table, through the
-#     provider table into every handler the kernel registers), one interrupt
-#     on top, and HOOK_ALLOWANCE for the platform hooks the walk counts but
-#     cannot follow.
+#   - under a module stepped on core 0, every RP silicon: within the target's
+#     `[kernel] kernel_stack_reserve_kb`, the share of the stack the composer
+#     keeps from a module: what is in use where the pass engine calls the
+#     module, the deepest call the module can make back (every entry of the
+#     syscall table, through the provider table into every handler the
+#     kernel registers, the primary-core ops included), one interrupt on top,
+#     and HOOK_ALLOWANCE for the platform hooks the walk counts but cannot
+#     follow;
+#   - on a second core that runs a domain (rp2350): from the core's entry
+#     within its `[smp] secondary_stack` less KERNEL_HEADROOM, and under a
+#     module within the stack's `reserve_kb`, the same sum. The primary-core
+#     ops are not in it: a second core hands them to core 0 as their first
+#     act, so the kernel's `primary_` functions count for their own frame
+#     there and no deeper.
 #
 # Where calls through registers lead:
 #   - the log facade reaches the kernel's logger, and the formatter its
@@ -272,32 +276,32 @@ esac
 #   - the provider table's dispatch code (the provider module, the syscall
 #     wrappers that inline it, the kernel bucket's call to the platform
 #     extension) reaches the handlers registered by the two functions that
-#     fill the tables; the script reads the handlers from the image.
+#     fill the tables, one dispatch deep; the script reads the handlers from
+#     the image.
 #
 # Functions counted for their own frame and not walked below: the panic
 # handler, which ends the core and is bounded as a root of its own (a panic
-# inside it is counted for the entry's frame); a table's first-use sizing,
-# which runs once, at boot on core 0 for every table a pass reads; and the
-# kernel's `primary_stack_*` functions, which refuse a core with a small
-# stack before they do anything else.
+# inside it is counted for the entry's frame); and a table's first-use
+# sizing, which runs once, at boot on core 0 for every table a pass reads.
 #
-# The interrupts are the lines core 1 enables: its step guard, its wake
-# alarm, its module timer, the DMA's second line and a module's bound line.
-if [[ "$SILICON" == "rp2350" ]]; then
-    secondary_field() {
-        sed -n "s/^secondary_stack[[:space:]]*=.*[{,][[:space:]]*$1[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p" "$SILICON_TOML"
+# The interrupts are the lines each core enables: its step guard, its wake
+# alarm, its module timer, its DMA line and a module's bound line.
+case "$SILICON" in
+  rp2040|rp2350)
+    silicon_kb() {
+        sed -n "s/^$1[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p" "$SILICON_TOML" | head -1
     }
-    STACK_KB="$(secondary_field size_kb)"
-    RESERVE_KB="$(secondary_field reserve_kb)"
-    [[ -n "$STACK_KB" && -n "$RESERVE_KB" ]] || {
-        echo "firmware: $SILICON_TOML declares no [smp] secondary_stack size_kb and reserve_kb" >&2
+    CORE0_RESERVE_KB="$(silicon_kb kernel_stack_reserve_kb)"
+    STATIC_MAX_KB="$(silicon_kb ram_static_max_kb)"
+    RAM_BYTES="$(sed -n 's/^ram_size[[:space:]]*=[[:space:]]*"\(0x[0-9A-Fa-f]*\)".*/\1/p' "$SILICON_TOML" | head -1)"
+    [[ -n "$CORE0_RESERVE_KB" && -n "$STATIC_MAX_KB" && -n "$RAM_BYTES" ]] || {
+        echo "firmware: $SILICON_TOML declares no kernel_stack_reserve_kb, ram_static_max_kb or ram_size" >&2
         exit 6
     }
     KERNEL_HEADROOM=2048
     HOOK_ALLOWANCE=256
     WHERE_CALLS_LEAD=(
         --leaf rust_begin_unwind --leaf "Raw::size_on_first_use"
-        --leaf "kernel::module::syscalls::primary_stack_"
         --reaches "GlobalLogger as log::Log>::log=RingLogger as log::Log>::log"
         --reaches "core::fmt::write=BufWriter as core::fmt::Write"
         --dispatch-from "kernel::module::provider::"
@@ -306,23 +310,55 @@ if [[ "$SILICON" == "rp2350" ]]; then
         --dispatch-from "kernel::module::syscalls::release_module_handles"
         --dispatch-table "kernel::module::syscalls::init_providers"
         --dispatch-table "platform::rp_providers::init"
+        --dispatch-depth 1
     )
+    SYSCALL_ENTRIES=(
+        --entry syscall_channel_read --entry syscall_channel_write
+        --entry syscall_channel_poll --entry syscall_channel_peek
+        --entry syscall_channel_discard
+        --entry syscall_heap_alloc --entry syscall_heap_free --entry syscall_heap_realloc
+        --entry syscall_provider_open --entry syscall_provider_call
+        --entry syscall_provider_query --entry syscall_provider_close
+    )
+    if [[ "$SILICON" == "rp2350" ]]; then
+        CORE0_LINES=(--interrupt TIMER1_IRQ_0 --interrupt TIMER1_IRQ_1 --interrupt TIMER1_IRQ_2)
+    else
+        CORE0_LINES=(--interrupt TIMER_IRQ_1 --interrupt TIMER_IRQ_2 --interrupt TIMER_IRQ_3)
+    fi
     python3 tools/img/kernel_stack_bound.py "target/$TARGET/firmware.elf" \
-        --root fluxor::platform::rp_core1::core1_entry \
-        --limit $((STACK_KB * 1024 - KERNEL_HEADROOM)) \
+        --root fluxor_rp_main \
+        --limit $(( RAM_BYTES - STATIC_MAX_KB * 1024 - KERNEL_HEADROOM )) \
         "${WHERE_CALLS_LEAD[@]}" \
         --depth-at "scheduler::pass::step_burst" \
-        --depth-at-limit $((RESERVE_KB * 1024)) \
-        --entry syscall_channel_read --entry syscall_channel_write \
-        --entry syscall_channel_poll --entry syscall_channel_peek \
-        --entry syscall_channel_discard \
-        --entry syscall_heap_alloc --entry syscall_heap_free --entry syscall_heap_realloc \
-        --entry syscall_provider_open --entry syscall_provider_call \
-        --entry syscall_provider_query --entry syscall_provider_close \
-        --interrupt TIMER0_IRQ_1 --interrupt TIMER0_IRQ_2 --interrupt TIMER0_IRQ_3 \
-        --interrupt DMA_IRQ_1 --interrupt kernel::exec::irq::irq_trampoline \
+        --depth-at-limit $((CORE0_RESERVE_KB * 1024)) \
+        "${SYSCALL_ENTRIES[@]}" \
+        "${CORE0_LINES[@]}" --interrupt DMA_IRQ_0 \
+        --interrupt kernel::exec::irq::irq_trampoline \
         --allowance "$HOOK_ALLOWANCE" || exit 6
+    if [[ "$SILICON" == "rp2350" ]]; then
+        secondary_field() {
+            sed -n "s/^secondary_stack[[:space:]]*=.*[{,][[:space:]]*$1[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p" "$SILICON_TOML"
+        }
+        STACK_KB="$(secondary_field size_kb)"
+        RESERVE_KB="$(secondary_field reserve_kb)"
+        [[ -n "$STACK_KB" && -n "$RESERVE_KB" ]] || {
+            echo "firmware: $SILICON_TOML declares no [smp] secondary_stack size_kb and reserve_kb" >&2
+            exit 6
+        }
+        python3 tools/img/kernel_stack_bound.py "target/$TARGET/firmware.elf" \
+            --root fluxor::platform::rp_core1::core1_entry \
+            --limit $((STACK_KB * 1024 - KERNEL_HEADROOM)) \
+            "${WHERE_CALLS_LEAD[@]}" \
+            --leaf "kernel::module::syscalls::primary_" \
+            --depth-at "scheduler::pass::step_burst" \
+            --depth-at-limit $((RESERVE_KB * 1024)) \
+            "${SYSCALL_ENTRIES[@]}" \
+            --interrupt TIMER0_IRQ_1 --interrupt TIMER0_IRQ_2 --interrupt TIMER0_IRQ_3 \
+            --interrupt DMA_IRQ_1 --interrupt kernel::exec::irq::irq_trampoline \
+            --allowance "$HOOK_ALLOWANCE" || exit 6
+    fi
     python3 tools/img/kernel_stack_bound.py "target/$TARGET/firmware.elf" \
         --root rust_begin_unwind --limit "$KERNEL_HEADROOM" \
         --leaf "Raw::size_on_first_use" --leaf "core::panicking::panic" || exit 6
-fi
+    ;;
+esac

@@ -339,12 +339,16 @@ fn generate_config_impl(
     // timer-class gate below resolves workload modules too; `parse_modules_map` (emit,
     // node-graph-only) just ignores the extra workload entries keyed by type.
     let manifest_src = Value::Array(validation_modules.clone());
-    let manifests = load_module_manifests_with_extra_for_target(
+    let mut manifests = load_module_manifests_with_extra_for_target(
         &manifest_src,
         extra_module_dirs,
         resolved_target,
         project_root,
     );
+    bind_capability_facts(&validation_modules, &mut manifests, &|entry, param| {
+        bound_param_value(entry, param, loc)
+    })?;
+    let manifests = manifests;
 
     // Send pools are sized from the graph: what each instance retains for
     // its consumers depends on who consumes it, which the wiring says.
@@ -631,12 +635,17 @@ fn generate_config_impl(
     // resolved for their capabilities and facts, against no target, since
     // the silicon they run on is their own graph's business.
     let remote_list = Value::Array(remote_members(config));
-    let remote_manifests = load_module_manifests_with_extra_for_target(
+    let mut remote_manifests = load_module_manifests_with_extra_for_target(
         &remote_list,
         extra_module_dirs,
         None,
         project_root,
     );
+    bind_capability_facts(
+        remote_list.as_array().map(Vec::as_slice).unwrap_or(&[]),
+        &mut remote_manifests,
+        &|entry, param| bound_param_value(entry, param, loc),
+    )?;
     for name in remote_member_names(config) {
         if !remote_manifests.contains_key(&name) {
             let node = instance_node(config, &name).unwrap_or_default();
@@ -704,16 +713,6 @@ fn generate_config_impl(
     validate_net_identity_writers(config, &module_names, &manifests)?;
     // One keeper of the key vault's durable image.
     validate_vault_store(config, &manifests)?;
-    // A module on a core other than 0 needs nothing only core 0 does.
-    if let Some(target) = target_desc.as_ref() {
-        validate_secondary_core_modules(
-            config,
-            validation_list,
-            &manifests,
-            &target.smp,
-            target.board_id.as_deref().unwrap_or(&target.id),
-        )?;
-    }
     // A module provider and the modules it serves share a domain (provider
     // code runs on the caller's core); one live-added workloads may reach
     // sits in the primary domain.

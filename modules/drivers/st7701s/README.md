@@ -22,6 +22,7 @@ Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 - `band_rows`
 - `bl_pin`
+- `cache_bytes`
 - `cs_pin`
 - `data0_pin`
 - `de_pin`
@@ -55,4 +56,6 @@ Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 `refreshes`, `underruns` (bands sent as the fill colour after a renderer
 could have armed them, a flash write's among them), `late_frames` (committed frames that waited more
 than one refresh), `render_us_per_band` (the mean over the last refresh)
-and `refresh_mhz` (the rate the sync divider gives).
+and `refresh_mhz` (the rate the sync divider gives). The `status_s` line
+adds `cached_bands` and `cache_used` (bands of the picture shown that are
+copied from the band cache, and the bytes they take).

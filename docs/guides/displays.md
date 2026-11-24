@@ -136,10 +136,28 @@ more for code running from flash with a cold cache. By that measure the
 first two rows are inside the 40 Hz budget; a panel of cards and text is
 not, on one core, and shows part of its bands each refresh.
 
+### The band cache
+
+A picture that stays up for more than one refresh need not be drawn every
+refresh. With `cache_bytes` set, from a picture's second refresh each band
+the driver draws is also kept, as the RGB565 bytes it sent, encoded as runs
+of one colour and literal pixels, while it fits; a kept band is copied into
+its slot instead of being drawn, byte for byte what drawing it gives. A
+`COMMIT`, or a new raster on `surface0`, drops every kept band, so a
+picture's first refresh is always drawn, and a stream that commits a frame
+every refresh keeps nothing and costs what it costs without a cache.
+
+On the same Cortex-M33 model, the 480 × 480 panel of cards and text above
+(30 instructions a pixel to draw) costs 3.9 a pixel from the cache, and
+encoding it, once, 17.6. It keeps in 69,408 bytes of its 460,800 bytes of
+RGB565; its largest band takes 3,112 bytes. `cache_bytes` holds a table of
+four bytes a band and then the bands: one that does not hold a picture's
+bands keeps the ones that fit, in scan order, and draws the rest.
+
 Read it from the telemetry, or from the status line `status_s` turns on:
 
 ```text
-[st7701s] measured_mhz=40006 refreshes=400 underruns=0 late_frames=0 render_us_per_band=… band_us=786
+[st7701s] measured_mhz=40006 refreshes=400 underruns=0 cached_bands=30 cache_used=69408 late_frames=0 render_us_per_band=… band_us=786
 ```
 
 | Counter | Meaning |
@@ -147,6 +165,7 @@ Read it from the telemetry, or from the status line `status_s` turns on:
 | `refresh_mhz` | The rate the sync divider gives (telemetry). `measured_mhz` in the status line is the rate the scan ran at since the last line, from bands sent. |
 | `refreshes` | Refreshes scanned. |
 | `underruns` | Bands that went out as fill after the driver could have armed them. |
+| `cached_bands`, `cache_used` | Bands of the picture shown that the cache holds, and the bytes they take (status line). |
 | `late_frames` | Committed frames that waited more than one refresh to show. |
 | `render_us_per_band` | The mean time the driver spent on a band over the last refresh, drawing and conversion. |
 
@@ -159,7 +178,8 @@ Read it from the telemetry, or from the status line `status_s` turns on:
   something else held the driver's core for longer than the ring covers
   (about `ring_rows / band_rows − 2` band periods), or a flash write ran.
 
-To fit a frame: lower `refresh_mhz`, give the driver a core to itself,
+To fit a frame: give it a band cache if it stays up, lower `refresh_mhz`,
+give the driver a core to itself,
 draw fewer translucent and glyph-dense pixels, or keep text in glyph packs
 the node image holds (`pack0` to `pack3`), which cost no resource memory
 and no transfer.
@@ -177,6 +197,7 @@ the instance state:
 | Defined resources | `resource_bytes` | 16,384 |
 | Read buffer | `record_bytes` | 1,024 |
 | `surface0` (two buffers) | `surface_bytes` × 2 | 0 |
+| Band cache | `cache_bytes` | 0 |
 | State | | about 6,400 |
 | **Total** | | **about 109,400** |
 

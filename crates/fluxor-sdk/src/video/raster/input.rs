@@ -86,13 +86,16 @@ impl Input {
         Texels::raster(pixels, w, h, format)
     }
 
-    /// Show the frame that is ready.
-    pub fn commit(&mut self) {
-        if self.ready {
-            self.front = 1 - self.front;
-            self.shown = self.arriving;
-            self.ready = false;
+    /// Show the frame that is ready: whether there was one, so what
+    /// `texels` answers changed.
+    pub fn commit(&mut self) -> bool {
+        if !self.ready {
+            return false;
         }
+        self.front = 1 - self.front;
+        self.shown = self.arriving;
+        self.ready = false;
+        true
     }
 
     /// Decide what the 20 bytes in `head` start.

@@ -5,6 +5,7 @@
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use portable_atomic::AtomicU64;
 
+use super::primary_call::{Caller, PrimaryCalls};
 use super::quiesce::{self, STEP, STRUCTURAL};
 use super::{core_domains, cross, domain_core};
 use crate::kernel::exec::irq;
@@ -264,14 +265,17 @@ pub fn pump_core(core_id: usize) {
 /// Primary-only, after [`request_quiesce`]: spin until every other core in
 /// its loop has parked.
 pub fn wait_parked() {
-    STRUCTURAL.wait_parked();
+    wait_parked_watching(|| {});
 }
 
 /// [`wait_parked`], calling `waiting` on every turn of the spin: for a
 /// platform that must notice, while it waits, a core that will never park
-/// (one that has stopped on a fault).
+/// (one that has stopped on a fault). A core waiting on a primary-core call
+/// of its own parks only once it is answered, so the calls posted are
+/// served on every turn.
 pub fn wait_parked_watching(mut waiting: impl FnMut()) {
     while !STRUCTURAL.all_parked() {
+        serve_primary_calls();
         waiting();
         core::hint::spin_loop();
     }
@@ -302,15 +306,22 @@ pub fn quiesce_peers_watching(waiting: impl FnMut()) -> bool {
     true
 }
 
-/// Whether core `core_id` has entered its domain loop.
+/// Whether core `core_id` has entered its domain loop: from here both
+/// quiesces wait for it to park. [`run`] joins the two in turn, so a core
+/// that has joined only the first is still on its way in, running code no
+/// step quiesce waits for.
 pub fn in_loop(core_id: usize) -> bool {
-    STRUCTURAL.in_loop(core_id)
+    quiesce::joined(core_id)
 }
 
 /// Between two module steps, on any core: park if the primary has asked for
-/// a step quiesce ([`quiesce::STEP`]). One atomic load when it has not.
+/// a step quiesce ([`quiesce::STEP`]); on the primary, serve the calls other
+/// cores posted ([`delegate`]). Two atomic loads when there is neither.
 #[inline]
 pub fn step_boundary() {
+    if PRIMARY_CALLS.any_posted() {
+        serve_primary_calls();
+    }
     if !STEP.requested() {
         return;
     }
@@ -355,6 +366,107 @@ pub fn release_step_quiesce() {
 /// Step quiesces taken since boot, over every core.
 pub fn step_parks() -> u32 {
     STEP.parks()
+}
+
+// ============================================================================
+// Primary-core calls
+// ============================================================================
+//
+// What runs on the primary core alone, called from a module on another
+// core: the core posts the call and waits, the primary runs it as the
+// caller. The protocol is in [`super::primary_call`].
+
+/// Every core's primary-core call.
+static PRIMARY_CALLS: PrimaryCalls = PrimaryCalls::new();
+
+/// Run `run` on the primary core and return its answer. On the primary (or
+/// before [`install`]) `run` runs here; on another core it is posted to the
+/// primary and this core waits, with its interrupts masked, honouring a
+/// step quiesce on every turn and never a structural one. The time waited
+/// is the kernel's: the caller's step deadline moves past it.
+pub fn delegate(run: &mut dyn FnMut() -> i32) -> i32 {
+    let Some(p) = platform() else {
+        return run();
+    };
+    let core = (p.core_id)();
+    if core == 0 {
+        return run();
+    }
+    let module = scheduler::current_module_index();
+    let caller = Caller {
+        module,
+        generation: scheduler::module_slot_generation(module),
+        requester: scheduler::caller_module_index(),
+    };
+    let _masked = crate::kernel::sys::guard::KernelGuard::acquire();
+    let started = (p.counter)();
+    let rc = PRIMARY_CALLS.delegate(
+        core,
+        caller,
+        run,
+        || {
+            (p.signal)();
+            crate::kernel::sys::hal::wake_scheduler();
+        },
+        || {
+            STEP.park_if_requested(core, p.park);
+            (p.wait_event)();
+        },
+    );
+    #[cfg(feature = "rp")]
+    {
+        // The RP counter is the microsecond timer.
+        let waited = (p.counter)().wrapping_sub(started) as u32;
+        crate::platform::rp_step_guard::rp_step_guard_defer(waited);
+    }
+    #[cfg(not(feature = "rp"))]
+    let _ = started;
+    rc
+}
+
+/// Whether core `core` is waiting on a primary-core call: it is live as
+/// long as the primary is.
+pub fn waiting_on_primary(core: usize) -> bool {
+    PRIMARY_CALLS.waiting(core)
+}
+
+/// On the primary: run every call another core posted, each as its caller.
+/// A no-op elsewhere, when none is posted, and inside a call being served.
+pub fn serve_primary_calls() {
+    if !PRIMARY_CALLS.any_posted() {
+        return;
+    }
+    let Some(p) = platform() else {
+        return;
+    };
+    if (p.core_id)() != 0 {
+        return;
+    }
+    // Served between two steps of a burst, the time is the kernel's, not the
+    // bursting module's: this core's deadline moves past it.
+    #[cfg(feature = "rp")]
+    let started = (p.counter)();
+    PRIMARY_CALLS.serve(
+        |c| {
+            c.module >= scheduler::module_slots()
+                || scheduler::module_slot_generation(c.module) == c.generation
+        },
+        |c, run| {
+            let requester = scheduler::caller_module_index();
+            scheduler::set_caller_module(c.requester);
+            let rc = scheduler::with_module_context(c.module, run);
+            scheduler::set_caller_module(requester);
+            rc
+        },
+        |core, away| STRUCTURAL.set_away(core, away),
+        p.signal,
+    );
+    #[cfg(feature = "rp")]
+    {
+        let served = (p.counter)().wrapping_sub(started) as u32;
+        let _masked = crate::kernel::sys::guard::KernelGuard::acquire();
+        crate::platform::rp_step_guard::rp_step_guard_defer(served);
+    }
 }
 
 // ============================================================================

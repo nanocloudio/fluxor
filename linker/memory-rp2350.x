@@ -4,18 +4,12 @@ MEMORY {
      */
     FLASH : ORIGIN = 0x10000000, LENGTH = 4096K
     /*
-     * RAM consists of 8 banks, SRAM0-SRAM7, with a striped mapping.
-     * This is usually good for performance, as it distributes load on
-     * those banks evenly.
+     * SRAM0-SRAM7 (512 KiB, striped across the eight banks) and SRAM8-SRAM9
+     * (4 KiB each, direct-mapped) directly above them: one region. The
+     * statics come first, core 1's stack among them (a static of
+     * `rp_core1`), and core 0's stack takes the top.
      */
-    RAM : ORIGIN = 0x20000000, LENGTH = 512K
-    /*
-     * SRAM8 and SRAM9 are direct-mapped, 4 KiB each, directly above the
-     * striped region. Together they are core 1's stack: nothing is linked
-     * into them.
-     */
-    SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
-    SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
+    RAM : ORIGIN = 0x20000000, LENGTH = 520K
 }
 
 SECTIONS {
@@ -76,11 +70,6 @@ PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
  * constant. */
 PROVIDE(__flash_start__ = ORIGIN(FLASH));
 PROVIDE(__flash_end__ = ORIGIN(FLASH) + LENGTH(FLASH));
-
-/* Core 1's stack: SRAM8 and SRAM9, contiguous. */
-PROVIDE(__core1_stack_limit = ORIGIN(SRAM8));
-PROVIDE(__core1_stack_top = ORIGIN(SRAM9) + LENGTH(SRAM9));
-ASSERT(ORIGIN(SRAM9) == ORIGIN(SRAM8) + LENGTH(SRAM8), "SRAM8 and SRAM9 are not contiguous");
 
 /* Exclusive accesses are arbitrated between the cores only in main SRAM
  * (0x20000000 to 0x20082000). Every lock word and atomic the two cores share

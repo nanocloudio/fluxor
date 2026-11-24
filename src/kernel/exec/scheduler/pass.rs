@@ -158,6 +158,9 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
             // lines whose `irq` module ended.
             fault::apply_posted(sched, modules);
             fault::retire_isr_lines();
+            // The primary-core calls other cores are waiting on.
+            #[cfg(all(feature = "smp", target_os = "none"))]
+            crate::kernel::exec::domains::serve_primary_calls();
         }
         if sched.domains[domain].exec_mode.is_interrupt() {
             // An interrupt-mode domain's modules run from their interrupt;

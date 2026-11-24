@@ -6,15 +6,21 @@ timer_class = "agnostic"
 #
 # `file` takes the bytes of one vector file
 # (`abi::contracts::video_draw::vector`): its raster inputs, then its draw
-# stream. Once the whole file has arrived the module sends each raster
-# input, a whole-surface record as the file holds it, on `surface0` and
-# `surface1` (`abi::contracts::video_raster`), then the stream on `draw`
+# stream, read into one heap block of `file_bytes`. Once the whole file
+# has arrived the module sends each raster input, a whole-surface record
+# as the file holds it, on `surface0` and `surface1`
+# (`abi::contracts::video_raster`), then the stream on `draw`
 # (`abi::contracts::video_draw`), byte for byte, and rests. A raster input
 # whose port is not wired is not sent. The byte strings a vector's RES_REF
 # records name are not sent anywhere: the consumer holds those itself.
 #
-# A file larger than 8,192 bytes, or one that is not a vector, is logged
+# A file larger than `file_bytes`, or one that is not a vector, is logged
 # and nothing is sent.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name       | Type | Default | Description |
+# |-----|------------|------|---------|-------------|
+# | 1   | file_bytes | u32  | 8192    | The largest vector file held: the heap block the file is read into. |
 
 [[ports]]
 name = "file"
@@ -34,7 +40,8 @@ glyph_formats = ["a1", "a8"]
 max_depth = 8
 max_resources = 8
 resource_bytes = 65536
-frame_bytes = 8192
+# A frame is replayed from the file, so it is no larger than the file.
+frame_bytes = { param = "file_bytes" }
 damage = ["full"]
 atomic = ["no"]
 
@@ -57,6 +64,13 @@ required = false
 [ports.facts]
 formats = ["rgb565", "rgba8"]
 regions = ["bands"]
+
+[capacities]
+# The file, from the heap: one byte per `file_bytes` (params tag 1), on
+# top of the allocation header.
+heap_per_param = { base = 64, params = [
+    { tag = 1, default = 8192, bytes_each = 1 },
+] }
 
 [observability]
 exempt = "a fixture — it replays one file and rests"

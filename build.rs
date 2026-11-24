@@ -46,7 +46,6 @@ struct SmpToml {
 /// under a module.
 #[derive(Deserialize)]
 struct SecondaryStackToml {
-    base: String,
     size_kb: u32,
     reserve_kb: u32,
 }
@@ -346,35 +345,6 @@ fn linker_ram_bytes(script: &[u8]) -> Option<u32> {
         },
     };
     digits.trim().parse::<u32>().ok().map(|n| n * scale)
-}
-
-/// The `(ORIGIN, LENGTH)` of region `name` in a linker memory map.
-fn linker_region(script: &[u8], name: &str) -> Option<(u32, u32)> {
-    let text = std::str::from_utf8(script).ok()?;
-    let line = text.lines().map(str::trim).find(|l| {
-        l.strip_prefix(name)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })?;
-    let origin = line
-        .split("ORIGIN")
-        .nth(1)?
-        .trim_start_matches([' ', '='])
-        .split(',')
-        .next()?
-        .trim();
-    let len = line
-        .split("LENGTH")
-        .nth(1)?
-        .trim_start_matches([' ', '='])
-        .trim();
-    let (digits, scale) = match len.strip_suffix('K') {
-        Some(d) => (d, 1024),
-        None => (len, 1),
-    };
-    Some((
-        parse_hex(origin),
-        digits.trim().parse::<u32>().ok()? * scale,
-    ))
 }
 
 fn emit_const(gen: &mut String, name: &str, ty: &str, val: &str) {
@@ -1633,31 +1603,13 @@ fn emit_rp(out: &Path, family: Rp) {
         "{toml_path}: [kernel.timers] secondary is declared exactly when [smp] domain_cores \
          runs a domain off core 0"
     );
+    // Core 1's stack is a static the kernel links (`rp_core1`), sized here.
     if let Some(stack) = &smp.secondary_stack {
-        let base = parse_hex(&stack.base);
         let size = stack.size_kb * 1024;
         let reserve = stack.reserve_kb * 1024;
-        let bank = |name: &str| {
-            linker_region(linker_script, name)
-                .unwrap_or_else(|| panic!("no {name} region in the {toml_path} linker map"))
-        };
-        let (low_base, low_len) = bank("SRAM8");
-        let (high_base, high_len) = bank("SRAM9");
-        assert!(
-            base == low_base && high_base == low_base + low_len && size == low_len + high_len,
-            "{toml_path}: [smp] secondary_stack ({base:#x}, {size} B) is not the linker's \
-             SRAM8 and SRAM9 regions ({low_base:#x}, {} B)",
-            low_len + high_len
-        );
         assert!(
             reserve < size,
             "{toml_path}: [smp] secondary_stack reserve_kb leaves no stack for a module"
-        );
-        emit_const(
-            &mut generated,
-            "SECONDARY_STACK_BASE",
-            "usize",
-            &format!("{base:#x}"),
         );
         emit_const(
             &mut generated,

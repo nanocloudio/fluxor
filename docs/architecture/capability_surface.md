@@ -382,6 +382,26 @@ or an entry the fact's schema does not admit is refused at manifest
 parse, whichever ABI is being built. Plain string
 and integer facts hold for every target.
 
+A numeric fact whose value is one of the module's integer params binds
+that param instead of stating a number, in the shape a port fact binds
+one ([av_capability_surface.md](av_capability_surface.md)):
+
+```toml
+[capability_facts."sensor.sample"]
+period_ms = { param = "interval_ms" }
+```
+
+The composer reads it per instance, as it reads a bound port fact: what
+the graph sets for that param, or the param's default, so every check
+that reads the fact reads the instance's value. The build holds a binding
+to the module's own schema (`define_params!`, or a native module's
+`[[params]]`): the param exists and is a `u8`, `u16` or `u32`. A numeric
+capability fact stated as a number under the name of one of the module's
+integer params is refused at build: a graph could set the param while the
+fact went on stating its default. (A port fact may share a param's name
+and mean something else, as a `width` ceiling beside a window's first
+`width`, so it is held only to its binding.)
+
 `replication.state_machine` sits one layer above the storage
 read / write / durability surfaces: its index echo, snapshot callbacks, and
 reset signal have no equivalent in the `storage.namespace` + `event.log`

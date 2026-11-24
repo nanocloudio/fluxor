@@ -734,7 +734,9 @@ pub(crate) fn as_module_step<R>(f: impl FnOnce() -> R) -> R {
 /// Used by event::event_create() to set event ownership.
 pub fn current_module_index() -> usize {
     let core = crate::kernel::sys::hal::core_id();
-    CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
+    CURRENT_MODULE_PER_CORE.get(core).map_or(MAX_MODULES, |c| {
+        c.load(portable_atomic::Ordering::Relaxed) as usize
+    })
 }
 
 /// The module currently being stepped on this core, as the id an owner
@@ -825,7 +827,9 @@ pub fn module_state_footprint(idx: usize) -> u32 {
 /// Set the current module index. Used by provider dispatch for context switching.
 pub fn set_current_module(idx: usize) {
     let core = crate::kernel::sys::hal::core_id();
-    CURRENT_MODULE_PER_CORE[core].store(idx as u32, portable_atomic::Ordering::Relaxed);
+    if let Some(c) = CURRENT_MODULE_PER_CORE.get(core) {
+        c.store(idx as u32, portable_atomic::Ordering::Relaxed);
+    }
 }
 
 /// Run `f` as module `idx`, then return to whichever context was current.

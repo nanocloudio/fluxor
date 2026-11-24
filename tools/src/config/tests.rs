@@ -5906,129 +5906,53 @@ mod asset_param_tests {
     }
 }
 
-/// Modules in a domain a core other than 0 runs.
+/// Modules in a domain a core other than 0 runs: the kernel hands their
+/// primary-core ops (flash, the key vault, a change of the graph) to core 0,
+/// so the composer places them like any other module.
 #[cfg(test)]
 mod secondary_core_tests {
     use super::*;
-    use crate::manifest::Manifest;
-    use std::collections::HashMap;
 
-    fn manifest(body: &str) -> Manifest {
-        Manifest::from_toml_str_for_target(
-            &format!("version = \"0.1.0\"\nhardware_targets = [\"rp2350\", \"rp2040\"]\n{body}"),
-            None,
+    fn root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    /// Compose `config` for the Pico 2 W against the built rp2350 modules.
+    fn compose(config: &Value) -> Result<Vec<u8>> {
+        let root = root();
+        let dir = root.join("target/fluxor/thumbv8m/modules");
+        generate_config_ext(
+            config,
+            &ConfigBuilder::new(),
+            &[],
+            &dir,
+            &[],
+            0,
+            0,
+            Some("pico2w"),
+            &root,
         )
-        .expect("manifest parses")
     }
 
-    fn smp(target: &str) -> crate::target::SmpFacts {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        crate::target::load_target(target, &root).expect("target loads").smp
-    }
-
-    /// A graph of `modules` (name, domain, manifest) on `target`.
-    fn check(target: &str, modules: &[(&str, &str, Manifest)]) -> Result<()> {
+    /// The flash driver and a module writing flash, both on core 1: the
+    /// driver serves the writer from its own domain, and every erase,
+    /// program and BOOTSEL read is core 0's to run.
+    #[test]
+    fn flash_modules_compose_on_core_1() {
         let config = json!({
-            "execution": {"domains": [{"name": "main"}, {"name": "second"}, {"name": "third"}]},
-            "modules": modules
-                .iter()
-                .map(|(name, domain, _)| json!({"name": name, "domain": domain}))
-                .collect::<Vec<_>>(),
+            "target": "pico2w",
+            "execution": {"domains": [{"name": "main"}, {"name": "compute", "exec": "poll"}]},
+            "modules": [
+                {"name": "flash_rp", "domain": "compute"},
+                {"name": "writer", "type": "core_probe", "domain": "compute",
+                 "mode": "flash", "sector": 0x3FA000, "period_ms": 500, "count": 4, "tag": 119},
+            ],
+            "wiring": [],
         });
-        let manifests: HashMap<String, Manifest> = modules
-            .iter()
-            .map(|(name, _, m)| ((*name).to_string(), m.clone()))
-            .collect();
-        let list = config["modules"].as_array().unwrap().clone();
-        validate_secondary_core_modules(&config, &list, &manifests, &smp(target), target)
-    }
-
-    const FLASH: &str = "grants = [\"flash\"]\nprovider_contracts = [\"runtime_params\"]\n";
-    const NEEDS_PARAMS: &str = "grants = [\"runtime_params\"]\n";
-
-    #[test]
-    fn a_plain_module_runs_on_core_1() {
-        check("pico2w", &[("compute", "second", manifest(""))]).unwrap();
-    }
-
-    /// RP2040 steps every domain on core 0, so nothing is refused there.
-    #[test]
-    fn rp2040_runs_the_same_graph_on_one_core() {
-        check(
-            "pico",
-            &[
-                ("store", "second", manifest(FLASH)),
-                ("ota", "second", manifest("grants = [\"reconfigure.ota\"]\n")),
-                ("user", "second", manifest(NEEDS_PARAMS)),
-            ],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn a_flash_or_ota_module_is_refused_on_core_1() {
-        for (grant, body) in [
-            ("flash", FLASH.to_string()),
-            ("reconfigure.ota", "grants = [\"reconfigure.ota\"]\n".to_string()),
-        ] {
-            let e = check("pico2w", &[("m", "second", manifest(&body))])
-                .expect_err(grant)
-                .to_string();
-            assert!(
-                e.contains("module 'm'")
-                    && e.contains("domain 'second'")
-                    && e.contains("pico2w runs on core 1")
-                    && e.contains(grant)
-                    && e.contains("core 0's"),
-                "{e}"
-            );
-            // Domain 2 shares core 0's loop.
-            check("pico2w", &[("m", "third", manifest(&body))]).unwrap();
-            check("pico2w", &[("m", "main", manifest(&body))]).unwrap();
-        }
-    }
-
-    /// A provider call runs on the caller's core: a core-1 module that calls
-    /// a contract the flash driver provides would run flash code there.
-    #[test]
-    fn a_core_1_module_calling_a_flash_backed_provider_is_refused() {
-        let e = check(
-            "pico2w",
-            &[
-                ("store", "main", manifest(FLASH)),
-                ("user", "second", manifest(NEEDS_PARAMS)),
-            ],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            e.contains("module 'user'")
-                && e.contains("runtime_params")
-                && e.contains("module 'store'")
-                && e.contains("ENOTSUP"),
-            "{e}"
-        );
-        // The same caller on core 0, and a provider that holds no flash.
-        check(
-            "pico2w",
-            &[
-                ("store", "main", manifest(FLASH)),
-                ("user", "third", manifest(NEEDS_PARAMS)),
-            ],
-        )
-        .unwrap();
-        check(
-            "pico2w",
-            &[
-                (
-                    "ram_store",
-                    "main",
-                    manifest("provider_contracts = [\"runtime_params\"]\n"),
-                ),
-                ("user", "second", manifest(NEEDS_PARAMS)),
-            ],
-        )
-        .unwrap();
+        compose(&config).expect("a core-1 domain holding flash composes");
     }
 }
 
@@ -6337,6 +6261,53 @@ mod port_fact_tests {
         .collect();
         let cfg = json!({"wiring": [{"from": "src.p", "to": "sink.p"}]});
         validate_port_facts(&cfg, &m, &no_bound_params).unwrap();
+    }
+
+    /// A capability fact bound to a param takes each instance's value, the
+    /// same way a port fact does: `interval_ms: 1000` on the entry is the
+    /// instance's `sensor.sample` `period_ms`, and an instance that leaves
+    /// it unset states the schema default.
+    #[test]
+    fn a_param_bound_capability_fact_is_read_per_instance() {
+        use crate::schema::{ParamSchema, ParamType, SchemaParam};
+        let sensor = manifest(
+            "capabilities = [\"sensor.sample\"]\n\n\
+             [capability_facts.\"sensor.sample\"]\nquantity = \"temperature\"\n\
+             period_ms = { param = \"interval_ms\" }\nmax_payload = 24\n",
+        );
+        let schema = ParamSchema::from_params(vec![SchemaParam {
+            tag: 1,
+            ptype: ParamType::U32,
+            name: "interval_ms".to_string(),
+            default: 5000,
+            enums: HashMap::new(),
+        }]);
+        let param_of =
+            |entry: &Value, param: &str| -> Result<BoundParam> { Ok(bound_param_in(entry, &schema, param)) };
+        let modules = vec![
+            json!({"name": "fast", "type": "temp_sensor", "interval_ms": 1000}),
+            json!({"name": "set", "type": "temp_sensor", "params": {"interval_ms": 250}}),
+            json!({"name": "idle", "type": "temp_sensor"}),
+        ];
+        let mut m: HashMap<String, Manifest> = ["fast", "set", "idle"]
+            .into_iter()
+            .map(|n| (n.to_string(), sensor.clone()))
+            .collect();
+        bind_capability_facts(&modules, &mut m, &param_of).unwrap();
+        for (name, want) in [("fast", "1000"), ("set", "250"), ("idle", "5000")] {
+            let facts = &m[name].capability_facts["sensor.sample"];
+            assert_eq!(facts["period_ms"], want, "{name}");
+            assert_eq!(facts["max_payload"], "24", "{name}");
+        }
+
+        // A binding to a param the schema does not hold as an integer is
+        // refused per instance.
+        let mut m: HashMap<String, Manifest> = [("fast".to_string(), sensor.clone())].into();
+        let none = |_: &Value, _: &str| -> Result<BoundParam> { Ok(BoundParam::NotAnInteger) };
+        let e = bind_capability_facts(&modules, &mut m, &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("fact `period_ms` is bound to param `interval_ms`"), "{e}");
     }
 
     /// Only a numeric fact binds to a param, and the table names the param
@@ -7554,12 +7525,12 @@ mod check_mode_file_tests {
         let (_, packed, sources) = lift_credential_sources("srv", empty.clone(), all).unwrap();
         assert_eq!((packed, sources), (empty, CredentialSources::default()));
 
-        // A module whose schema declares none of them is left alone: an
-        // interrupt-mode module's `trust: platform` is a trust level.
-        let level = json!({"trust": "platform"});
+        // A module whose schema declares none of them is left alone; the
+        // param check refuses the key there.
+        let undeclared = json!({"trust": "platform"});
         let (_, packed, sources) =
-            lift_credential_sources("isr", level.clone(), |_| false).unwrap();
-        assert_eq!((packed, sources), (level, CredentialSources::default()));
+            lift_credential_sources("isr", undeclared.clone(), |_| false).unwrap();
+        assert_eq!((packed, sources), (undeclared, CredentialSources::default()));
 
         for (bad, says) in [
             (json!({"cert_file": "certs/server.pem"}), "absolute path"),

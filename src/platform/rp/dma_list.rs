@@ -184,14 +184,19 @@ impl List {
         let block = rel / BLOCK_BYTES;
         let inside = !rel.is_multiple_of(BLOCK_BYTES);
         let entries = self.shape.entries as u32;
-        let entry = if inside {
-            block % entries
+        // `checked_rem`: a shape always has entries, and the data channel's
+        // interrupt this runs in has no panic to reach.
+        let at = if inside {
+            block.checked_rem(entries)
         } else if block == 0 {
-            0
+            Some(0)
         } else {
-            (block - 1) % entries
+            (block - 1).checked_rem(entries)
         };
-        entry as u16
+        match at {
+            Some(entry) => entry as u16,
+            None => 0,
+        }
     }
 
     /// Account for the entries the scan has passed since this last ran,
@@ -203,7 +208,8 @@ impl List {
     pub fn advance(&mut self, bus: &mut impl Bus) {
         let now = self.scan_at(bus.control_offset());
         let entries = self.shape.entries;
-        let passed = (now + entries - self.at) % entries;
+        // As `scan_at`: no panic in the interrupt this runs in.
+        let passed = (now + entries - self.at).checked_rem(entries).unwrap_or(0);
         let mut entry = self.at;
         for _ in 0..passed {
             if self.armed & (1 << entry) != 0 {

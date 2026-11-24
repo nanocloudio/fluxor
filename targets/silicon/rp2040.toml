@@ -216,7 +216,7 @@ module_code_kb = 384
 buffer_arena_kb = 16
 # The kernel's one static pool, split per graph between its tables and the
 # two arenas above (their default split); see rp2350.toml. The kernel's fixed
-# statics are ~96 KiB, so 112 leaves ~8 KiB of slack under the 216 KiB
+# statics are ~65 KiB, so 112 leaves ~35 KiB of slack under the 212 KiB
 # ceiling, and a typical graph's tables (~12 KiB) leave it ~84 KiB of state.
 kernel_pool_kb = 112
 config_buffer_kb = 8
@@ -232,17 +232,19 @@ telemetry_ring_kb = 4
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
 # out of the linker's 256 KiB RAM region. What is left over is the
 # stack, which grows down from the top of that region and which every
-# module steps on in turn: 40 KiB here.
+# module steps on in turn: 44 KiB here.
 # The linker already refuses an image that cannot fit at all; this
 # binds earlier, so steady creep fails a gate instead of arriving
 # as a link error nobody can attribute. Raising it takes the same bytes
 # from the stack, which the composer then admits modules against.
-ram_static_max_kb = 216
+ram_static_max_kb = 212
 # The kernel's own frames at a module call: the scheduler under the step,
-# syscalls and interrupts above it. The stack less this, 32 KiB, is the
-# deepest a module may go; the scheduler fences every step there and
-# reports the measured depths.
-kernel_stack_reserve_kb = 8
+# the deepest syscall above it (an add that checks a signature, the key
+# vault) and an interrupt on top. The firmware build measures that sum in
+# the linked image and refuses an image over it. The stack less this,
+# 32 KiB, is the deepest a module may go; the scheduler fences every step
+# there and reports the measured depths.
+kernel_stack_reserve_kb = 12
 # Clock profile. 125 MHz is the documented RP2040 default; no overclock
 # profile is offered for this die. USB needs exactly 48 MHz.
 sys_hz = 125000000

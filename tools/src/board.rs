@@ -154,9 +154,31 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
 /// What a module entry in an interrupt-mode domain declares about itself,
 /// read by [`validate_isr_modules`]: keys of the entry, not parameters of
 /// the module. The composer's parameter check passes each one that the
-/// module's schema does not declare as a parameter of its own (tls and quic
-/// declare a `trust` parameter, their anchors).
-pub(crate) const INTERRUPT_MODE_KEYS: [&str; 3] = ["trust", "max_cycles", "irq"];
+/// module's schema does not declare as a parameter of its own.
+pub(crate) const INTERRUPT_MODE_KEYS: [&str; 2] = ["max_cycles", "irq"];
+
+/// Why a module holding `manifest`'s grants cannot run in an `exec: mode`
+/// (`timer` or `irq`) domain, if it cannot: the calls that run on the
+/// primary core (flash, the `reconfigure` contract and its op grants, the
+/// key vault) answer `ENOTSUP` in handler mode, so a module holding one of
+/// them would hold a grant it can never use. The refusal names the module
+/// and the grant.
+pub(crate) fn isr_grant_refusal(
+    name: &str,
+    mode: &str,
+    manifest: &crate::manifest::Manifest,
+) -> Option<String> {
+    // Everything the kernel lets it call: named grants and claimed contracts.
+    let grants = manifest.grant_set().unwrap_or(manifest.grants);
+    let grant = crate::manifest::grant_names(grants).into_iter().find(|g| {
+        matches!(*g, "flash" | "key_vault" | "reconfigure") || g.starts_with("reconfigure.")
+    })?;
+    Some(format!(
+        "module '{name}' is in an `exec: {mode}` domain and holds the `{grant}` grant: flash, \
+         reconfigure and key vault calls run on the primary core and answer ENOTSUP from an \
+         interrupt handler. Move the module to a cooperative domain, or drop the grant."
+    ))
+}
 
 /// Validate interrupt-mode module declarations.
 ///
@@ -164,7 +186,8 @@ pub(crate) const INTERRUPT_MODE_KEYS: [&str; 3] = ["trust", "max_cycles", "irq"]
 /// `tier:` and no `rate_hz:` of its own (a `timer` domain declares the
 /// cadence). Modules in a `timer` or `irq` domain must have
 /// ([`INTERRUPT_MODE_KEYS`]):
-/// - `trust: "platform"` (an ISR runs privileged)
+/// - the trust class `platform` (an ISR runs privileged): the module's
+///   `trust_class`, else the graph's `default_trust_class`, else `platform`
 /// - for `timer`, a declared `max_cycles` that fits the domain's period, and
 ///   a combined `timer` budget under half of that period
 /// - for `irq`, an `irq` field
@@ -223,13 +246,15 @@ fn validate_isr_modules(
         let mode = exec.mode.name();
         isr_module_count += 1;
 
-        // Trust level validation
-        let trust = module.get("trust").and_then(|t| t.as_str()).unwrap_or("");
-        if trust != "platform" {
-            result.add_error(format!(
-                "{prefix} ({name}): an `exec: {mode}` module requires trust: \"platform\" \
-                 (got '{trust}')"
-            ));
+        // An invalid class is refused by `validate_isolation`.
+        if let Ok((class, _, _)) = crate::protection::requested(module, config) {
+            if class != crate::protection::TrustClass::Platform {
+                result.add_error(format!(
+                    "{prefix} ({name}): an `exec: {mode}` module runs privileged and requires \
+                     trust class platform (its trust class is {})",
+                    format!("{class:?}").to_lowercase()
+                ));
+            }
         }
 
         if exec.mode == ExecMode::Timer {
@@ -658,11 +683,11 @@ mod tests {
         );
     }
 
-    /// A module in a `timer` domain states its trust and its cycle budget,
-    /// and one in an `irq` domain its trust and its line; each missing key
-    /// is refused by name.
+    /// A module in a `timer` domain states its cycle budget and one in an
+    /// `irq` domain its line; each missing key is refused by name. Both run
+    /// privileged, so both resolve to trust class platform.
     #[test]
-    fn an_interrupt_mode_module_states_its_trust_budget_and_line() {
+    fn an_interrupt_mode_module_states_its_budget_and_line_and_is_platform_class() {
         let graph = |timer: Value, irq: Value| {
             json!({
                 "execution": { "domains": [
@@ -673,8 +698,8 @@ mod tests {
                 "modules": [timer, irq]
             })
         };
-        let timer = json!({ "name": "t", "domain": "fast", "trust": "platform", "max_cycles": 2000, "spin": 4 });
-        let irq = json!({ "name": "i", "domain": "line", "trust": "platform", "irq": 7 });
+        let timer = json!({ "name": "t", "domain": "fast", "max_cycles": 2000, "spin": 4 });
+        let irq = json!({ "name": "i", "domain": "line", "irq": 7 });
         assert!(isr_errors(&graph(timer.clone(), irq.clone())).is_empty());
 
         let without = |module: &Value, key: &str| {
@@ -682,18 +707,48 @@ mod tests {
             m.as_object_mut().expect("entry").remove(key);
             m
         };
+        let with = |module: &Value, key: &str, value: Value| {
+            let mut m = module.clone();
+            m.as_object_mut().expect("entry").insert(key.into(), value);
+            m
+        };
+        // A graph whose modules default to another class: both refused.
+        let mut community_default = graph(timer.clone(), irq.clone());
+        community_default["default_trust_class"] = json!("community");
+        let errors = isr_errors(&community_default);
+        for says in [
+            "(t): an `exec: timer` module runs privileged and requires trust class platform \
+             (its trust class is community)",
+            "(i): an `exec: irq` module runs privileged and requires trust class platform \
+             (its trust class is community)",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(says)),
+                "{says}: {errors:?}"
+            );
+        }
+        // The module's own class wins over the graph's default.
+        let mut overridden = graph(
+            with(&timer, "trust_class", json!("platform")),
+            with(&irq, "trust_class", json!("platform")),
+        );
+        overridden["default_trust_class"] = json!("community");
+        assert!(isr_errors(&overridden).is_empty());
+
         for (config, says) in [
             (
-                graph(without(&timer, "trust"), irq.clone()),
-                "(t): an `exec: timer` module requires trust: \"platform\"",
+                graph(with(&timer, "trust_class", json!("verified")), irq.clone()),
+                "(t): an `exec: timer` module runs privileged and requires trust class platform \
+                 (its trust class is verified)",
             ),
             (
                 graph(without(&timer, "max_cycles"), irq.clone()),
                 "(t): an `exec: timer` module requires a max_cycles declaration",
             ),
             (
-                graph(timer.clone(), without(&irq, "trust")),
-                "(i): an `exec: irq` module requires trust: \"platform\"",
+                graph(timer.clone(), with(&irq, "trust_class", json!("unsigned"))),
+                "(i): an `exec: irq` module runs privileged and requires trust class platform \
+                 (its trust class is unsigned)",
             ),
             (
                 graph(timer.clone(), without(&irq, "irq")),
@@ -708,6 +763,38 @@ mod tests {
         }
     }
 
+    /// A module holding a grant whose calls run on the primary core is
+    /// refused from an interrupt-mode domain, by name and grant; others pass.
+    #[test]
+    fn an_interrupt_mode_module_holds_no_primary_core_grant() {
+        let manifest = |grants: &str| {
+            crate::manifest::Manifest::from_toml_str_for_target(
+                &format!("version = \"0.1.0\"\ninterrupt_safe = true\n{grants}\n"),
+                None,
+            )
+            .expect("manifest parses")
+        };
+        for (grants, grant) in [
+            ("grants = [\"flash\"]", "flash"),
+            ("grants = [\"reconfigure.ota\"]", "reconfigure.ota"),
+            ("grants = [\"reconfigure.owner\"]", "reconfigure.owner"),
+            (
+                "[[resources]]\nrequires_contract = \"key_vault\"\naccess = \"read\"",
+                "key_vault",
+            ),
+        ] {
+            let why = isr_grant_refusal("beat", "timer", &manifest(grants))
+                .unwrap_or_else(|| panic!("{grants} is refused"));
+            assert!(
+                why.contains("module 'beat' is in an `exec: timer` domain")
+                    && why.contains(&format!("holds the `{grant}` grant")),
+                "{why}"
+            );
+        }
+        assert!(isr_grant_refusal("beat", "irq", &manifest("grants = [\"counters\"]")).is_none());
+        assert!(isr_grant_refusal("beat", "irq", &manifest("")).is_none());
+    }
+
     #[test]
     fn timer_budgets_are_checked_against_the_domain_period() {
         // 1 kHz at 150 MHz: a 150 000-cycle period, 75 000 for every module.
@@ -718,8 +805,8 @@ mod tests {
                     { "name": "pwm", "exec": "timer", "rate_hz": 1000 }
                 ]},
                 "modules": [
-                    { "name": "a", "domain": "pwm", "trust": "platform", "max_cycles": cycles[0] },
-                    { "name": "b", "domain": "pwm", "trust": "platform", "max_cycles": cycles[1] },
+                    { "name": "a", "domain": "pwm", "max_cycles": cycles[0] },
+                    { "name": "b", "domain": "pwm", "max_cycles": cycles[1] },
                     { "name": "c", "domain": "main" }
                 ]
             })

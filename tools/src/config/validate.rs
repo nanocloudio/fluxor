@@ -2049,90 +2049,6 @@ pub fn validate_provider_domains(
     Ok(())
 }
 
-/// Refuse a module placed in a domain a core other than 0 runs when it needs
-/// what only core 0 does.
-///
-/// Flash operations and an over-the-air update stop the other core for
-/// their length, and the kernel takes them on core 0 alone. So a module in a
-/// domain `smp` steps on another core is refused when:
-///
-///   - its manifest holds the `flash` or the `reconfigure.ota` grant; or
-///   - it requires a contract whose provider in the graph holds the `flash`
-///     grant: a provider call runs the provider's code on the caller's core,
-///     where the kernel answers the flash operation `ENOTSUP`.
-///
-/// `modules` is every module the composer validates, each with its manifest
-/// by name; `target` names the target in the refusal.
-pub fn validate_secondary_core_modules(
-    config: &Value,
-    modules: &[Value],
-    manifests: &HashMap<String, Manifest>,
-    smp: &crate::target::SmpFacts,
-    target: &str,
-) -> Result<()> {
-    const CORE_0_GRANTS: &[&str] = &["flash", "reconfigure.ota"];
-    if !smp.bridges_cores() {
-        return Ok(());
-    }
-    let holds = |m: &Manifest, grant: &str| crate::manifest::grant_names(m.grants).contains(&grant);
-    let named = |m: &Value| m.get("name").and_then(Value::as_str).map(str::to_string);
-    for m in modules {
-        let Some(name) = named(m) else {
-            continue;
-        };
-        let Some(manifest) = manifests.get(&name) else {
-            continue;
-        };
-        let domain = resolve_domain_id(m, config)?;
-        let core = smp.domain_core(domain);
-        if core == 0 {
-            continue;
-        }
-        let domain_name = m.get("domain").and_then(Value::as_str).unwrap_or("?");
-        let placed = format!(
-            "module '{name}' is in domain '{domain_name}', which {target} runs on core {core}"
-        );
-        let remedy = "Place it in a domain core 0 runs";
-        if let Some(grant) = CORE_0_GRANTS.iter().find(|g| holds(manifest, g)) {
-            return Err(Error::Config(format!(
-                "{placed}, and it holds the `{grant}` grant: flash and over-the-air updates \
-                 are core 0's. {remedy}."
-            )));
-        }
-        // The contracts it may call: a bit of its first grant word each (its
-        // `[[resources]]` claims and the contracts its `grants` name), less
-        // a claim its configuration never exercises.
-        for contract in 0..64u16 {
-            if manifest.grants[0] & (1u64 << contract) == 0 {
-                continue;
-            }
-            let idle_claim = manifest.resources.iter().any(|r| {
-                u16::from(r.device_class) == contract
-                    && !r.exercised_by(|p| entry_str_param(config, m, p))
-            });
-            if idle_claim {
-                continue;
-            }
-            let provider = modules.iter().filter_map(named).find(|p| {
-                *p != name
-                    && manifests
-                        .get(p)
-                        .is_some_and(|pm| pm.provider_contracts.contains(&contract) && holds(pm, "flash"))
-            });
-            if let Some(provider) = provider {
-                let contract = fluxor_abi::registry::contract_name(contract).unwrap_or("unknown");
-                return Err(Error::Config(format!(
-                    "{placed}, and it requires `{contract}`, which module '{provider}' \
-                     provides holding the `flash` grant: a provider call runs the provider's \
-                     code on the caller's core, and flash is core 0's, so the call would \
-                     answer ENOTSUP. {remedy}."
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Refuse a graph whose edge contracts do not meet across their edges.
 ///
 /// A port that reaches an edge contract (`contract = "storage.block"`) binds
@@ -2513,21 +2429,69 @@ fn instance_port_facts(
                 .find(|m| m.get("name").and_then(Value::as_str) == Some(instance))
         })
         .unwrap_or(&empty);
-    for (fact, param) in &port.fact_params {
+    for (fact, v) in bound_fact_values(entry, &port.fact_params, spec, param_of)? {
+        facts.insert(fact, vec![v.to_string()]);
+    }
+    Ok(facts)
+}
+
+/// The value of each param-bound fact in `bindings` (fact to param) for the
+/// module instance `entry`, `what` naming the port or capability for the
+/// refusal. A fact whose module schema is not at hand is left out.
+fn bound_fact_values(
+    entry: &Value,
+    bindings: &std::collections::BTreeMap<String, String>,
+    what: &str,
+    param_of: BoundParamOf<'_>,
+) -> Result<Vec<(String, u32)>> {
+    let instance = entry.get("name").and_then(Value::as_str).unwrap_or("?");
+    let mut out = Vec::with_capacity(bindings.len());
+    for (fact, param) in bindings {
         match param_of(entry, param)? {
-            BoundParam::Value(v) => {
-                facts.insert(fact.clone(), vec![v.to_string()]);
-            }
+            BoundParam::Value(v) => out.push((fact.clone(), v)),
             BoundParam::NotAnInteger => {
                 return Err(Error::Config(format!(
-                    "`{spec}`: fact `{fact}` is bound to param `{param}`, which module \
+                    "`{what}`: fact `{fact}` is bound to param `{param}`, which module \
                      `{instance}` does not declare as an integer param (u8, u16 or u32)"
                 )))
             }
             BoundParam::NoSchema => {}
         }
     }
-    Ok(facts)
+    Ok(out)
+}
+
+/// Write each instance's param-bound capability facts
+/// (`Manifest::capability_fact_params`) into its manifest's
+/// `capability_facts`, at the value the instance's param holds: what the
+/// graph sets, or the param's schema default. `manifests` is keyed by
+/// instance name, as the composer loads it, and `modules` is the graph's
+/// module list. Every check that reads a capability fact then reads the
+/// instance's own.
+pub fn bind_capability_facts(
+    modules: &[Value],
+    manifests: &mut HashMap<String, Manifest>,
+    param_of: BoundParamOf<'_>,
+) -> Result<()> {
+    for entry in modules {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(manifest) = manifests.get_mut(name) else {
+            continue;
+        };
+        for (cap, bindings) in manifest.capability_fact_params.clone() {
+            let what = format!("{name} {cap}");
+            for (fact, v) in bound_fact_values(entry, &bindings, &what, param_of)? {
+                manifest
+                    .capability_facts
+                    .entry(cap.clone())
+                    .or_default()
+                    .insert(fact, v.to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compare the stream facts both ends of each edge declare, and refuse fan-in

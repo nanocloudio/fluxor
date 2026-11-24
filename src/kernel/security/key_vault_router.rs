@@ -226,12 +226,19 @@ fn open_by_label(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_
     }
 }
 
-/// Call `op` on `handle` through the router, with `data` as the call's span.
+/// Call `op` on `handle` in the backend that holds it, with `data` as the
+/// call's span: the key ops the share and attestation paths make
+/// (`DESCRIBE`, `PUBLIC`, `ECDH`, `SIGN`), each of which [`route`] sends to
+/// that backend unchanged. Going to the backend directly keeps the router
+/// from calling itself, so its depth is bounded.
 ///
 /// # Safety
 /// As [`route`].
 unsafe fn call(handle: i32, op: u32, arg: &mut [u8], data: &mut [u8]) -> i32 {
-    route(handle, op, arg, UserSpan::of(data))
+    match backend_of(handle) {
+        Ok(backend) => backend(handle, op, arg, UserSpan::of(data)),
+        Err(e) => e,
+    }
 }
 
 /// What `DESCRIBE` says of a key.

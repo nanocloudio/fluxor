@@ -43,6 +43,9 @@ pub struct Quiesce {
     /// The generation each core last parked in (0, which is even, before its
     /// first).
     parked_in: [AtomicU32; MAX_CORES],
+    /// Bit `c` set while core `c` is suspended inside a call the primary is
+    /// running for it: it counts as parked in whatever request is in flight.
+    away: AtomicU32,
     /// Parks taken, over every core.
     parks: AtomicU32,
 }
@@ -59,6 +62,7 @@ impl Quiesce {
             generation: AtomicU32::new(0),
             in_loop: AtomicU32::new(0),
             parked_in: [const { AtomicU32::new(0) }; MAX_CORES],
+            away: AtomicU32::new(0),
             parks: AtomicU32::new(0),
         }
     }
@@ -118,17 +122,35 @@ impl Quiesce {
         true
     }
 
+    /// Primary-only. Mark core `core` suspended inside a call the primary
+    /// runs for it (`true`), or back from it (`false`). While marked it
+    /// counts as parked: it runs nothing until the call returns, which is
+    /// after the primary has released whatever the call itself requested.
+    pub fn set_away(&self, core: usize, away: bool) {
+        if core == 0 || core >= MAX_CORES {
+            return;
+        }
+        if away {
+            self.away.fetch_or(1 << core, Ordering::SeqCst);
+        } else {
+            self.away.fetch_and(!(1 << core), Ordering::SeqCst);
+        }
+    }
+
     /// Whether every other core in its loop has parked in the request in
-    /// flight.
+    /// flight, or is suspended in a call the primary is running for it.
     pub fn all_parked(&self) -> bool {
         let generation = self.generation.load(Ordering::Relaxed);
         let in_loop = self.in_loop.load(Ordering::SeqCst);
+        let away = self.away.load(Ordering::SeqCst);
         (1..MAX_CORES)
-            .filter(|&c| in_loop & (1 << c) != 0)
+            .filter(|&c| in_loop & !away & (1 << c) != 0)
             .all(|c| self.parked_in[c].load(Ordering::Acquire) == generation)
     }
 
-    /// Whether core `core` is parked in the request in flight.
+    /// Whether core `core` has parked in the request in flight: it is in
+    /// its park, which on a platform whose parks keep to RAM means it
+    /// fetches nothing from flash. A core away in a call is not parked here.
     pub fn parked(&self, core: usize) -> bool {
         let generation = self.generation.load(Ordering::SeqCst);
         generation & 1 == 1
@@ -174,3 +196,11 @@ pub static STRUCTURAL: Quiesce = Quiesce::new();
 /// run beside (taking execute-in-place flash away): cores park between
 /// module steps, so the primary waits for one step and not a whole pass.
 pub static STEP: Quiesce = Quiesce::new();
+
+/// Whether core `core` has joined both quiesces, so that each waits for it
+/// to park. A core joins them one after the other as it enters its loop;
+/// one that has joined only [`STRUCTURAL`] is still on its way in, and a
+/// step request would find nothing in [`STEP`] to wait for while it runs.
+pub fn joined(core: usize) -> bool {
+    STRUCTURAL.in_loop(core) && STEP.in_loop(core)
+}

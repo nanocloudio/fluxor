@@ -1120,6 +1120,9 @@ fn validate_interrupt_admission(
                 mode = exec_mode.name()
             )));
         }
+        if let Some(why) = crate::board::isr_grant_refusal(name, exec_mode.name(), manifest) {
+            return Err(Error::Config(why));
+        }
         // The lookup goes through `resolve_module_root` so the search order
         // is identical to the manifest loader's: an explicit YAML
         // `module_search_paths:` entry shadowing a bundled module wins for
@@ -1549,10 +1552,10 @@ pub(crate) fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
 }
 
 /// Load a native module's manifest from the source tree and
-/// synthesize a `ParamSchema` from its `[[params]]` declarations.
-/// Returns `None` when the manifest doesn't exist, isn't marked
-/// native module, or declares no params. Repeated lookups share a
-/// per-process cache via `Manifest::from_source_tree`.
+/// synthesize a `ParamSchema` from its `[[params]]` declarations: the
+/// empty schema for one that declares none. Returns `None` when the
+/// manifest doesn't exist or isn't marked native module. Repeated
+/// lookups share a per-process cache via `Manifest::from_source_tree`.
 fn load_native_param_schema(
     module_type: &str,
 ) -> Option<(crate::manifest::Manifest, schema::ParamSchema)> {
@@ -1560,7 +1563,7 @@ fn load_native_param_schema(
     if !m.builtin {
         return None;
     }
-    let s = schema::ParamSchema::from_manifest(&m)?;
+    let s = schema::ParamSchema::from_manifest(&m);
     Some((m, s))
 }
 
@@ -2141,6 +2144,17 @@ fn validate_yaml_params(
                 .iter()
                 .filter_map(|c| closest_param_name(c, schema))
                 .next();
+            // A key that is the stem of an entry key (`trust` of
+            // `trust_class`) names the entry key, not a param.
+            if suggestion.is_none() {
+                let stem = format!("{key}_");
+                if let Some(entry) = NON_PARAM_KEYS.iter().find(|k| k.starts_with(&stem)) {
+                    return Err(Error::Config(format!(
+                        "module '{module_name}': unknown param '{key}' — did you mean the \
+                         module entry key '{entry}'?"
+                    )));
+                }
+            }
             return Err(Error::Config(format!(
                 "module '{}': unknown param '{}'{}",
                 module_name,
@@ -2172,6 +2186,8 @@ fn nested_key_candidates(outer: &str, inner: &str) -> Vec<String> {
 fn format_hint(suggestion: Option<&str>, schema: &schema::ParamSchema) -> String {
     if let Some(s) = suggestion {
         format!(" — did you mean '{s}'?")
+    } else if schema.params.is_empty() {
+        " — the module declares no params".to_string()
     } else {
         let valid: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
         format!(" — valid params: {}", valid.join(", "))
@@ -2854,9 +2870,7 @@ fn build_module_entry_in(
     // trust-anchor source spec: validated against the schema with the
     // other keys, then lifted out, since its value is resolved to an anchor bundle
     // (extended tag 12 below) and never packed as a string TLV. On any
-    // other module `trust` keeps whatever meaning that module gives it —
-    // an interrupt-mode module's `trust: platform` is a trust LEVEL, read by
-    // `board::validate_config`, and is left exactly as written.
+    // other module `trust` is an unknown key, refused by the param check.
     let declares = |key: &str| pic_schema.as_ref().is_some_and(|s| s.find(key).is_some());
     let normalized_module = normalize_peer_names(name, type_name, normalized_module, declares)?;
     let (normalized_module, packed_module, sources) =
@@ -2880,17 +2894,23 @@ fn build_module_entry_in(
         pic_schema.as_ref(),
     )?;
 
+    // A module with an empty schema takes no params: every key was checked
+    // as unknown above it, and nothing is packed.
     if let Some(param_schema) = pic_schema {
         validate_yaml_params(module, &param_schema, type_name)?;
-        params_len = schema::build_params_from_schema(
-            packed_module,
-            &param_schema,
-            &mut entry,
-            0,
-            data_section,
-            type_name,
-        )
-        .map_err(|e| out_of_room_or(out_of_room, e))?;
+        params_len = if param_schema.params.is_empty() {
+            0
+        } else {
+            schema::build_params_from_schema(
+                packed_module,
+                &param_schema,
+                &mut entry,
+                0,
+                data_section,
+                type_name,
+            )
+            .map_err(|e| out_of_room_or(out_of_room, e))?
+        };
     } else if let Some((manifest, param_schema)) = load_native_param_schema(type_name) {
         validate_yaml_params(module, &param_schema, type_name)?;
         validate_param_ranges(module, &manifest, type_name)?;
@@ -2900,15 +2920,19 @@ fn build_module_entry_in(
         // reads values straight off the wire, with no defaults
         // duplicated in Rust.
         let module_with_defaults = inject_manifest_defaults(packed_module, &manifest);
-        params_len = schema::build_params_from_schema(
-            &module_with_defaults,
-            &param_schema,
-            &mut entry,
-            0,
-            data_section,
-            type_name,
-        )
-        .map_err(|e| out_of_room_or(out_of_room, e))?;
+        params_len = if param_schema.params.is_empty() {
+            0
+        } else {
+            schema::build_params_from_schema(
+                &module_with_defaults,
+                &param_schema,
+                &mut entry,
+                0,
+                data_section,
+                type_name,
+            )
+            .map_err(|e| out_of_room_or(out_of_room, e))?
+        };
     } else {
         // Module type with no schema source — typically a misnamed
         // YAML entry. Emit an empty params section; downstream
@@ -3782,11 +3806,58 @@ mod tests {
         schema::ParamSchema::from_bytes(&b).expect("schema bytes")
     }
 
+    /// A module that declares no params has the empty schema: a key that
+    /// is not a module entry key is refused, naming it, and the entry keys
+    /// pass.
+    #[test]
+    fn a_module_without_params_refuses_every_key_but_the_entry_keys() {
+        let schema = schema::ParamSchema::empty();
+        let entry = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({ "name": "beat", "type": "timer_beat" });
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            m
+        };
+        let e = validate_yaml_params(
+            &entry(serde_json::json!({ "bogus_key": 3 })),
+            &schema,
+            "timer_beat",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("unknown param 'bogus_key'") && e.contains("declares no params"),
+            "{e}"
+        );
+        let e = validate_yaml_params(
+            &entry(serde_json::json!({ "trust": "platform" })),
+            &schema,
+            "timer_beat",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("'trust_class'"), "{e}");
+        validate_yaml_params(
+            &entry(serde_json::json!({
+                "domain": "main",
+                "trust_class": "platform",
+                "max_cycles": 2000,
+                "max_restarts": 2,
+                "fault_policy": "skip",
+            })),
+            &schema,
+            "timer_beat",
+        )
+        .expect("entry keys are not params");
+    }
+
     /// A module with a parameter of its own composes in an interrupt-mode
     /// domain: the keys its entry declares for the mode are not parameters.
     /// A key that is neither is still unknown, and a module that has a
-    /// parameter named like one of them (a `trust` anchor set) has that key
-    /// checked as its parameter.
+    /// parameter named like one of them has that key checked as its
+    /// parameter. `trust` is no entry key: on a module without a `trust`
+    /// param it is unknown, and the refusal names `trust_class`.
     #[test]
     fn interrupt_mode_declarations_are_not_params() {
         let schema = blob_param_schema();
@@ -3800,22 +3871,34 @@ mod tests {
             m
         };
         for keys in [
-            serde_json::json!({ "trust": "platform", "max_cycles": 2000 }),
-            serde_json::json!({ "trust": "platform", "irq": 7 }),
+            serde_json::json!({ "max_cycles": 2000 }),
+            serde_json::json!({ "irq": 7, "trust_class": "platform" }),
         ] {
             validate_yaml_params(&entry(keys.clone()), &schema, "timer_beat")
                 .unwrap_or_else(|e| panic!("{keys}: {e}"));
         }
         let e = validate_yaml_params(
-            &entry(serde_json::json!({ "trust": "platform", "max_cycle": 2000 })),
+            &entry(serde_json::json!({ "max_cycle": 2000 })),
             &schema,
             "timer_beat",
         )
         .unwrap_err()
         .to_string();
         assert!(e.contains("unknown param 'max_cycle'"), "{e}");
+        let e = validate_yaml_params(
+            &entry(serde_json::json!({ "trust": "platform", "max_cycles": 2000 })),
+            &schema,
+            "timer_beat",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("unknown param 'trust' — did you mean the module entry key 'trust_class'?"),
+            "{e}"
+        );
 
-        // `trust`, a string param (tag 3) of this schema.
+        // `trust`, a string param (tag 3) of this schema: the trust
+        // anchors of tls and quic.
         let mut b = vec![b'S', b'P', 1, 1, 3, 5, 0, 0, 0, 0, 5];
         b.extend_from_slice(b"trust");
         b.push(0);

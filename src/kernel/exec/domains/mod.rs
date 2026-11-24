@@ -18,6 +18,9 @@
 //! domain 0, or the platform's own loop over core 0's domains.
 
 pub mod core_map;
+/// Compiled beside [`quiesce`], whose core count it shares.
+#[cfg(target_has_atomic = "32")]
+pub mod primary_call;
 /// Compiled where the processor has compare-and-swap: a target without it
 /// (ARMv6-M) runs every domain on one loop and has no other core to park.
 #[cfg(target_has_atomic = "32")]

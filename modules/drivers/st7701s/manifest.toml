@@ -50,6 +50,15 @@ deferred_ready = true
 # image keeps it, hashing each once after it starts, a slice a step, and
 # takes no stream until that is done.
 #
+# A picture shown for more than one refresh is cached: from its second
+# refresh each band drawn is also kept, as the RGB565 bytes the panel was
+# sent, encoded as runs and literals, in `cache_bytes` (four bytes a band
+# for the table, the rest for bands, first come while they fit). From then
+# on a cached band is copied into its slot instead of being drawn, byte for
+# byte what drawing it gives. A COMMIT or a new raster on `surface0` drops
+# the cache, so a picture's first refresh is always drawn and a stream that
+# commits every refresh never fills it. `cache_bytes = 0`: no cache.
+#
 # A faulted stream is logged with the fault and the byte offset, the frame
 # in progress is discarded, the retained frame keeps showing, and records
 # are skipped to the next STREAM.
@@ -89,6 +98,7 @@ deferred_ready = true
 # | 24  | underrun_rgb565 | u16  | 0       | The colour of a band that was not drawn in time. |
 # | 25  | status_s        | u8   | 0       | Seconds between `[st7701s] measured_mhz=… refreshes=… underruns=…` log lines; 0 for none. |
 # | 26-29 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack or one strike. |
+# | 30  | cache_bytes     | u32  | 0       | The band cache: 0 for none, else at least four bytes a band. |
 
 [[params]]
 name = "pack0"
@@ -154,7 +164,7 @@ access = "write"
 [capacities]
 # One block from the heap: the ring (two bytes a pixel of a 480-pixel row),
 # the scratch band (three), two retained frames, the resource arena, the
-# read buffer and two buffers for `surface0`.
+# read buffer, two buffers for `surface0` and the band cache.
 heap_per_param = { base = 128, params = [
     { tag = 19, default = 48, bytes_each = 960 },
     { tag = 18, default = 16, bytes_each = 1440 },
@@ -162,6 +172,7 @@ heap_per_param = { base = 128, params = [
     { tag = 21, default = 16384, bytes_each = 1 },
     { tag = 22, default = 1024, bytes_each = 1 },
     { tag = 23, default = 0, bytes_each = 2 },
+    { tag = 30, default = 0, bytes_each = 1 },
 ] }
 
 [observability]

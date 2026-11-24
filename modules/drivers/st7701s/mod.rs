@@ -33,6 +33,17 @@
 //! piece of drawing: draw the next band into the scratch, or convert the
 //! scratch into a free ring slot and arm its entry. Nothing waits.
 //!
+//! A picture shown for more than one refresh is kept: from its second
+//! refresh each band the driver draws is also encoded into the band cache
+//! (`cache_bytes`) while it fits, and from then on a cached band is copied
+//! into its ring slot instead of being drawn. The cache holds the RGB565 bytes the panel was
+//! sent, so a cached refresh is byte for byte a drawn one. A COMMIT, or a
+//! new raster on `surface0`, drops it: the first refresh of a picture is
+//! always drawn.
+//!
+//! The panel starts over several steps, a few kernel calls each: no step
+//! of the start does more than a fraction of the work, and none draws.
+//!
 //! A band can be armed while the scan is two or more entries short of it.
 //! The renderer works ahead of the scan by up to the ring; when the scan
 //! catches it, it does not chase: it resumes at the first band it can
@@ -63,8 +74,8 @@ mod pio_programs;
 use fluxor_rt::asset::{self, Asset};
 use fluxor_rt::*;
 use fluxor_sdk::video::raster::{
-    self, Band, Entry, Event, Held, Index, Ingest, Input, Painter, Shape, Slot, Store, Surfaces,
-    Texels, BAND_BPP,
+    self, Band, BandCache, Entry, Event, Held, Index, Ingest, Input, Painter, Shape, Slot, Store,
+    Surfaces, Texels, BAND_BPP,
 };
 
 // ============================================================================
@@ -165,10 +176,49 @@ enum Phase {
     SleepOut,
     /// DISPLAY_ON has been sent; its 120 ms run.
     DisplayOn,
-    /// Configure the state machines and start the scan.
+    /// Configure the state machines and start the scan, one part a step
+    /// (`State::start_part`).
     Start,
     Run,
     Failed,
+}
+
+/// The parts of the start, a step each: none makes more than 50 of the
+/// start's 265 kernel calls.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// The sync block's base and the HSYNC program.
+    HsyncProgram,
+    /// The VSYNC program.
+    VsyncProgram,
+    /// The sync machines and their pins.
+    SyncMachines,
+    /// The data block's base and the DE program.
+    DeProgram,
+    /// The pixel program.
+    PixelProgram,
+    /// The DE and pixel machines and DE's output.
+    DataMachines,
+    /// The 16 data pins.
+    DataPins,
+    /// The machines' first words, the scan list, the sync machines.
+    Scan,
+}
+
+impl Part {
+    fn next(self) -> Option<Part> {
+        match self {
+            Part::HsyncProgram => Some(Part::VsyncProgram),
+            Part::VsyncProgram => Some(Part::SyncMachines),
+            Part::SyncMachines => Some(Part::DeProgram),
+            Part::DeProgram => Some(Part::PixelProgram),
+            Part::PixelProgram => Some(Part::DataMachines),
+            Part::DataMachines => Some(Part::DataPins),
+            Part::DataPins => Some(Part::Scan),
+            Part::Scan => None,
+        }
+    }
 }
 
 #[repr(C)]
@@ -179,6 +229,9 @@ pub struct State {
     bl_handle: i32,
     dma_fd: i32,
     phase: Phase,
+    start_part: Part,
+    /// Program origins: HSYNC, VSYNC, DE, pixels.
+    origins: [u8; 4],
 
     // Params.
     cs_pin: u8,
@@ -206,6 +259,7 @@ pub struct State {
     resource_bytes: u32,
     record_bytes: u32,
     surface_bytes: u32,
+    cache_bytes: u32,
     pack_params: [[u8; PACK_PARAM]; PACKS],
     pack_lens: [u8; PACKS],
 
@@ -241,6 +295,10 @@ pub struct State {
     scratch: *mut u8,
     scratch_bytes: usize,
     ring: *mut u8,
+    /// The bands of the picture shown, as they were sent.
+    cache: Option<BandCache<'static>>,
+    /// Refreshes the picture shown has begun, up to 255.
+    picture_refreshes: u8,
 
     // The scan, as `LIST_STATUS` last answered. Band counts wrap.
     /// Bands sent since the list started.
@@ -267,6 +325,8 @@ pub struct State {
     drawn: bool,
     /// Band `next` is black: nothing is retained to draw.
     black: bool,
+    /// Band `next` is in the cache, not drawn.
+    cached: bool,
     /// Band `next` is the first drawn of its refresh.
     first_of_refresh: bool,
     /// A frame committed and waits for the next refresh.
@@ -330,6 +390,7 @@ mod params_def {
         27, pack1, str, 0 => |s, d, len| { keep_pack(s, 1, d, len); };
         28, pack2, str, 0 => |s, d, len| { keep_pack(s, 2, d, len); };
         29, pack3, str, 0 => |s, d, len| { keep_pack(s, 3, d, len); };
+        30, cache_bytes, u32, 0 => |s, d, len| { s.cache_bytes = p_u32(d, len, 0, 0); };
     }
 }
 
@@ -818,6 +879,12 @@ pub unsafe extern "C" fn module_new(
             b"ring_rows must be 3 to 32 bands of band_rows, and no more than height",
         );
     }
+    if s.cache_bytes != 0 && (s.cache_bytes as usize) < BandCache::table_bytes(bands as u16) {
+        return refuse(
+            sys,
+            b"cache_bytes must be 0 or hold four bytes for each band",
+        );
+    }
     if s.frame_bytes == 0 || (s.record_bytes as usize) < vd::HEADER + vd::BORDER_LEN {
         return refuse(
             sys,
@@ -904,8 +971,8 @@ pub unsafe extern "C" fn module_new(
     }
 
     // One block from the heap: the read buffer, two retained frames, the
-    // resource arena, the scratch band, the ring, and two buffers for
-    // `surface0`.
+    // resource arena, the scratch band, the ring, two buffers for
+    // `surface0`, and the band cache.
     let scratch_bytes = usize::from(s.band_rows) * usize::from(s.width) * BAND_BPP;
     let ring_bytes = s.slot_bytes as usize * slots as usize;
     let parts = [
@@ -917,6 +984,7 @@ pub unsafe extern "C" fn module_new(
         ring_bytes,
         s.surface_bytes as usize,
         s.surface_bytes as usize,
+        s.cache_bytes as usize,
     ];
     let mut total = 0usize;
     for part in parts {
@@ -958,6 +1026,13 @@ pub unsafe extern "C" fn module_new(
         &raw mut s.surface,
         Some(Input::new(surface_chan, buffers, cap)),
     );
+    let cache = if s.cache_bytes == 0 {
+        None
+    } else {
+        let memory = core::slice::from_raw_parts_mut(carve(parts[8]), parts[8]);
+        BandCache::new(memory, s.bands)
+    };
+    core::ptr::write(&raw mut s.cache, cache);
 
     let limits = vd::Limits {
         ops: vd::OPS_ALL,
@@ -1090,115 +1165,159 @@ fn write_own_frame(s: &mut State) {
 // Starting the scan
 // ============================================================================
 
-/// Configure the four state machines, start the scan list and release the
-/// sync machines. The kernel's errno when a step fails.
-unsafe fn start(s: &mut State) -> Result<(), i32> {
-    let sys = &*s.syscalls;
-    let (sync, data) = (s.pio_sync, s.pio_data);
+/// The pins the state machines are configured with, counted from the
+/// block's GPIO base: HSYNC, VSYNC, DE and the sync machines', then the
+/// DE and pixel machines'.
+struct Layout {
+    hsync: Pins,
+    vsync: Pins,
+    de: Pins,
+    rgb: Pins,
+}
+
+fn layout(s: &State) -> Layout {
     let rel = |pin: u8| pin - s.gpio_base;
-    let (de, vsync, hsync) = (rel(s.de_pin), rel(s.vsync_pin), rel(s.hsync_pin));
-    let data0 = rel(s.data0_pin);
     // The data programs wait on input pins 4 to 7 for DE, VSYNC, HSYNC and
     // PCLK: the input base sits four pins below DE, around the window.
-    let in_base = (de + 32 - 4) % 32;
-
-    // Sync block: machine 0 makes HSYNC and, one pin up, the pixel clock;
-    // machine 1 makes VSYNC, counting machine 0's lines.
-    let mut base = [sync, (s.gpio_base == 16) as u8];
-    pio_call(sys, sync, abi::registry::rp_raw::PIO_GPIOBASE, &mut base);
-    pio_enable(sys, sync, 0x0F, false);
-    let hsync_origin = pio_load(sys, sync, &pio_programs::HSYNC_PROGRAM);
-    let vsync_origin = pio_load(sys, sync, &pio_programs::VSYNC_PROGRAM);
-    if hsync_origin < 0 || vsync_origin < 0 {
-        return Err(hsync_origin.min(vsync_origin));
+    let in_base = (rel(s.de_pin) + 32 - 4) % 32;
+    Layout {
+        hsync: Pins {
+            side_base: rel(s.hsync_pin),
+            side_count: 3,
+            ..Pins::NONE
+        },
+        vsync: Pins {
+            side_base: rel(s.vsync_pin),
+            side_count: 2,
+            ..Pins::NONE
+        },
+        de: Pins {
+            side_base: rel(s.de_pin),
+            side_count: 2,
+            in_base,
+            ..Pins::NONE
+        },
+        rgb: Pins {
+            out_base: rel(s.data0_pin),
+            out_count: 16,
+            in_base,
+            ..Pins::NONE
+        },
     }
-    let (hsync_origin, vsync_origin) = (hsync_origin as u8, vsync_origin as u8);
-    let hsync_pins = Pins {
-        side_base: hsync,
-        side_count: 3,
-        ..Pins::NONE
-    };
-    let vsync_pins = Pins {
-        side_base: vsync,
-        side_count: 2,
-        ..Pins::NONE
-    };
-    pio_machine(
-        sys,
-        sync,
-        0,
-        hsync_origin,
-        (pio_programs::HSYNC_WRAP_TARGET, pio_programs::HSYNC_WRAP),
-        pio_programs::HSYNC_SIDESET_OPT,
-        hsync_pins,
-        s.divider_256 << 8,
-    );
-    pio_machine(
-        sys,
-        sync,
-        1,
-        vsync_origin,
-        (pio_programs::VSYNC_WRAP_TARGET, pio_programs::VSYNC_WRAP),
-        pio_programs::VSYNC_SIDESET_OPT,
-        vsync_pins,
-        CLKDIV_ONE,
-    );
-    pio_pin(sys, s.hsync_pin, sync, 0);
-    pio_pin(sys, s.pclk_pin, sync, 0);
-    pio_pin(sys, s.vsync_pin, sync, 0);
-    pio_outputs(sys, sync, 0, hsync, 2, hsync_pins);
-    pio_outputs(sys, sync, 1, vsync, 1, vsync_pins);
+}
 
-    // Data block: machine 0 makes DE from the sync pins; machine 1 puts a
-    // pixel on the 16 data pins each pixel clock DE is high.
-    let mut base = [data, (s.gpio_base == 16) as u8];
-    pio_call(sys, data, abi::registry::rp_raw::PIO_GPIOBASE, &mut base);
-    pio_enable(sys, data, 0x0F, false);
-    let de_origin = pio_load(sys, data, &pio_programs::RGB_DE_PROGRAM);
-    let rgb_origin = pio_load(sys, data, &pio_programs::RGB_PROGRAM);
-    if de_origin < 0 || rgb_origin < 0 {
-        return Err(de_origin.min(rgb_origin));
-    }
-    let (de_origin, rgb_origin) = (de_origin as u8, rgb_origin as u8);
-    let de_pins = Pins {
-        side_base: de,
-        side_count: 2,
-        in_base,
-        ..Pins::NONE
-    };
-    let rgb_pins = Pins {
-        out_base: data0,
-        out_count: 16,
-        in_base,
-        ..Pins::NONE
-    };
-    pio_machine(
-        sys,
-        data,
-        0,
-        de_origin,
-        (pio_programs::RGB_DE_WRAP_TARGET, pio_programs::RGB_DE_WRAP),
-        pio_programs::RGB_DE_SIDESET_OPT,
-        de_pins,
-        CLKDIV_ONE,
-    );
-    pio_machine(
-        sys,
-        data,
-        1,
-        rgb_origin,
-        (pio_programs::RGB_WRAP_TARGET, pio_programs::RGB_WRAP),
-        false,
-        rgb_pins,
-        CLKDIV_ONE,
-    );
-    for i in 0..16 {
-        pio_pin(sys, s.data0_pin + i, data, 2);
-    }
-    pio_pin(sys, s.de_pin, data, 0);
-    pio_outputs(sys, data, 1, data0, 16, rgb_pins);
-    pio_outputs(sys, data, 0, de, 1, de_pins);
+/// Put block `pio` on the window's GPIO base with its machines stopped.
+unsafe fn claim_block(s: &State, pio: u8) {
+    let sys = &*s.syscalls;
+    let mut base = [pio, (s.gpio_base == 16) as u8];
+    pio_call(sys, pio, abi::registry::rp_raw::PIO_GPIOBASE, &mut base);
+    pio_enable(sys, pio, 0x0F, false);
+}
 
+/// Load `program` into block `pio` as program `which` of `origins`.
+unsafe fn load_into(s: &mut State, pio: u8, which: usize, program: &[u16]) -> Result<(), i32> {
+    let origin = pio_load(&*s.syscalls, pio, program);
+    if origin < 0 {
+        return Err(origin);
+    }
+    if let Some(o) = s.origins.get_mut(which) {
+        *o = origin as u8;
+    }
+    Ok(())
+}
+
+/// One part of the start: whether it was the last. The kernel's errno
+/// when a call fails.
+unsafe fn start_part(s: &mut State, part: Part) -> Result<bool, i32> {
+    let sys = &*s.syscalls;
+    let (sync, data) = (s.pio_sync, s.pio_data);
+    let pins = layout(s);
+    match part {
+        // Sync block: machine 0 makes HSYNC and, one pin up, the pixel
+        // clock; machine 1 makes VSYNC, counting machine 0's lines.
+        Part::HsyncProgram => {
+            claim_block(s, sync);
+            load_into(s, sync, 0, &pio_programs::HSYNC_PROGRAM)?;
+        }
+        Part::VsyncProgram => load_into(s, sync, 1, &pio_programs::VSYNC_PROGRAM)?,
+        Part::SyncMachines => {
+            pio_machine(
+                sys,
+                sync,
+                0,
+                s.origins[0],
+                (pio_programs::HSYNC_WRAP_TARGET, pio_programs::HSYNC_WRAP),
+                pio_programs::HSYNC_SIDESET_OPT,
+                pins.hsync,
+                s.divider_256 << 8,
+            );
+            pio_machine(
+                sys,
+                sync,
+                1,
+                s.origins[1],
+                (pio_programs::VSYNC_WRAP_TARGET, pio_programs::VSYNC_WRAP),
+                pio_programs::VSYNC_SIDESET_OPT,
+                pins.vsync,
+                CLKDIV_ONE,
+            );
+            pio_pin(sys, s.hsync_pin, sync, 0);
+            pio_pin(sys, s.pclk_pin, sync, 0);
+            pio_pin(sys, s.vsync_pin, sync, 0);
+            pio_outputs(sys, sync, 0, pins.hsync.side_base, 2, pins.hsync);
+            pio_outputs(sys, sync, 1, pins.vsync.side_base, 1, pins.vsync);
+        }
+        // Data block: machine 0 makes DE from the sync pins; machine 1
+        // puts a pixel on the 16 data pins each pixel clock DE is high.
+        Part::DeProgram => {
+            claim_block(s, data);
+            load_into(s, data, 2, &pio_programs::RGB_DE_PROGRAM)?;
+        }
+        Part::PixelProgram => load_into(s, data, 3, &pio_programs::RGB_PROGRAM)?,
+        Part::DataMachines => {
+            pio_machine(
+                sys,
+                data,
+                0,
+                s.origins[2],
+                (pio_programs::RGB_DE_WRAP_TARGET, pio_programs::RGB_DE_WRAP),
+                pio_programs::RGB_DE_SIDESET_OPT,
+                pins.de,
+                CLKDIV_ONE,
+            );
+            pio_machine(
+                sys,
+                data,
+                1,
+                s.origins[3],
+                (pio_programs::RGB_WRAP_TARGET, pio_programs::RGB_WRAP),
+                false,
+                pins.rgb,
+                CLKDIV_ONE,
+            );
+            pio_pin(sys, s.de_pin, data, 0);
+            pio_outputs(sys, data, 0, pins.de.side_base, 1, pins.de);
+        }
+        Part::DataPins => {
+            for i in 0..16 {
+                pio_pin(sys, s.data0_pin + i, data, 2);
+            }
+            pio_outputs(sys, data, 1, pins.rgb.out_base, 16, pins.rgb);
+        }
+        Part::Scan => {
+            start_scan(s)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Give each machine its first word, start the scan list and release the
+/// sync machines. The kernel's errno when a call fails.
+unsafe fn start_scan(s: &mut State) -> Result<(), i32> {
+    let sys = &*s.syscalls;
+    let (sync, data) = (s.pio_sync, s.pio_data);
+    let [hsync_origin, vsync_origin, de_origin, rgb_origin] = s.origins;
     // Each program begins by pulling one word: the HSYNC and pixel
     // machines the width less one, the VSYNC and DE machines the height
     // less one.
@@ -1388,15 +1507,19 @@ fn advance(s: &mut State, count: u32) {
 
 /// What the first band of a refresh starts with: the mean cost of the
 /// refresh before, the frame that committed, the raster frame that is
-/// ready. A refresh shows one frame.
+/// ready. A refresh shows one picture; a new frame or a new raster is a new
+/// picture, whose cached bands are those of the one before and are
+/// dropped.
 unsafe fn begin_refresh(s: &mut State) {
     if let Some(mean) = s.refresh_cost_us.checked_div(s.refresh_bands) {
         s.render_us_per_band = mean;
     }
     s.refresh_cost_us = 0;
     s.refresh_bands = 0;
+    let mut changed = false;
     if s.frame_waiting {
         s.frame_waiting = false;
+        changed = true;
         if s.next.wrapping_sub(s.committed_at) > u32::from(s.bands) {
             s.late_frames = s.late_frames.wrapping_add(1);
         }
@@ -1405,8 +1528,15 @@ unsafe fn begin_refresh(s: &mut State) {
         }
     }
     if let Some(surface) = s.surface.as_mut() {
-        surface.commit();
+        changed |= surface.commit();
     }
+    if changed {
+        s.picture_refreshes = 0;
+        if let Some(cache) = s.cache.as_mut() {
+            cache.clear();
+        }
+    }
+    s.picture_refreshes = s.picture_refreshes.saturating_add(1);
 }
 
 /// Draw band `next` into the scratch.
@@ -1453,12 +1583,20 @@ unsafe fn draw_band(s: &mut State) {
     raster::replay(frame, index, painter, &mut band, ingest.store(), &surfaces);
 }
 
-/// Convert the scratch into ring slot `slot`, or black it.
+/// Write band `next` into ring slot `slot`: black, from the cache, or
+/// converted from the scratch. A converted band of a picture past its
+/// first refresh is cached while the cache has room.
 unsafe fn fill_slot(s: &mut State, slot: usize) {
     let bytes = s.slot_bytes as usize;
     let out = core::slice::from_raw_parts_mut(s.ring.add(slot * bytes), bytes);
     if s.black {
         out.fill(0);
+        return;
+    }
+    if s.cached {
+        if let Some(cache) = s.cache.as_ref() {
+            cache.decode(s.next_entry, out);
+        }
         return;
     }
     let region = vd::PRect {
@@ -1476,6 +1614,11 @@ unsafe fn fill_slot(s: &mut State, slot: usize) {
     for i in 0..usize::from(s.band_rows) {
         if let Some(row) = out.get_mut(i * row_bytes..(i + 1) * row_bytes) {
             band.row_rgb565(i32::from(region.y) + i as i32, row);
+        }
+    }
+    if s.picture_refreshes >= 2 {
+        if let Some(cache) = s.cache.as_mut() {
+            cache.encode(s.next_entry, out);
         }
     }
 }
@@ -1499,7 +1642,12 @@ unsafe fn render(s: &mut State) -> Result<bool, i32> {
             begin_refresh(s);
         }
         let began = dev_micros(sys);
-        draw_band(s);
+        s.cached = s.cache.as_ref().is_some_and(|c| c.holds(s.next_entry));
+        if s.cached {
+            s.black = false;
+        } else {
+            draw_band(s);
+        }
         s.band_cost_us = dev_micros(sys).wrapping_sub(began) as u32;
         s.drawn = true;
         return Ok(true);
@@ -1594,6 +1742,10 @@ unsafe fn report(s: &mut State) {
         .number(s.refreshes)
         .text(b" underruns=")
         .number(underruns(s))
+        .text(b" cached_bands=")
+        .number(u32::from(s.cache.as_ref().map_or(0, |c| c.cached())))
+        .text(b" cache_used=")
+        .number(s.cache.as_ref().map_or(0, |c| c.used()) as u32)
         .text(b" late_frames=")
         .number(s.late_frames)
         .text(b" render_us_per_band=")
@@ -1635,14 +1787,19 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             if timer_expired(sys, s.timer_fd) {
                 spi9_cs(s, 1);
                 s.phase = Phase::Start;
-                return StepReturn::Burst;
+                s.start_part = Part::HsyncProgram;
             }
             StepReturn::Continue
         }
-        Phase::Start => match start(s) {
-            Ok(()) => {
-                s.phase = Phase::Run;
-                StepReturn::Burst
+        // One part a step, each step its own: no burst carries the start
+        // into the next part or into the first band.
+        Phase::Start => match start_part(s, s.start_part) {
+            Ok(last) => {
+                match s.start_part.next() {
+                    Some(next) if !last => s.start_part = next,
+                    _ => s.phase = Phase::Run,
+                }
+                StepReturn::Continue
             }
             Err(rc) if rc == abi::errno::ENOMEM => fail(
                 s,

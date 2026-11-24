@@ -11,9 +11,9 @@ capabilities = ["sensor.sample"]
 
 [capability_facts."sensor.sample"]
 quantity = "temperature"
-# The default read interval; a graph that overrides `interval_ms` overrides this
-# with it. Zero would mean event-driven, which this sensor is not.
-period_ms = 5000
+# The read interval: the instance's `interval_ms` (default 5000). Zero would
+# mean event-driven, which this sensor is not.
+period_ms = { param = "interval_ms" }
 max_payload = 24
 
 [[ports]]

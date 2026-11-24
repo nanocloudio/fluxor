@@ -52,6 +52,13 @@ the replacement for each one in the way.
 | **node owner** | The owner that holds the node's own authority (`OWNER_NODE`). | Owns the node graph. A workload never runs as the node owner. |
 | **workload** | An owner's unit of work on a node, run by one backend: a workload graph (the graph backend) or a host process (the host-process backend). | A node runs many workloads, each for one owner. |
 
+## Trust
+
+| Term | Definition | Relations |
+|---|---|---|
+| **trust class** | A module instance's provenance: `platform`, `verified`, `community` or `unsigned`. The instance's `trust_class`, else the graph's `default_trust_class`, else `platform`. | Sets the instance's default protection level ([module_isolation.md](module_isolation.md)). A module in a `timer` or `irq` domain runs privileged and must resolve to `platform`. |
+| **trust anchors** | The certificates an endpoint verifies a peer's chain against: the tls and quic `trust` param, set to a `${file:<path>}` bundle embedded by the build, a path read at run time, or `system`, the platform's own store answered through the `trust` contract ([security.md](security.md)). | Per endpoint instance. Unrelated to the trust class: a `trust` key on a module entry is always its anchors. |
+
 ## Artefacts
 
 An **image** is compiled and ready to admit; a **package** is the source

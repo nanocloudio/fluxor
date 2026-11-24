@@ -1471,8 +1471,9 @@ fn rp_system_extension_dispatch(
     use crate::abi::internal::flash;
     // The flash ops detach execute-in-place, which parks the other core
     // between two of its steps: they run outside the cores' lock, which a
-    // core waiting to park could otherwise be spinning on. They are core 0's
-    // alone and keep the other core out by parking it.
+    // core waiting to park could otherwise be spinning on. Core 0 runs them
+    // (core 1's are handed to it) and keeps the other core out by parking
+    // it.
     if matches!(
         opcode,
         flash::SIDEBAND | flash::RAW_ERASE | flash::RAW_PROGRAM
@@ -2364,11 +2365,6 @@ fn init_rp_providers() {
     // loader when their PIC module's manifest names it in `provider_contracts`.
     // Register system extension for hardware opcodes (raw register bridges)
     register_system_extension(rp_system_extension_dispatch);
-    // Core 1 steps on the 8 KiB of `[smp] secondary_stack`.
-    #[cfg(feature = "smp")]
-    crate::kernel::module::syscalls::register_small_stack(Some(|| {
-        crate::platform::chip::core_id() != 0
-    }));
 }
 
 // HAL GPIO: open-style opcodes (CLAIM, SET_INPUT, SET_OUTPUT) answer the

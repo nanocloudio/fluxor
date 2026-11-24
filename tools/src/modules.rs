@@ -1570,6 +1570,20 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
     Ok(())
 }
 
+/// A param-bound fact names an integer param of the module's own schema
+/// (`define_params!`), and a numeric fact named like one binds it
+/// (`manifest::check_fact_params`).
+fn check_schema_fact_params(input: &Path, manifest: &Manifest, schema: &[u8]) -> Result<()> {
+    let params = schema_params(schema);
+    // `schema::ParamType` ids: 0 `u8`, 1 `u16`, 2 `u32`.
+    let named: Vec<(&str, bool)> = params
+        .iter()
+        .map(|(_, ty, name, _)| (name.as_str(), *ty <= 2))
+        .collect();
+    manifest::check_fact_params(manifest, &named)
+        .map_err(|e| Error::Module(format!("{}: {e}", input.display())))
+}
+
 /// A `[[resources]]` claim's `selector_param` or `selector_table` names the
 /// param whose value the composer reads as the volume, or the table of
 /// volumes, the claim reaches. A name the module's schema (`define_params!`)
@@ -1875,6 +1889,7 @@ pub fn pack_fmod(
     )?;
     check_param_rule_tags(input, &module_manifest, schema_data)?;
     check_claim_selector_params(input, &module_manifest, schema_data)?;
+    check_schema_fact_params(input, &module_manifest, schema_data)?;
 
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
@@ -2137,6 +2152,7 @@ pub fn pack_fmod_wasm(
     }
     check_param_rule_tags(input, &module_manifest, schema_data)?;
     check_claim_selector_params(input, &module_manifest, schema_data)?;
+    check_schema_fact_params(input, &module_manifest, schema_data)?;
 
     // Integrity hash over the wasm code payload. Empty data section.
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));

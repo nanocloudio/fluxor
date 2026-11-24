@@ -471,11 +471,15 @@ pub mod store {
     /// core's step deadline moves past it instead of firing the moment
     /// interrupts return.
     ///
-    /// Refused, with nothing detached: `ENOTSUP` on a core other than 0
-    /// (only core 0 detaches XIP); `EBUSY` when the other core did not reach
-    /// a park point within its step's deadline, or a DMA channel reading
-    /// flash did not finish within the quiesce limit. Each bound is a
-    /// refusal the caller sees, never a wait without end.
+    /// Only core 0 detaches XIP: called on another core, the detach is
+    /// handed to core 0 and the caller waits for it, parked in RAM while
+    /// core 0 runs it.
+    ///
+    /// Refused, with nothing detached: `ENOTSUP` from an interrupt handler;
+    /// `EBUSY` when the other core did not reach a park point within its
+    /// step's deadline, or a DMA channel reading flash did not finish within
+    /// the quiesce limit. Each bound is a refusal the caller sees, never a
+    /// wait without end.
     ///
     /// `flushes_cache` says `op` empties the execute-in-place cache (an
     /// erase or a program does; the BOOTSEL read does not): the code both
@@ -510,9 +514,23 @@ pub mod store {
         use crate::kernel::sys::errno;
         use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
 
+        // An interrupt handler would wait on a pass.
+        if crate::arch::cortex_m::in_handler_mode() {
+            return Err(errno::ENOTSUP);
+        }
+        // Only core 0 takes execute-in-place away: another core hands it
+        // the detach and waits for it, parking in RAM for it like any core
+        // core 0 detaches under.
         #[cfg(feature = "smp")]
         if crate::platform::chip::core_id() != 0 {
-            return Err(errno::ENOTSUP);
+            let rc = crate::kernel::exec::domains::delegate(&mut || {
+                // SAFETY: the caller's contract, passed on; core 0 runs it.
+                match unsafe { detached(flushes_cache, &mut *op) } {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                }
+            });
+            return if rc == 0 { Ok(()) } else { Err(rc) };
         }
         let outcome = crate::arch::cortex_m::interrupt_free(|| {
             let started = crate::platform::rp_timer::alarm::now_raw_lo();

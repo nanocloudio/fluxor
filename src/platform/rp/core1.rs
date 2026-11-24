@@ -186,10 +186,26 @@ fn park(generation_word: &AtomicU32, parked_word: &AtomicU32, generation: u32) {
 
 // ── Launch (core 0) ──────────────────────────────────────────────────────
 
-unsafe extern "C" {
-    /// The top of core 1's stack and its floor, from the linker script.
-    static __core1_stack_top: u32;
-    static __core1_stack_limit: u32;
+/// Core 1's stack. In `.uninit`, among the kernel's statics, so the
+/// static-RAM ceiling counts it, and left unzeroed at boot: core 0 paints it
+/// before each launch.
+#[repr(C, align(8))]
+struct Stack([u8; chip::SECONDARY_STACK_SIZE]);
+
+#[link_section = ".uninit.CORE1_STACK"]
+#[no_mangle]
+static mut CORE1_STACK: core::mem::MaybeUninit<Stack> = core::mem::MaybeUninit::uninit();
+
+/// The floor of core 1's stack.
+#[inline]
+fn stack_floor() -> usize {
+    (&raw const CORE1_STACK) as usize
+}
+
+/// One past the top of core 1's stack.
+#[inline]
+fn stack_top() -> usize {
+    stack_floor() + chip::SECONDARY_STACK_SIZE
 }
 
 /// The word free stack holds until a frame reaches it.
@@ -278,7 +294,7 @@ fn launch_sequence() -> bool {
     WAITING.store(1, Ordering::Release);
     paint_stack();
 
-    let top = &raw const __core1_stack_top as u32;
+    let top = stack_top() as u32;
     let entry = core1_entry as unsafe extern "C" fn() -> ! as usize as u32;
     // The bootrom's sequence: each word is echoed; a wrong echo starts over.
     let sequence = [0, 0, 1, chip::FLASH_BASE, top, entry | 1];
@@ -329,11 +345,11 @@ fn launch_sequence() -> bool {
 
 /// Paint core 1's stack so its depth can be read back ([`stack_peak`]).
 fn paint_stack() {
-    let mut word = &raw const __core1_stack_limit as *mut u32;
-    let end = &raw const __core1_stack_top as *mut u32;
+    let mut word = stack_floor() as *mut u32;
+    let end = stack_top() as *mut u32;
     while word < end {
-        // SAFETY: SRAM8 and SRAM9, which nothing is linked into; core 1 is
-        // not running.
+        // SAFETY: core 1's stack, which nothing else uses; core 1 is not
+        // running.
         unsafe {
             core::ptr::write_volatile(word, STACK_PAINT);
             word = word.add(1);
@@ -343,8 +359,8 @@ fn paint_stack() {
 
 /// The deepest core 1's stack has been since launch, and its size, in bytes.
 pub fn stack_peak() -> (usize, usize) {
-    let floor = &raw const __core1_stack_limit as usize;
-    let top = &raw const __core1_stack_top as usize;
+    let floor = stack_floor();
+    let top = stack_top();
     let mut word = floor as *const u32;
     // SAFETY: every address in `[floor, top)` is core 1's stack RAM.
     unsafe {
@@ -357,10 +373,7 @@ pub fn stack_peak() -> (usize, usize) {
 
 /// The bounds of core 1's stack, `(floor, top)`.
 pub fn stack_bounds() -> (usize, usize) {
-    (
-        &raw const __core1_stack_limit as usize,
-        &raw const __core1_stack_top as usize,
-    )
+    (stack_floor(), stack_top())
 }
 
 /// Let core 1 enter its domain loop. Core 0, after `domains::release`, when
@@ -383,7 +396,7 @@ pub fn go() {
 unsafe extern "C" fn core1_entry() -> ! {
     // SAFETY: MSPLIM is this core's own; the limit is the linker's symbol.
     unsafe {
-        let limit = &raw const __core1_stack_limit as u32;
+        let limit = stack_floor() as u32;
         core::arch::asm!("msr MSPLIM, {0}", in(reg) limit, options(nomem, nostack, preserves_flags));
     }
     crate::platform::rp_counters::enable_cycle_counter();
@@ -696,13 +709,16 @@ core::arch::global_asm!(
     ".type fluxor_rp_core1_fault, %function",
     ".thumb_func",
     "fluxor_rp_core1_fault:",
-    "    ldr r12, =__core1_stack_top",
+    "    ldr r12, ={stack}",
+    "    add r12, r12, #{size}",
     "    msr msp, r12",
     "    ldr r12, =fluxor_rp_core1_fault_stop",
     "    bx r12",
     ".ltorg",
     ".size fluxor_rp_core1_fault, . - fluxor_rp_core1_fault",
     ".text",
+    stack = sym CORE1_STACK,
+    size = const chip::SECONDARY_STACK_SIZE,
 );
 
 unsafe extern "C" {
@@ -730,7 +746,9 @@ pub fn alive() -> bool {
     if !launched() || !running() {
         return true;
     }
-    if quiesce::STRUCTURAL.parked(1) || quiesce::STEP.parked(1) {
+    // Parked for core 0, or waiting for core 0 to answer a call: core 1 is
+    // as live as this core is.
+    if quiesce::STRUCTURAL.parked(1) || quiesce::STEP.parked(1) || domains::waiting_on_primary(1) {
         return true;
     }
     let beat = heartbeat();

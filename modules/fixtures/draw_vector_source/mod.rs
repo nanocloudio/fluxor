@@ -1,7 +1,8 @@
 //! draw_vector_source — a conformance vector replayed into a graph.
 //!
 //! The module reads one vector file (`abi::contracts::video_draw::vector`)
-//! from `file` into its state. When the bytes held are a whole vector it
+//! from `file` into a heap block of `file_bytes`, the one allocation its
+//! params size (`heap_per_param`). When the bytes held are a whole vector it
 //! sends the file's raster inputs, each a whole-surface `VideoRaster`
 //! record, on `surface0` and `surface1`, then the draw stream on `draw`,
 //! all as the file holds them; then it rests.
@@ -17,8 +18,11 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-/// The largest vector file held.
-const FILE_BYTES: usize = 8192;
+/// The largest vector file held when the graph leaves `file_bytes` unset.
+const FILE_BYTES_DEFAULT: u32 = 8192;
+/// The heap besides the file: the block header, rounding to the
+/// allocator's 16-byte granularity and the canary (`heap_per_param.base`).
+const ARENA_BASE: u32 = 64;
 /// Raster inputs a vector's SURFACE records may name.
 const SURFACES: usize = 2;
 
@@ -42,16 +46,34 @@ pub struct State {
     /// Bytes of that part sent.
     sent: usize,
     len: usize,
-    bytes: [u8; FILE_BYTES],
+    /// The heap block the file is read into, `cap` bytes.
+    bytes: *mut u8,
+    cap: usize,
 }
 
-fluxor_rt::module_facts! { state: State }
+fluxor_rt::module_facts! { state: State, arena: ARENA_BASE }
+
+mod params_def {
+    use super::*;
+    fluxor_rt::define_params! {
+        State;
+        1, file_bytes, u32, FILE_BYTES_DEFAULT
+            => |s, d, len| { s.cap = p_u32(d, len, 0, FILE_BYTES_DEFAULT) as usize; };
+    }
+}
+
+/// The bytes of the file read so far.
+fn held(s: &State) -> &[u8] {
+    // SAFETY: `bytes` is the instance's heap block of `cap` bytes, taken
+    // at construction and live as long as the instance; `len <= cap`.
+    unsafe { core::slice::from_raw_parts(s.bytes, s.len) }
+}
 
 /// Where part `part` of the vector in `file` lies, and the channel it goes
 /// to: `None` past the last part, a channel below zero for a part not
 /// sent.
 fn part_of(s: &State, part: u8) -> Option<(usize, usize, i32)> {
-    let file = s.bytes.get(..s.len)?;
+    let file = held(s);
     let v = Vector::decode(file)?;
     let at = |inner: &[u8]| inner.as_ptr() as usize - file.as_ptr() as usize;
     if usize::from(part) < SURFACES {
@@ -84,8 +106,8 @@ pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -100,6 +122,11 @@ pub unsafe extern "C" fn module_new(
     let s = &mut *(state as *mut State);
     s.syscalls = syscalls as *const SyscallTable;
     let sys = &*s.syscalls;
+    if !params.is_null() && params_len > 0 {
+        params_def::parse_tlv(s, params, params_len);
+    } else {
+        params_def::set_defaults(s);
+    }
     s.file = in_chan;
     s.draw = out_chan;
     s.surfaces = [dev_channel_port(sys, 1, 1), dev_channel_port(sys, 1, 2)];
@@ -111,6 +138,27 @@ pub unsafe extern "C" fn module_new(
             b"[draw_vector_source] refusing to construct: `file` and `draw` must be wired",
         );
         return abi::errno::EINVAL;
+    }
+    if s.cap == 0 {
+        log(
+            sys,
+            1,
+            b"[draw_vector_source] refusing to construct: file_bytes must be non-zero",
+        );
+        return abi::errno::EINVAL;
+    }
+    let Ok(cap) = u32::try_from(s.cap) else {
+        return abi::errno::EINVAL;
+    };
+    s.bytes = (sys.heap_alloc)(cap);
+    if s.bytes.is_null() {
+        log(
+            sys,
+            1,
+            b"[draw_vector_source] refusing to construct: the heap cannot hold file_bytes \
+              (heap.arena_bytes below what heap_per_param sizes)",
+        );
+        return abi::errno::ENOMEM;
     }
     0
 }
@@ -124,18 +172,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     let sys = &*s.syscalls;
     if s.phase == Phase::Reading {
-        let space = FILE_BYTES - s.len;
-        let n = (sys.channel_read)(s.file, s.bytes.as_mut_ptr().add(s.len), space);
+        let space = s.cap - s.len;
+        let n = (sys.channel_read)(s.file, s.bytes.add(s.len), space);
         if n > 0 {
             s.len += n as usize;
         }
         if part_of(s, 0).is_some() {
             s.phase = Phase::Sending;
-        } else if s.len == FILE_BYTES {
+        } else if s.len == s.cap {
             log(
                 sys,
                 1,
-                b"[draw_vector_source] the file is not a vector of at most 8192 bytes: nothing is sent",
+                b"[draw_vector_source] the file is not a vector of at most file_bytes bytes: nothing is sent",
             );
             s.phase = Phase::Rest;
         } else {
@@ -159,7 +207,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             return StepReturn::Continue;
         }
         let n = (end - at).min(room as usize);
-        if (sys.channel_write)(chan, s.bytes.as_ptr().add(at), n) != n as i32 {
+        if (sys.channel_write)(chan, s.bytes.add(at), n) != n as i32 {
             return StepReturn::Continue;
         }
         s.sent += n;

@@ -540,7 +540,7 @@ fn fan_count(config: &crate::kernel::boot::config::Config) -> usize {
         k += 2;
     }
     let keys = &mut keys[..k];
-    keys.sort_unstable();
+    heap_sort(keys);
     let mut fans = 0;
     let mut i = 0;
     while i < keys.len() {
@@ -554,6 +554,36 @@ fn fan_count(config: &crate::kernel::boot::config::Config) -> usize {
         i = j;
     }
     fans
+}
+
+/// Sort `keys` ascending in place, in a bounded stack: a heapsort, where the
+/// library's sorts recurse to a depth the kernel's stack bound cannot see.
+pub fn heap_sort(keys: &mut [u32]) {
+    /// Restore the max-heap below `root` within `keys[..end]`.
+    fn sift_down(keys: &mut [u32], mut root: usize, end: usize) {
+        loop {
+            let mut child = 2 * root + 1;
+            if child >= end {
+                return;
+            }
+            if child + 1 < end && keys[child + 1] > keys[child] {
+                child += 1;
+            }
+            if keys[root] >= keys[child] {
+                return;
+            }
+            keys.swap(root, child);
+            root = child;
+        }
+    }
+    let n = keys.len();
+    for root in (0..n / 2).rev() {
+        sift_down(keys, root, n);
+    }
+    for end in (1..n).rev() {
+        keys.swap(0, end);
+        sift_down(keys, 0, end);
+    }
 }
 
 /// `(workloads, modules, edges)` the config's resident workloads will admit

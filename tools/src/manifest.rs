@@ -223,22 +223,47 @@ type RawCapabilityFacts =
 type CapabilityFacts =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
 
-/// One `[capability_facts]` value: flat (`max_payload = 4096`) or per-target
-/// (`max_payload = { default = 4096, rp2040 = 512 }`), in the same shape as a
-/// port's `buffer_size`. Keys of a per-target table are the silicon ids of
-/// `CAPACITY_TARGET_KEYS` plus `default`.
+/// One `[capability_facts]` value: flat (`max_payload = 4096`), per-target
+/// (`max_payload = { default = 4096, rp2040 = 512 }`, in the same shape as a
+/// port's `buffer_size`; keys are the silicon ids of `CAPACITY_TARGET_KEYS`
+/// plus `default`), or bound to one of the module's integer params
+/// (`period_ms = { param = "interval_ms" }`, the shape of a bound
+/// `[ports.facts]` value), read per instance by the composer.
 enum FactValue {
     Flat(String),
     PerTarget(std::collections::BTreeMap<String, String>),
+    Param(String),
 }
 
 impl FactValue {
+    /// The literal values written; a bound fact has none.
     fn values(&self) -> impl Iterator<Item = &String> {
         let (flat, per_target) = match self {
             FactValue::Flat(v) => (Some(v), None),
             FactValue::PerTarget(map) => (None, Some(map.values())),
+            FactValue::Param(_) => (None, None),
         };
         flat.into_iter().chain(per_target.into_iter().flatten())
+    }
+}
+
+/// The param a `{ param = "<name>" }` fact value names, for a table that is
+/// one: `None` for a table without a `param` key (a per-target table), an
+/// error for a `param` key beside others or not a non-empty string.
+fn bound_fact_param(
+    what: &str,
+    fact: &str,
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<Option<String>> {
+    if !table.contains_key("param") {
+        return Ok(None);
+    }
+    match (table.len(), table.get("param")) {
+        (1, Some(toml::Value::String(p))) if !p.is_empty() => Ok(Some(p.clone())),
+        _ => Err(Error::Module(format!(
+            "{what}: fact `{fact}` takes an integer, or `{{ param = \"<name>\" }}` to take \
+             its value from one of the module's integer params."
+        ))),
     }
 }
 
@@ -281,12 +306,18 @@ fn normalise_capability_facts(
         let mut facts = std::collections::BTreeMap::new();
         for (fact, value) in table {
             let value = match value {
-                toml::Value::Table(per_target) => FactValue::PerTarget(per_target_fact(
-                    &capability,
-                    &fact,
-                    per_target,
-                    hardware_targets,
-                )?),
+                toml::Value::Table(table) => {
+                    let what = format!("capability `{capability}`");
+                    match bound_fact_param(&what, &fact, &table)? {
+                        Some(param) => FactValue::Param(param),
+                        None => FactValue::PerTarget(per_target_fact(
+                            &capability,
+                            &fact,
+                            table,
+                            hardware_targets,
+                        )?),
+                    }
+                }
                 scalar => FactValue::Flat(fact_scalar(&capability, &fact, scalar)?),
             };
             facts.insert(fact, value);
@@ -348,13 +379,25 @@ fn module_abis(hardware_targets: u16) -> impl Iterator<Item = &'static str> {
 /// ABI's entry, else the table's explicit `default`. A `None` ABI resolves
 /// `default` only. A target the table does not answer for is refused rather
 /// than dropped, since a missing fact would skip the compose-time checks that
-/// read it.
-fn resolve_capability_facts(raw: RawCapabilityFacts, abi: Option<&str>) -> Result<CapabilityFacts> {
+/// read it. A bound fact goes to the second map, capability to fact to param,
+/// and is resolved per instance by the composer.
+fn resolve_capability_facts(
+    raw: RawCapabilityFacts,
+    abi: Option<&str>,
+) -> Result<(CapabilityFacts, CapabilityFacts)> {
     let mut out = CapabilityFacts::new();
+    let mut bound = CapabilityFacts::new();
     for (capability, facts) in raw {
         let mut flat = std::collections::BTreeMap::new();
         for (fact, value) in facts {
             let text = match value {
+                FactValue::Param(param) => {
+                    bound
+                        .entry(capability.clone())
+                        .or_default()
+                        .insert(fact, param);
+                    continue;
+                }
                 FactValue::Flat(v) => v,
                 FactValue::PerTarget(mut map) => {
                     let hit = abi.and_then(|s| map.remove(s));
@@ -374,7 +417,72 @@ fn resolve_capability_facts(raw: RawCapabilityFacts, abi: Option<&str>) -> Resul
         }
         out.insert(capability, flat);
     }
-    Ok(out)
+    Ok((out, bound))
+}
+
+/// Hold a module's facts to its params. `params` is the module's param
+/// schema (`define_params!` for a PIC module, `[[params]]` for a native one):
+/// each param's name and whether it is an integer (`u8`, `u16`, `u32`).
+///
+/// - A fact bound to a param (`{ param = "<name>" }`, in `[ports.facts]` or
+///   `[capability_facts]`) names one of those integer params.
+/// - A numeric capability fact written as a number under the name of one of
+///   those integer params is refused: a graph that sets the param changes
+///   what the instance does while the fact keeps stating the default. It
+///   binds it. A port fact is not held to this: a stream fact may bound what
+///   the port takes (a `width` ceiling) while a param of the same name sets
+///   something else (a window's first extent).
+pub(crate) fn check_fact_params(manifest: &Manifest, params: &[(&str, bool)]) -> Result<()> {
+    use fluxor_contracts::vocabulary::fact_is_numeric;
+    let integer = |name: &str| params.iter().any(|&(n, int)| n == name && int);
+    let bound = manifest
+        .ports
+        .iter()
+        .flat_map(|p| {
+            let port = p.name.clone().unwrap_or_else(|| "<unnamed>".into());
+            p.fact_params
+                .iter()
+                .map(move |(f, param)| (format!("port `{port}`"), f, param))
+        })
+        .chain(
+            manifest
+                .capability_fact_params
+                .iter()
+                .flat_map(|(cap, facts)| {
+                    facts
+                        .iter()
+                        .map(move |(f, param)| (format!("capability `{cap}`"), f, param))
+                }),
+        );
+    for (on, fact, param) in bound {
+        if !integer(param) {
+            let found = if params.iter().any(|&(n, _)| n == param) {
+                format!("`{param}` is not an integer param")
+            } else {
+                format!("the module has no param `{param}`")
+            };
+            return Err(Error::Module(format!(
+                "{on}: fact `{fact}` is bound to param `{param}`, but {found}; a bound fact \
+                 names a `u8`, `u16` or `u32` param of the module."
+            )));
+        }
+    }
+    let literal = manifest.capability_facts.iter().flat_map(|(cap, facts)| {
+        facts
+            .keys()
+            .filter(|f| fact_is_numeric(cap, f))
+            .map(move |f| (format!("[capability_facts.\"{cap}\"]"), f.clone()))
+    });
+    for (table, fact) in literal {
+        if integer(&fact) {
+            return Err(Error::Module(format!(
+                "{table} states `{fact}` as a number, but `{fact}` is also an integer param of \
+                 the module, which a graph may set; bind the fact to it: \
+                 `{fact} = {{ param = \"{fact}\" }}`."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `[capability_facts]` table: every capability it names must be
@@ -439,6 +547,12 @@ fn validate_capability_facts(
                     candidates.join(", "),
                 )));
             };
+            if matches!(written, FactValue::Param(_)) && !fact_is_numeric(&canonical, fact) {
+                return Err(Error::Module(format!(
+                    "fact `{fact}` on capability `{canonical}` is not numeric; only a numeric \
+                     fact takes its value from a param."
+                )));
+            }
             for value in written.values() {
                 if fact_is_numeric(&canonical, fact) {
                     if value.parse::<u32>().is_err() {
@@ -504,13 +618,12 @@ fn normalise_port_facts(
         };
         let values = match (fact_rule(&fact, admitted), value) {
             (FactRule::Exact | FactRule::Ceiling | FactRule::Floor, toml::Value::Table(t)) => {
-                let param = match (t.len(), t.get("param")) {
-                    (1, Some(toml::Value::String(p))) if !p.is_empty() => p.clone(),
-                    _ => {
-                        return Err(Error::Module(format!(
-                            "port `{port}`: fact `{fact}` takes an integer, or                              `{{ param = \"<name>\" }}` to take its value from one of the                              module's integer params."
-                        )))
-                    }
+                let what = format!("port `{port}`");
+                let Some(param) = bound_fact_param(&what, &fact, &t)? else {
+                    return Err(Error::Module(format!(
+                        "{what}: fact `{fact}` takes an integer, or `{{ param = \"<name>\" }}` \
+                         to take its value from one of the module's integer params."
+                    )));
                 };
                 bound.insert(fact, param);
                 continue;
@@ -1868,6 +1981,13 @@ pub struct Manifest {
     /// capability name; see `fluxor_contracts::vocabulary::CAPABILITY_FACTS`.
     pub capability_facts:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Numeric capability facts whose value is one of the instance's integer
+    /// params (`period_ms = { param = "interval_ms" }`), keyed by capability,
+    /// then fact, to the param's name. Absent from `capability_facts`; the
+    /// composer reads each per instance, as it reads a port's `fact_params`
+    /// (`config::validate::bind_capability_facts`). Tools-side only.
+    pub capability_fact_params:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Role/surface capabilities this module declares (parsed from TOML,
     /// not serialized to the binary `.fmod`). The whitelist lives in
     /// `CAPABILITY_NAMES`; the config validator consults this field to
@@ -2025,6 +2145,7 @@ impl Default for Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
             capability_facts: std::collections::BTreeMap::new(),
+            capability_fact_params: std::collections::BTreeMap::new(),
             capabilities: Vec::new(),
             observability: Observability::default(),
             builtin: false,
@@ -2662,6 +2783,8 @@ impl Manifest {
         self.capabilities.retain(|c| !omitted_caps.contains(c));
         self.capability_facts
             .retain(|c, _| !omitted_caps.contains(c));
+        self.capability_fact_params
+            .retain(|c, _| !omitted_caps.contains(c));
         self.ports.retain(|p| {
             p.name
                 .as_deref()
@@ -2984,7 +3107,8 @@ impl Manifest {
             .filter_map(|p| p.requires_capability.clone())
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
-        let capability_facts = resolve_capability_facts(capability_facts, abi)?;
+        let (capability_facts, capability_fact_params) =
+            resolve_capability_facts(capability_facts, abi)?;
         let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
         // Read for publication by `publish_withheld`; checked here so a
         // reasonless withholding fails the build, not only the publish.
@@ -3538,7 +3662,7 @@ impl Manifest {
             }
         }
 
-        Ok(Manifest {
+        let manifest = Manifest {
             module_version,
             hardware_targets,
             state_bytes_64,
@@ -3557,6 +3681,7 @@ impl Manifest {
             commands,
             provides,
             capability_facts,
+            capability_fact_params,
             capabilities,
             observability,
             builtin,
@@ -3580,7 +3705,24 @@ impl Manifest {
             timer_class,
             step_period_ticks,
             execution,
-        })
+        };
+        // A native module's schema is its `[[params]]`; a PIC module's is
+        // embedded at build and checked there (`modules::pack`).
+        if manifest.builtin {
+            let params: Vec<(&str, bool)> = manifest
+                .params
+                .iter()
+                .map(|p| {
+                    let integer = matches!(
+                        p.ptype,
+                        ManifestParamType::U8 | ManifestParamType::U16 | ManifestParamType::U32
+                    );
+                    (p.name.as_str(), integer)
+                })
+                .collect();
+            check_fact_params(&manifest, &params)?;
+        }
+        Ok(manifest)
     }
 
     /// Serialize manifest to binary format.
@@ -4021,6 +4163,7 @@ impl Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(), // not serialized in binary format
             capability_facts: std::collections::BTreeMap::new(), // not serialized
+            capability_fact_params: std::collections::BTreeMap::new(), // not serialized
             capabilities: Vec::new(), // not serialized in binary format
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
@@ -6907,5 +7050,151 @@ store_subscriptions = 1
         );
         let err = Manifest::from_toml_str_for_target(&src, None).expect_err("must refuse");
         assert!(err.to_string().contains("metrics"), "{err}");
+    }
+
+    /// A sensor manifest whose `sensor.sample` `period_ms` fact is written
+    /// `fact`.
+    fn sensor_manifest(fact: &str) -> String {
+        format!(
+            "version = \"0.1.0\"\ncapabilities = [\"sensor.sample\"]\n\n\
+             [capability_facts.\"sensor.sample\"]\nquantity = \"temperature\"\n{fact}\n\
+             max_payload = 24\n"
+        )
+    }
+
+    /// The params of a module like temp_sensor: `interval_ms` and `sensor_id`
+    /// integers, `label` a string.
+    const SENSOR_PARAMS: [(&str, bool); 3] =
+        [("interval_ms", true), ("sensor_id", true), ("label", false)];
+
+    /// A numeric capability fact bound to a param leaves the literal table
+    /// and names the param, read per instance by the composer.
+    #[test]
+    fn a_capability_fact_binds_to_an_integer_param() {
+        let m = Manifest::from_toml_str_for_target(
+            &sensor_manifest("period_ms = { param = \"interval_ms\" }"),
+            None,
+        )
+        .expect("a bound numeric fact");
+        assert_eq!(
+            m.capability_fact_params["sensor.sample"]["period_ms"],
+            "interval_ms"
+        );
+        assert!(!m.capability_facts["sensor.sample"].contains_key("period_ms"));
+        assert_eq!(m.capability_facts["sensor.sample"]["max_payload"], "24");
+        check_fact_params(&m, &SENSOR_PARAMS).expect("an integer param");
+    }
+
+    /// The binding names an integer param of the module, and only a numeric
+    /// fact binds.
+    #[test]
+    fn a_capability_fact_binding_is_held_to_the_params() {
+        let bound = |param: &str| {
+            let m = Manifest::from_toml_str_for_target(
+                &sensor_manifest(&format!("period_ms = {{ param = \"{param}\" }}")),
+                None,
+            )
+            .expect("parses");
+            check_fact_params(&m, &SENSOR_PARAMS)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = bound("interval");
+        assert!(e.contains("the module has no param `interval`"), "{e}");
+        let e = bound("label");
+        assert!(e.contains("`label` is not an integer param"), "{e}");
+
+        let refused = |fact: &str| {
+            Manifest::from_toml_str_for_target(&sensor_manifest(fact), None)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = refused("period_ms = 5000\nx = { param = \"a\" }");
+        assert!(e.contains("unknown fact `x`"), "{e}");
+        let e = refused("period_ms = { param = \"interval_ms\", default = 5 }");
+        assert!(e.contains("{ param ="), "{e}");
+        let e = refused("period_ms = { param = \"\" }");
+        assert!(e.contains("{ param ="), "{e}");
+        let e = Manifest::from_toml_str_for_target(
+            &sensor_manifest("period_ms = 5000")
+                .replace("quantity = \"temperature\"", "quantity = { param = \"q\" }"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("is not numeric"), "{e}");
+    }
+
+    /// A numeric capability fact stated as a number under the name of an
+    /// integer param is refused; it binds the param instead. A string param
+    /// of that name, or a bound fact, passes.
+    #[test]
+    fn a_literal_capability_fact_named_like_an_integer_param_is_refused() {
+        let m = Manifest::from_toml_str_for_target(&sensor_manifest("period_ms = 1000"), None)
+            .expect("parses");
+        let e = check_fact_params(&m, &[("period_ms", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("states `period_ms` as a number")
+                && e.contains("`period_ms = { param = \"period_ms\" }`"),
+            "{e}"
+        );
+        check_fact_params(&m, &[("period_ms", false)]).expect("a string param of that name");
+        check_fact_params(&m, &SENSOR_PARAMS).expect("no param of that name");
+        let m = Manifest::from_toml_str_for_target(
+            &sensor_manifest("period_ms = { param = \"period_ms\" }"),
+            None,
+        )
+        .expect("parses");
+        check_fact_params(&m, &[("period_ms", true)]).expect("bound");
+
+        // A port fact is held only to its binding: a literal stream fact
+        // may bound what a param of the same name does not set.
+        let port = |facts: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ndirection = \"input\"\n\
+                     content_type = \"VideoRaster\"\n[ports.facts]\n{facts}\n"
+                ),
+                None,
+            )
+            .expect("parses")
+        };
+        check_fact_params(&port("width = 4096"), &[("width", true)])
+            .expect("a ceiling beside a param of its name");
+        check_fact_params(&port("width = { param = \"width\" }"), &[("width", true)])
+            .expect("bound");
+        let e = check_fact_params(&port("width = { param = \"w\" }"), &[("width", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("port `p`: fact `width` is bound to param `w`"),
+            "{e}"
+        );
+    }
+
+    /// A native module's `[[params]]` are its schema, checked at load.
+    #[test]
+    fn a_native_module_binds_its_facts_to_its_own_params() {
+        let native = |fact: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "{}\n[[params]]\nname = \"interval_ms\"\ntag = 10\ntype = \"u32\"\n\
+                     default = 5000\n",
+                    sensor_manifest(fact).replacen(
+                        "version = \"0.1.0\"\n",
+                        "version = \"0.1.0\"\nbuiltin = true\n",
+                        1
+                    )
+                ),
+                None,
+            )
+        };
+        native("period_ms = { param = \"interval_ms\" }").expect("bound to its own param");
+        let e = native("period_ms = { param = \"interval\" }")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the module has no param `interval`"), "{e}");
     }
 }

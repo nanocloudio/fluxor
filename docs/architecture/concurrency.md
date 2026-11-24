@@ -191,7 +191,7 @@ own instance); the armed, timed-out and protection-fault flags
 (`kernel/exec/step_guard.rs`, indexed by core); the gated-module control
 block and the MPU, which each core programs for the module it steps
 (`rp/protection.rs`); the stack fence and the measured entry depth
-(`rp/boot.rs`; core 1 steps on its own stack in SRAM8 and SRAM9); the
+(`rp/boot.rs`; core 1 steps on a stack of its own, a static of `rp/core1.rs`); the
 module-timer alarm and the `timer` slots tagged with the core
 (`kernel/exec/timer.rs`); the NVIC. Each core's NVIC can be written by that
 core alone, so a line bound for core 1 is recorded in a line set
@@ -209,9 +209,10 @@ bridges) run each call inside the same section while core 1 runs a domain
 main SRAM, the only memory where the two cores' exclusive accesses are
 arbitrated.
 
-**Core 0 only.** USB, the console, the watchdog, flash, and every quiesce
-request. Core 0 feeds the watchdog only while core 1's heartbeat moves, core
-1 is parked for core 0, or core 1 runs no domain.
+**Core 0 only.** USB, the console, the watchdog, flash, the primary-core
+ops (below), and every quiesce request. Core 0 feeds the watchdog only while
+core 1's heartbeat moves, core 1 is parked for core 0 or waiting on a
+primary-core op, or core 1 runs no domain.
 
 **Bridged.** An edge between a domain on core 0 and one on core 1 is split
 into two channels joined by a lock-free ring (`domains/cross.rs`); an edge
@@ -227,8 +228,11 @@ parked, and returns only once core 0 has restored XIP. Core 0 waits no
 longer than the deadline of the step core 1 is in plus a millisecond, and
 answers `EBUSY` past it. Core 1 is started for the first graph that places a
 module on it, waits in the same RAM loop until that graph is released, and
-parks there for a structural quiesce. A flash op issued on core 1 answers
-`ENOTSUP`. The time a core is held for a detach (core 0 with its interrupts
+parks there for a structural quiesce. Core 0 detaches only once core 1 has
+joined both quiesces (`domains::in_loop`): a core that has joined one is
+still running its way into the loop from flash. A flash op issued on core 1
+is a primary-core op: core 0 runs the detach while core 1 waits, parked in
+RAM for it. The time a core is held for a detach (core 0 with its interrupts
 masked, core 1 parked) is not the stepping module's: its deadline moves past
 it and the scheduler leaves it out of the step's time. An erase or a program
 also empties the cache both cores fetch through, so each core's steps may
@@ -236,18 +240,39 @@ run over their deadlines by one refill of that cache in the passes that
 follow (`rp/step_charge.rs`). Before an erase or a program every DMA scan
 list's armed entries return to fill.
 
-**Core 1's stack.** Core 1 steps on a stack of its own, 8 KiB
-(`[smp] secondary_stack` in the target file). A gated module runs on the
+**Core 1's stack.** Core 1 steps on a stack of its own, 16 KiB
+(`[smp] secondary_stack` in the target file), linked among the kernel's
+statics so the static-RAM ceiling counts it. A gated module runs on the
 stack in its private region; a module that is not gated runs on core 1's,
 and the composer admits it against the stack less `reserve_kb`, the kernel's
 own share under it: its frames where it calls the module, the deepest call
 the module can make back (through the provider table to a handler and the
-logger), and one interrupt on top. The firmware build measures that sum in
+logger), and one interrupt on top. The primary-core ops are not in that
+share: core 1 hands them to core 0. The firmware build measures the sum in
 the linked image (`tools/img/kernel_stack_bound.py`) and refuses an image
-that needs more than the reserve. Three kinds of call run frames deeper than
-core 1's whole stack (a signature check, the loader): the `reconfigure`
-contract, the signing root and the key vault answer `ENOTSUP` on core 1, as
-flash does.
+that needs more than the reserve; it bounds core 0's share under a module
+(`[kernel] kernel_stack_reserve_kb`, the primary-core ops included) the same
+way, on RP2040 too.
+
+**Primary-core ops.** The `reconfigure` contract, the signing root, the key
+vault and its store, and taking XIP away run on the primary core alone: they
+run the kernel's deepest frames, a change of the graph parks the other cores
+from the primary, and the vault's state has one writer. On every kernel that
+steps modules off core 0, a module on another core still calls them as it
+always does: its core posts the call (`domains/primary_call.rs`) and waits
+with its interrupts masked, honouring a step quiesce (on RP, parking in RAM)
+and never a structural one; the primary serves it between two module steps,
+at its pass boundary and inside its own waits for the other cores to park,
+as the caller (its module context, grants and realm), and the call returns
+its answer synchronously, the caller's frame and lends live throughout. A
+caller whose module slot was freed while it waited is answered `ESRCH`.
+While its call runs the caller counts as parked for a structural quiesce the
+call itself takes (an add, a removal), as the primary's own pass is
+suspended under such a call; a posted call is served before a structural
+change lands, so the change never lands under a step in flight. The time
+the caller waits is not its module's: its step deadline moves past it, and
+the time core 0 serves is not core 0's stepping module's. Called from an
+interrupt handler, a primary-core op answers `ENOTSUP`.
 
 **Faults.** A module's fault on core 1 is taken by its policy like any
 other, and the work of the policy is core 0's: on every kernel that runs

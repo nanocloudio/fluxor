@@ -397,17 +397,14 @@ pub fn init_providers() {
     // backend), a hardware backend; each handle names the backend that
     // holds its key. Consumers never name a platform — they read
     // PROBE/CUSTODY/DESCRIBE.
-    provider::register(dev_class::KEY_VAULT, primary_stack_key_vault);
+    provider::register(dev_class::KEY_VAULT, primary_dispatch);
     provider::register(
         crate::abi::registry::metal_device::ID,
         crate::kernel::module::metal_device::dispatch,
     );
     // The vault's durable store is the same router's other surface; its ops
     // need the `seal_key` grant.
-    provider::register(
-        crate::abi::registry::vault_store::ID,
-        primary_stack_key_vault,
-    );
+    provider::register(crate::abi::registry::vault_store::ID, primary_dispatch);
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
     // handles route through the vtable; handle=-1 globals fall through
@@ -522,7 +519,7 @@ static BRIDGE_VTABLE: crate::kernel::module::provider::ProviderVTable =
 static KEY_VAULT_VTABLE: crate::kernel::module::provider::ProviderVTable =
     crate::kernel::module::provider::ProviderVTable {
         contract: crate::kernel::module::provider::contract::KEY_VAULT,
-        call: primary_stack_key_vault,
+        call: primary_dispatch,
         query: None,
         default_close_op: contracts::key_vault::DESTROY,
         poll: None,
@@ -713,16 +710,6 @@ static HAL_PWM_VTABLE: crate::kernel::module::provider::ProviderVTable =
         default_close_op: contracts::hal::pwm::CLOSE,
         poll: None,
     };
-
-/// The key vault's provider: the router, on a stack that holds a signature
-/// (see [`primary_stack_dispatch`]); `ENOTSUP` on a small one.
-#[inline(never)]
-fn primary_stack_key_vault(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
-    if on_small_stack() {
-        return errno::ENOTSUP;
-    }
-    crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, data)
-}
 
 // ============================================================================
 // Generic Device Call / Query
@@ -1154,26 +1141,6 @@ pub fn register_dev_query_extension(f: QueryExtensionFn) {
     }
 }
 
-/// The platform's answer to whether the calling core steps on a stack too
-/// small for the kernel's deepest calls: a secondary core with a small stack
-/// of its own. None registered: every core's stack holds them.
-static mut SMALL_STACK: Option<fn() -> bool> = None;
-
-/// Name the platform's small-stack test. Boot-time, or `None` to clear it.
-pub fn register_small_stack(f: Option<fn() -> bool>) {
-    // SAFETY: as `register_system_extension` — boot-time installation.
-    unsafe {
-        SMALL_STACK = f;
-    }
-}
-
-/// Whether the calling core steps on a small stack ([`register_small_stack`]).
-fn on_small_stack() -> bool {
-    // SAFETY: written once at boot before any module runs; a word-sized copy.
-    let test = unsafe { *core::ptr::addr_of!(SMALL_STACK) };
-    test.is_some_and(|f| f())
-}
-
 fn system_extension() -> Option<ExtensionFn> {
     // SAFETY: written once at boot before any module runs; a word-sized copy.
     unsafe { *core::ptr::addr_of!(SYSTEM_EXTENSION) }
@@ -1293,26 +1260,44 @@ fn signal_core(arg: &[u8]) -> i32 {
     }
 }
 
-/// Whether `opcode` is one the kernel answers on the primary stack alone:
+/// Whether `opcode` is a primary-core op the kernel bucket routes by class:
 /// the `reconfigure` contract (a change of the graph, a staged update) and
-/// the signing root, which reads and checks the image's layout.
-fn primary_stack_op(opcode: u32) -> bool {
+/// the signing root, which reads and checks the image's layout. The key
+/// vault and its store are the others ([`primary_dispatch`] is their
+/// provider).
+fn primary_op(opcode: u32) -> bool {
     opcode >> 8 == u32::from(crate::abi::registry::reconfigure::ID)
         || opcode == crate::abi::kernel_abi::SIGNING_ROOT
 }
 
-/// The ops of [`primary_stack_op`]. They run the kernel's deepest frames (a
-/// signature check, the loader), so a core that steps on a small stack of its
-/// own is refused `ENOTSUP` before any of them runs
-/// ([`register_small_stack`]). The firmware build's stack bound counts a
-/// `primary_stack_*` function for its own frame and no deeper on such a
-/// core, which holds because the refusal is the function's first act.
+/// The kernel's primary-core ops: [`primary_op`]'s, and every op of the key
+/// vault and its store. They run the kernel's deepest frames (a signature
+/// check, the loader, the vault's suites) and assume one call at a time on
+/// the primary: a change of the graph parks the other cores from there, and
+/// the vault's state has one writer. So they run on the primary core alone.
+/// Called on another core, the call is handed to the primary as the caller
+/// and this core waits for the answer (`domains::delegate`), which is the
+/// function's first act: the firmware build's bound on a secondary core's
+/// stack counts this frame and no deeper. An interrupt handler calling one
+/// is refused `ENOTSUP`: it would wait on a pass.
 #[inline(never)]
-fn primary_stack_dispatch(opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+fn primary_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::reconfigure;
     use crate::kernel::exec::scheduler;
-    if on_small_stack() {
+    #[cfg(target_arch = "arm")]
+    if crate::arch::cortex_m::in_handler_mode() {
         return errno::ENOTSUP;
+    }
+    #[cfg(all(feature = "smp", target_os = "none"))]
+    if crate::kernel::sys::hal::core_id() != 0 {
+        let mut call = Some((arg, data));
+        return crate::kernel::exec::domains::delegate(&mut || match call.take() {
+            Some((arg, data)) => primary_dispatch(handle, opcode, arg, data),
+            None => errno::EBUSY,
+        });
+    }
+    if !primary_op(opcode) {
+        return crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, data);
     }
     match opcode {
         crate::abi::kernel_abi::SIGNING_ROOT => {
@@ -1483,7 +1468,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg),
 
         // ── Live reconfigure, graph mutation, staging; the signing root ──
-        op if primary_stack_op(op) => primary_stack_dispatch(op, arg, data),
+        op if primary_op(op) => primary_dispatch(handle, op, arg, data),
 
         _ => match system_extension() {
             // Platform extension for hardware-specific opcodes.

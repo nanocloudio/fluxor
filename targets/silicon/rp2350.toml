@@ -223,7 +223,7 @@ flash_program_size = "0x100"
 # board's kernel image under it; raising it costs each board that much slot.
 kernel_flash_reserve = "0xA0000"
 ram_base = "0x20000000"
-ram_size = "0x80000"
+ram_size = "0x82000"
 
 [kernel]
 watchdog_ctrl = "0x400D8000"
@@ -273,8 +273,8 @@ buffer_arena_kb = 64
 # refused at boot naming the pool that did not fit. A full graph's tables
 # (32 module slots, 128 channels) take some 33 KiB, so 344 leaves every graph
 # the composer admits its 240 KiB of state beside the 64 KiB buffer arena;
-# the kernel's fixed statics are ~112 KiB, so 344 leaves ~8 KiB of slack
-# under the 464 KiB ceiling.
+# the kernel's fixed statics are ~85 KiB and core 1's stack 16 KiB, which
+# leaves ~20 KiB of slack under the 466 KiB ceiling.
 kernel_pool_kb = 344
 config_buffer_kb = 16
 # Early-boot log ring: sized to hold a whole boot until a reader arrives —
@@ -286,20 +286,22 @@ log_ring_kb = 8
 # records waiting for `observe`/`otel` to drain them. It must hold one whole
 # PSTATUS round (80 B per module slot plus 32 B per kernel pool).
 telemetry_ring_kb = 8
-# Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
-# out of the linker's 512 KiB RAM region. What is left over is the
-# stack, which grows down from the top of that region and which every
-# module steps on in turn: 48 KiB here.
+# Ceiling on the kernel image's static RAM (.data + .bss + .uninit, core 1's
+# stack included) out of the linker's 520 KiB RAM region. What is left over
+# is core 0's stack, which grows down from the top of that region and which
+# every module on core 0 steps on in turn: 54 KiB here.
 # The linker already refuses an image that cannot fit at all; this
 # binds earlier, so steady creep fails a gate instead of arriving
 # as a link error nobody can attribute. Raising it takes the same bytes
 # from the stack, which the composer then admits modules against.
-ram_static_max_kb = 464
-# The kernel's own frames at a module call: the scheduler under the step,
-# syscalls and interrupts above it. The stack less this, 40 KiB, is the
-# deepest a module may go; the scheduler fences every step there and
-# reports the measured depths.
-kernel_stack_reserve_kb = 8
+ram_static_max_kb = 466
+# The kernel's own frames at a module call on core 0: the scheduler under
+# the step, the deepest syscall above it (an add that checks a signature,
+# the key vault) and an interrupt on top. The firmware build measures that
+# sum in the linked image and refuses an image over it. The stack less
+# this, 40 KiB, is the deepest a module may go; the scheduler fences every
+# step there and reports the measured depths.
+kernel_stack_reserve_kb = 14
 # Clock profile. The production system clock is the datasheet default;
 # `overclock_sys_hz` is a non-production profile selected by the
 # `rp-overclock` cargo feature and is never what a shipped image runs.
@@ -410,16 +412,16 @@ secondary_alarms = [
 [smp]
 cores = 2
 domain_cores = [0, 1, 0, 0]
-# Core 1's stack: SRAM8 and SRAM9, the two direct-mapped 4 KiB banks above
-# the striped region. `reserve_kb` is the kernel's own share under a module
-# stepped there: its pass frames where it calls the module, the deepest call
-# the module can make back into the kernel (a provider open, through the
-# provider table to a handler and the logger) and one interrupt on top. The
-# firmware build measures that sum in the linked image and refuses an image
-# where it is over the reserve. A module that is not gated is admitted
-# against the rest, 2 KiB; a gated one runs on the stack in its private
-# region.
-secondary_stack = { base = "0x20080000", size_kb = 8, reserve_kb = 6 }
+# Core 1's stack, a static the kernel links among the others (so the
+# static-RAM ceiling counts it). `reserve_kb` is the kernel's own share under
+# a module stepped there: its pass frames where it calls the module, the
+# deepest call the module can make back into the kernel (a provider open,
+# through the provider table to a handler and the logger; the primary-core
+# ops are handed to core 0) and one interrupt on top. The firmware build
+# measures that sum in the linked image and refuses an image where it is
+# over the reserve. A module that is not gated is admitted against the
+# rest, 11 KiB; a gated one runs on the stack in its private region.
+secondary_stack = { size_kb = 16, reserve_kb = 5 }
 
 # What the hardware counters a module reads through the `counters` contract
 # count: the facts of the target capabilities `counter.cycles` and

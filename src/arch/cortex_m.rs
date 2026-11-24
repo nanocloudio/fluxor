@@ -114,6 +114,16 @@ pub fn primask_is_active() -> bool {
     primask & 1 == 1
 }
 
+/// Whether the core runs an exception handler (`IPSR` names an exception)
+/// rather than thread code.
+#[inline(always)]
+pub fn in_handler_mode() -> bool {
+    let ipsr: u32;
+    // SAFETY: reads an architected special register into a local.
+    unsafe { asm!("mrs {}, IPSR", out(reg) ipsr, options(nomem, nostack, preserves_flags)) }
+    ipsr & 0x1FF != 0
+}
+
 /// Enable interrupts (`cpsie i`).
 ///
 /// # Safety

@@ -461,13 +461,18 @@ its number for life, a retired one is never reused, and declaration
 order carries no meaning. The manifest and the matching tag constants
 in `src/platform/linux/<name>.rs` change together or not at all.
 
-Validation runs at config-build time (`fluxor build`):
+Validation runs at config-build time, in `fluxor build` and
+`fluxor build --check` alike:
 
 - **Unknown param**: hard error with a "did you mean…" hint
-  (Levenshtein-based). The packer's flattening rules are mirrored, so
-  nested objects (`eq: { low_freq: 100 }`), the transparent
-  `params: { ... }` wrapper, and `_envelope`/`_config`/`_settings`/
-  `_params` suffix-stripping all resolve correctly.
+  (Levenshtein-based). A module that declares no params (no
+  `define_params!`, no `[[params]]`) has the empty schema, so every key
+  on its entry other than the module entry's own (`name`, `type`,
+  `variant`, `domain`, `protection`, `trust_class`, `max_cycles`, `irq`,
+  the restart and heap keys …) is refused. The packer's flattening
+  rules are mirrored, so nested objects (`eq: { low_freq: 100 }`), the
+  transparent `params: { ... }` wrapper, and `_envelope`/`_config`/
+  `_settings`/`_params` suffix-stripping all resolve correctly.
 - **Range**: `range = [min, max]` checks numeric YAML values;
   out-of-range values fail the build with the manifest's bounds.
 - **Required**: `required = true` makes YAML omission a hard error —

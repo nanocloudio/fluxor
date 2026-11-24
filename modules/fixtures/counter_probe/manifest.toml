@@ -14,8 +14,9 @@ grants = ["counters"]
 #   [counter_probe] n=<report> turns=<turns run> cycles=<cycles, less the
 #   read's own> hit=<cache hits> access=<cache accesses> permille=<hits per
 #   thousand accesses> want=<cycles expected> ok=<1 or 0>
-# `want` is `cycles_per_turn` times the turns, and `ok` is 1 when the cycles
-# are within 5 % of it; with `cycles_per_turn: 0` nothing is expected and
+# `want` is `cycles_per_turn_x100` (hundredths of a cycle a turn) times the
+# turns, over 100, and `ok` is 1 when the cycles are within 5 % of it; with
+# `cycles_per_turn_x100: 0` nothing is expected and
 # `ok` is 1 when the cycle counter moved. The counts cover everything that
 # ran on the core in the region, interrupts included, and with scope `node`
 # every other reader of the cache.
@@ -31,7 +32,7 @@ capabilities = ["measurement.stream"]
 encoding            = "u32le"
 channels            = 3
 samples_per_channel = 1
-period_ms           = 1000
+period_ms           = { param = "period_ms" }
 max_payload         = 28
 
 [[resources]]

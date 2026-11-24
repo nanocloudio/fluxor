@@ -49,10 +49,8 @@ pub const TAG_OPERATOR_TRUST: u8 = 16;
 /// asks the `trust` contract instead of its own verifier.
 pub const TAG_TRUST_SYSTEM: u8 = 17;
 
-/// The value that names the platform's own trust store. Spelled `system`
-/// and not `platform`: `trust: "platform"` already means an ISR trust LEVEL
-/// on a module entry (`tools/src/board.rs`), and reusing the literal would
-/// make two unrelated things read the same in a graph.
+/// The value that names the platform's own trust store, served by the
+/// `trust` contract.
 pub const SYSTEM_SPEC: &str = "system";
 
 /// The path a `${file:<path>}` source spec names; `None` for any other

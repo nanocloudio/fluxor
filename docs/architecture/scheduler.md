@@ -15,7 +15,12 @@ Source: `src/kernel/exec/scheduler/mod.rs`, `src/kernel/exec/interrupt.rs`,
 The modes form two families. The **cooperative** family (`tick`, `poll`)
 gets the full syscall surface. The **interrupt** family (`timer`, `irq`)
 is bridge-only, and admission requires the module's `interrupt_safe`
-attestation.
+attestation and its trust class `platform` (the instance's `trust_class`,
+else the graph's `default_trust_class`, else `platform`): an interrupt-mode
+module runs privileged. Such a module holds none of the grants whose calls
+run on the primary core (`flash`, the `reconfigure` contract and its
+`reconfigure.*` grants, `key_vault`): from an interrupt handler they answer
+`ENOTSUP`, so the build refuses the module there, naming the grant.
 
 | Mode (domain `exec:`, wire byte) | Family | Execution context | Cycle budget | Budget enforcement | Allowed syscalls | Use cases |
 |------|--------|-------------------|--------------|--------------------|------------------|-----------|
