@@ -13,9 +13,6 @@
 //! core see the same `&'static HalOps`. See
 //! `docs/architecture/concurrency.md`.
 
-/// `seal` / `unseal`: associated data, input, output → bytes written.
-pub type SealFn = fn(&[u8], &[u8], &mut [u8]) -> Option<usize>;
-
 /// Function-pointer table for all platform-specific operations.
 ///
 /// Each platform constructs a `static HalOps` and passes it to `hal::init()`.
@@ -61,68 +58,18 @@ pub struct HalOps {
     /// Where this platform's sealing key comes from, and therefore what
     /// sealing is WORTH here. See [`SealProvenance`].
     ///
-    /// The provenance is a separate hook from `seal`/`unseal` on purpose.
-    /// Sealing that works and sealing that protects are different
-    /// questions, and a platform that can do the first without the second
-    /// must be able to say so — otherwise the vault's custody would
-    /// have to be inferred from whether an encrypt call returned bytes,
-    /// which it always does.
+    /// Separate from [`seal_key`](HalOps::seal_key) on purpose: a platform
+    /// that has a key without the key protecting anything (a host secret
+    /// any root process reads) must be able to say so.
     pub seal_provenance: fn() -> SealProvenance,
+    /// The platform's sealing key, `None` when it has none. Read only by
+    /// `security::seal`, which hands a module a key derived from it and
+    /// never the key itself.
+    pub seal_key: fn() -> Option<[u8; 32]>,
     /// The signing root modules and node images are verified against:
     /// every platform answers with the root written into its kernel image
     /// (`security::root::image_root`).
     pub signing_root: fn() -> Option<[u8; 32]>,
-    /// Seal `plain` into `out` under associated data `aad`, returning the
-    /// sealed length.
-    ///
-    /// `None` when this platform cannot seal, or the output does not fit.
-    /// A sealed blob is opaque: only [`unseal`](HalOps::unseal) on the same
-    /// platform, given the same `aad`, reads it back. The associated data is
-    /// authenticated, not stored: it is how a record binds the facts it is
-    /// filed under to the secret it holds.
-    pub seal: SealFn,
-    /// Reverse [`seal`](HalOps::seal). `None` on any failure, including
-    /// different associated data — a sealed blob that does not open is not
-    /// a key, and there is no partial answer worth returning.
-    pub unseal: SealFn,
-    /// Write a sealed blob under `label`, so it outlives the PROCESS.
-    ///
-    /// [`seal`](HalOps::seal) makes bytes opaque; this decides where they
-    /// live, and the two are separate because they fail for different
-    /// reasons. A platform that can seal but has nowhere durable to put the
-    /// result must be able to say so: an in-RAM table survives a scheduler
-    /// reset but goes with the process, and an issuer that re-keys on every
-    /// cold start invalidates every credential it ever signed, silently,
-    /// because a verifier just sees a bad signature.
-    ///
-    /// `true` only once the blob would survive a power cut: written,
-    /// flushed and atomically in place. `false` when it is not — because
-    /// this platform has no durable store, or because the write failed; the
-    /// vault asks [`seal_blob_store`](HalOps::seal_blob_store) to tell the
-    /// two apart.
-    ///
-    /// The blob is already sealed. This hook must not be given plaintext.
-    pub seal_blob_write: fn(&[u8], &[u8]) -> bool,
-    /// Whether this platform has a durable store for sealed blobs at all.
-    pub seal_blob_store: fn() -> bool,
-    /// Remove the blob filed under `label`, durably. `true` when no blob
-    /// remains — removed, or never there; `false` when one may still come
-    /// back on the next read.
-    pub seal_blob_delete: fn(&[u8]) -> bool,
-    /// Read back what [`seal_blob_write`](HalOps::seal_blob_write) stored.
-    ///
-    /// `None` when absent or too large for `out` — both mean "no key here",
-    /// and the vault then generates one rather than proceeding with a
-    /// partial read.
-    pub seal_blob_read: fn(&[u8], &mut [u8]) -> Option<usize>,
-    /// Whether the durable store [`seal_blob_store`](HalOps::seal_blob_store)
-    /// names can be read yet. A store that exists but is not readable (its
-    /// medium still coming up at boot) must not be read as empty: a key
-    /// already stored there would be generated afresh over it. While this is
-    /// `false` the vault answers a labelled open `EAGAIN`, and the caller
-    /// asks again. A platform with no store, or one always readable, answers
-    /// `true`.
-    pub seal_blob_ready: fn() -> bool,
     /// Monotonic tick count (wrapping).
     pub tick_count: fn() -> u32,
 
@@ -521,35 +468,6 @@ include!("seal_provenance.rs");
 // something whose other half only runs on a board.
 include!("vc_mailbox.rs");
 
-/// See [`HalOps::seal_blob_write`].
-#[inline(always)]
-pub fn seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
-    (ops().seal_blob_write)(label, blob)
-}
-
-/// See [`HalOps::seal_blob_store`].
-#[inline(always)]
-pub fn seal_blob_store() -> bool {
-    (ops().seal_blob_store)()
-}
-
-/// See [`HalOps::seal_blob_delete`].
-#[inline(always)]
-pub fn seal_blob_delete(label: &[u8]) -> bool {
-    (ops().seal_blob_delete)(label)
-}
-
-/// See [`HalOps::seal_blob_read`].
-#[inline(always)]
-pub fn seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
-    (ops().seal_blob_read)(label, out)
-}
-
-/// See [`HalOps::seal_blob_ready`].
-pub fn seal_blob_ready() -> bool {
-    (ops().seal_blob_ready)()
-}
-
 /// See [`HalOps::seal_provenance`].
 #[inline(always)]
 pub fn seal_provenance() -> SealProvenance {
@@ -561,16 +479,9 @@ pub fn signing_root() -> Option<[u8; 32]> {
     (ops().signing_root)()
 }
 
-/// See [`HalOps::seal`].
-#[inline(always)]
-pub fn seal(aad: &[u8], plain: &[u8], out: &mut [u8]) -> Option<usize> {
-    (ops().seal)(aad, plain, out)
-}
-
-/// See [`HalOps::unseal`].
-#[inline(always)]
-pub fn unseal(aad: &[u8], sealed: &[u8], out: &mut [u8]) -> Option<usize> {
-    (ops().unseal)(aad, sealed, out)
+/// See [`HalOps::seal_key`].
+pub fn seal_key() -> Option<[u8; 32]> {
+    (ops().seal_key)()
 }
 
 #[inline(always)]

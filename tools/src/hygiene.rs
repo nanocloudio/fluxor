@@ -2731,7 +2731,7 @@ mod tests {
     #[test]
     fn mechanism_words_are_refused_in_the_kernel_and_docs_outside_exempt_blocks() {
         let src = "// the provider renders nftables\n// vocabulary-exempt-begin: names the Linux backend\n// veth pairs and netns\n// vocabulary-exempt-end\n// a channel bridge, an owner uid\n";
-        let v = scan_tenancy_vocabulary(Path::new("src/kernel/net_policy.rs"), src);
+        let v = scan_tenancy_vocabulary(Path::new("src/kernel/workload/lanes.rs"), src);
         assert_eq!(
             v.len(),
             1,
@@ -2744,7 +2744,7 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].line == 1 && v[0].message.contains("`kubernetes` in an architecture doc"));
         assert!(
-            scan_tenancy_vocabulary(Path::new("src/platform/linux/net_policy.rs"), src).is_empty(),
+            scan_tenancy_vocabulary(Path::new("src/platform/linux/providers.rs"), src).is_empty(),
             "a platform names its own mechanisms"
         );
         assert!(scan_tenancy_vocabulary(Path::new("docs/guides/x.md"), md).is_empty());
@@ -2878,13 +2878,12 @@ mod tests {
     #[test]
     fn every_spawned_command_sweeps_inherited_descriptors() {
         let bare = "fn f() { let c = std::process::Command::new(\"nft\"); }\n";
-        let v = scan_descriptor_hygiene(Path::new("src/platform/linux/net_policy.rs"), bare);
+        let v = scan_descriptor_hygiene(Path::new("src/platform/linux/providers.rs"), bare);
         assert_eq!(v.len(), 1);
         let swept =
             "fn f() { let mut c = Command::new(\"nft\"); descriptors::sweep_on_exec(&mut c); }\n";
         assert!(
-            scan_descriptor_hygiene(Path::new("src/platform/linux/net_policy.rs"), swept)
-                .is_empty()
+            scan_descriptor_hygiene(Path::new("src/platform/linux/providers.rs"), swept).is_empty()
         );
     }
 

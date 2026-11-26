@@ -224,6 +224,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("observability", verbose, || run_observability(project_root))
     });
 
+    // ───── contract claims ───────────────────────────────────────────────
+    //
+    // A module that calls a module-provided contract (`key_vault`) claims
+    // it, so a graph without the provider is refused at compose rather than
+    // answered ENOSYS at the first call.
+    results.push(if skip.hygiene {
+        skipped("contract-claims")
+    } else {
+        run_step("contract-claims", verbose, || {
+            run_contract_claims(project_root)
+        })
+    });
+
     // ───── presentation placement ────────────────────────────────────────
     //
     // Run the placement resolver
@@ -951,6 +964,54 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: None,
             package_gate: Some("fluxor-rig-observers"),
         },
+        // The host lane and the host providers: shipped binaries of their own
+        // crates (`hosts/linux/`), each holding a third-party tree the runtime
+        // does not link, so each crate is a job of its own like the observers.
+        ClippyJob {
+            label: "host-lane",
+            cwd: "hosts/linux/lane",
+            args: &[
+                "clippy",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            feature_gate: None,
+            package_gate: Some("fluxor-host-lane"),
+        },
+        ClippyJob {
+            label: "provider-hsm",
+            cwd: "hosts/linux/hsm",
+            args: &[
+                "clippy",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            feature_gate: None,
+            package_gate: Some("fluxor-provider-hsm"),
+        },
+        ClippyJob {
+            label: "provider-net",
+            cwd: "hosts/linux/net",
+            args: &[
+                "clippy",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            feature_gate: None,
+            package_gate: Some("fluxor-provider-net"),
+        },
         // The UEFI loader, on the firmware's PE target: its own crate, so its
         // own job, like the observers.
         ClippyJob {
@@ -1429,11 +1490,35 @@ const HARNESS_TARGET: &str = "aarch64-unknown-linux-gnu";
 /// Always built: cargo's incremental build makes an up-to-date tree a no-op.
 /// A failed build fails this phase and so the run; the later suites still run
 /// (every phase does), against whatever binary the last good build left.
+///
+/// The host providers are built with it, into the same directory: `host_lane`
+/// finds a provider beside the runtime, and the harness's lane suites start
+/// them from there (`fluxor-lane-loopback`, `fluxor-provider-hsm`,
+/// `fluxor-provider-net`).
 fn build_host_binary(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
     if verbose {
-        println!("  building fluxor-linux for the test suites");
+        println!("  building fluxor-linux and the host providers for the test suites");
     }
-    cargo_in(project_root, &host_binary_build_args())
+    cargo_in(project_root, &host_binary_build_args())?;
+    cargo_in(project_root, &host_provider_build_args())
+}
+
+/// The host provider crates: every one `[project].runtimes` publishes, and
+/// the lane's test provider. Built for [`HARNESS_TARGET`] in release mode,
+/// so they land beside `fluxor-linux`.
+const HOST_PROVIDER_PACKAGES: [&str; 3] = [
+    "fluxor-host-lane",
+    "fluxor-provider-hsm",
+    "fluxor-provider-net",
+];
+
+/// The `cargo` arguments that build [`HOST_PROVIDER_PACKAGES`]' binaries.
+fn host_provider_build_args() -> Vec<&'static str> {
+    let mut args = vec!["build", "--release", "--target", HARNESS_TARGET, "--bins"];
+    for p in HOST_PROVIDER_PACKAGES {
+        args.extend_from_slice(&["-p", p]);
+    }
+    args
 }
 
 /// The `cargo` arguments that build the host runtime for [`HARNESS_TARGET`].
@@ -1445,7 +1530,7 @@ fn host_binary_build_args() -> [&'static str; 9] {
         "fluxor-linux",
         "--no-default-features",
         "--features",
-        "host-linux,host-playback,host-hsm",
+        "host-linux,host-playback",
         "--target",
         HARNESS_TARGET,
     ]
@@ -1616,6 +1701,23 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     Err(msg)
 }
 
+/// Contract-claim phase: every module whose sources import a claimed
+/// contract's op surface carries the `[[resources]]` claim
+/// (`contract_claims`).
+fn run_contract_claims(project_root: &Path) -> std::result::Result<(), String> {
+    let unclaimed = crate::contract_claims::unclaimed_callers(&project_root.join("modules"));
+    if unclaimed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} module(s) call a contract they do not claim ({}): add `[[resources]] \
+         requires_contract = \"<contract>\"` (with `active_when_params` where the call is \
+         conditional)",
+        unclaimed.len(),
+        unclaimed.join(", ")
+    ))
+}
+
 /// The executable of the CLI running this gate, or `None` when it is gone.
 ///
 /// A concurrent `cargo build` replaces the running binary by rename, after
@@ -1632,7 +1734,7 @@ fn running_exe() -> Option<PathBuf> {
 /// `blobs/sha256/<hex>` — spawning it bare puts the hex digest in the child's
 /// argv[0] and the busybox applet dispatch fires instead of the subcommand
 /// parse. Pin argv[0].
-fn self_invoke() -> Command {
+pub(crate) fn self_invoke() -> Command {
     let exe = running_exe().unwrap_or_else(|| {
         if cfg!(target_os = "linux") {
             PathBuf::from("/proc/self/exe")
@@ -3272,10 +3374,10 @@ fn preview(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_staleness, cli_dir_for, host_binary_build_args, inline_tests_forbidden_for,
-        live_staleness_scope, load_setup_scripts, path_with_first, release_cli_dir, run,
-        run_setup_scripts, shim_dir, with_running_cli, PhaseStatus, RunningCli, SkipSet,
-        HARNESS_TARGET,
+        classify_staleness, cli_dir_for, host_binary_build_args, host_provider_build_args,
+        inline_tests_forbidden_for, live_staleness_scope, load_setup_scripts, path_with_first,
+        release_cli_dir, run, run_setup_scripts, shim_dir, with_running_cli, PhaseStatus,
+        RunningCli, SkipSet, HARNESS_TARGET,
     };
     use crate::store_sync::StalenessScope;
 
@@ -3692,6 +3794,18 @@ mod tests {
         assert!(args.contains(&"--release"));
         assert!(args.windows(2).any(|w| w == ["--target", HARNESS_TARGET]));
         assert!(args.windows(2).any(|w| w == ["--bin", "fluxor-linux"]));
+    }
+
+    /// The host providers are built beside the runtime, for the same triple.
+    #[test]
+    fn the_host_providers_build_beside_the_runtime() {
+        let args = host_provider_build_args();
+        assert_eq!(args[0], "build");
+        assert!(args.contains(&"--release"));
+        assert!(args.windows(2).any(|w| w == ["--target", HARNESS_TARGET]));
+        assert!(args.windows(2).any(|w| w == ["-p", "fluxor-provider-hsm"]));
+        assert!(args.windows(2).any(|w| w == ["-p", "fluxor-provider-net"]));
+        assert!(args.windows(2).any(|w| w == ["-p", "fluxor-host-lane"]));
     }
 
     /// A tree whose every lib and bin root lies under a directory that forbids

@@ -17,10 +17,12 @@
 //! - **Cadence**: [`emit_all`] publishes one `POOL` record per kernel pool
 //!   in the scheduler's PSTATUS round (`sample_pstatus`), kernel-stamped.
 //!
-//! A pool a module provider serves (`resource::module_provided_pool_contract`:
-//! the store's subscriptions, under a module `storage.namespace` provider) is
-//! sampled from its owner like any other pool, and its owner is the
-//! provider. [`emit_all`] asks it
+//! A pool a module provider serves (the module range,
+//! `resource::module_provided_pool_contract`: the store's subscriptions, under
+//! the graph's `storage.namespace` providers) is sampled from its owner like
+//! any other pool, and its owner is the provider. Its plan is what the graph
+//! declares (DMND) plus the envelope's entry: the figure the composer sized
+//! the providers' heap to. [`emit_all`] asks it
 //! (`resource::POOL_SAMPLE`, to a provider whose manifest says `samples_pool = true`)
 //! and keeps the answer as the pool's in-use figure until the next round, so
 //! a [`deny`] or [`stats`] between rounds reports it without calling into
@@ -39,78 +41,59 @@ use crate::abi::contracts::resource as res;
 use crate::abi::contracts::telemetry as tlm;
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+/// Ledger rows: the kernel pools, then the module-served pools.
+const ROWS: usize = res::KERNEL_POOL_COUNT + res::MODULE_POOL_COUNT;
+
 // Every figure is held in the pool's own unit (bytes for the arenas, slots
 // for the tables) as a `u64`: an arena on a large machine is past 4 GiB. The
 // `u32` surfaces below (`ceiling`, `plan_parts`, `stats`) are for the tables
 // and saturate; the arenas read [`ceiling_bytes`] and [`enforced`].
-static DENIALS: [AtomicU32; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU32::new(0) }; res::KERNEL_POOL_COUNT];
-static PEAKS: [AtomicU64; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
+static DENIALS: [AtomicU32; ROWS] = [const { AtomicU32::new(0) }; ROWS];
+static PEAKS: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
 /// Per-deployment reserve (or size) from the boot config's ENVL envelope
 /// section, in the pool's own unit; meaningful where `HAS_ENTRY` is set.
-static ENTRY: [AtomicU64; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
-static HAS_ENTRY: [AtomicBool; res::KERNEL_POOL_COUNT] =
-    [const { AtomicBool::new(false) }; res::KERNEL_POOL_COUNT];
+static ENTRY: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
+static HAS_ENTRY: [AtomicBool; ROWS] = [const { AtomicBool::new(false) }; ROWS];
 /// What the graph's modules declare they will ask of each pool (the boot
 /// config's DMND section).
-static DECLARED: [AtomicU64; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
+static DECLARED: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
 /// What the parsed config derives for each pool (module count, edges,
 /// resident workloads), set by [`plan`].
-static DERIVED: [AtomicU64; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
+static DERIVED: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
 /// A plan has been made: before one, ceilings are the defaults alone.
 static PLANNED: AtomicBool = AtomicBool::new(false);
 /// The in-use figure the module serving a pool last answered (`POOL_SAMPLE`,
 /// pulled in [`emit_all`]); meaningful where `HAS_MODULE_SAMPLE` is set,
 /// which is cleared when no module answers.
-static MODULE_SAMPLE: [AtomicU64; res::KERNEL_POOL_COUNT] =
-    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
-static HAS_MODULE_SAMPLE: [AtomicBool; res::KERNEL_POOL_COUNT] =
-    [const { AtomicBool::new(false) }; res::KERNEL_POOL_COUNT];
+static MODULE_SAMPLE: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
+static HAS_MODULE_SAMPLE: [AtomicBool; ROWS] = [const { AtomicBool::new(false) }; ROWS];
 
-/// Kernel pool ids are 1-based and contiguous (`resource` contract).
+/// A pool's ledger row: kernel pools are `1..=KERNEL_POOL_COUNT`, module
+/// pools `POOL_MODULE_BASE..` after them (`resource` contract).
 fn idx(pool: u16) -> Option<usize> {
     if pool >= 1 && (pool as usize) <= res::KERNEL_POOL_COUNT {
         Some(pool as usize - 1)
+    } else if pool >= res::POOL_MODULE_BASE
+        && ((pool - res::POOL_MODULE_BASE) as usize) < res::MODULE_POOL_COUNT
+    {
+        Some(res::KERNEL_POOL_COUNT + (pool - res::POOL_MODULE_BASE) as usize)
     } else {
         None
     }
 }
 
+/// The pool each ledger row holds.
+fn pool_at(row: usize) -> u16 {
+    if row < res::KERNEL_POOL_COUNT {
+        row as u16 + 1
+    } else {
+        res::POOL_MODULE_BASE + (row - res::KERNEL_POOL_COUNT) as u16
+    }
+}
+
 /// The pool's name as a capacity envelope (`capacity:`) spells it.
 pub fn pool_name(pool: u16) -> &'static str {
-    match pool {
-        res::POOL_STATE_ARENA => "state_arena",
-        res::POOL_BUFFER_ARENA => "buffer_arena",
-        res::POOL_CONFIG_ARENA => "config_arena",
-        res::POOL_CHANNELS => "channels",
-        res::POOL_EVENTS => "events",
-        res::POOL_TIMERS => "timers",
-        res::POOL_OWNERS => "owners",
-        res::POOL_MODULE_SLOTS => "module_slots",
-        res::POOL_ELASTIC_REGION => "elastic_region",
-        res::POOL_STORE_SUBS => "store_subs",
-        res::POOL_STORE_READS => "store_reads",
-        res::POOL_STORE_WRITES => "store_writes",
-        res::POOL_STORE_GRANTS => "store_grants",
-        res::POOL_SANDBOXES => "sandboxes",
-        res::POOL_TTY_SESSIONS => "tty_sessions",
-        res::POOL_HANDLES => "handles",
-        res::POOL_STATE_FREE_LIST => "state_free_list",
-        res::POOL_NET_POLICY_TABLES => "net_policy_tables",
-        res::POOL_NET_POLICY_TABLE_BYTES => "net_policy_table_bytes",
-        res::POOL_OWNER_STORE_SUBS => "owner_store_subs",
-        res::POOL_OWNER_STORE_READS => "owner_store_reads",
-        res::POOL_OWNER_STORE_WRITES => "owner_store_writes",
-        res::POOL_NET_ROUTE_SEGMENTS => "net_route_segments",
-        res::POOL_NET_ROUTE_PEERS => "net_route_peers",
-        res::POOL_NET_ROUTE_HELD => "net_route_held",
-        res::POOL_LENDS => "lends",
-        _ => "unknown",
-    }
+    crate::abi::registry::pool::name(pool).unwrap_or("unknown")
 }
 
 /// Ask the module serving `pool` for its in-use figure and keep the answer
@@ -156,20 +139,10 @@ fn sample_cur(pool: u16) -> u64 {
         res::POOL_ELASTIC_REGION => crate::kernel::mem::elastic::region_usage().0 as u64,
         res::POOL_HANDLES => crate::kernel::module::provider::routed_handles_in_use() as u64,
         res::POOL_LENDS => crate::kernel::ipc::lend::in_use() as u64,
+        #[cfg(feature = "chip-bcm2712")]
+        res::POOL_ISOLATED_SLOTS => crate::arch::aarch64::isolation::slots_in_use() as u64,
         res::POOL_STATE_FREE_LIST => {
             crate::kernel::module::loader::state_free_list_usage().0 as u64
-        }
-        res::POOL_NET_ROUTE_SEGMENTS | res::POOL_NET_ROUTE_PEERS | res::POOL_NET_ROUTE_HELD => {
-            crate::kernel::net_route::in_use(pool) as u64
-        }
-        #[cfg(feature = "host-linux")]
-        res::POOL_STORE_SUBS
-        | res::POOL_STORE_READS
-        | res::POOL_STORE_WRITES
-        | res::POOL_STORE_GRANTS => crate::platform::linux::store::pool_in_use(pool) as u64,
-        #[cfg(feature = "chip-bcm2712")]
-        res::POOL_STORE_SUBS | res::POOL_STORE_READS => {
-            crate::platform::store::pool_in_use(pool) as u64
         }
         _ => 0,
     }
@@ -226,7 +199,7 @@ pub fn set_declared(pool: u16, n: u32) {
 /// not inherit the previous deployment's. Called by the boot-config parse
 /// before it installs a blob's entries.
 pub fn reset_envelope() {
-    for i in 0..res::KERNEL_POOL_COUNT {
+    for i in 0..ROWS {
         ENTRY[i].store(0, Ordering::Relaxed);
         HAS_ENTRY[i].store(false, Ordering::Relaxed);
         DECLARED[i].store(0, Ordering::Relaxed);
@@ -475,6 +448,13 @@ fn emit_one(pool: u16, t_micros: u64) {
     let cur = sample_cur(pool);
     let cap = report_cap(pool);
     let peak = update_peak(i, cur);
+    let denials = DENIALS[i].load(Ordering::Relaxed);
+    // A pool the profile sizes to nothing, never used and never asked for,
+    // is a resource this node does not have (isolation slots on a node with
+    // no protection backend): there is nothing to publish.
+    if cap == 0 && cur == 0 && peak == 0 && denials == 0 {
+        return;
+    }
     let mut rec = [0u8; tlm::PSTATUS_POOL_SIZE];
     if let Some(n) = tlm::write_pstatus_pool(
         &mut rec,
@@ -485,16 +465,18 @@ fn emit_one(pool: u16, t_micros: u64) {
         cap,
         cur,
         peak,
-        DENIALS[i].load(Ordering::Relaxed),
+        denials,
     ) {
         crate::kernel::sys::telemetry_ring::emit(tlm::MODULE_KERNEL, &rec[..n]);
     }
 }
 
-/// Publish one `POOL` record per kernel pool — called from the scheduler's
-/// PSTATUS round; the caller has already checked ring subscription.
+/// Publish one `POOL` record per pool the node has — called from the
+/// scheduler's PSTATUS round; the caller has already checked ring
+/// subscription.
 pub fn emit_all(t_micros: u64) {
-    for pool in 1..=res::KERNEL_POOL_COUNT as u16 {
+    for row in 0..ROWS {
+        let pool = pool_at(row);
         pull_module_sample(pool);
         emit_one(pool, t_micros);
     }
@@ -533,11 +515,17 @@ fn fan_count(config: &crate::kernel::boot::config::Config) -> usize {
         return n;
     }
     let mut k = 0;
+    // A lane end is no module port: only an edge's module ends are keyed.
     for edge in config.graph_edges.iter().take(n).flatten() {
         let to_key = (u32::from(edge.to_port) << 4) | u32::from(edge.to_port_index);
-        keys[k] = (u32::from(edge.from_id) << 5) | u32::from(edge.from_port_index);
-        keys[k + 1] = (1 << 31) | (u32::from(edge.to_id) << 5) | to_key;
-        k += 2;
+        if edge.lane.is_none_or(|l| l.to) {
+            keys[k] = (u32::from(edge.from_id) << 5) | u32::from(edge.from_port_index);
+            k += 1;
+        }
+        if edge.lane.is_none_or(|l| !l.to) {
+            keys[k] = (1 << 31) | (u32::from(edge.to_id) << 5) | to_key;
+            k += 1;
+        }
     }
     let keys = &mut keys[..k];
     heap_sort(keys);
@@ -621,7 +609,7 @@ pub fn crossings() -> usize {
 /// kernel with domains on their own cores bridges each with a consumer-side
 /// channel of its own beside the producer's (`domains::cross::bridge_edges`).
 /// A tee or merge takes the domain of the module it fans on, so fanning adds
-/// no crossing.
+/// no crossing; a lane is never split.
 #[cfg(feature = "smp")]
 fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
     use crate::kernel::boot::config::EdgeClass;
@@ -633,6 +621,7 @@ fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
         .iter()
         .take(config.edge_count as usize)
         .flatten()
+        .filter(|e| e.lane.is_none())
         .filter(|e| {
             e.edge_class == EdgeClass::CrossCore
                 || match (domain(e.from_id), domain(e.to_id)) {

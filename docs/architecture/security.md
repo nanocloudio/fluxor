@@ -76,7 +76,7 @@ trust profiles:
 
 | Profile | Source | Integrity check | Signature check | Used by |
 |---|---|---|---|---|
-| **Trusted native** | A platform's native module (`NativeVtable`, e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM native modules, registered at platform init; resolved when the loader has no module of the name |
+| **Trusted native** | A platform's native module (`NativeVtable`, e.g. `host_lane`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM native modules, registered at platform init; resolved when the loader has no module of the name |
 | **Signed flash image** | RP / Pi 5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | Under a signing root: a present signature must verify; an unsigned module runs gated or not at all | Production RP2350 + Pi 5 firmware images |
 | **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform | Same as flash image when present | Linux dev runs, wasm bundles |
 | **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | See [reconfigure.md](reconfigure.md) and [network_boot.md](network_boot.md) for the staged-image model |
@@ -121,14 +121,16 @@ trusted until verify returns true, and an external crate in that path
 widens the supply chain that must be reviewed. The kernel links the SDK's
 implementations (`crates/fluxor-sdk/src/crypto/`) as a crate, so the
 loader and every module run one SHA-256, one SHA-512 and one Ed25519 (RFC
-8032) and cannot drift (§Cryptography ownership).
+8032) and cannot drift (§Cryptography ownership). Verify is the kernel's;
+signing never is.
 
 ## KEY_VAULT (contract id `0x0005`)
 
 Source: `crates/fluxor-abi/src/contracts/key_vault.rs` (contract),
-`src/kernel/security/key_vault.rs` (software backend).
+`modules/foundation/key_vault/` (the provider).
 
-The kernel's opaque key custody, for asymmetric and symmetric keys alike.
+Opaque key custody, for asymmetric and symmetric keys alike, served by the
+`key_vault` module a graph composes.
 Every slot names its **suite**:
 - P-256, Ed25519, one of the three ML-DSA parameter sets, or RSA at 2048,
   3072 or 4096 bits;
@@ -245,167 +247,143 @@ modules.
 
 ### Persisted keys
 
-A labelled key asked to persist is sealed through the platform HAL.
+The vault is a module, `key_vault`, that a graph composes like any other
+provider: every module that calls it claims it (`[[resources]]
+requires_contract = "key_vault"`), the composer refuses a graph whose
+exercised claim has no vault, and the vault runs in its callers' execution
+domain, in their frames. Its keys live in its own heap. A labelled key asked
+to persist is kept as a sealed record.
 - **The record.** The header (namespace, label, suite and usage) is the
   seal's associated data, so a record altered at rest does not open as
   anything.
-- **Durability.** On a platform with a durable store, a record that could
-  not be written durably refuses the key rather than reporting it persisted.
-  Linux writes a temporary file, flushes it, renames it, and flushes the
-  directory.
-- **Where records live.** In a graph that wires a `vault_store` module, on
-  whatever `storage.block` source it is wired to: one implementation for every
-  board (`modules/foundation/vault_store/README.md`, wire contract
-  `abi::internal::vault_store`). The records are one `FXVS` image in kernel
-  RAM; the module keeps it in two A/B slots, writing each new image to the
-  slot not holding the durable one and flushing before it reports it, so a
-  power cut leaves the previous image whole. Each image carries a sequence
-  number and a SHA-256 over itself, and a load takes the valid image with the
-  higher sequence. Without one: on Linux, one file per label under
-  `FLUXOR_VAULT_DIR`, or `vault/` under `FLUXOR_STORE_DIR`; on a bare-metal
-  board, nowhere — keys serve the boot that made them, and `DESCRIBE`
-  reports them unpersisted. On a Pi 5 the store is a file on the board's
-  FAT32 (`file_block` under the `fat32` on `nvme.blocks`); a graph with
-  nothing else on `nvme.blocks` can use the first 32 KiB of the NVMe's
-  External backing space instead, which every arena leaves free:
-  `start_sector: 2097152`, `sector_count: 64`, `image: 16384`.
-- **Waiting for the medium.** A key made with `PERSIST` through a
-  `vault_store` is in the image at once and on the medium only once the module
-  reports it. Until then the open that made it, and every open of it, answers
-  `EAGAIN`; asked again, the same key is answered. A destroy answers `EAGAIN`
-  until the medium no longer holds the record; asked again after that, the
-  label names nothing and the answer is `ENOENT`. A write the medium refuses
-  answers the waiting opens `ERROR`, and the module retries.
-- **Sealing.** `vault_store`'s `seal` names it. `hardware` (the default):
-  records are sealed through the platform HAL — ChaCha20-Poly1305 under a key
-  derived from the Pi 5's OTP device key, or the RP2350's OTP seal key once
-  provisioned — and a board with no such key persists nothing and says so
-  once. `none`: records are kept readable under `FXVC` (`FXVR` for a
-  workload's), whoever holds the medium holds the keys, and `DESCRIBE`
-  reports `persisted::CLEAR` with custody `SOFTWARE` (as does `CUSTODY`), so a
-  consumer that needs a key protected at rest refuses it. A sealed store
-  never takes a readable record as a key: one found there is absent.
+- **Where records live.** On the `storage.block` source wired to the vault's
+  `blocks` input: a flash region, a file on an SD card's FAT, a raw
+  partition, an NVMe window, a host file (`file_block`). The records are one
+  `FXVS` image in the vault's heap (`image` bytes); the vault keeps it in two
+  A/B slots, writing each new image to the slot not holding the durable one
+  and flushing before it counts it, so a power cut leaves the previous image
+  whole. Each image carries a sequence number and a SHA-256 over itself, and
+  a load takes the valid image with the higher sequence. With nothing wired
+  to `blocks` no key outlives the instance, and `DESCRIBE` reports keys
+  unpersisted. On a Pi 5 a graph with nothing else on `nvme.blocks` can use
+  the first 32 KiB of the NVMe's External backing space, which every arena
+  leaves free: `start_sector: 2097152`, `sector_count: 64`, `image: 16384`.
+- **Waiting for the medium.** Until its image has loaded, every labelled op
+  answers `EAGAIN`. A key made with `PERSIST` is in the image at once and on
+  the medium only once its write has flushed; until then the open that made
+  it, and every open of it, answers `EAGAIN`; asked again, the same key is
+  answered. A destroy answers `EAGAIN` until the medium no longer holds the
+  record; asked again after that, the label names nothing and the answer is
+  `ENOENT`. A write the medium refuses answers the waiting opens `ERROR`, and
+  the vault retries.
+- **Sealing.** The vault's `seal` names it. `hardware` (the default): records
+  are sealed under a key the vault derives from the platform's sealing key
+  (`SEAL_KEY_DERIVE`: HKDF-SHA256 bound to the vault's module type; the
+  platform key never leaves the kernel) — the Pi 5's OTP device key, the
+  RP2350's OTP seal key once provisioned, a Linux host's `FLUXOR_SEAL_KEY`.
+  The composer refuses `hardware` on a target with no sealing key (RP2040,
+  UEFI). `owner`: the record key is derived from a 32-byte key the node agent
+  writes to the vault's `seal_in` port over the caller lane the composer
+  wires into a workload graph, before any labelled op, which is how a
+  workload's own vault, over its own storage, keeps keys that follow that
+  storage and that key rather than the node; custody `SOFTWARE`. `none`:
+  records are kept readable under `FXVC`, whoever holds the medium holds the
+  keys, and `DESCRIBE` reports `persisted::CLEAR` with custody `SOFTWARE` (as
+  does `CUSTODY`), so a consumer that needs a key protected at rest refuses
+  it. A sealed store never takes a readable record as a key: one found there
+  is absent.
 - **Destroy.** Destroying a label removes its record, so the key does not
   come back.
-- **A workload's records.** Without a vault of its own a workload's record
-  is kept in the platform's store under `FXVW`, its header followed by its
-  realm, so it is authenticated to that workload and opens for no other. A
-  workload given a vault (`workload::vault`, on a Linux graph workload) keeps
-  its records in a directory on a volume it is lent instead, under `FXVK`,
-  sealed with ChaCha20-Poly1305 under the key its owner supplied: they follow
-  the volume and that key, not the node, `DESCRIBE` reports them `SOFTWARE`,
-  and a record there that does not open is refused `EACCES` rather than
-  replaced. See [scheduler.md](scheduler.md#a-workloads-own-vault).
-- **Provisioning.** `fluxor-linux vault-import --module <type>` provisions a
-  shared secret into a module type's namespace (the node's realm).
+- **Provisioning.** `fluxor vault import` provisions a shared secret into a
+  module type's namespace in a record image off the device, and `fluxor vault
+  identity` opens or makes a P-256 identity there and prints its public half:
+  both seal exactly as the vault does, from the same derivation, so a graph
+  whose vault is wired to that image opens the records.
 
 Sizes come from `DESCRIBE_SUITE` rather than from a caller's assumption,
 because they are not uniform: an ML-DSA-87 signature is 4627 bytes where a
-P-256 or Ed25519 one is 64. The private length a backend reports is
-what it actually holds, which is not always the algorithm's encoded private
-key — the software backend holds an ML-DSA key as the 32-byte FIPS 204 seed
-that reproduces it, so it reports 32 and a caller with an already-expanded
-key learns from that number that it cannot import one here.
+P-256 or Ed25519 one is 64. The private length the vault reports is what it
+actually holds, which is not always the algorithm's encoded private key — it
+holds an ML-DSA key as the 32-byte FIPS 204 seed that reproduces it, so it
+reports 32 and a caller with an already-expanded key learns from that number
+that it cannot import one here.
 
-The software backend's slot table holds 64 slots on aarch64 and 8 elsewhere,
-of up to 64 bytes each — a seed or a scalar, never an expanded key. With no
-free slot, generate, import, open, derive and unwrap are refused `ENOMEM`.
-A key is zeroised by `DESTROY`, and once its owning module is gone: when the
+The vault's slot table holds `slots` keys (a param; each open key is a
+routed handle, so the composer holds it to the node's `handles` pool), of up
+to 64 bytes each — a seed or a scalar, never an expanded key. With no free
+slot, generate, import, open, derive and unwrap are refused `ENOMEM`. A key
+is zeroised by `DESTROY`, and once its owning module is gone: when the
 scheduler slot it was made in holds a new occupancy (restart, replacement or
-graph rebuild), the vault zeroises the key before it next allocates a slot or
-looks a label up. Slot contents are never surfaced through any introspection
-API. The backend's primitives are those `src/kernel/security/crypto/`
-names (§Cryptography ownership): P-256 with RFC 6979 nonces, Ed25519, and
-ML-DSA over SHA-3.
+graph rebuild), the vault zeroises the key before it next allocates a slot
+or looks a label up. Slot contents are never surfaced through any
+introspection API. Its primitives are the SDK's: P-256 with RFC 6979 nonces
+(the compact Armv6-M implementation on RP2040), Ed25519, and ML-DSA over
+SHA-3.
 
-ML-DSA is a per-target capability, the `pq-vault` Cargo feature. Its
-polynomial scratch is a backend static dimensioned for the widest parameter
-set — a signing operation needs more of it than the stack any caller
-arrives on — and that is ~58 KB of kernel `.bss`, which an RP-class part
-with 256 KB of SRAM does not have to spare. A kernel built without
-`pq-vault` reports the ML-DSA suites as unsupported: `DESCRIBE_SUITE`
-skips them, so a caller discovers the absence
-before it allocates rather than by storing a key the backend could not then
-sign with. Every length, usage mask and enumeration flows from one gate, so
-the suites cannot be half-present.
+ML-DSA and RSA are suites of the vault's build, not of the target: the
+`key_vault` variants are `p256_ed25519` (the default: P-256, Ed25519 and the
+AEAD sealing key), `pq` (adding ML-DSA), `rsa` (adding RSA) and `full`
+(both). ML-DSA's polynomial scratch is dimensioned for the widest parameter
+set, about 58 KB, and RSA's keys and signing job about 22 KB; each comes from
+the heap of the variant that carries it, so a graph that composes the default
+vault — every RP graph — pays for neither. A build without a suite reports it
+unsupported: `DESCRIBE_SUITE` skips it, so a caller discovers the absence
+before it allocates rather than by storing a key the vault could not then
+sign with, and the composer refuses an RSA `key_file` beside a vault variant
+that holds no RSA suite.
 
-RSA is the other per-target capability, the `rsa-vault` Cargo feature,
-enabled wherever `pq-vault` is. An RSA slot's key is a PKCS#1
-`RSAPrivateKey` with its CRT fields, held in one of two backend entries
-with the Montgomery constants of its three moduli — about 22 KB of
-`.bss` for both entries and the one signing job — and a slot names the
-entry it holds. `STORE` admits any DER up to the width's reported
-ceiling, checks `p·q = n` and the CRT fields, and prepares the moduli;
-`PUBLIC` answers the `RSAPublicKey` DER at its exact length; `GENERATE`
-is `ENOSYS` — the vault imports RSA keys and never mints them. `SIGN` is
-RSASSA-PSS-SHA256 over a 32-byte digest with a 32-byte salt from the
-kernel's entropy, and it is resumable as P-256 and ML-DSA signing are: a
+An RSA slot's key is a PKCS#1 `RSAPrivateKey` with its CRT fields, held in
+one of two entries with the Montgomery constants of its three moduli, and a
+slot names the entry it holds. `STORE` admits any DER up to the width's
+reported ceiling, checks `p·q = n` and the CRT fields, and prepares the
+moduli; `PUBLIC` answers the `RSAPublicKey` DER at its exact length;
+`GENERATE` is `ENOSYS` — the vault imports RSA keys and never mints them.
+`SIGN` is RSASSA-PSS-SHA256 over a 32-byte digest with a 32-byte salt from
+the kernel's entropy, and it is resumable as P-256 and ML-DSA signing are: a
 private operation is milliseconds on the fastest target and the call runs
-inside the caller's step, so the first `SIGN` starts a job and answers `EAGAIN`
-after a bounded number of Montgomery rows, each further `SIGN` with the
-same digest advances it, and the last answers the signature; another slot
-or digest meanwhile is `EBUSY`. `VERIFY` is not extended to RSA: the tls
+inside the caller's step, so the first `SIGN` starts a job and answers
+`EAGAIN` after a bounded number of Montgomery rows, each further `SIGN` with
+the same digest advances it, and the last answers the signature; another
+slot or digest meanwhile is `EBUSY`. `VERIFY` is not extended to RSA: the tls
 module verifies peers in-module and nothing calls the vault with a
 certificate key.
 
-### Backends and the router
+### Hardware custody
 
-Modules call one KEY_VAULT provider, the router
-(`src/kernel/security/key_vault_router.rs`). It serves the software backend
-and, on Linux when `FLUXOR_HSM_PKCS11_MODULE` is set at platform boot, a
-PKCS#11 backend (`src/platform/linux/hsm_key_vault.rs`) beside it. The
-PKCS#11 backend is compiled into the published runtime (the `host-hsm`
-feature); a binary built without it reports the absence through
-`--print-features`. Registration is fail-soft: a configured token that
-cannot be opened leaves the software backend alone.
+A vault composed with `custody: token` claims `key_custody`: P-256 keys held
+by a host token behind a host provider (`host_lane serves = "key_custody"`),
+six ops on flat records. The vault keeps one policy: identities go to the
+token, everything else stays in software.
 
 | Request | Served by |
 | --- | --- |
-| An operation on a handle | The backend that minted it; each backend resolves only its own handles |
+| An operation on a handle | Where its key is held; the vault resolves each handle to its own slot or the token's key |
 | `GENERATE` for a suite the token serves (P-256), and that suite's `DESCRIBE_SUITE` record | The token |
-| `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise. A workload's: software alone, since the token's labels name no realm |
-| `DESTROY_BY_LABEL` | Both: removed wherever the label is held (a workload's: software) |
+| `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise |
+| `DESTROY_BY_LABEL` | Both: removed wherever the label is held |
 | Other labels, `STORE`, symmetric and every other suite | Software |
-| `CUSTODY` | The token when present: the backend that holds identity keys |
-| `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC` and `DESCRIBE` on its own backend |
+| `CUSTODY` | The token: the custody that holds identity keys |
+| `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The vault, reaching a token key through the token's `ECDH`, `PUBLIC` and `SIGN` |
+
+A token call is resumable: the provider answers `EAGAIN` until the token has
+answered, and the vault answers its caller `EAGAIN` meanwhile, keeping the
+operation's state per key, so an operation that takes several token calls
+(an open by label, an agreement, an attestation) never blocks a step. A vault
+composed with a token never falls back to software for what the token
+serves: a token that does not answer is the caller's error, not a weaker key.
 
 A key's own custody is its `DESCRIBE`. A volume key reconstructed from
 shares opened by a token recipient key is a software session key:
-- the agreed secrets cross only bounded kernel scratch, zeroed on every
-  path;
+- the agreed secrets cross only bounded vault scratch, zeroed on every path;
 - `DESCRIBE` and `ATTEST_KEY` report it `SOFTWARE`, never the token's custody.
 
-The token's keys come in two lifetimes. An unlabelled `GENERATE` key is a
-PKCS#11 session object, gone with the process whatever its mask says: it has
-no name to be reopened by. A labelled key asked to `PERSIST` is a pair of
-token objects (`CKA_TOKEN=true`, the private half sensitive and never
-extractable), and a later process — a new session on the same token —
-reopens it by the same name with the same public key:
-- the name is the token's `CKA_LABEL`, `fluxor-kv/<namespace>/<label>` with
-  the caller's module type as eight hex digits and the label in hex, so
-  labels are per module type exactly as in software;
-- the usage mask is sealed at creation into `CKA_ID`
-  (`FXVK ‖ namespace:u32 ‖ suite:u16 ‖ usage:u32`, little-endian), both
-  halves created `CKA_MODIFIABLE=false`, and every reopen CHECKS it: another
-  suite or a wider mask is `EACCES`, never a widened key;
-- the contract's other answers are the software backend's: `ENOENT` for
-  `OPEN` of an absent label, `EBUSY` for a key another instance of the type
-  holds open, `ENOMEM` with no slot, `ERANGE` before anything is made;
-- lookup and creation run under the backend's one session lock, so within a
-  process "is it there?" and "make it" are one step. PKCS#11 offers nothing
-  across processes; a name the token holds two private keys under is refused
-  rather than resolved by picking one;
-- `DESCRIBE` reports it persisted; `DESTROY` frees its handle and leaves it
-  on the token, and `DESTROY_BY_LABEL` removes both objects.
-
-A share opener must permit `AGREE` and `EXPORT_PUBLIC`: the router names the
+A share opener must permit `AGREE` and `EXPORT_PUBLIC`: the vault names the
 recipient by its public key. A token key cannot be split (`ENOSYS`), and its
 attestation carries its public thumbprint and no commitment.
 
-The software backend reports `DEVICE_HW` only when the platform's sealing
-key is device-unique and the platform actually seals with it; a board that
-reads a device key but cannot seal holds every key in RAM and reports
-`SOFTWARE`. See [abi_layers.md](abi_layers.md) for the backend rules.
+The vault reports `DEVICE_HW` only when the key it seals under derives from a
+device-unique platform key; a token-held key reports `PROCESS_HW`; every other
+key `SOFTWARE`. See [abi_layers.md](abi_layers.md) for the custody rules.
 
 ### TLS integration
 
@@ -413,8 +391,8 @@ A `tls` or `quic` instance takes its certificate chain, key and trust
 anchors (`cert_file`, `key_file`, `trust`) from files it reads at
 runtime, through the `fs` contract, when they are given as absolute paths
 (modules/foundation/tls/cred_file.rs): on the Linux host a node graph
-reads the host's paths and a workload reads beneath its owner root and the
-volumes lent to it, so a workload image carries no credential and takes
+reads the host's paths and a workload reads through the node's workload
+`fs` layer (`owner_fs`), beneath its own root and the volumes lent to it, so a workload image carries no credential and takes
 its identity from a volume its node lends it. PEM or DER is accepted. Until every
 named file has been read and validated the instance is not ready: a server
 refuses each handshake before presenting anything, a client answers a dial
@@ -743,19 +721,18 @@ across lanes.
 Source: `src/kernel/security/crypto/mod.rs`.
 
 There is one body of crypto, the SDK's (`crates/fluxor-sdk/src/crypto/`):
-module-side protocol code (TLS, QUIC) and the kernel's root of trust (the
-loader's signature check, the key vault) link the same files. The loader's
-check runs *before* any PIC module is admitted, so the kernel takes the
-code as a crate it links, never through a module. Every kernel use is
-load-bearing: `ed25519` backs the loader signature verify, `sha512` its
-inner hash, `p256` the key-vault ECDSA/ECDH, `ml_dsa` the vault's
-post-quantum signing and `sha3` the SHAKE stream it expands everything
-from, `rsa` the vault's RSA suites, and `chacha20`, `aes_gcm` and `hmac`
-its sealing and derivation.
+module-side code (TLS, QUIC, the key vault) and the kernel's root of trust
+link the same files. The loader's check runs *before* any PIC module is
+admitted, so the kernel takes the code as a crate it links, never through
+a module. The kernel keeps only what the root of trust needs: `ed25519`
+verify for the loader and node-image signatures, `sha256` and `sha512`
+their hashes, and HKDF-SHA256 (`hmac`) for `SEAL_KEY_DERIVE`. Everything
+that signs, agrees or seals — P-256, Ed25519 signing, ML-DSA and the SHA-3
+it expands from, RSA, ChaCha20-Poly1305, AES-GCM — is the key vault's.
 
-The one exception is P-256 on RP2040: the kernel links a compact P-256
-(`p256_rp2040.rs`, constant-time per layer as its header states) a quarter
-the size of the SDK's, because RP2040's flash cannot hold the SDK's.
+P-256 has a compact implementation for Armv6-M (`p256_m0`, constant-time
+per layer as its header states), a quarter the size of the wider one, which
+the vault links on RP2040, whose flash cannot hold the other.
 
 One source matters most for ML-DSA and SHA-3: the vault signs with the
 same file a TLS module verifies with, so a disagreement between signer and
@@ -778,8 +755,8 @@ standard are what the code runs.
 
 ## Composition Attestation and Key Custody
 
-Source: `src/kernel/exec/scheduler/attest.rs`,
-`src/kernel/security/key_vault.rs`, contract
+Source: `src/kernel/exec/scheduler/attest.rs` (the record, served by
+`COMPOSITION_RECORD`), `modules/foundation/key_vault/`, contract
 `crates/fluxor-abi/src/contracts/key_vault.rs` (`ATTEST_COMPOSITION`, `KEY_WRAP`,
 `KEY_UNWRAP`, `AEAD_SEAL`, `AEAD_OPEN`).
 

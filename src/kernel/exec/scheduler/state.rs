@@ -40,7 +40,7 @@ pub fn edge_peer(module_idx: usize, port_type: u8, index: u8) -> Option<(usize, 
     }
 }
 
-/// Read a port channel handle for a module. Mirror of `set_module_port`.
+/// Read a port channel handle for a module.
 /// Returns -1 if unset or out of range.
 pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 {
     if module_idx >= module_slots() {
@@ -81,52 +81,6 @@ pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 
 /// wired it, so no platform restates a port's number by hand.
 pub fn module_port(module_idx: usize, port: (u8, u8)) -> i32 {
     get_module_port(module_idx, port.0, port.1)
-}
-
-/// Set a port channel handle for a module. Used by BCM2712 platform
-/// which doesn't go through the RP-side instantiate_one_module path.
-/// port_type: 0=in, 1=out, 2=ctrl
-pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel: i32) {
-    if module_idx >= module_slots() {
-        return;
-    }
-    // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
-    let ports = unsafe { &mut SCHED.ports[module_idx] };
-    let idx = port_index as usize;
-    // The module is that end of the channel, unless an edge already named it.
-    let end = if port_type == 1 {
-        crate::kernel::ipc::channel::End::Producer
-    } else {
-        crate::kernel::ipc::channel::End::Consumer
-    };
-    crate::kernel::ipc::channel::channel_bind_end(channel, end, module_idx as ModuleId);
-    match port_type {
-        0 => {
-            if idx < MAX_PORTS {
-                ports.in_chans[idx] = channel;
-                if idx as u8 >= ports.in_count {
-                    ports.in_count = idx as u8 + 1;
-                }
-            }
-        }
-        1 => {
-            if idx < MAX_PORTS {
-                ports.out_chans[idx] = channel;
-                if idx as u8 >= ports.out_count {
-                    ports.out_count = idx as u8 + 1;
-                }
-            }
-        }
-        2 => {
-            if idx < MAX_PORTS {
-                ports.ctrl_chans[idx] = channel;
-                if idx as u8 >= ports.ctrl_count {
-                    ports.ctrl_count = idx as u8 + 1;
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Per-module arena info: (ptr, size). Null if module has no arena.

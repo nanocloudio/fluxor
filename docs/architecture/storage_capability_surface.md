@@ -28,7 +28,7 @@ compose the family; every provider declares one or more.
 
 | Surface             | Carries                                                         | Providers / consumers                                        |
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
-| `storage.block`     | Raw block I/O                                                   | nvme, sd, flash_rp (data store), file_block, crypt_block provide; fat32, crypt_block, nbd_serve and vault_store consume |
+| `storage.block`     | Raw block I/O                                                   | nvme, sd, flash_rp (data store), file_block, crypt_block provide; fat32, crypt_block, nbd_serve and key_vault consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
 | `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers and fs_object (§5); scanners and stores consume |
 | `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers and fs_object (§5); object_bank consumes |
@@ -77,8 +77,8 @@ Loadable modules carrying `provides = [...]` in their `manifest.toml`:
 |---------------------|-----------------------------------------------------|
 | `storage.block`     | `modules/drivers/nvme`, `modules/foundation/sd`, `modules/foundation/file_block`, `modules/foundation/crypt_block` |
 | `file.data`         | `modules/foundation/fat32`, `modules/foundation/mount`              |
-| `storage.namespace` | `modules/foundation/fs_object`, `modules/fixtures/mem_ns` (a RAM test fixture) |
-| `storage.object`    | `modules/foundation/fs_object`                              |
+| `storage.namespace` | `modules/foundation/fs_object`, `modules/foundation/fs_namespace`, `modules/fixtures/mem_ns` (a RAM test fixture) |
+| `storage.object`    | `modules/foundation/fs_object`, `modules/foundation/file_object` (read only) |
 
 The hosts carry no `provides` rows: on Linux and wasm these surfaces are
 served by platform dispatchers inside the runtime (§5) rather than by
@@ -255,13 +255,7 @@ caller retries. `file_block` is deferred-ready and
 reports Ready only once its open has succeeded, which is how a
 filesystem built on it waits.
 
-A contract may additionally opt out of single-provider validation via
-the chain-aware allowlist (`CHAIN_AWARE_PROVIDES` in
-`tools/src/config/validate.rs`): a contract on that list tolerates
-multiple providers in one graph because its callers fan through the
-providers via the `CHAIN_NEXT` flag rather than letting the last
-registration win. No contract is on the list, so every duplicate
-provider is an error.
+Every duplicate unkeyed provider of a contract in one graph is an error.
 
 Multi-volume routing covers the `fs` contract (`file.data`) only: the
 `mount` module routes `fs` opcodes, and nothing routes
@@ -742,7 +736,7 @@ Lifecycle rules:
 ### 3.1 Presenting a grant to a store
 
 Source: `crates/fluxor-abi/src/contracts/storage/object.rs` (`PRESENT`, `grant`),
-`src/platform/linux/store.rs`.
+`modules/foundation/store`.
 
 A module reaches a guarded store through `provider_call`, which has no
 session for the mesh's `MSG_CAP_PRESENT` to ride. So `storage.object` has
@@ -780,12 +774,15 @@ Anything else is `EACCES`:
 The store's namespace surface cannot carry a grant, so a guarded store
 refuses it entirely rather than list what a scope hides.
 
-Roots come from `FLUXOR_MESH_ROOTS`: up to two comma-separated 64-hex
-Ed25519 public keys, the second for a rotation. Roots that do not parse
-fail the store, rather than open it unguarded. Without roots the store is
-an unguarded local store: `PRESENT` answers `ENOSYS` and an op with
-`handle = -1` is served without a grant. The bcm2712 store has no roots and answers `PRESENT` with
-`ENOSYS`.
+Roots are the `store` instance's `roots` param, up to two 64-hex Ed25519
+public keys, the second for a rotation: a store with roots is guarded. Roots
+that do not parse fail the instance, rather than open it unguarded, and a
+guarded instance requires `time.wall` (its trusted clock, `[[requires_when]]
+active_when_params = ["roots"]`), so a target without one refuses the graph.
+Without `roots` the store is an unguarded local
+store: `PRESENT` answers `ENOSYS` and an op with `handle = -1` is served
+without a grant. The chain is verified in the module, with the SDK's
+SHA-256 and Ed25519; the kernel holds no roots.
 
 `HandleKind::Stream` is the kind issued for either `file.data` reads or
 for an `event.log` subscription (§4).
@@ -889,22 +886,15 @@ store that keeps them is one whose writes are durable and logged.
 
 ## 5. Platform providers
 
-The host platforms serve the storage surfaces through dispatchers built
-into the runtime rather than loadable modules:
+The host platforms serve the storage surfaces the node itself reaches
+through dispatchers built into the runtime:
 
 - **Linux `file.data`** — `src/platform/linux/providers.rs`
   (`linux_fs_dispatch`), libc-backed random-access file I/O with the
-  per-handle fence recording described in §2.
-- **Linux `storage.namespace`** — `src/platform/linux/namespace.rs`,
-  directory enumeration (`LIST` / `STAT`) over the host filesystem via
-  `std::fs`. Namespace keys are raw filesystem paths, byte-identical to
-  what `linux_fs_dispatch` opens, so a consumer can `LIST` here and fetch
-  each hit through the FS contract on the same key. The per-handle fence
-  is `Volatile` (a live, mutable host filesystem).
-- **Linux `storage.object`** — `src/platform/linux/object.rs`, HTTP/1.1
-  `Range:` reads (`HEAD` / `GET` / `RANGE_GET` / `CLOSE`) so a
-  Linux-hosted graph can demand-page immutable assets by byte range.
-  `LIST` answers `ENOSYS`: an HTTP origin offers no enumeration.
+  per-handle fence recording described in §2. It is registered node-only
+  (`provider::register_node_only`): a caller acting with an authority of
+  its own is answered `EACCES` however it reaches it — by class byte or
+  a `platform` bind.
 - **wasm peers** — `src/platform/wasm/fs.rs`, `namespace.rs`, and
   `object.rs` serve the same three contracts in the browser host. The
   wasm `storage.object` answers `LIST` with `ENOSYS`: its reads fall
@@ -912,176 +902,173 @@ into the runtime rather than loadable modules:
   enumerated, and a listing of the written layer alone would omit objects
   `GET` serves.
 
+Every other storage surface is a module a graph composes: the versioned
+store (`modules/foundation/store`), a directory listing over `fs`
+(`modules/foundation/fs_namespace`, LIST/STAT under a `root` param, over
+`fat32` or the Linux host fs alike), the files under such a directory read
+as objects (`modules/foundation/file_object`, HEAD/GET/RANGE_GET under the
+same `root`, composed beside `fs_namespace`), a store over a filesystem
+(`fs_object`), and a workload's rooted `fs` (`modules/foundation/owner_fs`).
+No target answers `storage.object` or `storage.namespace` as a platform
+fact: a graph that requires one without composing a provider is refused at
+compose, not answered `ENOSYS` at its first call.
+
 ### What a workload reaches
 
-A workload runs for an owner other than the node owner, and the platform
-providers above are the node's. A provider layer serves the owner whose module registered it
-and no one else: a contract resolves only through layers of the caller's
-own owner. The node's provider modules (its `fat32`, its `fs_object`, its
-`mount`) are invisible to a workload, and a workload's own provider modules
-serve that workload alone, so a workload can neither reach the node through
-the node's providers nor stand in as the node's.
+A workload runs for an owner other than the node owner. A provider layer is
+owner-scoped or workload-scoped (`provider_scope`):
+
+- an **owner-scoped** layer serves the owner whose module registered it,
+  and owners acting with that owner's authority. The node's provider
+  modules (its `fat32`, its `fs_object`, its `mount`, its `store`) are
+  invisible to a workload, and a workload's own provider modules serve that
+  workload alone;
+- a **workload-scoped** layer serves every caller acting with an authority
+  of its own, and no caller acting with the node's. Only a node-owned
+  module registers one (`EACCES` otherwise), and only for a contract the
+  registry marks `workload_served` (`fs`). It is how a workload reaches what
+  the node holds: rooted, and charged to its own owner.
 
 An owner admitted to act with the node's authority (`ADD_FLAG_CREATOR_AUTHORITY`,
 see [reconfigure.md](reconfigure.md#adding-a-subgraph-with-the-nodes-authority))
-is not a workload here. It reaches the node's provider layers as the node does,
-and the platform providers serve it unrooted: host paths on Linux, the node's
-store, nothing charged to a ledger and no root made or removed. Its own layers
-still serve it alone, unseen by the node and by its siblings. Every handle a
-platform provider hands it is stamped with its own owner, answers that owner
-alone (the node and its siblings included) and is closed when it is
-released, and a node provider holding something for it (the node's
-`fat32`, its open files) releases it on the owner-release notification, as
-for any consumer. On Linux it holds at most 32 host files open at once, as a
-workload holds through its root.
+is not a workload here. It reaches the node's layers and the node-only
+platform providers as the node does (host paths on Linux), holds no storage
+line and is never rooted. Its own layers still serve it alone. Every handle a
+provider hands it is stamped with its own owner, answers that owner alone and
+is closed when it is released.
 
-What a workload reaches of the node's storage is what its admission
-granted, recorded on its owner. A `CREATE` names the grant in its header's
-`storage` byte; an owner admitted by the node's own plan or a live add holds
-the default grant:
+**The workload layer.** A node graph that admits workloads with storage
+composes `owner_fs` above its own `fs` (`fat32`, or the Linux host fs):
 
-- **`STORAGE_OWN_ROOT`** (the default): a root of the owner's own, made on
-  first use and removed when the owner is released.
-- **`STORAGE_NONE`**: nothing of the node's. The platform's `fs`,
-  `storage.object` and `storage.namespace` answer `EACCES`, and what the
-  workload keeps it keeps in a provider of its own over a volume lent to it.
+```yaml
+  - name: owner_fs
+    root: /owners          # Linux: a host directory such as /var/lib/nanocloud.io/owners
+```
 
-No grant names a node path, and none carries a user, group or mode bit:
-what a workload may reach is decided by its owner's grant, and the platform
-makes the grant real inside a root it resolves for that owner. Where no
-layer of its own serves a contract, a workload falls through to the
-platform provider, which confines it as follows.
+`owner_fs` resolves a workload's paths beneath `<root>/<owner uid hex>/files/`,
+refusing `..`, a backslash or a NUL; a leading `/` is the root. It reaches
+the layer beneath with an ordinary call in its own frame: its own layer is
+invisible to the node, so the call lands on the node's `fs`. Every handle is
+a slot of its own table, stamped with its opener (`EBADF` to anyone else),
+at most `max_open_per_owner` (32) per owner. `LINK`, `SYMLINK` and
+`READLINK` are `ENOSYS` and absent from its caps, so nothing inside a root
+is ever a link it made; a symlink the host plants is not followed out by
+any path `owner_fs` builds, and lexical confinement plus the absence of link
+ops is the whole confinement on every target. Nothing in the layer waits:
+making, charging and removing a root are bounded jobs across steps, and a
+call that finds its root not ready is `EAGAIN`.
 
-- **Linux `file.data`** resolves a workload's paths beneath
-  `$FLUXOR_OWNER_ROOT/<owner uid>/files/` (default
-  `/var/lib/fluxor/owners`) with `openat2` and `RESOLVE_BENEATH`,
-  `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`: a leading `/` is the
-  root, `..` never leaves it, and a symlink planted inside it leads
-  nowhere. A path that would leave the root is `EACCES`. The ops that
-  name an entry rather than open it (`UNLINK`, `MKDIR`, `RMDIR`, `RENAME`,
-  `FSYNC_NAME`) open the parent beneath the root the same way and act on
-  the name inside it. `LINK` is `ENOSYS` and absent from the caps a
-  workload is answered: a second name for an inode would let a file be
-  charged once and held twice.
-- **Linux volumes.** A `CREATE`'s `mount`/`bind` entries
-  (`workload::volume`, `<src>\0<dst>\0<ro>`) lend the workload host
-  directories: a path at or under `dst` resolves beneath `src` with
-  `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`, whatever the owner's grant
-  (a workload granted `STORAGE_NONE` reaches its volumes and nothing else).
-  Unlike the owner's root, a volume follows a symlink whose target stays
-  beneath `src`, so a projection laid out with the timestamped-directory
-  swap (`key -> ..data/key`, `..data -> ..<timestamp>`) reads, and the node
-  agent's swap of `..data` is seen by the next `OPEN`; a link leading out
-  (an absolute target, a `..` past `src`) or a magic link is `EACCES`. The
-  ops that name an entry (`UNLINK`, `RENAME`, `RMDIR`, `READLINK`) act on a
-  link itself, never on its target, and `READDIR` lists a link as an entry
-  of its own (type 0). A read-only volume
-  opens read-only and refuses every change with `EACCES`; the volume's own
-  name is `EBUSY` to `UNLINK`, `RMDIR` and `RENAME`; a `RENAME` between a
-  volume and anything else is `EXDEV`. Nothing a volume holds is charged to
-  the owner, and the owner's release closes the volume and removes nothing
-  in it: a workload keeps its state on a persistent volume and reads a
-  mounted secret this way.
-- **Linux `storage.object` and `storage.namespace`** reach a versioned
-  store of the owner's own, under `<root>/store/`, with the node store's
-  semantics and durability, handle tables of its own (16 watches, 8 open
-  reads, 4 streamed writes staging at most 16 MiB each) and no grants
-  (`PRESENT` is `ENOSYS`). A handle names an entry in its owner's tables
-  only, so a handle value from another owner's tables reaches nothing, and
-  a watch sees only its owner's changes. The host filesystem, the HTTP
-  origin and the node's control-plane store are never a workload's.
-- **bcm2712 `file.data`** resolves a workload's paths beneath
-  `/owners/<owner uid>/files/` on the node's own volume, refusing `..`, a
-  backslash or a NUL, and hands the request down to the node's `fat32`
-  rewritten beneath that root. Every handle is a slot of the rooting
-  layer's own table, stamped with its opener (`EBADF` to anyone else).
-  Nothing in the layer waits: making, charging and removing a root are
-  bounded background jobs, and a call that finds its root not yet ready is
-  `EAGAIN`.
-- **bcm2712 `storage.object` and `storage.namespace`** serve the node alone
-  (`EACCES` to a workload). The store is one fixed table with one history
-  and one revision clock: a workload sharing it could fill the table, flood
-  the history the node's watchers read, and read the rate of other owners'
-  writes off the clock.
+**Storage lines.** The kernel knows a cap and a count per owner, nothing
+about what a byte of storage is. A `CREATE` installs the owner's storage
+line from its header (`storage` byte: `STORAGE_OWN_ROOT` installs it,
+capped at `storage_bytes`, 0 uncapped; `STORAGE_NONE` installs none); a
+live add holds an uncapped one, an owner acting with the node's authority
+none. `owner_fs` charges with `resource::LEDGER_CHARGE` /
+`LEDGER_RELEASE`, which take no owner: the kernel charges the frame's
+caller, so a provider charges only an owner it is serving, and only a
+module holding a workload layer may charge at all. An owner with no line is
+refused its first charge, so it never gets a root. The costs are the
+layer's, one rule on every file system: a file costs its size plus 4096
+bytes, a directory or any other name 4096. A `WRITE` that would grow a
+file, a `PREALLOCATE`, an `OPEN_CREATE` or `MKDIR` of a new name past the
+cap is `ENOSPC`; an unlink, a truncate or a rmdir gives the bytes back. What
+an existing root already holds is charged when the owner first reaches it,
+past its cap if need be (`LEDGER_HELD`): over its cap it can shrink but not
+grow.
 
-Both platforms charge an owner by the same costs
-(`src/kernel/workload/storage.rs`), against the `storage_bytes` its `CREATE`
-admitted (0 is unlimited). A file costs its size plus 4096 bytes for its
-inode and directory entry, a directory or any other name 4096, a store entry
-its key, its value and a 64-byte record overhead, and a streamed write the
-bytes it has staged. An owner holds at most 32 files open through its root.
-A `WRITE` that would grow a file, a `PREALLOCATE`, an `OPEN_CREATE` or
-`MKDIR` of a new name, or a `PUT` past the cap is `ENOSPC`; an unlink, a
-truncate, a rmdir, a shrinking `PUT` or a delete gives the bytes back. On
-Linux the charge is kept per inode and read from the inode itself, so it
-follows a file through every handle and path that changes it.
+**Release.** A root is made when an owner first touches storage and removed
+when the owner is released (a `DESTROY`, a `KILL`, a rolled-back
+admission): the kernel's `OWNER_RELEASED` record carries the owner's uid, so
+`owner_fs` removes a root the owner never touched this boot. The removal is
+tombstoned before its first unlink, so a root half removed by a power cut is
+finished rather than reused. Nothing else removes a root, so it survives a
+restart, and an owner admitted again under the same identity finds what it
+held, charged to it again. Data that must outlive the owner belongs to a
+volume.
 
-A root is made when an owner granted one first touches storage, and removed
-when the owner is released: a `DESTROY`, a `KILL`, or a rolled-back
-admission. The release also closes every file, read, write and watch the
-owner holds. On bcm2712 the removal is tombstoned before its first unlink,
-so a root half removed by a power cut is finished rather than reused.
-Nothing else removes a root, so it survives a restart, and an owner admitted
-again under the same identity finds what it held, charged to its ledger
-again; past its cap if need be, in which case it can shrink but not grow
-until it is back under. Data that must outlive the owner itself belongs to
-a volume.
+**Volumes.** A graph workload's volumes are the workload layer's to lend, not
+its `CREATE`'s (the graph backend answers a required `workload::volume`
+entry `ENOSYS`). The node agent writes records to `owner_fs`'s `ctl` input
+before the workload is created: `ADD{uid, dst, volume, path, ro}` /
+`REMOVE`, an `ADD` idempotent per `(uid, dst)`. `volume` names a keyed `fs`
+backend (bound by name) or `platform` (the Linux host path `path`); a
+workload path at or under `dst` (longest match) is served there, uncharged.
+A read-only volume refuses every change `EROFS`; the volume's own name is
+`EBUSY` to `UNLINK`, `RMDIR` and `RENAME`; a `RENAME` between a volume and
+anything else is `EXDEV`; a `REMOVE` revokes the handles open on it.
+`owner_fs` drains its `ctl` at the top of every call and step, so a record
+written before the `CREATE` is applied before the workload's first call.
+
+**A workload's own store.** A workload that wants watchable keys composes
+`store` in its own subgraph over its rooted `fs` (`dir` inside its root).
+The store's log is files in the owner's root, so it is charged to the owner
+and goes with it.
+
+**Admission.** A workload whose modules claim a contract that nothing
+serves it — not its own subgraph, not a workload layer, not a platform
+provider that serves workloads — is refused at `CREATE` (`ENOSYS`), not
+answered at its first call. The composer leaves a workload's claim of a
+`workload_served` contract to that check: what serves it is the node's, not
+the workload's graph.
 
 ### The versioned watchable key store
 
 Some consumers do not want a filesystem or a byte range; they want keys they
-can watch. Both hosted platforms therefore serve `storage.object` and
-`storage.namespace` a second way — as a versioned, watchable key store — and
-a graph selects it by wiring, not by asking which platform it is on:
+can watch. The `store` module (`modules/foundation/store`) serves
+`storage.object` and `storage.namespace` over one keyspace with one revision
+clock, on Linux, bcm2712, UEFI and RP2350 alike, and a graph selects it by
+composing it:
 
-- **Linux** — `src/platform/linux/store.rs`. When `FLUXOR_STORE_DIR` is
-  set the two providers above route here instead of to HTTP and the host
-  filesystem, backed by an append-only log the directory holds.
+```yaml
+  - name: store
+    dir: /store            # its log directory on the `fs` beneath
+    durable: on            # off: RAM only
+```
 
-  Every write is appended to the log and synced before it is applied, and
-  the log's directory entry is synced when the store opens, so an
-  acknowledged write reports `LocalDurable`. An append that fails part-way
-  is cut back off before the write is refused. A crash mid-append leaves
-  at most one partial record; opening the store cuts it off, so the next
-  append never lands behind it. A complete record that cannot be applied
-  (an unknown op, an empty key, a key that is not UTF-8) is corruption,
-  and the open is refused rather than dropping the records behind it.
+Its tables come from its heap, sized by the composer from its params
+(`objects`, `value_bytes`, `history`, `reads`, `writes`, `grants`,
+`stage_max`) and from the graph's declared `store_subs` demand. A node
+composes one over its own volume; nothing in the environment names or moves
+it.
 
-  A workload names its own store with `store_dir` in the `[workload]`
-  table of its source manifest; it is carried into `workload.json` and
-  set for the runtime at launch, relative to the installed package unless
-  absolute. Declared there it wins over the caller's environment: an
-  applet's state is a property of the applet, and the same applet run
-  from two shells must reach the same store. The variable serves a
-  node-wide store that no single workload owns.
-- **bcm2712** — `src/platform/bcm2712/store.rs`, the same semantics and
-  byte-identical wire over a fixed-capacity RAM store, because bare metal
-  has no heap to grow one on. Its capacities (`MAX_OBJECTS`, `MAX_VALUE`,
-  `HISTORY`) are the honest ceiling; exceeding one is refused
-  rather than evicted, since a consumer reads a missing key as a deletion and
-  would tear down whatever that key named.
+- **Durable** (`durable: on`, `requires_contract = "fs"`): an append log
+  `<dir>/store.log` of records `[rev u64][op u8][key_len u16][val_len u32][key][val]`,
+  written through `fs` and fenced (`FSYNC`) before the write is acknowledged;
+  a `PUT` answers `EINPROGRESS` until its record is fenced, and the same
+  request asked again collects the outcome. One write is in flight at a
+  time; another is `EBUSY`. The log is never reopened for appending: the
+  store replays it, copies its valid records to `store.cpy`, publishes that
+  as `store.bak`, rewrites `store.log` from it and removes the backup, so a
+  crash at any point leaves the old log or a complete backup, and a torn
+  tail is cut. A complete record that cannot be applied is corruption, and
+  the open is refused rather than dropping the records behind it. An
+  acknowledged write reports `LocalDurable` on the `fs`'s device.
+- **RAM** (`durable: off`): no `fs`, and `Fence::RevisionMonotone`, never
+  `LocalDurable`, because under-reporting durability is the safe direction
+  and a caller must not conclude a write outlived a power cut.
 
-Both refuse (`EINVAL`) a `PUT` of the empty key, which is the
+A full object table is `ENOMEM`, an exhausted value arena `ENOSPC`; neither
+evicts a live key, since a consumer reads a missing key as a deletion and
+would tear down whatever that key named.
+
+The store refuses (`EINVAL`) a `PUT` of the empty key, which is the
 end-of-listing cursor on `LIST`, of
 a key that is not UTF-8, and of a key longer than `STORAGE_KEY_MAX` (255
 bytes, `handle.rs`), the longest name either listing carries. A
-precondition kind they do not know, or an `ETAG` without a whole revision,
+precondition kind it does not know, or an `ETAG` without a whole revision,
 is `EINVAL` rather than an unconditional write. `HEAD` into a buffer too
 small for its record answers `ENOMEM`. A `PUT`, `HEAD` or `DELETE` whose
 `arg` cannot hold its fence trailer is `EINVAL`, refused before the op acts,
 as the contract states for every op that carries a fence trailer.
 
-Both keep a monotone revision clock, use a key's revision as the CAS
-token, page `namespace::LIST` and `object::LIST` with a cursor, and serve
-`CHANGES` from a bounded change history — a read from before that window
+It keeps a monotone revision clock, uses a key's revision as the CAS
+token, pages `namespace::LIST` and `object::LIST` with a cursor, and serve
+`CHANGES` from a bounded change history (`history`) — a read from before that window
 is answered `LOST` and the watcher relists, rather than being handed a gap
 (see Subscriptions below). A page that cannot
 hold one entry is `ENOMEM` on both listings, never an empty page that
 returns the cursor it was given. Both cursors are the last name the page
-returned, so a write behind the cursor never shifts the page after it. The
-bcm2712 store is VOLATILE: it reports `Fence::RevisionMonotone` and never
-`LocalDurable`, because under-reporting durability is the safe direction and
-a caller must not conclude a write outlived a power cut.
+returned, so a write behind the cursor never shifts the page after it.
 
 ### Subscriptions
 
@@ -1098,12 +1085,12 @@ under its prefix changed, and reads what it needs, in bounded pages.
 - **A signalling handle.** `SUBSCRIBE` (`[prefix][flags]`) mints a
   subscription handle that signals (`abi_layers.md`, Handles): the store
   answers its own index, and the kernel hands it the subscription's doorbell
-  (`kernel::BIND_DOORBELL`). A refusal is `ENOMEM`, and the platform stores
-  count it against their `store_subs` (`owner_store_subs` for a workload's
-  own store) pool and name it in the log; `mem_ns` also holds each owner to
+  (`kernel::BIND_DOORBELL`). A refusal is `ENOMEM`, and the `store`
+  module counts it against the `store_subs` pool (`LEDGER_DENY`) and names
+  it in the log; `mem_ns` also holds each owner to
   a quota of its table. Each `SUBSCRIBE` is its own subscription.
 - **A ring per change.** A change under the prefix rings the subscription's
-  doorbell — the platform stores directly, `mem_ns` with
+  doorbell — the `store` module and `mem_ns` alike, with
   `kernel::DOORBELL_RING` — and a burst of rings before the consumer polls
   costs one wake. The handle is its minter's alone: the kernel refuses it to
   any other owner, and its `LAST_FENCE` is `ENOSYS` — a subscription is a
@@ -1227,6 +1214,8 @@ consumers share it.
 | wasm (`object.rs`, `namespace.rs`) | `ENOSYS` | served by the host index, in UTF-8 byte order |
 | `mem_ns` fixture | — | served, over its binding table |
 | `fs_object` | served, by a scan of its directory | served, same scan |
+| `fs_namespace` | — | served, immediate children of a directory in name order; a name that is not UTF-8 is not listed |
+| `file_object` | `ENOSYS`: its directory is `fs_namespace`'s to list | — |
 
 On bare metal, `modules/foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
@@ -1265,6 +1254,24 @@ and the second is refused `EEXIST`.
 | Concurrency | one write in flight (another is refused `EBUSY`) and one listing scan (another is answered `EAGAIN`); a request whose caller stops asking is superseded after `SUPERSEDE_AFTER` refusals |
 | Listing | a page of at most `PAGE_KEYS` keys in key order, resumed after a cursor, each page a `Volatile` fence; a page opens every object in the store, so it suits tens or hundreds of keys |
 | Not offered | grants (`PRESENT` is `ENOSYS`), streamed puts, change subscription, namespace `LOOKUP` / `STAT` |
+
+### Files read as objects: `file_object` beside `fs_namespace`
+
+`modules/foundation/fs_namespace` and `modules/foundation/file_object` read a
+directory tree the `fs` contract serves — a music library, a set of covers —
+without moving it into a store. Each provides one surface, so a graph
+composes both; given the same `root`, they key a file the same way, by its
+path beneath `root`, and a consumer LISTs through one and opens through the
+other by that key.
+
+| Property | Behaviour |
+| --- | --- |
+| Keys | the path beneath `root`, joined as `fs_namespace` joins a prefix: unset, `root` is `/` and the key is the path `fs` opens; set, a leading `/` stays beneath it. A component that climbs (`..`) or a NUL byte is `EACCES`; the confinement is lexical, as `fs` itself is |
+| `root` | at most 96 bytes; a longer one fails `module_new` with a log line, in both modules, rather than being cut or ignored (which would serve `/`) |
+| Reads | `GET` holds the file open as the handle (8 at once, `EBUSY` past them), `RANGE_GET` reads from any offset (a short count at the tail, 0 past it), `HEAD` answers size, mtime, no content type and the 8-byte etag `fs_namespace`'s `STAT` gives the same file; every read is `Volatile`, and the file system's `EAGAIN` is passed on |
+| Absent | a key naming nothing, or a directory, is `ENOENT` from `GET` and `ENXIO` from `HEAD` |
+| Writes | none: `PUT`, `DELETE`, `RETAIN` and the streamed puts are `EROFS`, and `CAPS` sets neither `WRITE` nor `LIST`. A consumer that also caches what it computes (a scan) composes a store for that |
+| Owners | node-owned and owner-scoped, like `fs_namespace`: a handle answers its opener alone and goes with it on `OWNER_RELEASED` |
 
 These are one adapter family; content-addressed, replicated, and
 object-store adapters can use the same surface vocabulary. Providers

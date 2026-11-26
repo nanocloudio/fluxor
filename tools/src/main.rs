@@ -38,6 +38,7 @@ mod capability;
 mod capacity;
 mod ci;
 mod config;
+mod contract_claims;
 mod crypto;
 mod error;
 mod gpu_contract;
@@ -91,6 +92,7 @@ pub(crate) use fluxor_tools::makefile_lint;
 pub(crate) use fluxor_tools::packaging;
 pub(crate) use fluxor_tools::stack;
 mod project;
+mod provider_chain;
 pub mod reconfigure;
 mod render_template;
 pub mod rig;
@@ -278,6 +280,20 @@ fn main() {
             identity,
             args,
         } => workload_src::exec_applet(&name, &args, ca.as_deref(), identity.as_deref(), verbose),
+        Commands::ComposeLaunch {
+            graph,
+            output,
+            module_root,
+            runtime,
+            applet,
+        } => workload_src::compose_launch_image(
+            &graph,
+            &output,
+            &module_root,
+            &runtime,
+            applet.as_deref(),
+            verbose,
+        ),
         Commands::Applet { action } => match action {
             AppletAction::Logs { name, tail, all } => workload_src::applet_logs(&name, tail, all),
         },
@@ -352,6 +368,7 @@ fn main() {
         Commands::Image {
             action: ImageAction::Root { action },
         } => cmd_image_root(action),
+        Commands::Vault { action } => cmd_vault(action),
         Commands::Modules { action } => match action {
             ModulesAction::Build {
                 target,

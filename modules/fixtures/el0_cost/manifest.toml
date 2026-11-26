@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# What a step costs a module behind the gateway. Each step it reads what its
+# peer wrote, makes `writes` channel_writes and `calls` timer.MICROS calls
+# (one mediated provider_call each), and times its own step body. Every 1000
+# steps it reports
+#   [el0_cost] <tag> steps=<n> body_us=<step bodies, 1000 steps> win_us=<wall time of the window>
+# Instances paired `protection: isolated` and privileged, at 0 and 10 ops,
+# give the EL0 round trip (window less bodies at 0 ops) and the per-op slope.
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[[ports]]
+name = "data_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "data_out"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "measurement fixture; its '[el0_cost]' lines are the observable, read by the pi5_el0_cost rig scenario"

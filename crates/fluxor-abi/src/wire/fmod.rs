@@ -189,8 +189,26 @@ pub const MANIFEST_HEADER_SIZE: usize = 34;
 /// Byte of the manifest head holding the flag bits below.
 pub const MANIFEST_FLAGS_AT: usize = 12;
 
-/// Byte of the manifest head counting the contracts the module provides.
+/// Byte of the manifest head counting the contracts the module provides
+/// (its [`PROVIDES_COUNT_MASK`] bits), with the [`PROVIDES_WORKLOAD_INSTANTIABLE`]
+/// fact in its top bit.
 pub const MANIFEST_PROVIDES_AT: usize = 13;
+
+/// Bits of the [`MANIFEST_PROVIDES_AT`] byte that count provided contracts.
+pub const PROVIDES_COUNT_MASK: u8 = 0x0F;
+
+/// Bit of the [`MANIFEST_PROVIDES_AT`] byte: the module is
+/// `workload_instantiable`. A metal node runs a module a workload composes
+/// unprivileged unless the node's own image carries its type and its signed
+/// manifest says this: a provider other modules call into cannot be gated, so
+/// only one the node vouches for may serve inside a workload. A module
+/// holding grants is never admitted that way, whatever this bit says.
+pub const PROVIDES_WORKLOAD_INSTANTIABLE: u8 = 0x80;
+
+/// The provided-contract count of a [`MANIFEST_PROVIDES_AT`] byte.
+pub const fn provides_count(byte: u8) -> usize {
+    (byte & PROVIDES_COUNT_MASK) as usize
+}
 
 /// `u32` of the manifest head: one instance's state, in 64-byte units
 /// rounded up. Wide enough for any state a module can have, so the figure
@@ -226,21 +244,36 @@ pub const FLAG_SIGNATURE: u8 = 0x02;
 pub const FLAG_ATTESTATION: u8 = 0x10;
 /// Manifest flag: port-capacity block (8 bytes per port) present.
 pub const FLAG_PORT_CAPACITY: u8 = 0x20;
-/// Manifest flag: conditional-grant block present, after the attestation.
+/// Manifest flag: conditions block present, after the attestation.
 ///
-/// A grant a module needs only under some configuration: the sealing path of
-/// a durable log calls the key vault, and is inert when the parameter that
-/// selects a cipher is 0. The two grant words say what the artifact may
-/// call; this block says which of those calls a configuration actually
-/// makes, so a node admitting a composition can judge the composition
+/// Which of the module's grants and claims a configuration exercises: the
+/// sealing path of a durable log calls the key vault only when a cipher is
+/// selected, a TLS instance reads files only when it names one. The grant
+/// words say what the artifact may call and the resource records what it
+/// claims; this block says under which params each conditional grant or
+/// claim holds, so a node admitting a composition judges the composition
 /// rather than the artifact. It is part of the signed manifest because the
-/// kernel decides admission with it — a workload supplying its own
-/// conditions would be declaring its own privileges.
+/// kernel decides admission with it: a workload supplying its own
+/// conditions would be declaring its own privileges. See [`cond`].
 ///
 /// 0x40: bits 0x04 and 0x08 are the head's `interrupt_safe` and `pre_pass`
-/// flags, so a conditional block cannot use them: a block flagged 0x04 would
-/// be claimed by every interrupt-safe module.
-pub const FLAG_COND_GRANTS: u8 = 0x40;
+/// flags.
+pub const FLAG_CONDITIONS: u8 = 0x40;
+
+/// Manifest flag: the module's provider layers are workload-scoped
+/// (`provider_scope = "workloads"`). Such a layer serves every caller acting
+/// with an authority of its own (a workload) and no caller acting with the
+/// node's: it is the one place a workload reaches what the node holds, so
+/// it is registered only by a node-owned module, and only it may charge the
+/// owner it serves (`resource::LEDGER_CHARGE`). Carries no block.
+pub const FLAG_WORKLOAD_SCOPE: u8 = 0x80;
+
+/// Size of the manifest's lanes block: the module's `[lanes]`, the
+/// workload lanes it serves as a base-graph module. The capacity is a param
+/// of the instance, so the graph that sizes the module's tables sizes the
+/// kernel's too; the kernel reads it as it instantiates the module, and
+/// never asks the module.
+pub const LANES_BLOCK_SIZE: usize = 2;
 
 /// Size of the integrity hash and of the attestation.
 pub const DIGEST_SIZE: usize = 32;
@@ -249,7 +282,7 @@ pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 
 /// Offsets of the manifest's blocks, from its counts and flags. Each block
 /// follows the previous one; a flag-selected block that is absent takes no
-/// space. Stack, arena and the provided-contract list are always present:
+/// space. Stack, arena, lanes and the provided-contract list are always present:
 /// every module states them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManifestLayout {
@@ -259,6 +292,10 @@ pub struct ManifestLayout {
     pub stack: usize,
     /// Arena block: `u32` heap-arena bytes.
     pub arena: usize,
+    /// Lanes block: `u8` tag of the param holding the module's lane
+    /// capacity, `u8` that param's schema default. A tag of 0: the module
+    /// serves no workload lanes. See [`LANES_BLOCK_SIZE`].
+    pub lanes: usize,
     /// Provided contracts: one `u16` contract id each, as many as the head's
     /// count.
     pub provides: usize,
@@ -266,104 +303,389 @@ pub struct ManifestLayout {
     pub hash: usize,
     /// Attestation (`FLAG_ATTESTATION`).
     pub attestation: usize,
-    /// Conditional-grant block (`FLAG_COND_GRANTS`): a `u8` count, then that
-    /// many [`COND_GRANT_FIXED`]-byte entries each followed by its values.
-    /// Last, so an artifact that declares none is byte-identical to one from
-    /// before the block existed.
-    pub cond_grants: usize,
+    /// Conditions block (`FLAG_CONDITIONS`): a `u8` count, then that many
+    /// [`cond::FIXED`]-byte entries, each followed by its values. Last: its
+    /// length is walked from its own bytes ([`conditions_block_len`]).
+    pub conditions: usize,
 }
 
-/// One conditional-grant entry's fixed part: `u8` grant word, `u8` bit,
-/// `u16` param id, `u8` flags, `u8` value count — the values, `i64` each,
-/// follow it.
-pub const COND_GRANT_FIXED: usize = 6;
-/// Conditional-grant entry flag: the grant is needed when the parameter is
-/// absent, because the schema default satisfies the condition. Resolved by
-/// the packer, which knows the schema the kernel does not.
-pub const COND_GRANT_WHEN_UNSET: u8 = 0x01;
+/// Bytes of one resource record: `[contract u8][access u8][instance u8]
+/// [claim u8]`.
+pub const RESOURCE_RECORD_SIZE: usize = 4;
+/// Byte of a resource record holding its [`claim`] byte.
+pub const RESOURCE_CLAIM_AT: usize = 3;
 
-/// One grant a configuration may or may not need.
+/// A resource record's claim byte: whether the module needs the contract
+/// served to run as configured.
+pub mod claim {
+    /// The contract must be served.
+    pub const REQUIRED: u8 = 0;
+    /// The module does without it: never required.
+    pub const OPTIONAL: u8 = 1;
+    /// Required when the conditions block's entries for this record hold.
+    pub const CONDITIONAL: u8 = 2;
+    /// The last claim byte defined: a record carrying a later one is refused.
+    pub const LAST: u8 = CONDITIONAL;
+}
+
+/// The conditions block: a `u8` entry count, then each entry's [`FIXED`]
+/// bytes and its values.
+///
+/// ```text
+/// [subject u8][index u8][param u16][group u8][flags u8][count u8][values]
+/// ```
+///
+/// `subject` names what the entry conditions ([`SUBJECT_CONTRACT_GRANT`]:
+/// bit `index` of the first grant word; [`SUBJECT_OP_GRANT`]: of the
+/// second; [`SUBJECT_CLAIM`]: resource record `index`). `param` is the
+/// instance param's TLV tag. A subject holds when every entry of some one
+/// of its `group`s holds: the block states each subject in disjunctive
+/// normal form. A grant with no entries holds always; a `CONDITIONAL`
+/// claim has at least one.
+///
+/// An entry's kind ([`KIND_MASK`]):
+/// - [`KIND_INT_IN`]: the param reads (sign-extended from its packed width)
+///   as one of `count` `i64` LE values;
+/// - [`KIND_STR_IN`]: the param's bytes equal one of `count` `[len u8]
+///   [bytes]` values;
+/// - [`KIND_SET`] (`count` 0): the param carries a non-empty entry.
+///
+/// An absent param holds an `INT_IN` or `STR_IN` entry exactly when
+/// [`WHEN_UNSET`] is set: the packer, which knows the schema default the
+/// kernel does not, resolves it. [`EXTENDED`] (with `SET` only) reads the
+/// tag from the params' extended section, where the builder embeds a value
+/// given at build (`${file:..}`) or at launch.
+///
+/// [`FIXED`]: cond::FIXED
+/// [`SUBJECT_CONTRACT_GRANT`]: cond::SUBJECT_CONTRACT_GRANT
+/// [`SUBJECT_OP_GRANT`]: cond::SUBJECT_OP_GRANT
+/// [`SUBJECT_CLAIM`]: cond::SUBJECT_CLAIM
+/// [`KIND_MASK`]: cond::KIND_MASK
+/// [`KIND_INT_IN`]: cond::KIND_INT_IN
+/// [`KIND_STR_IN`]: cond::KIND_STR_IN
+/// [`KIND_SET`]: cond::KIND_SET
+/// [`WHEN_UNSET`]: cond::WHEN_UNSET
+/// [`EXTENDED`]: cond::EXTENDED
+pub mod cond {
+    /// Bytes of an entry before its values.
+    pub const FIXED: usize = 7;
+    /// Subject: a bit of the first grant word (a contract).
+    pub const SUBJECT_CONTRACT_GRANT: u8 = 0;
+    /// Subject: a bit of the second grant word (an op-level grant).
+    pub const SUBJECT_OP_GRANT: u8 = 1;
+    /// Subject: a resource record.
+    pub const SUBJECT_CLAIM: u8 = 2;
+    /// Flag: an absent param holds the entry.
+    pub const WHEN_UNSET: u8 = 0x01;
+    /// Flag bits holding the entry's kind.
+    pub const KIND_MASK: u8 = 0x06;
+    /// Kind: an integer param is one of the values.
+    pub const KIND_INT_IN: u8 = 0x00;
+    /// Kind: a string param is one of the values.
+    pub const KIND_STR_IN: u8 = 0x02;
+    /// Kind: the param carries a non-empty entry.
+    pub const KIND_SET: u8 = 0x04;
+    /// Flag: the tag is the extended section's (`SET` only).
+    pub const EXTENDED: u8 = 0x08;
+    /// Every flag bit an entry may carry.
+    pub const FLAGS_KNOWN: u8 = WHEN_UNSET | KIND_MASK | EXTENDED;
+    /// The largest param tag: `0xFF` ends a params TLV's basic section.
+    pub const PARAM_MAX: u16 = 0xFE;
+}
+
+/// One entry of a conditions block, as [`for_each_condition`] reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CondGrant {
-    /// Which grant word the bit belongs to: 0 contracts, 1 op-level.
-    pub word: u8,
-    /// The bit in that word.
-    pub bit: u8,
-    /// The instance parameter the condition reads.
-    pub param_id: u16,
-    /// [`COND_GRANT_WHEN_UNSET`].
+pub struct Condition {
+    pub subject: u8,
+    pub index: u8,
+    pub param: u16,
+    pub group: u8,
     pub flags: u8,
     /// Offset of the entry's values within the block, and how many.
     pub values_at: usize,
-    pub value_count: u8,
+    pub count: u8,
 }
 
-impl CondGrant {
-    /// Whether this grant is needed by an instance whose parameter reads
-    /// `value`, or `None` when the instance does not set it.
-    pub fn needed(&self, block: &[u8], value: Option<i64>) -> bool {
-        let Some(v) = value else {
-            return self.flags & COND_GRANT_WHEN_UNSET != 0;
-        };
-        (0..self.value_count as usize).any(|i| {
-            let at = self.values_at + i * 8;
-            block
-                .get(at..at + 8)
-                .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                .is_some_and(|b| i64::from_le_bytes(b) == v)
-        })
+/// The byte length of one entry's values, or `None` when they run past
+/// `block` or the entry's shape is not one [`cond`] defines.
+fn entry_values_len(block: &[u8], head: &[u8], values_at: usize) -> Option<usize> {
+    let flags = head[5];
+    let count = head[6] as usize;
+    if flags & !cond::FLAGS_KNOWN != 0 {
+        return None;
+    }
+    match flags & cond::KIND_MASK {
+        cond::KIND_INT_IN if flags & cond::EXTENDED == 0 => {
+            let n = count * 8;
+            (values_at + n <= block.len()).then_some(n)
+        }
+        cond::KIND_STR_IN if flags & cond::EXTENDED == 0 => {
+            let mut at = values_at;
+            for _ in 0..count {
+                let len = *block.get(at)? as usize;
+                at += 1 + len;
+                if at > block.len() {
+                    return None;
+                }
+            }
+            Some(at - values_at)
+        }
+        cond::KIND_SET if count == 0 && flags & cond::WHEN_UNSET == 0 => Some(0),
+        _ => None,
     }
 }
 
-/// The exact length of a conditional-grant block, walked from its own count
-/// and entry sizes; `None` when it is malformed or runs past `block`.
+/// The exact length of a conditions block, walked from its own count and
+/// entry shapes; `None` when an entry is malformed or runs past `block`.
 ///
 /// The manifest's size is checked EXACTLY, not as a lower bound, because
-/// slack is corruption at best and at worst a second block appended past the
-/// canonical offset for a verifier that reads from the other end. A
-/// variable-length block keeps that property only if its length is derivable
-/// from its own bytes, which is what this walk is for: anything appended
-/// past the end it returns leaves the manifest the wrong size and is
-/// refused.
-pub fn cond_grants_block_len(block: &[u8]) -> Option<usize> {
+/// slack is corruption at best and at worst a second block appended past
+/// the canonical offset for a verifier that reads from the other end. A
+/// variable-length block keeps that property only if its length is
+/// derivable from its own bytes, which is what this walk is for.
+pub fn conditions_block_len(block: &[u8]) -> Option<usize> {
     let &count = block.first()?;
     let mut at = 1usize;
     for _ in 0..count {
-        let head = block.get(at..at + COND_GRANT_FIXED)?;
-        let end = at + COND_GRANT_FIXED + head[5] as usize * 8;
-        if end > block.len() {
+        let head = block.get(at..at + cond::FIXED)?;
+        if head[0] > cond::SUBJECT_CLAIM || u16::from_le_bytes([head[2], head[3]]) > cond::PARAM_MAX
+        {
             return None;
         }
-        at = end;
+        let values_at = at + cond::FIXED;
+        at = values_at + entry_values_len(block, head, values_at)?;
     }
     Some(at)
 }
 
-/// Walk a conditional-grant block, calling `f` for each entry. Stops at the
-/// first malformed entry rather than guessing, so a truncated block grants
-/// nothing conditionally instead of granting everything.
-pub fn for_each_cond_grant(block: &[u8], mut f: impl FnMut(CondGrant)) {
+/// Walk a conditions block, calling `f` for each entry. Stops at the first
+/// malformed entry rather than guessing.
+pub fn for_each_condition(block: &[u8], mut f: impl FnMut(Condition)) {
     let Some(&count) = block.first() else { return };
     let mut at = 1usize;
     for _ in 0..count {
-        let Some(head) = block.get(at..at + COND_GRANT_FIXED) else {
+        let Some(head) = block.get(at..at + cond::FIXED) else {
             return;
         };
-        let value_count = head[5];
-        let values_at = at + COND_GRANT_FIXED;
-        let end = values_at + value_count as usize * 8;
-        if end > block.len() {
+        let values_at = at + cond::FIXED;
+        let Some(n) = entry_values_len(block, head, values_at) else {
+            return;
+        };
+        f(Condition {
+            subject: head[0],
+            index: head[1],
+            param: u16::from_le_bytes([head[2], head[3]]),
+            group: head[4],
+            flags: head[5],
+            values_at,
+            count: head[6],
+        });
+        at = values_at + n;
+    }
+}
+
+/// Why a manifest's claims and conditions are refused at load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionsError {
+    /// The block is malformed or runs past the manifest.
+    Malformed,
+    /// A resource record's claim byte is past [`claim::LAST`].
+    ClaimByte,
+    /// A `CONDITIONAL` record that no entry conditions.
+    NoGroup,
+    /// An entry naming a grant bit past 63, a record past the module's, or
+    /// a record that is not `CONDITIONAL`.
+    Subject,
+}
+
+/// Check a manifest's resource records (`records`, [`RESOURCE_RECORD_SIZE`]
+/// bytes each) against its conditions block (`block`, empty when the
+/// manifest carries none): every claim byte is one [`claim`] defines, every
+/// entry is well formed and names a grant bit or a `CONDITIONAL` record the
+/// manifest has, and every `CONDITIONAL` record has an entry. The block's
+/// exact length on success.
+pub fn validate_conditions(records: &[u8], block: Option<&[u8]>) -> Result<usize, ConditionsError> {
+    let n = records.len() / RESOURCE_RECORD_SIZE;
+    let claim_of = |i: usize| records[i * RESOURCE_RECORD_SIZE + RESOURCE_CLAIM_AT];
+    for i in 0..n {
+        if claim_of(i) > claim::LAST {
+            return Err(ConditionsError::ClaimByte);
+        }
+    }
+    let len = match block {
+        Some(b) => conditions_block_len(b).ok_or(ConditionsError::Malformed)?,
+        None => 0,
+    };
+    let block = block.map_or(&[][..], |b| &b[..len]);
+    let mut bad = false;
+    for_each_condition(block, |c| {
+        bad |= match c.subject {
+            cond::SUBJECT_CONTRACT_GRANT | cond::SUBJECT_OP_GRANT => c.index >= 64,
+            _ => (c.index as usize) >= n || claim_of(c.index as usize) != claim::CONDITIONAL,
+        };
+    });
+    if bad {
+        return Err(ConditionsError::Subject);
+    }
+    for i in 0..n {
+        if claim_of(i) != claim::CONDITIONAL {
+            continue;
+        }
+        let mut found = false;
+        for_each_condition(block, |c| {
+            found |= c.subject == cond::SUBJECT_CLAIM && c.index as usize == i;
+        });
+        if !found {
+            return Err(ConditionsError::NoGroup);
+        }
+    }
+    Ok(len)
+}
+
+/// The first entry under `tag` in a params TLV's basic
+/// section (`[0xFE][ver][len u16]` header optional), bounds-checked: `None`
+/// when the instance does not set it.
+fn basic_entry(params: &[u8], tag: u8) -> Option<&[u8]> {
+    let mut pos = if params.first() == Some(&0xFE) { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let (t, len) = (params[pos], params[pos + 1] as usize);
+        if t == 0xFF {
+            return None;
+        }
+        let v = params.get(pos + 2..pos + 2 + len)?;
+        if t == tag {
+            return Some(v);
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
+/// Whether the extended section (past the basic section's `0xFF 0x00`,
+/// entries `[tag][0x00][len u16 BE][bytes]`) carries a non-empty entry
+/// under `tag`.
+fn extended_set(params: &[u8], tag: u8) -> bool {
+    let mut pos = if params.first() == Some(&0xFE) { 4 } else { 0 };
+    loop {
+        let (Some(&t), Some(&len)) = (params.get(pos), params.get(pos + 1)) else {
+            return false;
+        };
+        pos += 2 + len as usize;
+        if t == 0xFF {
+            break;
+        }
+    }
+    while let Some(h) = params.get(pos..pos + 4) {
+        if h[1] != 0 {
+            return false;
+        }
+        let len = u16::from_be_bytes([h[2], h[3]]) as usize;
+        if pos + 4 + len > params.len() {
+            return false;
+        }
+        if h[0] == tag && len != 0 {
+            return true;
+        }
+        pos += 4 + len;
+    }
+    false
+}
+
+/// Whether entry `c` of `block` holds for an instance whose params TLV is
+/// `params`. Every read is bounded by `block` and `params`.
+fn condition_holds(block: &[u8], c: &Condition, params: &[u8]) -> bool {
+    let Ok(tag) = u8::try_from(c.param) else {
+        return false;
+    };
+    match c.flags & cond::KIND_MASK {
+        cond::KIND_SET => {
+            if c.flags & cond::EXTENDED != 0 {
+                extended_set(params, tag)
+            } else {
+                basic_entry(params, tag).is_some_and(|v| !v.is_empty())
+            }
+        }
+        kind => {
+            let Some(v) = basic_entry(params, tag) else {
+                return c.flags & cond::WHEN_UNSET != 0;
+            };
+            let mut at = c.values_at;
+            if kind == cond::KIND_INT_IN {
+                if v.is_empty() || v.len() > 8 {
+                    return false;
+                }
+                let mut b = [0u8; 8];
+                b[..v.len()].copy_from_slice(v);
+                let shift = 64 - v.len() * 8;
+                let n = (i64::from_le_bytes(b) << shift) >> shift;
+                (0..c.count).any(|i| {
+                    block
+                        .get(at + i as usize * 8..at + i as usize * 8 + 8)
+                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                        .is_some_and(|b| i64::from_le_bytes(b) == n)
+                })
+            } else {
+                for _ in 0..c.count {
+                    let Some(&len) = block.get(at) else {
+                        return false;
+                    };
+                    let want = block.get(at + 1..at + 1 + len as usize);
+                    if want == Some(v) {
+                        return true;
+                    }
+                    at += 1 + len as usize;
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Whether `subject`/`index` holds for `params`: every entry of some one of
+/// its groups holds. `None` when the block has no entry for it.
+pub fn subject_holds(block: &[u8], subject: u8, index: u8, params: &[u8]) -> Option<bool> {
+    let mut seen = [0u64; 4];
+    let mut failed = [0u64; 4];
+    for_each_condition(block, |c| {
+        if c.subject != subject || c.index != index {
             return;
         }
-        f(CondGrant {
-            word: head[0],
-            bit: head[1],
-            param_id: u16::from_le_bytes([head[2], head[3]]),
-            flags: head[4],
-            values_at,
-            value_count,
-        });
-        at = end;
+        let (w, b) = ((c.group / 64) as usize, c.group % 64);
+        seen[w] |= 1 << b;
+        if failed[w] & (1 << b) == 0 && !condition_holds(block, &c, params) {
+            failed[w] |= 1 << b;
+        }
+    });
+    if seen == [0; 4] {
+        return None;
+    }
+    Some((0..4).any(|w| seen[w] & !failed[w] != 0))
+}
+
+/// Whether grant `bit` of grant word `word` (0 contracts, 1 op-level) holds
+/// for `params`: always, unless the block conditions it.
+pub fn grant_holds(block: &[u8], word: u8, bit: u8, params: &[u8]) -> bool {
+    let subject = if word == 0 {
+        cond::SUBJECT_CONTRACT_GRANT
+    } else {
+        cond::SUBJECT_OP_GRANT
+    };
+    subject_holds(block, subject, bit, params).unwrap_or(true)
+}
+
+/// Whether resource record `index` (`record`, its [`RESOURCE_RECORD_SIZE`]
+/// bytes) must be served for an instance whose params TLV is `params`:
+/// `REQUIRED` always, `OPTIONAL` never, `CONDITIONAL` when its entries in
+/// `block` hold (a record no entry conditions, which the loader refuses,
+/// reads as required). The kernel's admission and the composer both ask
+/// this, so they cannot disagree.
+pub fn claim_required(record: &[u8], index: u8, block: &[u8], params: &[u8]) -> bool {
+    match record.get(RESOURCE_CLAIM_AT) {
+        Some(&claim::OPTIONAL) => false,
+        Some(&claim::CONDITIONAL) => {
+            subject_holds(block, cond::SUBJECT_CLAIM, index, params).unwrap_or(true)
+        }
+        _ => true,
     }
 }
 
@@ -377,6 +699,7 @@ impl ManifestLayout {
         flags: u8,
     ) -> Self {
         let ports = port_count as usize;
+        let provides_count = provides_count & PROVIDES_COUNT_MASK;
         let capacity =
             MANIFEST_HEADER_SIZE + ports * 4 + resource_count as usize * 4 + dep_count as usize * 8;
         let stack = capacity
@@ -386,7 +709,8 @@ impl ManifestLayout {
                 0
             };
         let arena = stack + 2;
-        let provides = arena + 4;
+        let lanes = arena + 4;
+        let provides = lanes + LANES_BLOCK_SIZE;
         let hash = provides + provides_count as usize * 2;
         let attestation =
             hash + if flags & (FLAG_INTEGRITY | FLAG_SIGNATURE) != 0 {
@@ -398,7 +722,7 @@ impl ManifestLayout {
             } else {
                 0
             };
-        let cond_grants = attestation
+        let conditions = attestation
             + if flags & FLAG_ATTESTATION != 0 {
                 DIGEST_SIZE
             } else {
@@ -408,10 +732,11 @@ impl ManifestLayout {
             capacity,
             stack,
             arena,
+            lanes,
             provides,
             hash,
             attestation,
-            cond_grants,
+            conditions,
         }
     }
 
@@ -452,9 +777,10 @@ pub enum EnvelopeError {
 ///   the head, ports, resources, dependencies, port capacities, stack,
 ///   arena and provided contracts — the only bytes before the hash that
 ///   differ between the unsigned and the signed manifest are those two bits;
-/// - the attestation, at its canonical offset, when present. The manifest
-///   must end exactly after it: an inflated manifest could otherwise carry a
-///   second, signed copy while parsers read a substituted one.
+/// - the attestation, at its canonical offset, when present, and the
+///   conditions block after it. The manifest must end exactly after them:
+///   an inflated manifest could otherwise carry a second, signed copy while
+///   parsers read a substituted one.
 ///
 /// The signer may pass a manifest whose hash and signature are
 /// placeholders: neither is in the envelope.
@@ -474,8 +800,18 @@ pub fn signing_envelope<F: FnMut(&[u8])>(
         return Err(EnvelopeError::Truncated);
     }
     let flags = manifest[MANIFEST_FLAGS_AT];
-    if flags & FLAG_ATTESTATION != 0 && manifest.len() != layout.attestation + DIGEST_SIZE {
-        return Err(EnvelopeError::NonCanonical);
+    if flags & FLAG_ATTESTATION != 0 {
+        let conditions = if flags & FLAG_CONDITIONS != 0 {
+            manifest
+                .get(layout.conditions..)
+                .and_then(conditions_block_len)
+                .ok_or(EnvelopeError::NonCanonical)?
+        } else {
+            0
+        };
+        if manifest.len() != layout.conditions + conditions {
+            return Err(EnvelopeError::NonCanonical);
+        }
     }
     sink(&image[..HEADER_MANIFEST_SIZE_AT]);
     sink(&image[HEADER_MANIFEST_SIZE_AT + 2..]);

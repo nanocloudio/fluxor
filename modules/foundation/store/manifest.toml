@@ -1,0 +1,58 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux", "uefi"]
+
+# The versioned watchable key store: `storage.object` (CAS, listing, streamed
+# writes, grants) and `storage.namespace` (listing, SUBSCRIBE, CHANGES) over
+# one keyspace with a monotone revision clock. Durable over the `fs` wired
+# beneath it (`durable = 1`, an append log `<dir>/store.log`), or RAM only
+# (`durable = 0`). A node composes one over its own volume; a workload
+# composes its own over its rooted `fs`. See mod.rs.
+provides = ["storage.object", "storage.namespace"]
+provider_contracts = ["storage.object", "storage.namespace"]
+# A metal node runs it privileged inside a workload that composes it from the
+# node's image: it holds no grant and touches no device.
+workload_instantiable = true
+
+# Ready once the log is replayed: the contract-readiness gate holds the
+# store's consumers until then.
+deferred_ready = true
+# A released owner's reads, writes and subscriptions go with it.
+observes_owner_release = true
+# The ledger asks it for `store_subs` in use.
+samples_pool = true
+
+# Grants are checked against the kernel's trusted clock.
+timer_class = "wall_clock"
+
+# The log lives on the `fs` wired beneath; a RAM store calls none.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+when = { durable = ["on"] }
+
+# A store guarded by mesh roots checks each grant's window against a clock
+# the platform vouches for; a target without one cannot run it guarded.
+[[requires_when]]
+capability = "time.wall"
+active_when_params = ["roots"]
+
+[capacities]
+# Every table from the heap. An object costs 64 bytes of index, entry and
+# allocator overhead beside its key and value; keys, values and streamed
+# writes' staged bytes are allocated within `value_bytes`, each charged its
+# allocator overhead. A history entry is 16 bytes, a read slot 32, a
+# streamed-write slot 304, a grant 304. The base holds the replay and copy
+# buffer.
+heap_per_param = { base = 8192, params = [
+    { tag = 3, default = 512, bytes_each = 64 },
+    { tag = 4, default = 262144, bytes_each = 1 },
+    { tag = 5, default = 4096, bytes_each = 16 },
+    { tag = 7, default = 8, bytes_each = 32 },
+    { tag = 8, default = 2, bytes_each = 304 },
+    { tag = 9, default = 16, bytes_each = 304 },
+] }
+# One subscription slot, its prefix inline, per planned `store_subs`.
+heap_per_demand = { pool = "store_subs", bytes_each = 288 }
+
+[observability]
+exempt = "provider answered inside its consumers' steps; its writes' outcomes are its callers' to report, and its replay states itself in '[store]' log lines"

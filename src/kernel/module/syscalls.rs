@@ -391,20 +391,10 @@ pub fn init_providers() {
     // …) or a host platform dispatcher (linux_fs_dispatch) registers
     // itself. If nothing is registered, `provider::dispatch(FS, …)`
     // returns ENOSYS naturally; no stub needed.
-    // KEY_VAULT: the router, on BOTH paths — this class-byte dispatch and
-    // the KEY_VAULT_VTABLE below. It serves the kernel software backend
-    // and, when a platform registers one behind it (the Linux PKCS#11
-    // backend), a hardware backend; each handle names the backend that
-    // holds its key. Consumers never name a platform — they read
-    // PROBE/CUSTODY/DESCRIBE.
-    provider::register(dev_class::KEY_VAULT, primary_dispatch);
     provider::register(
         crate::abi::registry::metal_device::ID,
         crate::kernel::module::metal_device::dispatch,
     );
-    // The vault's durable store is the same router's other surface; its ops
-    // need the `seal_key` grant.
-    provider::register(crate::abi::registry::vault_store::ID, primary_dispatch);
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
     // handles route through the vtable; handle=-1 globals fall through
@@ -413,7 +403,6 @@ pub fn init_providers() {
     provider::register_vtable(&CHANNEL_VTABLE);
     provider::register_vtable(&TIMER_VTABLE);
     provider::register_vtable(&EVENT_VTABLE);
-    provider::register_vtable(&KEY_VAULT_VTABLE);
     provider::register_vtable(&FS_VTABLE);
     provider::register_vtable(&STORAGE_NAMESPACE_VTABLE);
     provider::register_vtable(&STORAGE_OBJECT_VTABLE);
@@ -513,16 +502,6 @@ static BRIDGE_VTABLE: crate::kernel::module::provider::ProviderVTable =
         query: None,
         default_close_op: 0,
         poll: Some(bridge_handle_poll),
-    };
-
-// KEY_VAULT vtable: the router, over every backend.
-static KEY_VAULT_VTABLE: crate::kernel::module::provider::ProviderVTable =
-    crate::kernel::module::provider::ProviderVTable {
-        contract: crate::kernel::module::provider::contract::KEY_VAULT,
-        call: primary_dispatch,
-        query: None,
-        default_close_op: contracts::key_vault::DESTROY,
-        poll: None,
     };
 
 // PCIE_DEVICE shares `system_provider_dispatch` (same call path as
@@ -759,7 +738,6 @@ fn refuse(what: u32, need: crate::abi::registry::OpGrant) -> Option<i32> {
 /// gated module's calls into the same table, so a gated and an ungated
 /// module meet the same rule.
 fn check_grant(op: u32) -> Option<i32> {
-    let op = op & !crate::abi::registry::CHAIN_NEXT;
     let Some(need) = crate::abi::registry::op_grant(op) else {
         return Some(E_NOSYS);
     };
@@ -1237,6 +1215,51 @@ fn handle_program_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32
     }
 }
 
+/// `resource::LEDGER_CHARGE` / `LEDGER_RELEASE`: a workload-scoped provider
+/// charges (or refunds) the owner it is serving. The owner is the frame's
+/// caller, never an argument: outside a provider frame, from a module that
+/// holds no workload layer, for a caller acting with the node's authority, or
+/// on any line but storage, the call is refused `EACCES`.
+fn owner_ledger_op(opcode: u32, arg: &[u8]) -> i32 {
+    use crate::abi::contracts::resource;
+    use crate::kernel::exec::scheduler;
+    let release = opcode == resource::LEDGER_RELEASE;
+    let need = if release {
+        resource::LEDGER_RELEASE_ARG_LEN
+    } else {
+        resource::LEDGER_CHARGE_ARG_LEN
+    };
+    let Some(a) = arg.get(..need) else {
+        return E_INVAL;
+    };
+    let line = u16::from_le_bytes([a[0], a[1]]);
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&a[2..10]);
+    let bytes = u64::from_le_bytes(b);
+    let caller = scheduler::caller_module_index();
+    if caller >= scheduler::module_slots()
+        || line != resource::OWNER_LINE_STORAGE
+        || !crate::kernel::module::provider::holds_workload_layer(scheduler::current_module_index())
+    {
+        return errno::EACCES;
+    }
+    let owner = scheduler::module_owner(caller);
+    let owners = scheduler::owners_mut();
+    if owners.authority_of(owner).is_node() {
+        return errno::EACCES;
+    }
+    if release {
+        owners.release(owner, line, bytes);
+        return 0;
+    }
+    let held = a[10] & resource::LEDGER_HELD != 0;
+    match owners.charge(owner, line, bytes, held) {
+        Ok(()) => 0,
+        Err(crate::kernel::workload::owner::ChargeRefused::NoLine) => errno::EACCES,
+        Err(crate::kernel::workload::owner::ChargeRefused::Cap) => errno::ENOSPC,
+    }
+}
+
 /// `kernel_abi::SIGNAL_CORE`: raise an SGI on one core. `arg = [core u8][sgi u8]`.
 fn signal_core(arg: &[u8]) -> i32 {
     let (core, sgi) = match *arg {
@@ -1260,28 +1283,29 @@ fn signal_core(arg: &[u8]) -> i32 {
     }
 }
 
-/// Whether `opcode` is a primary-core op the kernel bucket routes by class:
-/// the `reconfigure` contract (a change of the graph, a staged update) and
-/// the signing root, which reads and checks the image's layout. The key
-/// vault and its store are the others ([`primary_dispatch`] is their
-/// provider).
+/// Whether `opcode` is one of [`primary_dispatch`]'s.
 fn primary_op(opcode: u32) -> bool {
     opcode >> 8 == u32::from(crate::abi::registry::reconfigure::ID)
         || opcode == crate::abi::kernel_abi::SIGNING_ROOT
+        || opcode == crate::abi::kernel_abi::COMPOSITION_RECORD
+        || opcode == crate::abi::kernel_abi::SEAL_KEY_DERIVE
 }
 
-/// The kernel's primary-core ops: [`primary_op`]'s, and every op of the key
-/// vault and its store. They run the kernel's deepest frames (a signature
-/// check, the loader, the vault's suites) and assume one call at a time on
-/// the primary: a change of the graph parks the other cores from there, and
-/// the vault's state has one writer. So they run on the primary core alone.
+/// The kernel's primary-core ops: the `reconfigure` contract (a change of
+/// the graph, a staged update), the signing root, which reads and checks
+/// the image's layout, the composition record, which reads the loader's
+/// table and the graph, and the sealing-key derivation, which reads the
+/// platform key. They run the kernel's deepest frames (a signature
+/// check, the loader, a hash over every loaded blob) and assume one call at
+/// a time on the primary: a change of the graph parks the other cores from
+/// there. So they run on the primary core alone.
 /// Called on another core, the call is handed to the primary as the caller
 /// and this core waits for the answer (`domains::delegate`), which is the
 /// function's first act: the firmware build's bound on a secondary core's
 /// stack counts this frame and no deeper. An interrupt handler calling one
 /// is refused `ENOTSUP`: it would wait on a pass.
 #[inline(never)]
-fn primary_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+fn primary_dispatch(opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::reconfigure;
     use crate::kernel::exec::scheduler;
     #[cfg(target_arch = "arm")]
@@ -1292,14 +1316,23 @@ fn primary_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>
     if crate::kernel::sys::hal::core_id() != 0 {
         let mut call = Some((arg, data));
         return crate::kernel::exec::domains::delegate(&mut || match call.take() {
-            Some((arg, data)) => primary_dispatch(handle, opcode, arg, data),
+            Some((arg, data)) => primary_dispatch(opcode, arg, data),
             None => errno::EBUSY,
         });
     }
-    if !primary_op(opcode) {
-        return crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, data);
-    }
     match opcode {
+        // The caller's own sealing key; the gateway checked `seal_key`.
+        crate::abi::kernel_abi::SEAL_KEY_DERIVE => {
+            let idx = scheduler::current_module_index();
+            if idx >= scheduler::module_slots() {
+                return E_INVAL;
+            }
+            crate::kernel::security::seal::derive_for(scheduler::module_type_hash(idx), arg)
+        }
+        crate::abi::kernel_abi::COMPOSITION_RECORD => {
+            let mut out = data;
+            crate::kernel::exec::scheduler::attest::serve_record(arg, out.as_mut())
+        }
         crate::abi::kernel_abi::SIGNING_ROOT => {
             match crate::kernel::security::root::signing_root() {
                 Some(root) => match answer(arg, &root) {
@@ -1387,9 +1420,9 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
     use crate::abi::internal::{bridge, monitor};
     use crate::abi::kernel_abi::doorbell::DOORBELL_RING;
     use crate::abi::kernel_abi::{
-        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
-        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE, SIGNAL_CORE,
+        ARENA_GET, BOARD_FACT, BOOT_INCARNATION, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
+        MODULE_INSTANCE_PARAMS, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
+        SERIAL_WRITE, SIGNAL_CORE,
     };
     use crate::abi::registry::lend;
     use crate::kernel::exec::scheduler;
@@ -1397,14 +1430,13 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         SIGNAL_CORE => signal_core(arg),
         // ── Core primitives ──
         SELF_INDEX
-        | NET_IDENT_PROVIDER
         | BOOT_INCARNATION
         | ARENA_GET
         | REPORT_LATENCY
         | REPORT_STEP_EFFECT
         | LOG_WRITE
         | SERIAL_WRITE
-        | GET_HW_ETHERNET_MAC
+        | BOARD_FACT
         | HANDLE_POLL
         | RANDOM_FILL
         | MODULE_INSTANCE_PARAMS
@@ -1423,6 +1455,9 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         | crate::abi::kernel_abi::PROGRAM_READ
         | crate::abi::kernel_abi::SLOT_ADMITTED
         | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, data),
+        crate::abi::kernel_abi::LANE_TAKE
+        | crate::abi::kernel_abi::OWNER_GRANTS
+        | crate::abi::kernel_abi::MODULE_DIGESTS => handle_lane_op(opcode, arg, data),
         // ── Lends ──
         lend::OPEN => {
             let mut span = data;
@@ -1441,6 +1476,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
             ),
             _ => E_INVAL,
         },
+        resource::LEDGER_CHARGE | resource::LEDGER_RELEASE => owner_ledger_op(opcode, arg),
         telemetry::TLM_EMIT
         | telemetry::TLM_SUBSCRIBE
         | telemetry::TLM_DRAIN
@@ -1468,7 +1504,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg),
 
         // ── Live reconfigure, graph mutation, staging; the signing root ──
-        op if primary_op(op) => primary_dispatch(handle, op, arg, data),
+        op if primary_op(op) => primary_dispatch(op, arg, data),
 
         _ => match system_extension() {
             // Platform extension for hardware-specific opcodes.
@@ -1612,13 +1648,49 @@ fn log_write(level: u8, msg: &[u8]) {
     }
 }
 
+/// The ops a base-graph module serving workload lanes makes: the next lane
+/// change, an owner's grants, and the node image's module digests.
+fn handle_lane_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
+    use crate::kernel::exec::scheduler;
+    use crate::kernel::workload::lanes;
+    let me = scheduler::current_module_index();
+    match opcode {
+        crate::abi::kernel_abi::LANE_TAKE => lanes::take(me, arg),
+        crate::abi::kernel_abi::OWNER_GRANTS => {
+            let Some(rec) = arg.get(..8) else {
+                return E_INVAL;
+            };
+            let owner = crate::kernel::workload::owner::OwnerHandle {
+                slot: u16::from_le_bytes([rec[0], rec[1]]),
+                generation: u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
+            };
+            // An owner's grants are for the module serving its lanes.
+            if !lanes::holds_lane(me, owner) {
+                return errno::EACCES;
+            }
+            crate::kernel::workload::endpoints::owner_grants(
+                owner.slot,
+                owner.generation,
+                arg,
+                data.as_mut(),
+            )
+        }
+        // SAFETY: the loader's table is read on the scheduler thread, as the
+        // workload backend's digest read does.
+        _ => crate::kernel::workload::code_pack::node_digests(
+            unsafe { scheduler::static_loader() },
+            data.as_mut(),
+        ),
+    }
+}
+
 fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::bridge;
     use crate::abi::internal::monitor::INTERRUPT_METRICS;
     use crate::abi::kernel_abi::{
-        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
-        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE,
+        ARENA_GET, BOARD_FACT, BOOT_INCARNATION, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
+        MODULE_INSTANCE_PARAMS, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
+        SERIAL_WRITE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
@@ -1634,24 +1706,6 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
                 return errno::EAGAIN;
             }
             0
-        }
-        // Net-identity provider self-registration: the calling BASE-GRAPH
-        // module declares itself the node's shared network stack, carrying its
-        // own `addr_ctl` input-port index in `arg` (see
-        // `kernel_abi::NET_IDENT_PROVIDER`). Workload modules are refused —
-        // a owner must not hijack identity installs.
-        NET_IDENT_PROVIDER => {
-            let addr_ctl = match *arg {
-                [a, ..] => a,
-                _ => return E_INVAL,
-            };
-            let idx = scheduler::current_module_index();
-            if !scheduler::module_owner(idx).is_node() {
-                return crate::kernel::sys::errno::EACCES;
-            }
-            crate::kernel::workload::workload_graph::register_net_identity_provider(
-                idx as u16, addr_ctl,
-            )
         }
         // One of the calling module's own ISR bridges: `arg = [dir u8][index
         // u8]`. Answers the bridge's slot, which the kernel wraps in a handle.
@@ -1736,21 +1790,28 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
             }
             crate::kernel::sys::hal::serial_write(data.as_slice()) as i32
         }
-        GET_HW_ETHERNET_MAC => {
-            #[cfg(feature = "dtb")]
-            {
-                match crate::kernel::boot::dtb::read_ethernet_mac() {
-                    Some(mac) => match answer(arg, &mac) {
-                        Ok(()) => 6,
-                        Err(e) => e,
-                    },
-                    None => errno::ENODEV,
+        BOARD_FACT => {
+            let Some(&fact) = arg.first() else {
+                return E_INVAL;
+            };
+            match fact {
+                crate::abi::kernel_abi::board_fact::ETHERNET_MAC => {
+                    #[cfg(feature = "dtb")]
+                    {
+                        match crate::kernel::boot::dtb::read_ethernet_mac() {
+                            Some(mac) => match answer(arg, &mac) {
+                                Ok(()) => 6,
+                                Err(e) => e,
+                            },
+                            None => errno::ENODEV,
+                        }
+                    }
+                    #[cfg(not(feature = "dtb"))]
+                    {
+                        errno::ENODEV
+                    }
                 }
-            }
-            #[cfg(not(feature = "dtb"))]
-            {
-                let _ = arg;
-                errno::ENODEV
+                _ => E_INVAL,
             }
         }
         HANDLE_POLL => {
@@ -2027,7 +2088,7 @@ fn kernel_query_dispatch(handle: i32, key: u32, out: &mut [u8]) -> i32 {
         dev_query_key::CALLER_MODULE => {
             // A buffer that cannot hold the record is a malformed call,
             // whatever the provider stack holds.
-            if out.len() < 8 {
+            if out.len() < 12 {
                 return E_INVAL;
             }
             let caller = scheduler::caller_module_index();
@@ -2037,7 +2098,42 @@ fn kernel_query_dispatch(handle: i32, key: u32, out: &mut [u8]) -> i32 {
                 return errno::ESRCH;
             }
             let gen = scheduler::module_slot_generation(caller);
-            query_record(out, &module_record(caller as u16, gen))
+            let mut r = [0u8; 12];
+            r[..8].copy_from_slice(&module_record(caller as u16, gen));
+            r[8..].copy_from_slice(&scheduler::module_type_hash(caller).to_le_bytes());
+            query_record(out, &r)
+        }
+        dev_query_key::CALLER_OWNER_UID => {
+            if out.len() < 16 {
+                return E_INVAL;
+            }
+            let caller = scheduler::caller_module_index();
+            if caller >= scheduler::module_slots() {
+                return errno::ESRCH;
+            }
+            let owner = scheduler::module_owner(caller);
+            let uid = if owner.is_node() {
+                [0u8; 16]
+            } else {
+                scheduler::owners()
+                    .lookup(owner)
+                    .map_or([0u8; 16], |e| e.owner_uid)
+            };
+            query_record(out, &uid)
+        }
+        dev_query_key::CALLER_AUTHORITY => {
+            if out.len() < 8 {
+                return E_INVAL;
+            }
+            let caller = scheduler::caller_module_index();
+            if caller >= scheduler::module_slots() {
+                return errno::ESRCH;
+            }
+            let authority = scheduler::owners().authority_of(scheduler::module_owner(caller));
+            query_record(
+                out,
+                &crate::kernel::module::provider::encode_owner_record(authority),
+            )
         }
         // `out` holds the occupancy to test on entry.
         dev_query_key::MODULE_LIVE => {
@@ -2046,6 +2142,18 @@ fn kernel_query_dispatch(handle: i32, key: u32, out: &mut [u8]) -> i32 {
             };
             let idx = u16::from_le_bytes([rec[0], rec[1]]) as usize;
             let gen = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+            // A caller without the node's authority asks about its own
+            // owner's modules only: another owner's occupancy is not its to
+            // learn.
+            let caller = scheduler::caller_module_index();
+            if caller < scheduler::module_slots() {
+                let own = scheduler::module_owner(caller);
+                if !scheduler::owners().authority_of(own).is_node()
+                    && (idx >= scheduler::module_slots() || scheduler::module_owner(idx) != own)
+                {
+                    return errno::EACCES;
+                }
+            }
             let live = idx < scheduler::module_slots()
                 && scheduler::module_slot_generation(idx) == gen
                 && !scheduler::module_is_finished(idx);

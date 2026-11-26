@@ -315,6 +315,9 @@ pub mod errno {
     pub use super::super::registry::errno::ENOTEMPTY;
     /// No such device or address (e.g. I2C NACK).
     pub use super::super::registry::errno::ENXIO;
+    /// Read-only: a write, a create or a remove on a volume or object store
+    /// that takes none.
+    pub use super::super::registry::errno::EROFS;
     /// Generic / unspecified error.
     pub use super::super::registry::errno::ERROR;
     /// No such process / no such context. Answered by
@@ -733,18 +736,6 @@ pub use super::registry::kernel::SELF_INDEX;
 /// honoured on every target.
 pub use super::registry::kernel::MODULE_INSTANCE_PARAMS;
 
-/// Register the CALLING module as the node's net-identity provider (the
-/// module owning the shared network stack that realizes `net::identity`
-/// ADDR_ADD/ADDR_DEL installs).
-/// `arg = [addr_ctl_port: u8]` — the provider declares its own control
-/// input-port index, so the kernel learns it from the provider itself rather
-/// than from a name convention. A workload's traffic reaches the provider
-/// only over its own `Endpoint::Net` lanes.
-/// Gated to node-graph (node-owned) modules — a workload module cannot
-/// hijack identity installs — and first-wins (`EBUSY` on a second claim).
-/// `ENOSYS` on builds without a workload backend.
-pub use super::registry::kernel::NET_IDENT_PROVIDER;
-
 /// This boot's incarnation: 16 bytes drawn from the kernel CSPRNG once per
 /// boot, the same for every module that asks. What it is for: anything
 /// minted during a boot — an emission token, a fence epoch, a directory
@@ -791,6 +782,148 @@ pub use super::registry::kernel::PROGRAM_READ;
 /// (`graph_slot`) checks a signature before it activates a slot rather than
 /// leaving a bad image for the next boot to discover.
 pub use super::registry::kernel::SIGNING_ROOT;
+
+/// Derive the calling module's sealing key from the platform's.
+/// `handle = -1`; `arg` = `[ctx_len: u8][ctx: ctx_len bytes]` in (`ctx_len`
+/// at most [`seal::MAX_CTX`]), `[provenance: u8][key: 32]` out
+/// ([`seal::OUT_LEN`] bytes, so `arg` must be at least that long). Returns
+/// 33. The key is HKDF-SHA256 with salt [`seal::SALT`], the platform's
+/// sealing key as input keying material and info = the caller's module type
+/// hash (u32 LE) followed by `ctx` ([`seal::derive`]): the same key every
+/// boot for one module type and context, and another for any other. The
+/// platform key itself never leaves the kernel. `provenance` is the
+/// platform's `SealProvenance` byte. `ENOSYS` when the platform has no
+/// sealing key; needs the `seal_key` grant.
+pub use super::registry::kernel::SEAL_KEY_DERIVE;
+
+/// The graph's composition record, the payload `key_vault`'s
+/// `ATTEST_COMPOSITION` signs. `handle = -1`; `arg` = `[challenge: 32]
+/// [custody: u8]` in, `data` receives the record. Returns its length; when
+/// `data` is shorter, `ERANGE` with the length needed written to `arg[..4]`
+/// (u32 LE). Read only, and ungated: the record names hashes of what the
+/// node runs, nothing secret.
+pub use super::registry::kernel::COMPOSITION_RECORD;
+
+/// A fact of the board the firmware handed the kernel at boot (on bcm2712,
+/// the device tree): `handle = -1`; `arg` in = `[fact u8]`
+/// ([`board_fact`]), and on success the fact's bytes are written over it.
+/// Returns their length, `ENODEV` when the board gave none, `EINVAL` for a
+/// fact id none has, `ERANGE` when `arg` is shorter than the fact.
+pub use super::registry::kernel::BOARD_FACT;
+
+/// [`BOARD_FACT`] ids.
+pub mod board_fact {
+    /// The board's provisioned Ethernet MAC address, 6 bytes.
+    pub const ETHERNET_MAC: u8 = 1;
+}
+
+/// The next lane change the kernel queued for the calling module: a node
+/// module that serves lanes (`ip`; `linux_net`'s `host_lane`), whose every
+/// consumer — a node-graph module under the node owner (slot 0) or a
+/// workload's module under its own — reaches it by a lane.
+/// `handle = -1`; `arg` out = one [`lane`] record. Returns
+/// [`lane::RECORD_LEN`], 0 when nothing is queued, `EACCES` to a module
+/// that serves no lanes. An attach hands the caller the lane's commands
+/// channel (it reads) and events channel (it writes).
+pub use super::registry::kernel::LANE_TAKE;
+
+/// One [`LANE_TAKE`] record: `[op u8][key u8][0 u16][owner_slot u16]
+/// [0 u16][owner_gen u32][commands i32][events i32]`.
+pub mod lane {
+    pub const RECORD_LEN: usize = 20;
+    /// A lane attached.
+    pub const OP_ATTACH: u8 = 1;
+    /// Every lane of the owner detached: their channels are gone. Names the
+    /// owner only.
+    pub const OP_DETACH: u8 = 2;
+    /// The owner is draining: it admits nothing new (no new bind), and its
+    /// lanes stay until they detach. Names the owner only.
+    pub const OP_DRAIN: u8 = 3;
+    pub const OFF_OP: usize = 0;
+    pub const OFF_KEY: usize = 1;
+    pub const OFF_OWNER_SLOT: usize = 4;
+    pub const OFF_OWNER_GEN: usize = 8;
+    pub const OFF_COMMANDS: usize = 12;
+    pub const OFF_EVENTS: usize = 16;
+}
+
+/// A workload owner's grants, opaque to the kernel: `handle = -1`; `arg`
+/// in = `[slot u16][0 u16][generation u32]`; `data` out = the owner's
+/// `[kind u16][len u16][bytes]` records: the committed owner plan's, in plan
+/// order, then those its admission granted (a resident workload's boot
+/// record, a `CREATE`'s `net`/`endpoint` options). Returns their length, 0
+/// for an owner granted nothing, which holds nothing. Answered only to a
+/// module holding one of that owner's lanes (`EACCES` otherwise); `ERANGE`
+/// with the length needed as `[len u32]` in `arg` when `data` is short. The
+/// kinds are the stack's (`contracts::net::net_proto::grant`).
+pub use super::registry::kernel::OWNER_GRANTS;
+
+/// The node image's modules, as a workload creator pins against them:
+/// `handle = -1`; `data` out = `[count u16][0 u16]` then `[name_hash u32]
+/// [sha256 32]` per module. Returns the length, `ERANGE` when `data` is
+/// short.
+pub use super::registry::kernel::MODULE_DIGESTS;
+/// One [`MODULE_DIGESTS`] record: `[name_hash u32][sha256 32]`.
+pub const MODULE_DIGEST_RECORD: usize = 36;
+
+/// [`COMPOSITION_RECORD`]'s flags.
+pub mod composition {
+    /// Record magic.
+    pub const MAGIC: [u8; 4] = *b"FXAT";
+    /// Record version.
+    pub const VERSION: u8 = 1;
+    /// Offset of the challenge within the record: after the magic, the
+    /// version and the 16-byte boot incarnation.
+    pub const CHALLENGE_OFF: usize = 4 + 1 + 16;
+    /// Fixed prefix length: magic, version, incarnation, challenge, ABI
+    /// digest. The blob, instance and edge lists follow.
+    pub const PREFIX_LEN: usize = CHALLENGE_OFF + 32 + 32;
+    /// Or'd into the custody byte: answer the composition digest (the
+    /// record's SHA-256 under an all-zero challenge), 32 bytes into `data`,
+    /// in place of the record.
+    pub const DIGEST: u8 = 0x80;
+    /// The digest's length.
+    pub const DIGEST_LEN: usize = 32;
+}
+
+/// `SEAL_KEY_DERIVE`'s wire and its one derivation, shared by the kernel
+/// that serves it and the tools that provision sealed records off the
+/// device, so the two cannot drift.
+pub mod seal {
+    /// HKDF salt of every derived sealing key.
+    pub const SALT: [u8; 11] = *b"fluxor/seal";
+    /// Longest context a caller may name.
+    pub const MAX_CTX: usize = 64;
+    /// Bytes `SEAL_KEY_DERIVE` writes: `[provenance u8][key 32]`.
+    pub const OUT_LEN: usize = 33;
+    /// Bytes of a derived key.
+    pub const KEY_LEN: usize = 32;
+
+    /// The provenance byte `SEAL_KEY_DERIVE` answers first: where the
+    /// platform's key comes from, and so what a key derived from it is
+    /// worth.
+    pub mod provenance {
+        /// No platform key (never answered: the op is `ENOSYS` then).
+        pub const NONE: u8 = 0;
+        /// A key the host can also read: sealing protects against a
+        /// compromised module, not a compromised host.
+        pub const HOST_READABLE: u8 = 1;
+        /// A key bound to this device (OTP, fuses) and not extractable.
+        pub const DEVICE_UNIQUE: u8 = 2;
+    }
+
+    /// The HKDF `info` for `module_type` and `ctx`: the type hash (u32 LE)
+    /// then the context. Writes into `out` and returns its length, `None`
+    /// when `ctx` is longer than [`MAX_CTX`].
+    pub fn info(module_type: u32, ctx: &[u8], out: &mut [u8; 4 + MAX_CTX]) -> Option<usize> {
+        if ctx.len() > MAX_CTX {
+            return None;
+        }
+        out[..4].copy_from_slice(&module_type.to_le_bytes());
+        out[4..4 + ctx.len()].copy_from_slice(ctx);
+        Some(4 + ctx.len())
+    }
+}
 
 /// Which graph slots this boot's slot selector admitted: `handle = -1`, the
 /// answer is a mask (bit 0 = slot A, bit 1 = slot B), on an RP board only
@@ -886,12 +1019,6 @@ pub use super::registry::kernel::MODULE_FLOW_BUDGET;
 /// `ENOSYS` where the machine has no generic interrupt controller.
 pub use super::registry::kernel::SIGNAL_CORE;
 
-/// Read the hardware-provisioned ethernet MAC address from platform
-/// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,
-/// arg=output buffer of exactly 6 bytes. Returns 6 on success, or
-/// negative errno (ENODEV) if no MAC is available.
-pub use super::registry::kernel::GET_HW_ETHERNET_MAC;
-
 // ─────────────────────────────────────────────────────────────────────
 // Provider query keys
 // ─────────────────────────────────────────────────────────────────────
@@ -936,7 +1063,10 @@ pub mod query_key {
 
     /// The module occupancy that invoked the provider frame currently
     /// running: `handle = -1`; writes `[module idx: u16 LE][_pad: u16]
-    /// [slot generation: u32 LE]` (8 bytes) and returns 8. The generation
+    /// [slot generation: u32 LE][module type hash: u32 LE]` (12 bytes) and
+    /// returns 12; its first 8 bytes are the occupancy record
+    /// [`MODULE_LIVE`] takes. The type hash names the module's type, the
+    /// same for every instance of it. The generation
     /// moves whenever the slot is reset, restarted or given another module,
     /// so the pair names one occupancy: a provider stamps what it holds for
     /// a module with it and asks [`MODULE_LIVE`] later whether that
@@ -950,6 +1080,22 @@ pub mod query_key {
     /// lazily — before acting on the module's behalf — instead of relying on
     /// a release notification's timing.
     pub use super::super::registry::kernel::QUERY_MODULE_LIVE as MODULE_LIVE;
+
+    /// The durable owner uid of the module that invoked the provider frame
+    /// currently running: `handle = -1`; writes 16 bytes and returns 16.
+    /// A node-owned caller answers 16 zero bytes (the node's realm). `ESRCH`
+    /// when nothing is on the provider stack.
+    pub use super::super::registry::kernel::QUERY_CALLER_OWNER_UID as CALLER_OWNER_UID;
+
+    /// The authority the module that invoked the provider frame currently
+    /// running acts with: `handle = -1`; writes an 8-byte owner record as
+    /// [`CALLER_OWNER`] does — the node's (slot 0) for a node-owned module and
+    /// for an owner admitted with the node's authority, its own owner
+    /// otherwise — and returns 8. A provider of something that is the
+    /// node's (its routes, its packet policy) refuses a caller that does not
+    /// act with the node's authority. `ESRCH` when nothing is on the provider
+    /// stack.
+    pub use super::super::registry::kernel::QUERY_CALLER_AUTHORITY as CALLER_AUTHORITY;
 }
 
 // ─────────────────────────────────────────────────────────────────────

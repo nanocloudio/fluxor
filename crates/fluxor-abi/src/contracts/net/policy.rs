@@ -1,11 +1,12 @@
-// Contract: net.policy — the platform enforces packet policy and service NAT.
+// Contract: net.policy — the node's net provider enforces packet policy and
+// service NAT.
 //
 // Layer: contracts (public, stable).
 //
 // A consumer states WHAT traffic is allowed and where a virtual address leads;
-// the platform decides HOW: the host's packet filter on Linux, the native packet
-// filter on bare metal, nothing (and says so) where there is nothing to enforce
-// with.
+// the node's net provider decides HOW: the host's packet filter on Linux, the
+// `ip` module's own filter (or an in-graph enforcer it serves) on bare metal,
+// nothing (and says so) where there is nothing to enforce with.
 // The consumer never names a platform and never renders a platform's syntax,
 // so the same compiled policy runs everywhere and the difference between
 // targets is a capability bit, not a code path.
@@ -78,8 +79,7 @@
 // Little-endian lengths, big-endian addresses and ports (network order, as
 // they appear on the wire the rules describe).
 
-/// Provider class id (opcode class 0x15xx). Mirrors
-/// `kernel::module::provider::contract::NET_POLICY`.
+/// Provider class id (opcode class 0x15xx).
 pub const CLASS: u16 = super::super::super::registry::net_policy::ID;
 
 /// Capability bitmap. handle=-1 (or a bound handle); `arg` out is exactly 4

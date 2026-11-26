@@ -55,6 +55,8 @@ pub mod genstore_wire;
 pub mod gpu_exec_wire;
 /// The header every node image opens with, and its codec.
 pub mod node_image;
+/// A module's parameter schema: names, types, defaults and bounds.
+pub mod param_schema;
 /// UTF-8 text inside wire records: validation and scalar counts.
 pub mod utf8_text;
 

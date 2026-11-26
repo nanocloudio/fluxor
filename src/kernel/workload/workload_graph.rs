@@ -4,7 +4,7 @@
 //
 // The bare-metal realization of the `workload` contract: a workload is an owned
 // module subgraph, staged onto the live graph via the already-built owner /
-// lease / live-graph primitives.
+// live-graph primitives.
 // This is the metal twin of `platform::linux::workload` (the host-process
 // backend). It lives in `src/kernel` — not `src/platform/bcm2712` — because the
 // logic is kernel-generic: splice/`free_owner`/`owner_pause`
@@ -14,16 +14,23 @@
 //
 // Per-op mapping:
 //   CREATE  — decode the `source_ref` composed graph → the splice; stage paused
-//             (the START barrier); lease-gate the header endpoints; allocate a
-//             `WorkloadSlot`; return its index (the kernel wraps it in a
-//             handle).
+//             (the START barrier); allocate a `WorkloadSlot`; return its index
+//             (the kernel wraps it in a handle).
 //   START   — `owner_resume` (release the create-time pause).
 //   WAIT    — map the owner's live status → `[state:u8][code:i32 LE]`.
 //   SIGNAL  — TERM → `begin_drain`, KILL → `free_owner`.
 //   DESTROY — `free_owner` + clear the slot (idempotent).
 //   PAUSE / RESUME — `owner_pause` / `owner_resume` (direct).
-//   CAPS    — the metal bitmap: SHARED posture, FMOD_GRAPH source, PAUSE
-//             op, own-address net identity.
+//   CAPS    — the posture the node realizes, the source kinds, PAUSE and
+//             LOOKUP.
+//
+// The backend knows little of a workload's network: its address and name
+// service are the node agent's to give the node's net provider before START
+// (`net::identity` on the provider's `addr_ctl`); the endpoints it may
+// listen on are the `CREATE`'s `net`/`endpoint` options, which only a
+// creator acting with the node's authority gives (`endpoints::admit`); and
+// its lanes are kernel facts with no content
+// (`kernel::workload::lanes`).
 //
 // **Dispatch context invariant:** runtime splice/`free_owner` must run
 // on the primary domain / core 0 — `request_quiesce` (the peer-core quiesce
@@ -35,669 +42,10 @@ use crate::abi::contracts::workload as wl;
 use crate::kernel::exec::scheduler::{self, OwnerLiveStatus, OWNER_STATE_PAUSED};
 use crate::kernel::exec::scheduler::{live, splice};
 use crate::kernel::exec::step_guard::fault_type;
-use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::code_pack;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_NODE, OWNER_TABLE_SLOTS};
-use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
-use crate::kernel::workload::storage::StorageGrant;
-
-// ── Metal net identity install ───────────────────────────────────
-//
-// On CREATE of a `net=own` workload the backend installs the workload's
-// address into the node's shared net-identity provider by writing an
-// `ADDR_ADD` control frame to the provider's `addr_ctl` port; DESTROY/KILL
-// writes `ADDR_DEL`. The backend does NOT know which module the provider is,
-// what it is named, or how it stores addresses — the provider SELF-REGISTERS
-// at init via the `NET_IDENT_PROVIDER` syscall, declaring its module slot and
-// its control port index, and the backend speaks the shared
-// `net::identity` contract (opcodes, framing, payload layout) to whatever
-// registered. Any node-graph module implementing the contract's `addr_ctl`
-// receiver is a valid provider; the foundation `ip` module is one.
-
-use crate::abi::contracts::net::identity as netid;
-use portable_atomic::{AtomicU64, Ordering};
-
-/// Registered net-identity provider, packed as
-/// `[slot: u16][addr_ctl_port: u8][0: u8][slot generation: u32]`
-/// (little-endian view), or [`NO_PROVIDER`] when none has registered. One
-/// atomic so a reader never sees a torn registration. The generation names
-/// one occupancy of the slot: a registration whose slot has since been
-/// reset, restarted or given another module (a rebuild bumps every
-/// generation) is stale, resolves to no provider, and the next registrant
-/// takes it over — so a module that lands in the old slot is never taken for
-/// the provider (net.route's `REPORT`/`TAKE` admit by it).
-static NET_IDENT_PROVIDER_REG: AtomicU64 = AtomicU64::new(NO_PROVIDER);
-const NO_PROVIDER: u64 = u64::MAX;
-
-fn unpack_provider(packed: u64) -> (usize, u8, u32) {
-    (
-        (packed & 0xFFFF) as usize,
-        ((packed >> 16) & 0xFF) as u8,
-        (packed >> 32) as u32,
-    )
-}
-
-/// Whether a registration still names a live occupancy of its slot.
-fn provider_current(packed: u64) -> bool {
-    if packed == NO_PROVIDER {
-        return false;
-    }
-    let (slot, _, gen) = unpack_provider(packed);
-    scheduler::module_slot_generation(slot) == gen
-}
-
-/// Register `slot` (its current occupancy) as the node's net-identity
-/// provider with its declared control (`addr_ctl_port`) input-port index.
-/// First-wins while the registrant
-/// lives: a second registration returns `EBUSY`, unless the registered
-/// occupancy is gone (stale), when it takes over. One module is the node's
-/// network stack: with a live lane provider ([`crate::kernel::workload::net_attach`])
-/// in another slot the registration is `EACCES`, as `NET_PROVIDE` is from
-/// a slot other than the identity provider's, whichever registers first.
-/// The syscall path gates callers to node-graph (node-owned) modules; tests
-/// register directly.
-pub fn register_net_identity_provider(slot: u16, addr_ctl_port: u8) -> i32 {
-    if crate::kernel::workload::net_attach::live_provider_slot()
-        .is_some_and(|lane| lane != slot as usize)
-    {
-        return errno::EACCES;
-    }
-    let gen = scheduler::module_slot_generation(slot as usize);
-    let packed = (slot as u64) | ((addr_ctl_port as u64) << 16) | ((gen as u64) << 32);
-    let cur = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
-    if cur == packed {
-        // Same registration repeated (module re-init) is a benign no-op.
-        return 0;
-    }
-    if provider_current(cur) {
-        return errno::EBUSY;
-    }
-    match NET_IDENT_PROVIDER_REG.compare_exchange(cur, packed, Ordering::AcqRel, Ordering::Acquire)
-    {
-        Ok(_) => provision_addr_ctl(slot as usize, addr_ctl_port),
-        Err(now) if now == packed => 0,
-        Err(_) => errno::EBUSY,
-    }
-}
-
-/// `addr_ctl`'s ring, in bytes: the provider's declared buffer for it (`ip`'s
-/// manifest), low-rate control.
-const ADDR_CTL_RING_BYTES: u32 = 512;
-
-/// Give the provider's `addr_ctl` a channel when its graph left the port
-/// unwired. On a node that creates workloads the build refuses any module
-/// writer into `addr_ctl` — the kernel is its one writer — so the port is
-/// unwired there, and without a channel every identity install would answer
-/// `ENODEV`. A wired port (a coordinator's, on a node that creates no
-/// workloads) is left as it is. The provider reads the port after it
-/// registers.
-fn provision_addr_ctl(slot: usize, addr_ctl_port: u8) -> i32 {
-    if scheduler::get_module_port(slot, 0 /* PORT_IN */, addr_ctl_port) >= 0 {
-        return 0;
-    }
-    let cap = ADDR_CTL_RING_BYTES.to_le_bytes();
-    let ch = crate::kernel::ipc::channel::channel_open(&cap);
-    if ch < 0 {
-        NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
-        return ch;
-    }
-    scheduler::set_module_port(slot, 0 /* PORT_IN */, addr_ctl_port, ch);
-    0
-}
-
-/// Clear the registration (test isolation only — production providers live for
-/// the boot lifetime).
-#[cfg(feature = "host-linux")]
-pub fn reset_net_identity_provider() {
-    NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
-}
-
-/// The registered provider as `(slot, addr_ctl_port)`, or `None` (none
-/// registered, or its occupancy is gone).
-fn net_identity_provider() -> Option<(usize, u8)> {
-    let packed = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
-    if !provider_current(packed) {
-        return None;
-    }
-    let (slot, ctl, _) = unpack_provider(packed);
-    Some((slot, ctl))
-}
-
-/// Whether `(slot, generation)` is the registered net-identity provider.
-pub fn is_net_identity_provider(slot: usize, generation: u32) -> bool {
-    let packed = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
-    if !provider_current(packed) {
-        return false;
-    }
-    let (s, _, g) = unpack_provider(packed);
-    s == slot && g == generation
-}
-
-/// Whether a net-identity provider is registered in a live occupancy.
-pub fn net_identity_provider_present() -> bool {
-    provider_current(NET_IDENT_PROVIDER_REG.load(Ordering::Acquire))
-}
-
-// ── Per-owner name-service context ───────────────────────────────
-//
-// A workload's CREATE may carry the name service its queries go to and its
-// search list (`wl::resolver`, an options entry). The kernel holds it per
-// owner, keyed by the owner's (slot, generation) so a context never outlives
-// the occupancy it was given for, and the net provider (`ip`) reads it with
-// `wl::NET_RESOLVER`. It is written on the creator's core and read on the
-// provider's, so each entry is a sequence lock: a writer moves `seq` odd,
-// writes, moves it even; a reader copies and retries a bounded number of
-// times.
-
-#[derive(Clone, Copy)]
-struct ResolverCtx {
-    generation: u32,
-    len: u16,
-    data: [u8; wl::resolver::MAX],
-}
-
-impl ResolverCtx {
-    const EMPTY: ResolverCtx = ResolverCtx {
-        generation: 0,
-        len: 0,
-        data: [0; wl::resolver::MAX],
-    };
-}
-
-/// One context per owner slot, sized with the owner table.
-static mut RESOLVER_CTX: crate::kernel::mem::table::Table<ResolverCtx, OWNER_TABLE_SLOTS> = crate::boot_table!(
-    OWNER_TABLE_SLOTS,
-    ResolverCtx::EMPTY,
-    crate::abi::contracts::resource::POOL_OWNERS
-);
-/// The sequence of every context entry: writes are rare (one per CREATE),
-/// so one counter for the table keeps the reader's check one load.
-static RESOLVER_SEQ: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-const RESOLVER_READ_RETRIES: usize = 8;
-
-/// Check a resolver context value: a known family, a whole search list.
-fn resolver_ctx_ok(v: &[u8]) -> bool {
-    if v.len() < wl::resolver::HEAD || v.len() > wl::resolver::MAX {
-        return false;
-    }
-    if v[0] != wl::NET_FAM_IPV4 || v[1..17].iter().skip(4).any(|&b| b != 0) {
-        return false;
-    }
-    let n = v[17] as usize;
-    let mut at = wl::resolver::HEAD;
-    for _ in 0..n {
-        let Some(&len) = v.get(at) else {
-            return false;
-        };
-        let len = len as usize;
-        if len == 0 || len > crate::abi::contracts::net::net_proto::MAX_NAME_LEN {
-            return false;
-        }
-        at += 1 + len;
-    }
-    at == v.len()
-}
-
-/// One options entry: `[ns_len:u8][ns][key_len:u8][key][flags:u8]
-/// [val_len:u16 LE][val]`.
-#[derive(Clone, Copy)]
-struct CreateOption<'a> {
-    ns: &'a [u8],
-    key: &'a [u8],
-    flags: u8,
-    val: &'a [u8],
-}
-
-/// The entries of a options envelope, in order; `Err(EINVAL)` at the
-/// first that overruns it.
-struct CreateOptionIter<'a> {
-    opts: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Iterator for CreateOptionIter<'a> {
-    type Item = Result<CreateOption<'a>, i32>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.at >= self.opts.len() {
-            return None;
-        }
-        let opts = self.opts;
-        let at = self.at;
-        let entry = || -> Result<(CreateOption<'a>, usize), i32> {
-            let ns_len = *opts.get(at).ok_or(errno::EINVAL)? as usize;
-            let ns = opts.get(at + 1..at + 1 + ns_len).ok_or(errno::EINVAL)?;
-            let k = at + 1 + ns_len;
-            let key_len = *opts.get(k).ok_or(errno::EINVAL)? as usize;
-            let key = opts.get(k + 1..k + 1 + key_len).ok_or(errno::EINVAL)?;
-            let f = k + 1 + key_len;
-            let flags = *opts.get(f).ok_or(errno::EINVAL)?;
-            let vl = u16::from_le_bytes([
-                *opts.get(f + 1).ok_or(errno::EINVAL)?,
-                *opts.get(f + 2).ok_or(errno::EINVAL)?,
-            ]) as usize;
-            let val = opts.get(f + 3..f + 3 + vl).ok_or(errno::EINVAL)?;
-            Ok((
-                CreateOption {
-                    ns,
-                    key,
-                    flags,
-                    val,
-                },
-                f + 3 + vl,
-            ))
-        };
-        match entry() {
-            Ok((o, next)) => {
-                self.at = next;
-                Some(Ok(o))
-            }
-            Err(e) => {
-                self.at = opts.len();
-                Some(Err(e))
-            }
-        }
-    }
-}
-
-fn create_option_entries(opts: &[u8]) -> CreateOptionIter<'_> {
-    CreateOptionIter { opts, at: 0 }
-}
-
-/// An `env`/`var` entry's `(name, value)`: the name up to the first `=`,
-/// never empty, at most `wl::env::MAX_NAME`; `None` for anything else.
-fn env_entry(val: &[u8]) -> Option<(&[u8], &[u8])> {
-    let eq = val.iter().position(|&b| b == b'=')?;
-    (eq > 0 && eq <= wl::env::MAX_NAME).then(|| (&val[..eq], &val[eq + 1..]))
-}
-
-/// Whether this backend lends volumes (`wl::volume`): where the platform
-/// resolves a workload's `fs` paths through a root it can bind beneath.
-const LENDS_VOLUMES: bool = cfg!(feature = "host-linux");
-
-/// What a CREATE's options ask of this backend, every entry checked.
-struct CreateOptions<'a> {
-    /// The owner's name-service context, when one was given.
-    resolver: Option<&'a [u8]>,
-    /// The options envelope itself: its `env`/`var` entries feed the
-    /// subgraph's env binds ([`bind_env`]), its volumes the platform root.
-    opts: &'a [u8],
-}
-
-/// Walk the CREATE's Options: the resolver context is taken, the
-/// environment and the volumes are checked, every other entry is advisory
-/// unless required, and a required entry this backend does not realize
-/// fails admission (`ENOSYS`).
-fn create_options(opts: &[u8]) -> Result<CreateOptions<'_>, i32> {
-    let mut ctx = None;
-    let mut volumes = 0usize;
-    let mut vaults = 0usize;
-    for o in create_option_entries(opts) {
-        let o = o?;
-        if o.ns == wl::resolver::NS && o.key == wl::resolver::KEY {
-            if !resolver_ctx_ok(o.val) {
-                return Err(errno::EINVAL);
-            }
-            ctx = Some(o.val);
-        } else if o.ns == wl::env::NS && o.key == wl::env::KEY {
-            if env_entry(o.val).is_none() {
-                return Err(errno::EINVAL);
-            }
-        } else if LENDS_VOLUMES && o.ns == wl::volume::NS && o.key == wl::volume::KEY {
-            if volume_entry(o.val).is_none() {
-                return Err(errno::EINVAL);
-            }
-            volumes += 1;
-            if volumes > wl::volume::MAX {
-                return Err(errno::E2BIG);
-            }
-        } else if LENDS_VOLUMES && o.ns == wl::vault::NS && o.key == wl::vault::KEY {
-            if vault_entry(o.val).is_none() {
-                return Err(errno::EINVAL);
-            }
-            vaults += 1;
-            if vaults > 1 {
-                return Err(errno::EINVAL);
-            }
-        } else if o.flags & wl::opt::OPT_REQUIRED != 0 {
-            return Err(errno::ENOSYS);
-        }
-    }
-    Ok(CreateOptions {
-        resolver: ctx,
-        opts,
-    })
-}
-
-/// A `mount`/`bind` value: `(src, dst, read_only)`. `src` absolute, `dst`
-/// not empty, `ro` `1` or `0` (writable when left out, as the host-process
-/// backend reads it); nothing else.
-fn volume_entry(val: &[u8]) -> Option<(&[u8], &[u8], bool)> {
-    let mut parts = val.split(|&b| b == 0);
-    let src = parts.next()?;
-    let dst = parts.next()?;
-    let ro = match parts.next() {
-        None | Some(b"0") => false,
-        Some(b"1") => true,
-        Some(_) => return None,
-    };
-    if parts.next().is_some() || !src.starts_with(b"/") || dst.is_empty() {
-        return None;
-    }
-    Some((src, dst, ro))
-}
-
-/// A `vault`/`store` value: `(dir, seal_key)`. `dir` not empty, the key
-/// exactly 64 hex digits; nothing else.
-fn vault_entry(val: &[u8]) -> Option<(&[u8], [u8; wl::vault::SEAL_KEY_LEN])> {
-    let cut = val.iter().position(|&b| b == 0)?;
-    let (dir, hex) = (&val[..cut], &val[cut + 1..]);
-    if dir.is_empty() || hex.len() != 2 * wl::vault::SEAL_KEY_LEN {
-        return None;
-    }
-    let nibble = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    };
-    let mut key = [0u8; wl::vault::SEAL_KEY_LEN];
-    for (i, k) in key.iter_mut().enumerate() {
-        *k = (nibble(hex[2 * i])? << 4) | nibble(hex[2 * i + 1])?;
-    }
-    Some((dir, key))
-}
-
-/// Lend the CREATE's volumes to `owner`, before any of its modules runs,
-/// then give it its own vault in one of them. A volume that cannot be lent,
-/// or a vault that cannot be set up, fails the CREATE.
-#[cfg(feature = "host-linux")]
-fn lend_volumes(owner: OwnerHandle, opts: &[u8]) -> Result<(), i32> {
-    for o in create_option_entries(opts).flatten() {
-        if o.ns == wl::volume::NS && o.key == wl::volume::KEY {
-            let (src, dst, ro) = volume_entry(o.val).ok_or(errno::EINVAL)?;
-            // SAFETY: scheduler thread, as every platform dispatch.
-            unsafe { crate::platform::linux::owner_root::lend(owner, src, dst, ro)? };
-        }
-    }
-    for o in create_option_entries(opts).flatten() {
-        if o.ns == wl::vault::NS && o.key == wl::vault::KEY {
-            let (dir, mut key) = vault_entry(o.val).ok_or(errno::EINVAL)?;
-            // SAFETY: scheduler thread, as every platform dispatch.
-            let r = unsafe { crate::platform::linux::owner_root::set_vault(owner, dir, key) };
-            for b in key.iter_mut() {
-                // SAFETY: a live, exclusively-borrowed byte.
-                unsafe { core::ptr::write_volatile(b, 0) };
-            }
-            r?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "host-linux"))]
-fn lend_volumes(_owner: OwnerHandle, _opts: &[u8]) -> Result<(), i32> {
-    Ok(())
-}
-
-// ── Env binds ─────────────────────────────────────────────────────
-//
-// A module param the graph binds to an environment name travels as an env
-// bind record (`wl::env`, tag `wl::env::BIND_TAG`) in its params TLV. The
-// backend copies the caller's subgraph into its own memory through
-// [`bind_env`], which writes every record out as the param's entries.
-
-/// The value the last `env`/`var` entry gives `name`.
-fn env_value<'a>(opts: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut found = None;
-    for o in create_option_entries(opts).flatten() {
-        if o.ns == wl::env::NS && o.key == wl::env::KEY {
-            if let Some((n, v)) = env_entry(o.val) {
-                if n == name {
-                    found = Some(v);
-                }
-            }
-        }
-    }
-    found
-}
-
-/// An integer as an env value writes it: decimal, `0x` hex, `true`/`false`.
-fn parse_env_int(v: &[u8]) -> Option<u64> {
-    match v {
-        b"true" => return Some(1),
-        b"false" => return Some(0),
-        _ => {}
-    }
-    let (digits, radix) = match v.strip_prefix(b"0x").or_else(|| v.strip_prefix(b"0X")) {
-        Some(h) => (h, 16u32),
-        None => (v, 10u32),
-    };
-    if digits.is_empty() {
-        return None;
-    }
-    let mut n: u64 = 0;
-    for &c in digits {
-        let d = (c as char).to_digit(radix)? as u64;
-        n = n.checked_mul(radix as u64)?.checked_add(d)?;
-    }
-    Some(n)
-}
-
-/// A bounded writer over the backend's copy of the subgraph.
-struct BlobOut<'a> {
-    buf: &'a mut [u8],
-    at: usize,
-}
-
-impl BlobOut<'_> {
-    fn put(&mut self, b: &[u8]) -> Result<(), i32> {
-        let end = self.at.checked_add(b.len()).ok_or(errno::E2BIG)?;
-        self.buf
-            .get_mut(self.at..end)
-            .ok_or(errno::E2BIG)?
-            .copy_from_slice(b);
-        self.at = end;
-        Ok(())
-    }
-
-    /// One params entry, or several 255-byte ones under `tag` for a value
-    /// longer than one entry carries.
-    fn entries(&mut self, tag: u8, v: &[u8]) -> Result<(), i32> {
-        for chunk in v.chunks(u8::MAX as usize) {
-            self.put(&[tag, chunk.len() as u8])?;
-            self.put(chunk)?;
-        }
-        Ok(())
-    }
-}
-
-/// Write one env bind record out as its param's entries.
-fn emit_bind(rec: &[u8], opts: &[u8], out: &mut BlobOut<'_>) -> Result<(), i32> {
-    use wl::env as e;
-    if rec.len() < e::HEAD {
-        return Err(errno::EINVAL);
-    }
-    let (target, kind, flags, name_len) = (rec[0], rec[1], rec[2], rec[3] as usize);
-    let both = e::FLAG_REQUIRED | e::FLAG_DEFAULT;
-    if target >= e::BIND_TAG
-        || name_len == 0
-        || name_len > e::MAX_NAME
-        || flags & !both != 0
-        || flags == both
-    {
-        return Err(errno::EINVAL);
-    }
-    let name = rec.get(e::HEAD..e::HEAD + name_len).ok_or(errno::EINVAL)?;
-    let default = &rec[e::HEAD + name_len..];
-    if flags & e::FLAG_DEFAULT == 0 && !default.is_empty() {
-        return Err(errno::EINVAL);
-    }
-    let width = match kind {
-        e::KIND_U8 => Some(1),
-        e::KIND_U16 => Some(2),
-        e::KIND_U32 => Some(4),
-        e::KIND_STR | e::KIND_STR_CHUNKED => None,
-        _ => return Err(errno::EINVAL),
-    };
-    let text = |v: &[u8], out: &mut BlobOut<'_>| -> Result<(), i32> {
-        if kind == e::KIND_STR && v.len() > u8::MAX as usize {
-            return Err(errno::EINVAL);
-        }
-        out.entries(target, v)
-    };
-    match (env_value(opts, name), width) {
-        (Some(v), Some(w)) => {
-            let n = parse_env_int(v).ok_or(errno::EINVAL)?;
-            if n >> (8 * w) != 0 {
-                return Err(errno::EINVAL);
-            }
-            out.entries(target, &n.to_le_bytes()[..w])
-        }
-        (Some(v), None) => text(v, out),
-        (None, Some(w)) if flags & e::FLAG_DEFAULT != 0 => {
-            if default.len() != w {
-                return Err(errno::EINVAL);
-            }
-            out.entries(target, default)
-        }
-        (None, None) if flags & e::FLAG_DEFAULT != 0 => text(default, out),
-        (None, _) if flags & e::FLAG_REQUIRED != 0 => Err(errno::EINVAL),
-        (None, _) => Ok(()),
-    }
-}
-
-/// TLV header byte and terminator of a module's params.
-const TLV_MAGIC: u8 = 0xFE;
-const TLV_END: u8 = 0xFF;
-
-/// Write a module's params out with every env bind record replaced by its
-/// param's entries; params with none are copied as they are.
-fn bind_params(p: &[u8], opts: &[u8], out: &mut BlobOut<'_>) -> Result<(), i32> {
-    let start = if p.len() >= 4 && p[0] == TLV_MAGIC {
-        4
-    } else {
-        0
-    };
-    // Is there a record at all? Walked as the kernel walks params.
-    let mut pos = start;
-    let mut binds = false;
-    while pos + 2 <= p.len() && p[pos] != TLV_END {
-        binds |= p[pos] == wl::env::BIND_TAG;
-        pos += 2 + p[pos + 1] as usize;
-    }
-    if !binds {
-        return out.put(p);
-    }
-    let head_at = out.at;
-    out.put(&p[..start])?;
-    let payload_at = out.at;
-    let mut pos = start;
-    loop {
-        if pos + 2 > p.len() {
-            return Err(errno::EINVAL); // a record in params with no terminator
-        }
-        let (tag, len) = (p[pos], p[pos + 1] as usize);
-        if tag == TLV_END {
-            // The terminator, and whatever follows it, as they are; the
-            // header's advisory length runs through the terminator.
-            let end_at = out.at + 2;
-            out.put(&p[pos..])?;
-            if start == 4 {
-                let n = u16::try_from(end_at - payload_at).unwrap_or(u16::MAX);
-                out.buf[head_at + 2..head_at + 4].copy_from_slice(&n.to_le_bytes());
-            }
-            return Ok(());
-        }
-        let val = p.get(pos + 2..pos + 2 + len).ok_or(errno::EINVAL)?;
-        if tag == wl::env::BIND_TAG {
-            emit_bind(val, opts, out)?;
-        } else {
-            out.put(&p[pos..pos + 2 + len])?;
-        }
-        pos += 2 + len;
-    }
-}
-
-/// Copy a composed graph into `out` with each module's env bind records
-/// written out from the CREATE's `env`/`var` entries in `opts` (the
-/// contract's `wl::env`). The length written; `EINVAL` for a graph the codec
-/// refuses or a malformed record, or a required name no entry gives; `E2BIG`
-/// when a module record passes a `u16` or the graph `out`.
-pub fn bind_env(src: &[u8], opts: &[u8], out: &mut [u8]) -> Result<usize, i32> {
-    use fluxor_contracts::graph::{self, MODULE_HEAD_LEN, RECORD_ALIGN};
-    let g = graph::decode(src).map_err(|_| errno::EINVAL)?;
-    let mut o = BlobOut { buf: out, at: 0 };
-    let order_end =
-        (graph::HEADER_LEN + 2 * usize::from(g.module_count())).next_multiple_of(RECORD_ALIGN);
-    o.put(&src[..order_end])?;
-    let mut at = order_end;
-    for _ in 0..g.module_count() {
-        let len = usize::from(u16::from_le_bytes([src[at], src[at + 1]]));
-        let record_at = o.at;
-        o.put(&src[at..at + MODULE_HEAD_LEN])?;
-        bind_params(&src[at + MODULE_HEAD_LEN..at + len], opts, &mut o)?;
-        let written = u16::try_from(o.at - record_at).map_err(|_| errno::E2BIG)?;
-        o.buf[record_at..record_at + 2].copy_from_slice(&written.to_le_bytes());
-        while !o.at.is_multiple_of(RECORD_ALIGN) {
-            o.put(&[0])?;
-        }
-        at += len.next_multiple_of(RECORD_ALIGN);
-    }
-    o.put(&src[at..])?;
-    Ok(o.at)
-}
-
-/// Record owner `owner`'s context (the CREATE that made it carried one).
-unsafe fn resolver_ctx_set(owner: OwnerHandle, v: &[u8]) {
-    let t = &mut *core::ptr::addr_of_mut!(RESOLVER_CTX);
-    let Some(e) = t.get_mut(owner.slot as usize) else {
-        return;
-    };
-    RESOLVER_SEQ.fetch_add(1, Ordering::AcqRel);
-    e.generation = owner.generation;
-    e.len = v.len().min(wl::resolver::MAX) as u16;
-    e.data[..e.len as usize].copy_from_slice(&v[..e.len as usize]);
-    RESOLVER_SEQ.fetch_add(1, Ordering::AcqRel);
-}
-
-/// `wl::NET_RESOLVER` for the net provider at `slot`.
-unsafe fn resolver_ctx_read(slot: usize, buf: &mut [u8]) -> i32 {
-    if !crate::kernel::workload::net_attach::is_lane_provider(slot) {
-        return errno::EACCES;
-    }
-    if buf.len() < 8 {
-        return errno::EINVAL;
-    }
-    let owner_slot = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    let owner_gen = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let t = &*core::ptr::addr_of!(RESOLVER_CTX);
-    let Some(e) = t.get(owner_slot) else {
-        return errno::ENOENT;
-    };
-    for _ in 0..RESOLVER_READ_RETRIES {
-        let seq = RESOLVER_SEQ.load(Ordering::Acquire);
-        if seq & 1 != 0 {
-            core::hint::spin_loop();
-            continue;
-        }
-        let copy = core::ptr::read_volatile(e);
-        if RESOLVER_SEQ.load(Ordering::Acquire) != seq {
-            continue;
-        }
-        if copy.generation != owner_gen || copy.len == 0 || owner_gen == 0 {
-            return errno::ENOENT;
-        }
-        let n = copy.len as usize;
-        if buf.len() < n {
-            return errno::ERANGE;
-        }
-        buf[..n].copy_from_slice(&copy.data[..n]);
-        return n as i32;
-    }
-    errno::EAGAIN
-}
 
 /// One admitted metal workload: its owner subgraph. Mirrors the Linux
 /// `WorkloadSlot`, minus the host-process backend index (the subgraph *is* the
@@ -706,15 +54,6 @@ unsafe fn resolver_ctx_read(slot: usize, buf: &mut [u8]) -> i32 {
 struct WorkloadSlot {
     in_use: bool,
     owner: OwnerHandle,
-    /// The workload's installed IPv4 identity (16-byte address, IPv4 in bytes
-    /// 0..4 network order), or all-zero for a host-shared workload that never
-    /// took one. Retained at CREATE so DESTROY/KILL can emit the matching
-    /// `ADDR_DEL`.
-    net_addr: [u8; 16],
-    /// The `net.route` segment the identity joined (0: none). A segment with
-    /// a workload on it cannot leave the table (`net_route` SEGMENTS answers
-    /// `EBUSY`) while that identity is installed.
-    net_segment: u16,
     /// The creating module's lanes into the subgraph (`wl::LANE`).
     lanes: [CallerLane; wl::MAX_CALLER_LANES],
     lane_count: u8,
@@ -738,8 +77,6 @@ const NO_LANE: CallerLane = CallerLane {
 const WL_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
     owner: OWNER_NODE,
-    net_addr: [0u8; 16],
-    net_segment: 0,
     lanes: [NO_LANE; wl::MAX_CALLER_LANES],
     lane_count: 0,
 };
@@ -813,19 +150,13 @@ struct PendingCreate {
     caller_edge_count: usize,
 }
 
-/// What a `CREATE` holds from its first call to its last: the add it stages,
-/// and the name-service context of the owner that exists only once the last
-/// module is in.
+/// What a `CREATE` holds from its first call to its last: the add it stages.
 struct Staging {
     pending: Option<PendingCreate>,
-    resolver: (u16, [u8; wl::resolver::MAX]),
 }
 
 impl Staging {
-    const EMPTY: Staging = Staging {
-        pending: None,
-        resolver: (0, [0; wl::resolver::MAX]),
-    };
+    const EMPTY: Staging = Staging { pending: None };
 }
 
 /// A graph source is at most a `u16` long (the header's `source_ref_len`).
@@ -961,107 +292,6 @@ fn clamp_cap(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
     buf[off..off + 4].copy_from_slice(&clamped.to_le_bytes());
 }
 
-/// Resolve the net-identity provider's `addr_ctl` channel from the
-/// registration, or `-1` when no provider has registered (a node with
-/// no network stack).
-fn addr_ctl_channel() -> i32 {
-    match net_identity_provider() {
-        Some((slot, addr_ctl_port)) => {
-            scheduler::get_module_port(slot, 0 /* PORT_IN */, addr_ctl_port)
-        }
-        None => -1,
-    }
-}
-
-/// Single-writer gate: the backend is the *sole* writer of `addr_ctl`, so
-/// the node graph must leave the channel producer-less (no module edged into
-/// it). `channel_producer_owner` returns `OWNER_NODE` for a producer-less (or
-/// benign node-anchored) channel; a non-node producer means a mis-wired node
-/// graph — `channel_write` on an SPSC FIFO with a second producer violates the
-/// invariant, so we refuse rather than double-write.
-fn addr_ctl_writable(ch: i32) -> bool {
-    scheduler::channel_producer_module(ch).is_none()
-}
-
-/// Whether a module writes the registered net-identity provider's
-/// `addr_ctl`: the direct coordinator path (a fence coordinator, a capture
-/// harness). On such a graph the kernel installs no workload identity and
-/// the provider realizes no held address — one writer per ring (the build
-/// refuses the same on a graph that creates workloads).
-pub fn direct_addr_ctl_wired() -> bool {
-    let ch = addr_ctl_channel();
-    ch >= 0 && !addr_ctl_writable(ch)
-}
-
-/// Write one `net::identity`-framed `addr_ctl` control frame: `[msg_type:u8]
-/// [payload_len:u16 LE][payload]` (the shared net-contract TLV framing). Returns
-/// true iff the whole frame was accepted (the provider reads header+body
-/// atomically; a short write would desync the ring).
-///
-/// # Safety
-/// Scheduler-thread only (writes an SPSC channel by id). `ch` must be a valid
-/// channel and `payload.len() <= netid::MAX_PAYLOAD`.
-unsafe fn write_addr_ctl_frame(ch: i32, msg_type: u8, payload: &[u8]) -> bool {
-    let mut frame = [0u8; netid::FRAME_HDR + netid::MAX_PAYLOAD];
-    frame[0] = msg_type;
-    frame[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    frame[netid::FRAME_HDR..netid::FRAME_HDR + payload.len()].copy_from_slice(payload);
-    let total = netid::FRAME_HDR + payload.len();
-    channel_write(ch, frame.as_ptr(), total) == total as i32
-}
-
-/// Install a `net=own` workload's IPv4 identity into the net-identity provider
-///: resolve the `addr_ctl` channel, assert single-writer, and write
-/// `ADDR_ADD [addr:16][prefix_len:1][owner_tag:2 LE]` with
-/// `owner_tag = owner_slot`. The address is live before START releases the
-/// workload. Returns 0, or a negative errno:
-///   * `ENODEV` — no provider registered, so no `addr_ctl` (a `net=own`
-///     CREATE on a node with no network stack fails cleanly — never silently
-///     dropped; a registered provider's unwired port is given its channel at
-///     registration, [`provision_addr_ctl`]),
-///   * `EBUSY`  — the node graph wired a producer into addr_ctl (mis-wire),
-///   * `EAGAIN` — the low-rate control ring rejected the frame.
-///
-/// # Safety
-/// Scheduler-thread only. `addr16.len() == 16`.
-unsafe fn install_identity(addr16: &[u8], prefix_len: u8, owner_slot: u16) -> i32 {
-    let ch = addr_ctl_channel();
-    if ch < 0 {
-        return errno::ENODEV;
-    }
-    if !addr_ctl_writable(ch) {
-        return errno::EBUSY;
-    }
-    let mut payload = [0u8; netid::MAX_PAYLOAD];
-    payload[0..16].copy_from_slice(addr16);
-    payload[netid::ADD_PREFIX_LEN_OFF] = prefix_len;
-    payload[netid::ADD_OWNER_TAG_OFF..netid::ADD_OWNER_TAG_OFF + 2]
-        .copy_from_slice(&owner_slot.to_le_bytes());
-    if write_addr_ctl_frame(ch, netid::ADDR_ADD, &payload[..netid::ADDR_ADD_PAYLOAD_LEN]) {
-        0
-    } else {
-        errno::EAGAIN
-    }
-}
-
-/// Emit `ADDR_DEL [addr:16]` for a torn-down workload's address.
-/// Best-effort: a zero address (host-shared workload, never installed) is a
-/// no-op, and if the provider / addr_ctl is gone or the ring is momentarily
-/// full the address ages out with the freed owner anyway.
-///
-/// # Safety
-/// Scheduler-thread only.
-unsafe fn remove_identity(addr16: &[u8; 16]) {
-    if addr16.iter().all(|&b| b == 0) {
-        return;
-    }
-    let ch = addr_ctl_channel();
-    if ch < 0 || !addr_ctl_writable(ch) {
-        return;
-    }
-    let _ = write_addr_ctl_frame(ch, netid::ADDR_DEL, addr16);
-}
-
 /// Admit a new `CREATE` and stage its subgraph as the pending one: stage and
 /// admit its pack, refuse a module holding a node privilege, copy the
 /// subgraph into the backend's own memory (carrying the header's identity
@@ -1095,8 +325,7 @@ unsafe fn begin_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
 
     // ── Stage the subgraph: decode it, reserve the owner, assign slots and
     //    open its channels. A workload's traffic reaches the node's network
-    //    over its own `Endpoint::Net` lanes; `net=own` adds only the
-    //    identity install.
+    //    over its own lanes (`Endpoint::Lane`).
     live::set_caller(Some(scheduler::current_module_index()));
     let begun = splice::begin_encoded(blob);
     live::set_caller(None);
@@ -1152,10 +381,9 @@ unsafe fn stage_pack(buf: &[u8], req: &CreateSpec<'_>) -> Result<Option<code_pac
     Ok(Some(staged))
 }
 
-/// The backend's own copy of the subgraph: its modules' grants checked, its
-/// env binds written out from the CREATE's environment, carrying the
-/// header's identity (what the splice allocates the owner by) and the memory
-/// ceiling clamped onto the subgraph's caps.
+/// The backend's own copy of the subgraph: its modules' grants checked,
+/// carrying the header's identity (what the splice allocates the owner by)
+/// and the memory ceiling clamped onto the subgraph's caps.
 ///
 /// # Safety
 /// Scheduler thread; the pack the subgraph names is staged.
@@ -1181,9 +409,28 @@ unsafe fn own_subgraph(buf: &[u8], req: &CreateSpec<'_>) -> Result<&'static mut 
         // retried.
         return Err(errno::EACCES);
     }
+    // Every contract a module's claims require as configured is served to
+    // the new owner: by a module of its own subgraph, a workload layer of
+    // the node's or a platform provider that serves workloads. Refused here
+    // rather than answered at the first call; an optional claim, and a
+    // conditional one its params do not exercise, require nothing.
+    let provided = splice::module_provides(src_graph).ok_or(errno::EINVAL)?;
+    let required = splice::module_required_claims(src_graph).ok_or(errno::EINVAL)?;
+    for c in 0..64u16 {
+        if required & (1u64 << c) != 0
+            && provided & (1u64 << c) == 0
+            && !crate::kernel::module::provider::served_to_workload(c)
+        {
+            log::warn!(
+                "[workload] create refused: a module claims contract 0x{c:02x}, which no \
+                 provider serves to a workload here and the workload does not compose"
+            );
+            return Err(errno::ENOSYS);
+        }
+    }
     let pending = pending_blob().ok_or(errno::ENOSPC)?;
-    let blob_len = bind_env(src_graph, req.opts, pending)?;
-    let blob = &mut pending[..blob_len];
+    let blob = pending.get_mut(..src_graph.len()).ok_or(errno::E2BIG)?;
+    blob.copy_from_slice(src_graph);
     blob[GRAPH_OWNER_UID_OFF..GRAPH_OWNER_UID_OFF + 16].copy_from_slice(&req.identity);
     let mem_ceil = if req.memory_bytes == 0 {
         None
@@ -1195,22 +442,31 @@ unsafe fn own_subgraph(buf: &[u8], req: &CreateSpec<'_>) -> Result<&'static mut 
     Ok(blob)
 }
 
-/// What `owner` may hold in the node's storage, and the volumes it is lent.
+/// The owner's storage line as the header names it: installed and capped
+/// at `storage_bytes`, or none.
 ///
 /// # Safety
 /// Scheduler thread.
 #[inline(never)]
-unsafe fn grant_storage(owner: OwnerHandle, req: &CreateSpec<'_>) -> Result<(), i32> {
-    scheduler::owners_mut().set_storage_cap(owner, req.storage_bytes);
-    scheduler::owners_mut().set_storage_grant(owner, req.storage_grant);
-    lend_volumes(owner, req.opts)
+unsafe fn install_storage_line(owner: OwnerHandle, req: &CreateSpec<'_>) -> Result<(), i32> {
+    use crate::abi::contracts::resource::OWNER_LINE_STORAGE;
+    let owners = scheduler::owners_mut();
+    let ok = if req.storage_line {
+        owners.set_line(owner, OWNER_LINE_STORAGE, req.storage_bytes)
+    } else {
+        owners.remove_line(owner, OWNER_LINE_STORAGE)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(errno::ESRCH)
+    }
 }
 
-/// The staged add as the pending CREATE: its storage cap and grant and the
-/// volumes it is lent set before any of its modules runs, and the
-/// creator's own lanes (`Caller` edges) noted, each landing at the add's
-/// first edge plus its position. 0, or the negative errno with the add
-/// abandoned.
+/// The staged add as the pending CREATE: its storage line installed before
+/// any of its modules runs, and the creator's own lanes (`Caller` edges)
+/// noted, each landing at the add's first edge plus its position. 0, or the
+/// negative errno with the add abandoned.
 ///
 /// # Safety
 /// Scheduler thread.
@@ -1228,7 +484,16 @@ unsafe fn seat_pending(
         }
         e
     };
-    if let Err(e) = grant_storage(staged_add.handle(), req) {
+    if let Err(e) = install_storage_line(staged_add.handle(), req) {
+        return abandon(staged_add, e);
+    }
+    // The endpoints its options grant, checked whole by `parse_create`.
+    let opts = wl::CreateHeader::parse(buf).map_or(0..0, |(_, _, o)| o);
+    let endpoints = wl::opt::iter(&buf[opts])
+        .filter_map(Result::ok)
+        .filter(is_endpoint)
+        .flat_map(|o| crate::kernel::workload::endpoints::listed(o.val));
+    if let Err(e) = crate::kernel::workload::endpoints::admit(staged_add.handle(), endpoints) {
         return abandon(staged_add, e);
     }
     let src_graph = &buf[req.graph_off..req.graph_off + req.graph_len];
@@ -1266,18 +531,10 @@ struct CreateSpec<'a> {
     src_start: usize,
     memory_bytes: u64,
     storage_bytes: u64,
-    storage_grant: StorageGrant,
-    wants_identity: bool,
+    /// The header's `storage` byte: whether the owner holds a storage line.
+    storage_line: bool,
     identity: [u8; 16],
     spec: [u8; 32],
-    opts: &'a [u8],
-    resolver_ctx: Option<&'a [u8]>,
-    ep_start: usize,
-    endpoint_count: usize,
-    net_family: u8,
-    net_prefix_len: u8,
-    net_segment: u16,
-    net_addr: [u8; 16],
 }
 
 /// WORKLOAD_CREATE: stage a fmod-graph workload as a new owner subgraph from
@@ -1299,7 +556,7 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     if rc != 0 {
         return rc;
     }
-    advance_create(buf, &req)
+    advance_create()
 }
 
 /// The CREATE's spec read and checked, before anything is staged.
@@ -1308,98 +565,33 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
 /// Scheduler thread.
 #[inline(never)]
 unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<CreateSpec<'a>, i32> {
-    let arg_len = buf.len();
-    if arg_len < wl::CREATE_HEADER_SIZE {
-        return Err(errno::EINVAL);
-    }
-
-    let posture = buf[16];
-    let source_kind = buf[17];
-    let net_iso = buf[18];
-    let memory_bytes = u64::from_le_bytes([
-        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-    ]);
-    let storage_bytes = u64::from_le_bytes([
-        buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
-    ]);
-    let Some(storage_grant) = StorageGrant::from_wire(buf[19]) else {
-        return Err(errno::EINVAL);
+    let (h, src, opts) = wl::CreateHeader::parse(buf).ok_or(errno::EINVAL)?;
+    let storage_line = match h.storage {
+        wl::STORAGE_OWN_ROOT => true,
+        wl::STORAGE_NONE => false,
+        _ => return Err(errno::EINVAL),
     };
-    let source_ref_len = rd_u16(buf, 40) as usize;
-    let endpoint_count = rd_u16(buf, 42) as usize;
-    let options_len = rd_u32(buf, 44) as usize;
-    let net_family = buf[48];
-    let net_prefix_len = buf[49];
-    let net_segment = rd_u16(buf, 50);
-    // net_addr @52..68 (16 bytes; IPv4 in bytes 0..4, network order) — matches
-    // the `net::identity` ADDR_ADD address-slot layout, so it copies straight
-    // into the payload with no re-order.
-    let mut net_addr = [0u8; 16];
-    net_addr.copy_from_slice(&buf[52..68]);
-
-    // Section bounds.
-    let src_start = wl::CREATE_HEADER_SIZE;
-    let ep_start = src_start + source_ref_len;
-    let opt_start = ep_start + endpoint_count * wl::NET_ENDPOINT_SIZE;
-    let opt_end = opt_start + options_len;
-    if opt_end > arg_len {
-        return Err(errno::EINVAL);
-    }
 
     // ── Header validation (cheap, before any owner is allocated). Honest,
     //    fail-closed: this backend realizes only what CAPS advertises.
     // Backend selection is by source kind: only the fmod-graph source resolves
     // to the metal backend (a host-process source → the Linux host-process backend).
-    if source_kind != wl::SOURCE_FMOD_GRAPH && source_kind != wl::SOURCE_FMOD_PACK {
+    if h.source_kind != wl::SOURCE_FMOD_GRAPH && h.source_kind != wl::SOURCE_FMOD_PACK {
         return Err(errno::ENOSYS);
     }
-    // Only POSTURE_SHARED is realized; this backend gives a workload no
-    // isolation region of its own, so ISOLATED and HARDENED are refused.
-    if posture != wl::POSTURE_SHARED {
-        return Err(errno::ENOSYS);
-    }
-    // Net identity admission. The realized identity is IPv4 own-domain —
-    // `net_iso == OWN` together with `net_family == IPV4`. A bare
-    // host-shared workload (`SHARED` + `NONE`) installs nothing.
-    // Anything in between is fail-closed:
-    //   * net_iso beyond OWN is malformed,
-    //   * own-iso XOR a family (one without the other) is a half-specified
-    //     identity — not realized,
-    //   * IPv6 is not realized (ENOSYS),
-    //   * a segment ≥ 1 is validated against the node's net.route segments
-    //     (absent → ENOENT, address outside it or its gateway → EINVAL); the
-    //     workload joins it when the node's network stack realizes the
-    //     tables (its address is then one of that stack's), and is refused
-    //     ENOSYS where none is registered.
-    if net_iso > wl::NET_ISO_OWN {
-        return Err(errno::EINVAL);
-    }
-    let wants_identity = net_iso == wl::NET_ISO_OWN || net_family != wl::NET_FAM_NONE;
-    if wants_identity && (net_iso != wl::NET_ISO_OWN || net_family != wl::NET_FAM_IPV4) {
-        return Err(errno::ENOSYS);
-    }
-    if net_segment != 0 {
-        crate::kernel::net_route::validate_attach(
-            net_family,
-            &net_addr,
-            net_segment,
-            net_identity_provider_present(),
-        )?;
-    }
-    for i in 0..endpoint_count {
-        let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
-        let ep_iso = buf[e + 1];
-        if ep_iso > wl::NET_ISO_OWN {
-            return Err(errno::EINVAL);
-        }
-        if ep_iso == wl::NET_ISO_OWN {
-            return Err(errno::ENOSYS); // own-domain endpoint is not realized here
-        }
+    // The posture is a floor: a node realizes the one posture its CAPS
+    // names, and a request at or below it is realized there. HARDENED is
+    // realized nowhere; a node with no protection backend runs no workload.
+    match realized_posture() {
+        Some(p) if h.posture <= p => {}
+        _ => return Err(errno::ENOSYS),
     }
 
     // Where the composed graph lies in the source section: all of it for a
     // graph; past the pack reference and its pins for a pack.
-    let (graph_off, graph_len, pack) = if source_kind == wl::SOURCE_FMOD_PACK {
+    let src_start = src.start;
+    let source_ref_len = src.len();
+    let (graph_off, graph_len, pack) = if h.source_kind == wl::SOURCE_FMOD_PACK {
         use wl::pack_ref;
         if source_ref_len < pack_ref::SIZE {
             return Err(errno::EINVAL);
@@ -1421,10 +613,25 @@ unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<Create
     if graph_len < fluxor_contracts::graph::HEADER_LEN {
         return Err(errno::EINVAL); // not a composed graph
     }
-    // The options: the resolver context is this backend's; any other
-    // required entry is refused before anything is staged.
-    let options = create_options(&buf[opt_start..opt_end])?;
-    let resolver_ctx = options.resolver;
+    // The options: the endpoints the creator grants the owner, required or
+    // not (a grant is never dropped); any other entry this backend does not
+    // realize, so a required one is refused before anything is staged and an
+    // advisory one is ignored.
+    // They are admitted with the owner (`seat_pending`).
+    for o in wl::opt::iter(&buf[opts.clone()]) {
+        let o = o.map_err(|()| errno::EINVAL)?;
+        if is_endpoint(&o) {
+            // Granting the node's endpoints is the node's to do.
+            if scheduler::caller_authority() != OWNER_NODE {
+                return Err(errno::EACCES);
+            }
+            if o.val.len() != wl::endpoint::LEN {
+                return Err(errno::EINVAL);
+            }
+        } else if o.required() {
+            return Err(errno::ENOSYS);
+        }
+    }
 
     // ── Who the workload is, and what it may hold.
     //
@@ -1432,33 +639,27 @@ unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<Create
     // resources key on (storage scoped by `mount`, a volume's grant). The
     // null identity names no one — every workload created with it would be
     // the same owner to anything keyed on it — so it is refused.
-    if buf[..16].iter().all(|&b| b == 0) {
+    if h.identity.iter().all(|&b| b == 0) {
         return Err(errno::EINVAL);
     }
-    let mut identity = [0u8; 16];
-    identity.copy_from_slice(&buf[..16]);
-    let spec = spec_digest(&buf[..opt_end]);
+    let spec = spec_digest(buf);
 
     Ok(CreateSpec {
         graph_off,
         graph_len,
         pack,
         src_start,
-        memory_bytes,
-        storage_bytes,
-        storage_grant,
-        wants_identity,
-        identity,
+        memory_bytes: h.memory_bytes,
+        storage_bytes: h.storage_bytes,
+        storage_line,
+        identity: h.identity,
         spec,
-        opts: options.opts,
-        resolver_ctx,
-        ep_start,
-        endpoint_count,
-        net_family,
-        net_prefix_len,
-        net_segment,
-        net_addr,
     })
+}
+
+/// Whether `o` is a `net`/`endpoint` option.
+fn is_endpoint(o: &wl::opt::Entry<'_>) -> bool {
+    o.ns == wl::endpoint::NS && o.key == wl::endpoint::KEY
 }
 
 /// Begin the CREATE's add, or check a continuation names the one being
@@ -1468,12 +669,7 @@ unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<Create
 /// Scheduler thread.
 #[inline(never)]
 unsafe fn open_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
-    let CreateSpec {
-        identity,
-        spec,
-        resolver_ctx,
-        ..
-    } = *req;
+    let CreateSpec { identity, spec, .. } = *req;
     // A node whose plan seats no workload owner stages no CREATE.
     if staging().is_none() {
         return errno::ENOSPC;
@@ -1497,17 +693,6 @@ unsafe fn open_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
         if rc != 0 {
             return rc;
         }
-        // Captured on the first call; the owner it belongs to exists only
-        // once the last module is in.
-        let Some(st) = staging() else {
-            return errno::ENOSPC;
-        };
-        let pr = &mut st.resolver;
-        pr.0 = 0;
-        if let Some(v) = resolver_ctx {
-            pr.0 = v.len() as u16;
-            pr.1[..v.len()].copy_from_slice(v);
-        }
     }
 
     0
@@ -1519,7 +704,7 @@ unsafe fn open_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
 /// # Safety
 /// Scheduler thread.
 #[inline(never)]
-unsafe fn advance_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
+unsafe fn advance_create() -> i32 {
     // ── One batch of the pending add; the rest of CREATE once its last
     //    module is in.
     let Some(p) = staging().and_then(|st| st.pending.as_mut()) else {
@@ -1543,28 +728,17 @@ unsafe fn advance_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
             return e.code();
         }
     }
-    publish_create(buf, req)
+    publish_create()
 }
 
-/// The pending add, every module in, published: the owner activated, its
-/// endpoints lease-gated, its identity installed, it paused for START and
-/// its workload slot allocated. The slot's index, or the negative errno
-/// with the owner rolled back.
+/// The pending add, every module in, published: the owner activated, paused
+/// for START and its workload slot allocated. The slot's index, or the
+/// negative errno with the owner rolled back.
 ///
 /// # Safety
 /// Scheduler thread.
 #[inline(never)]
-unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
-    let CreateSpec {
-        wants_identity,
-        ep_start,
-        endpoint_count,
-        net_family,
-        net_prefix_len,
-        net_segment,
-        net_addr,
-        ..
-    } = *req;
+unsafe fn publish_create() -> i32 {
     let Some(p) = staging().and_then(|st| st.pending.take()) else {
         return errno::EINVAL;
     };
@@ -1585,49 +759,10 @@ unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
     if let Some(s) = p.pack {
         code_pack::bind(s, owner.slot);
     }
-    // The owner's name-service context, for its lanes' provider.
-    if let Some(st) = staging() {
-        let v = &st.resolver.1[..st.resolver.0 as usize];
-        resolver_ctx_set(owner, v);
-    }
-
-    // ── Lease-gate each declared endpoint against the owner's retained plan
-    //    (as `linux/workload.rs` does). A refusal fails CREATE
-    //    here — not silently at bind — so roll the staged owner back.
-    for i in 0..endpoint_count {
-        let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
-        let proto = buf[e];
-        let port = rd_u16(buf, e + 2);
-        if matches!(
-            lease_gate(owner.slot, owner.generation, proto, port),
-            LeaseGate::Refused
-        ) {
-            let _ = live::free_owner(owner);
-            // EBUSY, not EACCES: this workload may hold the endpoint, it is
-            // simply taken. A caller told this can wait or ask for another
-            // port; told EACCES it would read a policy it cannot satisfy.
-            return errno::EBUSY;
-        }
-    }
-
-    // ── Net-identity install. Install the workload's address into the
-    //    net-identity provider BEFORE the START barrier — the address is
-    //    live/ARP-answered before the workload ever runs (the provider makes it
-    //    "live before any bind"). owner_tag = the just-allocated
-    //    owner slot. A resolve/write failure fails CREATE and rolls the owner
-    //    back — a `net=own` workload never runs without its identity.
-    if wants_identity {
-        let rc = install_identity(&net_addr, net_prefix_len, owner.slot);
-        if rc != 0 {
-            let _ = live::free_owner(owner);
-            return rc;
-        }
-    }
 
     // ── START barrier: stage paused. the splice set the owner Active;
     //    pause it now so it does not run until START resumes it.
     if live::owner_pause(owner).is_err() {
-        remove_identity(&net_addr);
         let _ = live::free_owner(owner);
         return errno::EINVAL;
     }
@@ -1637,7 +772,6 @@ unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
     let widx = match slots.iter().position(|s| !s.in_use) {
         Some(i) => i,
         None => {
-            remove_identity(&net_addr);
             let _ = live::free_owner(owner); // don't leak the staged owner
             return errno::ENOMEM;
         }
@@ -1654,7 +788,6 @@ unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
                 lane_count - 1
             }
             None => {
-                remove_identity(&net_addr);
                 let _ = live::free_owner(owner);
                 return errno::ENOMEM;
             }
@@ -1665,38 +798,12 @@ unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
             lanes[at].from_caller = ch;
         }
     }
-    let slot = WorkloadSlot {
+    slots[widx] = WorkloadSlot {
         in_use: true,
         owner,
-        // Only an installed identity is remembered for the DESTROY-time
-        // ADDR_DEL; a host-shared workload stores a zero address (no-op DEL).
-        net_addr: if wants_identity { net_addr } else { [0u8; 16] },
-        net_segment: if wants_identity { net_segment } else { 0 },
         lanes,
         lane_count: lane_count as u8,
     };
-    if slot.net_segment != 0 {
-        // The segment was checked when this CREATE began, calls ago; a
-        // SEGMENTS replace since may have removed it, having seen no
-        // workload on it. The attachment is recorded under the lock that
-        // replace's check holds, after checking again, so either the
-        // replace sees it (`EBUSY`) or this CREATE sees the replace and is
-        // rolled back with the error a CREATE naming the segment now gets.
-        let rc = crate::kernel::net_route::attach_segment(
-            net_family,
-            &net_addr,
-            net_segment,
-            net_identity_provider_present(),
-            |_| slots[widx] = slot,
-        );
-        if let Err(e) = rc {
-            remove_identity(&net_addr);
-            let _ = live::free_owner(owner);
-            return e;
-        }
-    } else {
-        slots[widx] = slot;
-    }
     widx as i32
 }
 
@@ -1757,10 +864,19 @@ fn workload_wait(owner: Option<OwnerHandle>, out: &mut [u8]) -> i32 {
     5
 }
 
+/// The one posture this node realizes for a graph workload: a metal node
+/// with a protection backend runs every module a workload brings
+/// unprivileged (`POSTURE_ISOLATED`, the admission in `splice`), the Linux
+/// runtime in its own process (`POSTURE_SHARED`), a node with no backend
+/// none.
+fn realized_posture() -> Option<u8> {
+    crate::kernel::exec::scheduler::splice::node_workload_gate().posture()
+}
+
 /// `CAPS`: the metal backend's honest capability word.
 fn workload_caps() -> u32 {
-    // Postures: SHARED only. ISOLATED/HARDENED need EL0-per-workload.
-    let postures = wl::caps::POSTURE_SHARED;
+    // Postures: the one realized (a request below it is realized there).
+    let postures = realized_posture().map_or(0, wl::caps::posture);
     // Source kinds: an fmod graph, and a graph bringing its own modules where
     // the node has code space for packs. Never a host bundle: metal has no
     // rootfs to unpack one into.
@@ -1773,41 +889,19 @@ fn workload_caps() -> u32 {
     // Ops: PAUSE and LOOKUP. The SIGNAL bit asserts real process-group
     // signal delivery this backend does not provide (TERM→drain, KILL→free).
     let ops = wl::caps::PAUSE | wl::caps::LOOKUP;
-    // Net: NET_ISO_OWN | NET_IDENTITY — a `net=own` workload's own IPv4
-    // address is installed into the net-identity provider and ARP-answered,
-    // and the workload's binds land on it: `ip` stamps a lane's bind with the
-    // lane's owner and binds it to that owner's address (`lane_bind_target`),
-    // and an owned address is served only by a listener bound to it, never by
-    // a host wildcard listener. Both bits are honestly set.
-    let net = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
-    postures | sources | ops | net
+    postures | sources | ops
 }
 
-/// `OPTIONS`: the options entries the graph backend realizes — the owner's
-/// name-service context, read by the net provider for the owner's lanes;
-/// its environment, written into its modules' env binds; and, where the
-/// platform roots a workload's files, the volumes it is lent.
+/// `OPTIONS`: the options entries the graph backend realizes: the endpoints
+/// a creator grants the owner (`net`/`endpoint`). A graph workload's
+/// environment is bound into its params by its creator, and the rest of its
+/// network is the node's net provider's.
 fn workload_options(out: &mut [u8]) -> i32 {
-    match write_option_directory(out, GRAPH_OPTIONS) {
+    match write_option_directory(out, &[(wl::endpoint::NS, &[wl::endpoint::KEY])]) {
         0 => errno::ERANGE,
         n => n as i32,
     }
 }
-
-/// The options `(namespace, keys)` the graph backend realizes.
-const GRAPH_OPTIONS: &[(&[u8], &[&[u8]])] = if LENDS_VOLUMES {
-    &[
-        (wl::resolver::NS, &[wl::resolver::KEY]),
-        (wl::env::NS, &[wl::env::KEY]),
-        (wl::volume::NS, &[wl::volume::KEY]),
-        (wl::vault::NS, &[wl::vault::KEY]),
-    ]
-} else {
-    &[
-        (wl::resolver::NS, &[wl::resolver::KEY]),
-        (wl::env::NS, &[wl::env::KEY]),
-    ]
-};
 
 /// Write an `OPTIONS` namespace directory `[ns_count:u16] then ns_count ×
 /// ([ns_len:u8][ns][key_count:u16] then key_count × ([key_len:u8][key]))`
@@ -1953,6 +1047,21 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
         st.create_max_us,
         st.destroy_max_us,
     );
+    // What gated workload modules hold: isolated pages (state, heap, EL0
+    // stacks), isolation slots and minted gateway handles, each back to its
+    // fixed point when churn reaps cleanly.
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        let (pages, pages_cap) = crate::kernel::module::loader::isolated_pages_in_use();
+        log::info!(
+            "[live] iso pages={}/{} slots={} free={} gate_handles={}",
+            pages,
+            pages_cap,
+            crate::arch::aarch64::isolation::slots_in_use(),
+            crate::arch::aarch64::isolation::free_slots(),
+            crate::kernel::module::gateway::minted_in_use(),
+        );
+    }
 }
 
 /// `CREATE`: `arg` the spec, `data` a pack source's module table. The owner
@@ -2001,51 +1110,19 @@ unsafe fn create_op(arg: &mut [u8], data: &[u8]) -> i32 {
 }
 
 unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
-    if opcode == wl::MODULE_DIGESTS {
-        return code_pack::node_digests(scheduler::static_loader(), data.as_mut());
-    }
     if opcode == wl::CAPS {
         return crate::abi::kernel_abi::caps_word::answer(arg, workload_caps());
     }
     if opcode == wl::OPTIONS {
         return workload_options(data.as_mut());
     }
-    // A net provider that is a module (the bare-metal `ip`): it claims the
-    // role, takes the lanes staged workloads attach, and asks whether a
-    // lane's owner may bind (see `net_attach`).
-    if opcode == wl::NET_PROVIDE {
-        // `[lanes:u8]`: the provider's lane capacity.
-        if arg.len() < wl::net_lane::PROVIDE_LEN {
-            return errno::EINVAL;
+    if opcode == wl::OWNERS {
+        // Every owner's facts: the node's to read, as it alone composes them.
+        if !scheduler::caller_authority().is_node() {
+            return errno::EACCES;
         }
-        let slot = scheduler::current_module_index();
-        // One registration names the node's network stack: the lane
-        // provider is the registered net-identity provider, in the same
-        // occupancy (`net_attach` keys it by slot and generation too).
-        if let Some((reg, _)) = net_identity_provider() {
-            if reg != slot {
-                return errno::EACCES;
-            }
-            // Coordinator exclusivity: with a module writing `addr_ctl`, the
-            // kernel could not install a lane's identity there.
-            if direct_addr_ctl_wired() {
-                return errno::EBUSY;
-            }
-        }
-        return crate::kernel::workload::net_attach::provide_queued(slot, arg[0] as usize);
+        return crate::kernel::workload::owner_plan::owners_answer(data.as_mut());
     }
-    if opcode == wl::NET_RESOLVER {
-        return resolver_ctx_read(scheduler::current_module_index(), arg);
-    }
-    if opcode == wl::NET_LANE_TAKE || opcode == wl::NET_LANE_ADMIT {
-        let slot = scheduler::current_module_index();
-        return if opcode == wl::NET_LANE_TAKE {
-            crate::kernel::workload::net_attach::take_queued(slot, arg)
-        } else {
-            crate::kernel::workload::net_attach::admit_queued(slot, arg)
-        };
-    }
-
     if opcode == wl::LOOKUP {
         if arg.len() < 16 {
             return errno::EINVAL;
@@ -2136,13 +1213,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSp
                 }
                 // Immediate: tear the owner down. The slot is left in place so a
                 // subsequent WAIT resolves the handle and reports EXITED; DESTROY
-                // reaps the slot. Remove the net identity and clear the
-                // stored address so DESTROY does not re-emit ADDR_DEL.
+                // reaps the slot.
                 wl::SIG_KILL => {
                     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
-                    remove_identity(&slots[raw as usize].net_addr);
-                    slots[raw as usize].net_addr = [0u8; 16];
-                    slots[raw as usize].net_segment = 0;
                     // The lanes' channels close with the owner; their handles
                     // go with them.
                     slots[raw as usize].lanes = [NO_LANE; wl::MAX_CALLER_LANES];
@@ -2188,14 +1261,11 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSp
     }
 }
 
-/// Tear workload slot `widx` down: remove its net identity (ADDR_DEL) before
-/// freeing the owner (a zero or cleared address is a no-op: host-shared, or
-/// already removed by SIG_KILL), then free the slot and every handle naming
-/// it. A slot's index is the handle index the platform's provider answers
+/// Tear workload slot `widx` down: free the owner, then the slot and every
+/// handle naming it. A slot's index is the handle index the platform's provider answers
 /// for it on every platform.
 unsafe fn destroy_slot(widx: usize) -> i32 {
     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
-    remove_identity(&slots[widx].net_addr);
     let _ = live::free_owner(slots[widx].owner); // idempotent — stale handle is fine
     slots[widx] = WL_EMPTY;
     crate::kernel::module::provider::retire_routes_naming(
@@ -2203,23 +1273,6 @@ unsafe fn destroy_slot(widx: usize) -> i32 {
         widx as i32,
     );
     0
-}
-
-/// Whether an admitted workload's installed identity is on `net.route`
-/// segment `id` (`id` ≥ 1).
-pub fn segment_attached(id: u16) -> bool {
-    if id == 0 {
-        return false;
-    }
-    // SAFETY: a read of plain fields. A SEGMENTS replace asks under the
-    // segment table's apply flag, the flag CREATE records an attachment
-    // under (`net_route::attach_segment`), so it sees every attachment a
-    // CREATE completed; a DESTROY racing it is the answer a moment earlier
-    // or later.
-    let slots = unsafe { &*core::ptr::addr_of!(FMOD_WORKLOADS) };
-    slots
-        .iter()
-        .any(|s| s.in_use && s.net_segment == id && s.net_addr.iter().any(|&b| b != 0))
 }
 
 /// The live workload slot whose owner carries `identity`.

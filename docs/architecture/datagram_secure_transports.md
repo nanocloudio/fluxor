@@ -100,7 +100,7 @@ and transport_buffer, and is provided by `linux_net` (host `SOCK_DGRAM`
 sockets) and the bare-metal `ip` module.
 
 QUIC publishes its application surface over the **mux** contract
-(`crates/fluxor-abi/src/contracts/net/mux.rs`, opcodes `0xB0..0xCF`), so a
+(`crates/fluxor-abi/src/contracts/net/mux.rs`, opcodes `0xB1..0xCF`), so a
 consumer sees QUIC streams as a multiplexed-session channel without
 knowing anything about packet protection. Every application stream is
 surfaced this way; the transport does not speak the protocols carried

@@ -252,8 +252,9 @@ A consumer that already keeps what it sends — `tls`, whose retransmission
 window holds the encrypted records — declares `retains_send` on its input
 port. The composer marks every edge into such a port (the edge record's
 `retains_send` flag), marks the edge into a fan only when every edge
-out of the fan has it, and `ip` reads it for its own channel with `channel::FACTS`.
-On such a channel `ip` keeps no copy: it grants `RETX`, reports each
+out of the fan has it, and `ip` reads it for each lane's events channel
+with `channel::FACTS` as the lane attaches. On such a lane `ip` keeps no
+copy: it grants `RETX`, reports each
 movement of `SND.UNA` (`MSG_RETX_ACK`, whose `isn` places the consumer's
 bytes in sequence space however many it sent before the first report),
 and on the same triggers asks for the bytes again (`MSG_RETX_REQUEST`,
@@ -262,8 +263,8 @@ with `CMD_RETX_RESEND`, which `ip` sends at its own sequence numbers — the
 part in `[SND.UNA, SND.NXT)`, up to one segment — without allocating it as
 new data. A connection without the grant is never sent a `stream_retx`
 frame, and its consumer keeps nothing. `linux_net` never grants `RETX`:
-the host's TCP retains. Workload lanes are never marked; `ip` retains for
-them.
+the host's TCP retains. A workload's lanes are not marked; `ip` retains
+for them.
 
 The pool is `tcp_send_pool` bytes, as many blocks as it holds, and the
 composer derives it from the graph (`send_pool_param` on the port): none
@@ -320,11 +321,21 @@ periodic report carries the growth as `cgrow=<chunks granted>
 cdeny=<chunks refused> cslots=<records backed>`. On the embedded
 profiles the inline block is the whole table.
 
-### Fan-out and filtering
+### Lanes, and filtering on a shared one
 
-The provider has a single net_proto pair: `net_in` (commands in) and
-`net_out` (messages out). When several stream consumers share it, the
-config fans `net_out` to each of them and every consumer filters:
+Every consumer reaches the provider over a lane of its own: the provider
+declares lanes (`[lanes]`), and its manifest's `net_in` (commands in) and
+`net_out` (messages out) describe each lane's two channels. The composer
+gives each edge into `net_in` a lane of its own, keyed in wiring order,
+whose events go back to its producer — a node graph's modules under the
+node owner, a workload's under its own — and adds the node graph's lanes to
+the provider's `lanes`. Edges marked `edge_class: merge` share one lane:
+their commands reach it through a `merge` the composer inserts, and its
+events reach every `net_out` consumer that produces into no lane of its
+own through a `tee`. Wiring that leaves a lane's events no one place to go
+is refused at build: a module producing into the provider twice (or both
+alone and in the shared lane), a `net_out` consumer with no lane to read,
+and a lane whose events nobody reads. Consumers sharing a lane filter:
 
 - **Inbound connections** carry `local_port` in `MSG_ACCEPTED`; each
   consumer claims only connections accepted on the port it bound.
@@ -498,8 +509,9 @@ stack on bare-metal targets. Its channels are:
 
 - `frames_rx` (in[0]): raw Ethernet frames from the driver
 - `frames_tx` (out[0]): raw Ethernet frames to the driver
-- `net_in` (in[1]): net_proto / datagram commands from consumers
-- `net_out` (out[1]): net_proto / datagram messages to consumers
+- lanes (`net_in` / `net_out`): each consumer's net_proto / datagram
+  commands in and messages out, a lane of its own taken from the kernel
+  (`LANE_TAKE`), never a port
 
 ### Supported profile
 
@@ -581,13 +593,14 @@ see only the frames they receive on their channels.
 
 ### Receive windows
 
-Every TCP connection delivers into the same consumer ring (`net_out`), so
-receive windows are sized against that ring. After each delivery, and
+Every TCP connection delivers into its lane's events ring, so receive
+windows are sized against that ring. After each delivery, and
 from the timer sweep for a window that backpressure closed, the module
 asks the kernel how many bytes the ring can take (the channel's `WRITABLE`
 op) and
 computes each connection's share: an equal part of that room among the
-connections that received in the current or previous 50 ms epoch, less
+connections of the lane that received in the current or previous 50 ms
+epoch, less
 1/16 for `MSG_DATA` framing, capped at `MAX_RCV_WND` (4 KiB on aarch64,
 where that cap keeps the sum of windows inside the 32 KiB `frames_rx`
 ring; 8 KiB elsewhere). A share under 536 bytes — one default-MSS
@@ -641,16 +654,15 @@ step guard is what makes this a correctness rule rather than a
 preference: a step that walks the whole table on a 65,536-record profile
 ends the module.
 
-The same rule reaches the wiring around the module. A consumer port
-shared by two readers — `debug: to: net` puts `log_net` beside the
-application on `net_out` and `net_in` — is joined by a fan module the
-composer inserts (`tee` on the way out, `merge` on the way in), and what
+The same rule reaches the wiring around the module. A lane shared by
+several modules (`edge_class: merge`) is joined by fan modules the
+composer inserts (`tee` on its events, `merge` on its commands), and what
 the fan moves per step is then the ceiling on every accept, delivery and
-send. A fan moves whole frames, up to its `frames_per_step` (64 by
+send on that lane. A fan moves whole frames, up to its `frames_per_step` (64 by
 default) per step, and
 consumes nothing while any reader's ring is full, so every reader on a
-fanned port must drain what it does not want (`log_net` discards up to
-its own per-step budget) or the port stalls for all of them. Nor does
+shared lane must drain what it does not want or the lane stalls for all
+of them. Nor does
 the module log per connection: the `[ip] hb` and `[ip] drop` lines carry
 the counts, and a line per handshake at 8,192 handshakes a second is a
 log storm through the same NIC the handshakes need.
@@ -660,10 +672,19 @@ log storm through the same NIC the handshakes need.
 Source: `modules/platform/linux/linux_net/`.
 
 On the Linux target there is ordinarily no IP module in the graph. The
-`linux_net` platform module presents the same `net_in` / `net_out`
-net_proto surface and bridges it to host sockets internally, so the same
-consumer modules run unchanged. The Linux variant of `stacks/net.toml`
-instantiates it.
+`linux_net` platform module presents the same lanes over the net_proto
+surface and bridges them to host sockets, so the same consumer modules run
+unchanged. The Linux variant of `stacks/net.toml` instantiates it. A host
+provider serves it out of the runtime's process: the build makes the
+instance a `host_lane` running `fluxor-provider-net`, which also serves
+`net_route` and `net_policy` and takes address control on the lane's one
+static pair (`addr_ctl` / `addr_evt`). A static pair carries fixed-role
+channels alone: socket traffic on one is refused at build. Every lane —
+the node graph's, attached first, and each workload's — is one of the
+provider's dynamic lanes, drained in attach order; records cross whole on
+shared rings, and the runtime tells the provider each lane's owner and what
+that owner may claim (see the module's README). A lane the provider cannot
+carry is closed, its events ending in error.
 
 A graph that needs the stack itself — the transport-continuity surfaces
 checkpoint connections `ip` owns, which a host socket is not — runs `ip`
@@ -674,10 +695,11 @@ address of its own, in a network namespace the runtime owns) or a TAP.
 ### Lanes for a workload staged at runtime
 
 A subgraph staged by a `workload` CREATE (an fmod-graph source) joins the
-network through lanes of its own rather than the fanned `net_out`. Its
-composed graph names the provider as an endpoint, `Net(key)`: one edge from a module
-into it (commands) and one edge out of it to a module (events) per key.
-Each key becomes one lane.
+network through lanes of its own, as the node graph's modules do. Its
+composed graph names the provider as an endpoint, `Lane { key, target }`:
+one edge from a module into it (commands) and one edge out of it to a
+module (events) per key. Each key becomes one lane of the workload's
+owner.
 
 A workload's `wiring:` is written as a graph's: ends are `module.port`
 (resolved against the module's manifest; a bare `module` is its first
@@ -694,7 +716,10 @@ platform's own entry:
 
 ```yaml
 workloads:
-  - modules:
+  - endpoints:                    # what its lanes may listen on, and all
+      - protocol: tcp
+        port: 8443
+    modules:
       - name: front
         type: tls
       - name: link
@@ -712,14 +737,28 @@ workloads:
 
 | Rule | Effect |
 |---|---|
-| Owner | Commands run as the workload's owner: binds are lease-gated as it, and what they open is stamped with it |
+| Owner | Commands run as the workload's owner: a listen (a nonzero port) needs the owner's `net.endpoint` grant for it, and what they open is stamped with it |
 | Events | Every message about something the lane opened — accepts, data, closes, connect results — goes to the lane's events channel and nowhere else; a full lane back-pressures only its own sockets |
 | Isolation | A lane sends on and closes only what it opened; the node's own lanes cannot touch a workload's connections either |
 | Teardown | Freeing the owner detaches its lanes and closes everything they opened |
 
+A workload owner's grants are what the kernel's `OWNER_GRANTS` answers
+for it, and nothing else opens a port: the committed owner plan's (a
+package's `contract.exports`), and its admission's — a resident
+workload's `endpoints:` (above), carried in its boot record, or the
+`net`/`endpoint` options of the `CREATE` that made it, which only a
+creator acting with the node's authority may give. An owner granted
+nothing listens nowhere. The grant is what lets an owner holding no
+address listen on the node's shared addresses; an owner holding one
+listens on its own addresses alone. An endpoint is one live owner's at a
+time, and an admission naming one another owner holds is refused. The
+node owner's lanes are not gated: they listen on the node's addresses,
+any port. `linux_net` and `ip` apply one rule.
+
 Two providers implement lanes. On Linux, `linux_net` is the provider (the
-first instance in a graph); it serves the stream surface on a lane and
-refuses the datagram surface (`EOPNOTSUPP`). On bare metal, `ip` is: it
+lane target `linux_net`, its `host_lane` carrying each lane to the host
+network provider); it serves both surfaces on a lane, each endpoint the
+lane's own. On bare metal, `ip` is: it
 claims the provider role from the kernel's workload backend
 (`workload::NET_PROVIDE`) and takes each lane change the kernel queues for
 it (`NET_LANE_TAKE`) before it touches any lane, so a channel the kernel
@@ -728,9 +767,10 @@ both surfaces on a lane:
 
 - A bind lands as the lane's owner: on every address that owner holds,
   IPv4 and IPv6 alike, when it has any, on the node's shared addresses
-  otherwise, never as an owner a command names. The kernel admits it (`NET_LANE_ADMIT`) by the gate a
-  native provider applies — refused while the owner drains or is gone,
-  and refused for a port the committed plan does not lease to it.
+  otherwise, never as an owner a command names. It is refused while the
+  owner drains or is gone, and a listen (a nonzero port) is refused
+  `EACCES` unless the owner holds a `net.endpoint` grant for that
+  protocol and port. Port 0, an ephemeral source, is no claim.
 - A port another lane listens on at an overlapping address is
   `EADDRINUSE`, so no two lanes are offered the same connections.
 - A workload that holds addresses sources only from them, per family: its
@@ -739,10 +779,9 @@ both surfaces on a lane:
   holds no address of is refused `ENETUNREACH`, never sourced from the
   node's or another workload's address.
 - Control frames wait in an event queue per lane (`lane_events`, default
-  8, at least 4) and one of the node's own (`node_events`, default 32 on
-  aarch64, at least 8), each drained to its own channel: a lane that stops
-  reading holds up only its own frames, so the node's own events and its
-  receive path never wait on it. A lane's command intake pauses while its
+  8, at least 4), each drained to its own channel: a lane that stops
+  reading holds up only its own frames, so no other lane's events and no
+  receive path wait on it. A lane's command intake pauses while its
   queue has fewer than two slots free, and a connection whose accept
   cannot be announced on its lane (its `MSG_ACCEPTED` and peer report) is
   refused, as by a full accept backlog.
@@ -764,7 +803,8 @@ DESTROY detaches the owner's lanes and removes its address
 
 Lanes are a shared, bounded resource: `ip` states its capacity when it
 claims the provider role (its `lanes` parameter: 16 by default on aarch64,
-0 on the RPs, which have no workload backend) and `linux_net` holds 32. A
+0 on the RPs, which have no workload backend) and `linux_net` its own
+`lanes` parameter (32 by default). A
 workload takes as many lanes as its graph has `Net` keys, and a CREATE
 whose lanes the provider cannot all take is refused `EBUSY` with no owner,
 address or lane left behind. Placing workloads so that each finds its
@@ -889,7 +929,9 @@ generations of at most `MAX_ZONE_RRS` records and served with AA. Every
 UPDATE must carry an `hmac-sha256` TSIG under a key named in
 `update_allow` (`"keyname=name-suffix,TYPE,..."`); the key is a vault
 `HMAC_SHA256` key under the label `dns/tsig/<keyname>`, opened — never
-generated — at construct, and the MAC is checked inside the vault. Unsigned
+generated — from the first steps (asked again while the vault answers
+`EAGAIN`, nothing served meanwhile; a key the vault refuses fails the step),
+and the MAC is checked inside the vault. Unsigned
 requests are REFUSED; a bad key, signature or time is NOTAUTH with the TSIG
 error (BADKEY / BADSIG / BADTIME), and the time check reads the kernel's
 trusted calendar clock under a `MAX_TSIG_FUDGE_S` window, failing closed
@@ -1016,15 +1058,13 @@ consumer's.
 - **A frame-level module beside `ip` on one NIC.** A chain hop or tunnel
   end that writes whole Ethernet frames wires its output to the NIC's
   `frames_tx` beside `ip.frames_tx`. That fan-in is a `merge` module the
-  composer inserts, and since `EthernetFrame` edges carry
-  `[len: u16 LE][frame]` the composer gives it the Ethernet frame kind
-  (`FrameKind::Eth`): it peeks each input's length and moves one whole
-  frame at a time, never one its output cannot hold, so sharing a NIC
-  needs no module beyond the fan. A fan on a port that declares no framing
-  of its own (the NIC, stdout) takes its framing from its peers only when
-  every one that declares a framing declares the same; mixed producers — a `NetProto` port and an `OctetStream` one merged into
-  stdout — make a byte fan that keeps each write whole, where a framed fan
-  would read the stream as `NetProto` headers and stall for everyone. A frame-level module receives through the seam (its frames are
+  composer inserts. Every write to a channel is one record, so the merge
+  asks the channel each input's head record length (`RECORD_LEN`) and
+  moves one whole frame at a time, never one its output cannot hold, and
+  reads nothing of what the frame holds: sharing a NIC needs no module
+  beyond the fan. A fan runs over mailboxes only where the ports around it
+  carry mailbox records (`plan::port_mailbox`), over rings everywhere else,
+  and keeps every record whole either way. A frame-level module receives through the seam (its frames are
   forwarded to it), not through a tee of `frames_rx`, which would hand
   `ip` and it every frame.
 - **Service chains** (`disposition::CHAIN` 6). The disposition hands the
@@ -1188,7 +1228,8 @@ generation, which is the `fence_gen` a coordinator presents on
 `CMD_SC_ACTIVATE`. An actuator that does not confirm is refused
 `refusal::ACTUATOR`, leaving the host's state unknown and the standby
 unactivated. The reference agent is `modules/fixtures/fence_agent/`: its
-actuator is a command run on its own node through the `proc` executor,
+actuator is a command run on its own node through the node's command
+runner (`host_process::PROC_SPAWN`),
 by default the rig's power backend (`fluxor rig power off` / `on`), so a
 fence at the bench is the plug opening. A `platform_replicated_state`
 declaration needs both providers, and the agent's `cutoff = "wire"` counts
@@ -1312,7 +1353,11 @@ under a strictly higher epoch and a non-zero fence generation: timers
 are converted from their remaining durations with the transfer age
 charged, expired ones fire on the next sweep, congestion restarts
 conservatively (window capped at the initial window, recovery cleared),
-and the TCP side reports the live conn id the TLS side binds to. `ip` keeps
+and the TCP side reports the live conn id the TLS side binds to. The
+connection's events go to the node lane whose listener serves its port, as
+an accepted connection's do, or to the node's one lane where no listener
+does; an import that names neither is refused `STATUS_NOT_READY`, since no
+consumer here is the connection's. `ip` keeps
 a record of each activation — flow, epoch, connection slot and initial send
 sequence — on the shadow slot it freed, until that slot is prepared again:
 an `ABORT` naming the flow at the epoch it activated under, while the
@@ -1842,12 +1887,13 @@ challenge, the key wrapped to that destination only and opened on the
 authority's verdict, `0xC4` / `0xC5` as for `transport_continuity`). No
 master need be shared between hosts: each host's vault can make its own,
 and the authority enrols each host's custody identity by its public half
-(on Linux, `fluxor-linux vault-identity` opens or makes it in the host's
-vault and prints its public half) before it accepts evidence that identity
+(`fluxor vault identity` opens or makes it in the vault's record image and
+prints its public half) before it accepts evidence that identity
 signed.
 
-The destination-bound key wrap is one pure core (`src/kernel/security/custody_wrap.rs`):
-the kernel vault's `KEY_WRAP` and `KEY_UNWRAP` seal and open the `FXKW`
+The destination-bound key wrap is one pure core in the key vault
+(`modules/foundation/key_vault/`): its `KEY_WRAP` and `KEY_UNWRAP` seal and
+open the `FXKW`
 object with it (an HKDF-SHA256 KEK salted with the destination's
 composition digest over the ECDH secret, ChaCha20-Poly1305 under it with
 that digest as the associated data), so a peer or a harness holding the

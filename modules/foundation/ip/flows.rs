@@ -11,9 +11,9 @@
 //! address, the backend it was pinned to.
 //!
 //! **Storage.** The table and its index live in the module heap, sized at
-//! construction from `max_dg_flows`; nothing grows on a step. Each lane
-//! (the node's included) is guaranteed `dg_flow_floor` entries, and
-//! construction requires `max_dg_flows ≥ (lanes + 1) × floor`, so a lane
+//! construction from `max_dg_flows`; nothing grows on a step. Each lane is
+//! guaranteed `dg_flow_floor` entries, and construction requires
+//! `max_dg_flows ≥ lanes × floor`, so a lane
 //! under its floor always finds room; past it a lane draws on the shared
 //! part, and when that is spent the send is refused `ENOBUFS`. Before a
 //! refusal, expired flows are reclaimed and then an inbound-only flow of
@@ -103,9 +103,9 @@ impl DgFlow {
 /// (logged) when the declaration is inconsistent or does not fit.
 pub(crate) unsafe fn size(s: &mut IpState) -> bool {
     let n = s.max_dg_flows as usize;
-    let owners = s.lane_cap as usize + 1;
+    let owners = s.lane_cap as usize;
     if n < owners * s.dg_flow_floor as usize {
-        let msg = b"[ip] refusing to construct: max_dg_flows is below (lanes + 1) x dg_flow_floor";
+        let msg = b"[ip] refusing to construct: max_dg_flows is below lanes x dg_flow_floor";
         dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
         return false;
     }
@@ -237,11 +237,14 @@ pub(crate) unsafe fn get<'a>(s: &IpState, i: usize) -> &'a mut DgFlow {
 /// past it while the shared part has room.
 unsafe fn may_take(s: &IpState, lane: u8) -> bool {
     let floor = s.dg_flow_floor as u16;
-    if lane_state(s, lane).flows < floor {
+    let Some(st) = lane_state(s, lane) else {
+        return false;
+    };
+    if st.flows < floor {
         return true;
     }
-    let shared = (s.max_dg_flows as u32)
-        .saturating_sub((s.lane_cap as u32 + 1) * u32::from(s.dg_flow_floor));
+    let shared =
+        (s.max_dg_flows as u32).saturating_sub(s.lane_cap as u32 * u32::from(s.dg_flow_floor));
     s.flows_over_floor < shared
 }
 
@@ -298,10 +301,11 @@ pub(crate) unsafe fn make(s: &mut IpState, mut f: DgFlow) -> Result<usize, i8> {
         key_hash(seed, f.ep, f.peer_ip, f.peer_port),
         i * 2 + 1,
     );
-    let st = lane_state(s, f.lane);
-    st.flows += 1;
-    if st.flows > s.dg_flow_floor as u16 {
-        s.flows_over_floor += 1;
+    if let Some(st) = lane_state(s, f.lane) {
+        st.flows += 1;
+        if st.flows > s.dg_flow_floor as u16 {
+            s.flows_over_floor += 1;
+        }
     }
     Ok(i)
 }
@@ -333,11 +337,12 @@ pub(crate) unsafe fn release(s: &mut IpState, i: usize) {
         home(s, slot)
     });
     flow(s, i).flags = 0;
-    let st = lane_state(s, f.lane);
-    if st.flows > s.dg_flow_floor as u16 {
-        s.flows_over_floor = s.flows_over_floor.saturating_sub(1);
+    if let Some(st) = lane_state(s, f.lane) {
+        if st.flows > s.dg_flow_floor as u16 {
+            s.flows_over_floor = s.flows_over_floor.saturating_sub(1);
+        }
+        st.flows = st.flows.saturating_sub(1);
     }
-    st.flows = st.flows.saturating_sub(1);
     if (s.flow_free_top as usize) < s.max_dg_flows as usize {
         *s.flow_free.add(s.flow_free_top as usize) = i as u16;
         s.flow_free_top += 1;

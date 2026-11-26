@@ -548,9 +548,9 @@ service providers, in `provides`:
 ```
 channel  timer  stream_select  event  key_vault  gpio  spi  i2c  pio
 uart  adc  pwm  fs  storage.namespace  storage.object  trust  net_policy
-net_route  workload  host_mount  proc  usb_host  pcie_device
+net_route  workload  host_mount  usb_host  pcie_device
 platform_nic_ring  platform_dma  platform_dma_fd  metal_device
-storage.custody  storage.block  net_tx_drain  image_decode
+storage.custody  storage.block  net_tx_drain  image_decode  key_custody
 ```
 
 Naming is lowercase `snake_case`, with the storage contracts in their

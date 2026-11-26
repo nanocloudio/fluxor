@@ -22,11 +22,14 @@
 //! was admitted to act with the node's ([`Authority::Node`]). The owner
 //! handle stays the lifecycle — what is stamped, charged, paused, freed and
 //! released — while [`OwnerTable::authority_of`] answers whose authority a
-//! call carries: which provider layers it reaches and whether the platform
-//! roots its storage. Only a live add that a node-authority module places
-//! with `ADD_FLAG_CREATOR_AUTHORITY` acts with the node's.
+//! call carries: which provider layers it reaches, the node's own or the
+//! workload layers that serve workloads. Only a live add that a
+//! node-authority module places with `ADD_FLAG_CREATOR_AUTHORITY` acts with
+//! the node's.
 
-use crate::kernel::workload::storage::StorageGrant;
+use crate::abi::contracts::resource::{
+    OWNER_LINE_BUFFER, OWNER_LINE_COUNT, OWNER_LINE_STATE, OWNER_LINE_STORAGE,
+};
 
 /// The owner-slot RANGE, not a table size: the owner table — and every
 /// per-owner table beside it (log rings, code-pack regions, workload slots)
@@ -95,24 +98,31 @@ pub enum OwnerState {
     Paused,
 }
 
-/// Per-owner resource accounting and hard caps. Caps are populated from the
-/// signed resource profile at reservation; the allocator and admission paths
-/// charge against them.
+/// One ledger line of an owner: bytes charged against a cap (0 = uncapped).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Line {
+    pub used: u64,
+    pub cap: u64,
+}
+
+/// Why a charge to an owner's line was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChargeRefused {
+    /// The handle is stale, or the owner holds no such line.
+    NoLine,
+    /// The charge would take the line past its cap.
+    Cap,
+}
+
+/// Per-owner resource accounting and hard caps: one ledger line per
+/// `resource::OWNER_LINE_*`, and the counts of what the owner holds. The
+/// state and buffer lines every owner holds; the storage line only an owner
+/// whose admission installed one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OwnerAccounting {
-    pub state_bytes: u32,
-    pub state_cap: u32,
-    pub buffer_bytes: u32,
-    pub buffer_cap: u32,
-    /// Bytes the owner holds in the platform's storage: its files and its
-    /// store. Charged by the platform providers against `storage_cap`.
-    pub storage_bytes: u64,
-    pub storage_cap: u64,
-    /// What the owner was granted of the node's storage. Every admission
-    /// states it: a live add and a planned owner hold the default grant (a
-    /// root of its own), a workload `CREATE` the grant its header names. An
-    /// owner allocated by none of them holds none.
-    pub storage_grant: StorageGrant,
+    pub lines: [Line; OWNER_LINE_COUNT],
+    /// Bit `n` set: line `n` is installed.
+    pub present: u8,
     pub modules: u16,
     pub edges: u16,
     pub endpoints: u16,
@@ -121,15 +131,13 @@ pub struct OwnerAccounting {
     pub isolated_slots: u16,
 }
 
+/// The lines every owner holds from allocation: state and buffer.
+const BASE_LINES: u8 = 0b011;
+
 impl OwnerAccounting {
     pub const ZERO: OwnerAccounting = OwnerAccounting {
-        state_bytes: 0,
-        state_cap: 0,
-        buffer_bytes: 0,
-        buffer_cap: 0,
-        storage_bytes: 0,
-        storage_cap: 0,
-        storage_grant: StorageGrant::None,
+        lines: [Line { used: 0, cap: 0 }; OWNER_LINE_COUNT],
+        present: BASE_LINES,
         modules: 0,
         edges: 0,
         endpoints: 0,
@@ -137,16 +145,30 @@ impl OwnerAccounting {
         timers: 0,
         isolated_slots: 0,
     };
+
+    /// A planned owner's accounting: the base lines and an uncapped storage
+    /// line. An allocated owner holds the base lines alone until its
+    /// admission installs a storage line (a live add's, a `CREATE`'s header).
+    const ADMITTED: OwnerAccounting = OwnerAccounting {
+        present: BASE_LINES | 1 << OWNER_LINE_STORAGE,
+        ..OwnerAccounting::ZERO
+    };
+
+    /// Line `line` when installed.
+    pub fn line(&self, line: u16) -> Option<Line> {
+        let i = line as usize;
+        (i < OWNER_LINE_COUNT && self.present & (1 << i) != 0).then(|| self.lines[i])
+    }
 }
 
 /// Whose authority an owner's modules act with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Authority {
-    /// Its own: a workload, walled from the node's providers and rooted in
-    /// storage of its own.
+    /// Its own: a workload, walled from the node's providers and served by
+    /// the node's workload layers.
     Own,
-    /// The node's: it reaches the node's provider layers and the platform's
-    /// storage unrooted, as the node does, while its lifecycle stays its own.
+    /// The node's: it reaches the node's provider layers as the node does,
+    /// and no workload layer, while its lifecycle stays its own.
     Node,
 }
 
@@ -158,6 +180,17 @@ pub struct OwnerEntry {
     pub state: OwnerState,
     pub acct: OwnerAccounting,
     pub authority: Authority,
+    /// How many times the kernel instantiated this owner's modules: 1 from
+    /// its first activation, one more for each install of the same owner
+    /// (a rebuild re-instantiates its modules). Kept when the slot is freed.
+    pub activations: u32,
+    /// How the drain of the owner at this `generation` ended
+    /// (`workload::owners::DRAIN_*`), kept when the slot is freed until a
+    /// new owner takes it.
+    pub drain: u8,
+    /// When the drain freed it, unix seconds of the platform's clock (0:
+    /// not freed by a drain).
+    pub drained_at: u64,
 }
 
 impl OwnerEntry {
@@ -167,6 +200,9 @@ impl OwnerEntry {
         state: OwnerState::Free,
         acct: OwnerAccounting::ZERO,
         authority: Authority::Own,
+        activations: 0,
+        drain: 0,
+        drained_at: 0,
     };
 
     const NODE: OwnerEntry = OwnerEntry {
@@ -175,6 +211,9 @@ impl OwnerEntry {
         state: OwnerState::Active,
         acct: OwnerAccounting::ZERO,
         authority: Authority::Node,
+        activations: 0,
+        drain: 0,
+        drained_at: 0,
     };
 }
 
@@ -334,6 +373,9 @@ impl OwnerTable {
                     state: OwnerState::Reserved,
                     acct: OwnerAccounting::ZERO,
                     authority: Authority::Own,
+                    activations: 1,
+                    drain: 0,
+                    drained_at: 0,
                 };
                 self.ring_installed(slot as u16, owner_uid, generation);
                 return Some(OwnerHandle {
@@ -378,17 +420,24 @@ impl OwnerTable {
         if generation < self.entries[s].generation {
             return None;
         }
-        let mut acct = OwnerAccounting::ZERO;
-        acct.state_cap = state_cap;
-        acct.buffer_cap = buffer_cap;
-        // A planned owner holds the default grant: a root of its own.
-        acct.storage_grant = StorageGrant::OwnRoot;
+        let mut acct = OwnerAccounting::ADMITTED;
+        acct.lines[OWNER_LINE_STATE as usize].cap = u64::from(state_cap);
+        acct.lines[OWNER_LINE_BUFFER as usize].cap = u64::from(buffer_cap);
+        // The same owner installed again is instantiated again.
+        let activations = if generation == self.entries[s].generation {
+            self.entries[s].activations.saturating_add(1)
+        } else {
+            1
+        };
         self.entries[s] = OwnerEntry {
             owner_uid,
             generation,
             state: OwnerState::Active,
             acct,
             authority: Authority::Own,
+            activations,
+            drain: 0,
+            drained_at: 0,
         };
         self.ring_installed(slot, owner_uid, generation);
         Some(OwnerHandle { slot, generation })
@@ -504,7 +553,12 @@ impl OwnerTable {
 
     /// Move an owner into `Draining`.
     pub fn begin_drain(&mut self, h: OwnerHandle) -> bool {
-        self.set_state(h, OwnerState::Draining)
+        let drained = self.set_state(h, OwnerState::Draining);
+        if drained {
+            // The modules serving its lanes admit nothing new for it.
+            crate::kernel::workload::lanes::drain(h);
+        }
+        drained
     }
 
     /// Free `h`'s slot. The generation is retained so the next `alloc` bumps it;
@@ -543,6 +597,32 @@ impl OwnerTable {
         }
     }
 
+    /// Record how the drain of owner `(slot, generation)` ended, on its
+    /// freed slot: `outcome` (`workload::owners::DRAIN_*`) at `at` (unix
+    /// seconds, 0 when no drain ran here). A slot this table never held
+    /// at that generation takes it, so the owner's handles stay dead and the
+    /// next owner there gets a higher one; a slot a newer owner holds, or a
+    /// live one, is left as it is. Returns whether the outcome was recorded.
+    pub fn record_drain(&mut self, slot: u16, generation: u32, outcome: u8, at: u64) -> bool {
+        let s = slot as usize;
+        if s == 0 || s >= self.slots().len() {
+            return false;
+        }
+        let e = &mut self.slots_mut()[s];
+        if generation < e.generation
+            || (generation == e.generation && !matches!(e.state, OwnerState::Free))
+        {
+            return false;
+        }
+        if generation > e.generation {
+            e.generation = generation;
+            e.activations = 0;
+        }
+        e.drain = outcome;
+        e.drained_at = at;
+        true
+    }
+
     /// The entry at `slot`, regardless of state. `None` only for an
     /// out-of-range slot. Read-only view for status/telemetry aggregation
     /// (the owner-status surface walks resident slots).
@@ -558,32 +638,60 @@ impl OwnerTable {
             .count()
     }
 
-    // ── Per-owner resource accounting ───────────────────────────────────────
+    // ── Per-owner ledger lines ──────────────────────────────────────────────
     //
-    // Caps are the admitted hard limits from the signed resource profile,
-    // installed by the node agent at reservation. A cap of 0 means
-    // "unset/unlimited"; the node owner is never charged or capped.
+    // Caps are the admitted hard limits, installed at reservation. A cap of
+    // 0 means uncapped; the node owner is never charged or capped.
 
     /// Install the admitted state/buffer byte caps for an owner.
     pub fn set_caps(&mut self, h: OwnerHandle, state_cap: u32, buffer_cap: u32) -> bool {
+        self.set_line(h, OWNER_LINE_STATE, u64::from(state_cap))
+            && self.set_line(h, OWNER_LINE_BUFFER, u64::from(buffer_cap))
+    }
+
+    /// Install line `line` for `h` with `cap` (0 = uncapped), keeping what
+    /// it has charged. Returns `false` for a stale handle or an unknown line.
+    pub fn set_line(&mut self, h: OwnerHandle, line: u16, cap: u64) -> bool {
+        let i = line as usize;
+        if i >= OWNER_LINE_COUNT {
+            return false;
+        }
         match self.lookup_mut(h) {
             Some(e) => {
-                e.acct.state_cap = state_cap;
-                e.acct.buffer_cap = buffer_cap;
+                e.acct.present |= 1 << i;
+                e.acct.lines[i].cap = cap;
                 true
             }
             None => false,
         }
     }
 
-    /// Admit an owner to act with the node's authority. Its storage grant
-    /// becomes `None`: it reaches the node's storage as the node does, so the
-    /// platform never makes it a root. Returns `false` for a stale handle.
+    /// Remove line `line` from `h`: every later charge to it is refused.
+    /// The base lines cannot be removed.
+    pub fn remove_line(&mut self, h: OwnerHandle, line: u16) -> bool {
+        let i = line as usize;
+        if i >= OWNER_LINE_COUNT || BASE_LINES & (1 << i) != 0 {
+            return false;
+        }
+        match self.lookup_mut(h) {
+            Some(e) => {
+                e.acct.present &= !(1 << i);
+                e.acct.lines[i] = Line::default();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Admit an owner to act with the node's authority. It holds no storage
+    /// line: the workload layers do not serve it, so nothing roots its
+    /// storage. Returns `false` for a stale handle.
     pub fn set_node_authority(&mut self, h: OwnerHandle) -> bool {
         match self.lookup_mut(h) {
             Some(e) => {
                 e.authority = Authority::Node;
-                e.acct.storage_grant = StorageGrant::None;
+                e.acct.present &= !(1 << OWNER_LINE_STORAGE);
+                e.acct.lines[OWNER_LINE_STORAGE as usize] = Line::default();
                 true
             }
             None => false,
@@ -604,151 +712,64 @@ impl OwnerTable {
         }
     }
 
-    /// Install what an owner's `CREATE` granted it of the node's storage.
-    pub fn set_storage_grant(&mut self, h: OwnerHandle, grant: StorageGrant) -> bool {
-        match self.lookup_mut(h) {
-            Some(e) => {
-                e.acct.storage_grant = grant;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Install the admitted storage byte cap for an owner (0 = unlimited).
-    pub fn set_storage_cap(&mut self, h: OwnerHandle, cap: u64) -> bool {
-        match self.lookup_mut(h) {
-            Some(e) => {
-                e.acct.storage_cap = cap;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Charge `bytes` of storage to `h`. `Err(())` when the owner's storage
-    /// cap would be exceeded (the provider refuses the write), or `h` is
-    /// stale. The node owner is never charged.
-    #[allow(
-        clippy::result_unit_err,
-        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
-                  caller only branches on success vs failure"
-    )]
-    pub fn charge_storage(&mut self, h: OwnerHandle, bytes: u64) -> Result<(), ()> {
+    /// Charge `bytes` to `h`'s line `line`. `held`: bytes the owner already
+    /// holds, charged past the cap if need be — an owner over its cap can
+    /// shrink but not grow. The node owner is never charged.
+    pub fn charge(
+        &mut self,
+        h: OwnerHandle,
+        line: u16,
+        bytes: u64,
+        held: bool,
+    ) -> Result<(), ChargeRefused> {
         if h.is_node() {
             return Ok(());
         }
-        let e = self.lookup_mut(h).ok_or(())?;
-        let next = e.acct.storage_bytes.saturating_add(bytes);
-        if e.acct.storage_cap != 0 && next > e.acct.storage_cap {
-            return Err(());
+        let i = line as usize;
+        let e = self.lookup_mut(h).ok_or(ChargeRefused::NoLine)?;
+        if i >= OWNER_LINE_COUNT || e.acct.present & (1 << i) == 0 {
+            return Err(ChargeRefused::NoLine);
         }
-        e.acct.storage_bytes = next;
+        let l = &mut e.acct.lines[i];
+        let next = l.used.saturating_add(bytes);
+        if !held && l.cap != 0 && next > l.cap {
+            return Err(ChargeRefused::Cap);
+        }
+        l.used = next;
         Ok(())
     }
 
-    /// Charge `bytes` of storage `h` already holds, past its cap if need be:
-    /// storage found on disk is the owner's whatever its cap, and an owner
-    /// over its cap can shrink but not grow.
-    pub fn charge_storage_held(&mut self, h: OwnerHandle, bytes: u64) {
+    /// Give `bytes` back to `h`'s line `line`. Saturating; nothing for the
+    /// node owner, a stale handle or an absent line.
+    pub fn release(&mut self, h: OwnerHandle, line: u16, bytes: u64) {
         if h.is_node() {
             return;
         }
+        let i = line as usize;
         if let Some(e) = self.lookup_mut(h) {
-            e.acct.storage_bytes = e.acct.storage_bytes.saturating_add(bytes);
+            if i < OWNER_LINE_COUNT && e.acct.present & (1 << i) != 0 {
+                e.acct.lines[i].used = e.acct.lines[i].used.saturating_sub(bytes);
+            }
         }
     }
 
-    /// Give `bytes` of storage back to `h`'s ledger.
-    pub fn release_storage(&mut self, h: OwnerHandle, bytes: u64) {
-        if let Some(e) = self.lookup_mut(h) {
-            e.acct.storage_bytes = e.acct.storage_bytes.saturating_sub(bytes);
-        }
+    /// `h`'s line `line`: `None` for a stale handle or an absent line.
+    pub fn line(&self, h: OwnerHandle, line: u16) -> Option<Line> {
+        self.lookup(h).and_then(|e| e.acct.line(line))
     }
 
-    /// Charge `bytes` of module state to `h`. Returns `Err(())` if it would
-    /// exceed the owner's cap (the caller must then reject the allocation), or
-    /// if `h` is stale. The node owner is always permitted.
-    #[allow(
-        clippy::result_unit_err,
-        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
-                  caller only branches on success vs failure"
-    )]
-    pub fn charge_state(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
-        if h.is_node() {
-            return Ok(());
+    /// Drop every workload owner's charges on `line` back to zero, keeping
+    /// their caps. The resident instantiation pass re-folds the state
+    /// charges from the live module table on each rebuild; without this it
+    /// would add a rebuild's modules to the previous pass's total for any
+    /// slot that survived.
+    pub fn clear_charges(&mut self, line: u16) {
+        let i = line as usize;
+        if i >= OWNER_LINE_COUNT {
+            return;
         }
-        let e = self.lookup_mut(h).ok_or(())?;
-        let next = e.acct.state_bytes.saturating_add(bytes);
-        if e.acct.state_cap != 0 && next > e.acct.state_cap {
-            return Err(());
-        }
-        e.acct.state_bytes = next;
-        Ok(())
-    }
-
-    /// Drop every workload owner's charged state back to zero, keeping their
-    /// caps. The resident instantiation pass re-folds the charges from the live
-    /// module table on each rebuild; without this it would add a rebuild's
-    /// modules to the previous pass's total for any slot that survived.
-    pub fn clear_state_charges(&mut self) {
         for e in self.slots_mut().iter_mut().skip(1) {
-            e.acct.state_bytes = 0;
-        }
-    }
-
-    /// `(charged, cap)` state bytes for `h`. Cap 0 means unlimited.
-    pub fn charged_state(&self, h: OwnerHandle) -> (u32, u32) {
-        match self.lookup(h) {
-            Some(e) => (e.acct.state_bytes, e.acct.state_cap),
-            None => (0, 0),
-        }
-    }
-
-    /// Release `bytes` of previously charged module state. Saturating.
-    pub fn uncharge_state(&mut self, h: OwnerHandle, bytes: u32) {
-        if h.is_node() {
-            return;
-        }
-        if let Some(e) = self.lookup_mut(h) {
-            e.acct.state_bytes = e.acct.state_bytes.saturating_sub(bytes);
-        }
-    }
-
-    /// Charge `bytes` of channel-buffer memory to `h`. See [`charge_state`].
-    #[allow(
-        clippy::result_unit_err,
-        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
-                  caller only branches on success vs failure"
-    )]
-    pub fn charge_buffer(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
-        if h.is_node() {
-            return Ok(());
-        }
-        let e = self.lookup_mut(h).ok_or(())?;
-        let next = e.acct.buffer_bytes.saturating_add(bytes);
-        if e.acct.buffer_cap != 0 && next > e.acct.buffer_cap {
-            return Err(());
-        }
-        e.acct.buffer_bytes = next;
-        Ok(())
-    }
-
-    /// Release `bytes` of previously charged channel-buffer memory. Saturating.
-    pub fn uncharge_buffer(&mut self, h: OwnerHandle, bytes: u32) {
-        if h.is_node() {
-            return;
-        }
-        if let Some(e) = self.lookup_mut(h) {
-            e.acct.buffer_bytes = e.acct.buffer_bytes.saturating_sub(bytes);
-        }
-    }
-
-    /// Bytes currently charged to `h` (state, buffer). Zero for a stale handle.
-    pub fn charged_bytes(&self, h: OwnerHandle) -> (u32, u32) {
-        match self.lookup(h) {
-            Some(e) => (e.acct.state_bytes, e.acct.buffer_bytes),
-            None => (0, 0),
+            e.acct.lines[i].used = 0;
         }
     }
 }

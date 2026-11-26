@@ -80,8 +80,9 @@ fn stop_requested() -> bool {
 fn exit_by_stop_signal() -> ! {
     let sig = STOP_SIGNAL.load(core::sync::atomic::Ordering::Acquire);
     restore_terminal();
-    // Dying by the signal skips `atexit`: leave the host registry first.
-    fluxor::platform::linux::instance::shutdown();
+    // Dying by the signal skips `atexit`: stop the host providers first, so
+    // each takes down what it holds on the host before the runtime goes.
+    fluxor::platform::linux::host_lane::stop_all();
     // SAFETY: plain libc calls with a signal number the handler recorded.
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
@@ -90,13 +91,13 @@ fn exit_by_stop_signal() -> ! {
     process::exit(128 + sig);
 }
 
-/// Publish the final owner status and logs, then end the process by the
+/// Publish the final owner facts and logs, then end the process by the
 /// signal that stopped it.
 fn finish_stop(
-    owner_status: Option<&mut OwnerStatusWriter>,
+    owner_facts: Option<&mut OwnerFactsWriter>,
     logs_dir: Option<&std::path::Path>,
 ) -> ! {
-    if let Some(w) = owner_status {
+    if let Some(w) = owner_facts {
         w.tick();
     }
     if let Some(dir) = logs_dir {

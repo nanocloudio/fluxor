@@ -240,6 +240,18 @@ pub fn admit_resident_workloads_from_config() {
                 let slot = handle.slot as usize;
                 admitted_slots[slot / 64] |= 1 << (slot % 64);
                 admitted += 1;
+                // The endpoints the graph's author granted it: what its
+                // lanes may listen on, and all they may.
+                if let Err(rc) = crate::kernel::workload::endpoints::admit(
+                    handle,
+                    crate::kernel::workload::endpoints::listed(workload.endpoints),
+                ) {
+                    log::error!(
+                        "[multigraph] resident workload endpoints refused rc={rc}; rolling back"
+                    );
+                    failed = true;
+                    break;
+                }
                 // The workload's idle-safe attestation goes on its
                 // modules; the index is rebuilt from them below. Unattested
                 // workloads stay fail-closed (backstop cadence).

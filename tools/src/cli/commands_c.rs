@@ -99,7 +99,7 @@ fn cmd_build(
     // emits the committed package + per-target blobs instead of a single
     // image. Any other `.toml` falls through.
     if workload_src::is_source_manifest(path) {
-        workload_src::emit_package(path, module_root, verbose)?;
+        workload_src::emit_package(path, module_root, workload_src::Emit::Run, verbose)?;
         return Ok(());
     }
     if path.is_dir() {
@@ -2491,4 +2491,45 @@ mod qemu_port_tests {
     fn a_graph_without_a_port_keeps_the_old_default() {
         assert_eq!(ports("modules:\n  - name: debug\n"), vec![80]);
     }
+}
+
+/// `fluxor vault import|identity`.
+fn cmd_vault(action: VaultAction) -> Result<()> {
+    use fluxor_tools::vault;
+    let geometry = |at: &VaultImageArgs| vault::Geometry {
+        image_size: at.image_size,
+        start_sector: at.start_sector,
+    };
+    let lib_err = |e: fluxor_tools::error::Error| Error::Config(e.to_string());
+    let seal = vault::seal_key_from_env().map_err(lib_err)?;
+    match action {
+        VaultAction::Import {
+            at,
+            module,
+            label,
+            suite,
+            key_hex,
+            wrap,
+        } => {
+            let wrap = match wrap.as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => return Err(Error::Config("--wrap takes yes or no".into())),
+            };
+            let key = vault::ImportKey {
+                suite: &suite,
+                key_hex: &key_hex,
+                wrap,
+            };
+            vault::import(&at.image, &geometry(&at), &seal, &module, &label, &key).map_err(lib_err)?;
+            println!("vault import: {label} ({suite}) sealed");
+        }
+        VaultAction::Identity { at, module, label } => {
+            let public =
+                vault::identity(&at.image, &geometry(&at), &seal, &module, &label).map_err(lib_err)?;
+            let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
+            println!("vault identity: {label} {hex}");
+        }
+    }
+    Ok(())
 }

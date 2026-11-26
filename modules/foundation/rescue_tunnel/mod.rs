@@ -116,6 +116,11 @@ pub struct RtState {
     /// The vault's HMAC-SHA256 slot it names, or -1: its tags are made by
     /// the vault (`SIGN`) and the key never leaves it.
     cell_key: i32,
+    /// `key_label`'s key is still to be opened: from the first step (the
+    /// vault is a provider of the graph, reachable once the graph is
+    /// instantiated), and again each step while the vault answers `EAGAIN`.
+    /// Nothing is sealed or opened until it is.
+    cell_key_pending: bool,
     host_id: [u8; 8],
     service_id: [u8; 16],
     route_gen: u32,
@@ -321,7 +326,8 @@ unsafe fn text<'a>(d: *const u8, len: usize) -> Option<&'a [u8]> {
 
 /// Open the cell's provisioned HMAC-SHA256 key `label` in this host's
 /// vault (imported there, the same key on every host of the cell; never
-/// made here): a handle that answers tags (`SIGN`), or -1.
+/// made here): a handle that answers tags (`SIGN`), or the vault's refusal
+/// (`EAGAIN` while it cannot answer yet).
 unsafe fn open_cell_key(sys: &SyscallTable, label: &[u8]) -> i32 {
     let mut arg = [0u8; kv::open::MAX_ARG];
     let req = kv::open::Request {
@@ -331,15 +337,33 @@ unsafe fn open_cell_key(sys: &SyscallTable, label: &[u8]) -> i32 {
         label,
     };
     let Some(n) = kv::open::encode(&mut arg, &req) else {
-        return -1;
+        return abi::errno::EINVAL;
     };
     // An HMAC key has no public half: nothing comes back in `data`.
-    let h = (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0);
-    if h < 0 {
-        -1
-    } else {
-        h
+    (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
+}
+
+/// Open `key_label`'s key while it waits for the vault. True once it is
+/// open (or none is named); false while the vault answers `EAGAIN`. A
+/// refusal leaves the tunnel no key: the step answers an error, and the key
+/// stays pending, so nothing is sealed or opened without it.
+unsafe fn cell_key_step(s: &mut RtState) -> Result<bool, i32> {
+    if !s.cell_key_pending {
+        return Ok(true);
     }
+    let sys = &*s.syscalls;
+    let h = open_cell_key(sys, &s.key_label[..usize::from(s.key_label_len)]);
+    if h == abi::errno::EAGAIN {
+        return Ok(false);
+    }
+    if h < 0 {
+        let m = b"[rescue_tunnel] no HMAC-SHA256 key under key_label in this vault: nothing is sealed or opened";
+        dev_log(sys, 1, m.as_ptr(), m.len());
+        return Err(h);
+    }
+    s.cell_key_pending = false;
+    s.cell_key = h;
+    Ok(true)
 }
 
 /// HMAC-SHA256 of `data` by the vault's slot `h` (`SIGN`, `RAW`, in place
@@ -774,12 +798,8 @@ pub unsafe extern "C" fn module_new(
     }
     s.cell_key = -1;
     if s.bad_param == 0 && s.key_label_len != 0 {
-        s.cell_key = open_cell_key(sys, &s.key_label[..usize::from(s.key_label_len)]);
-        if s.cell_key < 0 {
-            let m = b"[rescue_tunnel] refusing to construct: no HMAC-SHA256 key under key_label in this vault";
-            dev_log(sys, 1, m.as_ptr(), m.len());
-            return -22;
-        }
+        // Opened from the first step (`cell_key_step`).
+        s.cell_key_pending = true;
         s.key_set = true;
     }
     if s.bad_param != 0 || !s.key_set {
@@ -817,6 +837,11 @@ pub unsafe extern "C" fn module_new(
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut RtState);
     s.step_count = s.step_count.wrapping_add(1);
+    match cell_key_step(s) {
+        Ok(true) => {}
+        Ok(false) => return StepReturn::Continue,
+        Err(rc) => return StepReturn::error(rc),
+    }
     bind(s);
     anchor(s);
     ingress(s);

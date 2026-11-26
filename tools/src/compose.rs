@@ -267,9 +267,10 @@ pub struct CompositionPlan {
     /// empty.
     pub revocations: Vec<PlanRevocation>,
     /// Granted endpoint leases, ordered by
-    /// (slot, protocol, port), empty when the workload declares no exports. The
-    /// lease section is always encoded — its presence marks the plan lease-aware
-    /// and makes bind-gate enforcement mandatory.
+    /// (slot, protocol, port), empty when the workload declares no exports.
+    /// Each is encoded as a `net.endpoint` grant (`net_proto::grant`) in the
+    /// plan's grant section, which is always present: a committed plan makes
+    /// the network stack's bind gate mandatory.
     pub leases: Vec<PlanLease>,
     pub plan_digest: Digest32,
 }
@@ -281,14 +282,14 @@ pub struct CompositionPlan {
 pub struct PlanLease {
     pub slot: u16,
     pub generation: u32,
-    /// 1 = tcp, 2 = udp.
+    /// An IP protocol number: 6 = tcp, 17 = udp.
     pub protocol: u8,
     pub port: u16,
 }
 
 /// Protocol byte values for [`PlanLease::protocol`].
-pub const LEASE_PROTO_TCP: u8 = owner_plan::PROTOCOL_TCP;
-pub const LEASE_PROTO_UDP: u8 = owner_plan::PROTOCOL_UDP;
+pub const LEASE_PROTO_TCP: u8 = fluxor_abi::contracts::net::net_proto::grant::PROTO_TCP;
+pub const LEASE_PROTO_UDP: u8 = fluxor_abi::contracts::net::net_proto::grant::PROTO_UDP;
 
 /// Map an export's protocol string to a lease protocol byte; `None` for
 /// protocols the lease system does not cover (reported but not granted/gated).
@@ -655,7 +656,7 @@ fn owned_assignment(a: owner_plan::Assignment) -> OwnerAssignment {
     }
 }
 
-/// The plan's bytes: header, `ASGN`, `RVOK`, `LEAS` (each always present,
+/// The plan's bytes: header, `ASGN`, `RVOK`, `GRNT` (each always present,
 /// empty or not), then the SHA-256 over all of it.
 fn plan_bytes(
     generation: u64,
@@ -674,13 +675,21 @@ fn plan_bytes(
             deadline_unix: r.deadline_unix,
         })
         .collect();
-    let leases: Vec<owner_plan::Lease> = leases
+    let endpoints: Vec<[u8; 3]> = leases
         .iter()
-        .map(|l| owner_plan::Lease {
+        .map(|l| {
+            let p = l.port.to_le_bytes();
+            [l.protocol, p[0], p[1]]
+        })
+        .collect();
+    let grants: Vec<owner_plan::Grant<'_>> = leases
+        .iter()
+        .zip(&endpoints)
+        .map(|(l, e)| owner_plan::Grant {
             slot: l.slot,
             generation: l.generation,
-            protocol: l.protocol,
-            port: l.port,
+            kind: fluxor_abi::contracts::net::net_proto::grant::ENDPOINT,
+            bytes: e,
         })
         .collect();
     owner_plan::encode(
@@ -688,7 +697,7 @@ fn plan_bytes(
             generation,
             assignments: &assignments,
             revocations: &revocations,
-            leases: &leases,
+            grants: &grants,
         },
         max_assignments,
         sha256_of,
@@ -730,7 +739,7 @@ pub fn encode_plan(plan: &CompositionPlan) -> Result<Vec<u8>, ComposeError> {
     )
     .map_err(|e| match e {
         owner_plan::PlanError::TooMany {
-            tag: owner_plan::tag::LEASES,
+            tag: owner_plan::tag::GRANTS,
             ..
         } => ComposeError::EndpointsExceeded,
         _ => ComposeError::OwnerSlotsExhausted,
@@ -757,12 +766,16 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, owner_plan::PlanErro
             })
             .collect(),
         leases: plan
-            .leases()
-            .map(|l| PlanLease {
-                slot: l.slot,
-                generation: l.generation,
-                protocol: l.protocol,
-                port: l.port,
+            .grants()
+            .filter(|g| {
+                g.kind == fluxor_abi::contracts::net::net_proto::grant::ENDPOINT
+                    && g.bytes.len() == fluxor_abi::contracts::net::net_proto::grant::ENDPOINT_LEN
+            })
+            .map(|g| PlanLease {
+                slot: g.slot,
+                generation: g.generation,
+                protocol: g.bytes[0],
+                port: u16::from_le_bytes([g.bytes[1], g.bytes[2]]),
             })
             .collect(),
         plan_digest: plan.digest,
@@ -1299,7 +1312,7 @@ mod tests {
     #[test]
     fn a_plan_has_the_canonical_layout_with_every_section_present() {
         // Hand-built: header (magic, generation), the assignment section, an
-        // empty revocation section and an empty lease section, each
+        // empty revocation section and an empty grant section, each
         // `tag | len | count | records`, little-endian, then SHA-256 over all
         // of it. Every section is emitted, empty or not.
         let plan = sample_plan();
@@ -1322,7 +1335,7 @@ mod tests {
             expected.extend_from_slice(&a.state_cap.to_le_bytes());
             expected.extend_from_slice(&a.buffer_cap.to_le_bytes());
         }
-        for tag in [b"RVOK", b"LEAS"] {
+        for tag in [b"RVOK", b"GRNT"] {
             expected.extend_from_slice(tag);
             expected.extend_from_slice(&4u32.to_le_bytes());
             expected.extend_from_slice(&0u32.to_le_bytes());

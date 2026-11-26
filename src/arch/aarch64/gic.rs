@@ -261,6 +261,28 @@ pub fn timer_ppi() -> u32 {
     TIMER_PPI.load(Ordering::Relaxed)
 }
 
+/// The deadline timer's PPI: the generic timer the tick does not use (the
+/// virtual timer's 27 beside a physical tick's 30, and the other way
+/// round), which stops a gated entry at its deadline. 0 when the tick runs
+/// on neither.
+pub fn deadline_ppi() -> u32 {
+    match timer_ppi() {
+        30 => 27,
+        27 => 30,
+        _ => 0,
+    }
+}
+
+/// The SGIs, the tick and the deadline timer: the banked lines every core
+/// enables for itself.
+fn banked_enable() -> u32 {
+    let deadline = match deadline_ppi() {
+        0 => 0,
+        p => 1u32 << p,
+    };
+    0xFFFF | (1u32 << timer_ppi()) | deadline
+}
+
 /// The `CPUTargetList` / `ITARGETSR` bit that reaches core `core`: what the
 /// distributor told that core at its GIC init. Before then, and on a
 /// uniprocessor GIC (where `ITARGETSR0` reads as zero), `1 << core`.
@@ -683,7 +705,10 @@ pub unsafe fn init_v3_cpu(rd: usize) {
         mmio::write8(rd + GICR_IPRIORITYR + sgi, V3_PRIORITY);
     }
     mmio::write8(rd + GICR_IPRIORITYR + ppi as usize, V3_PRIORITY);
-    mmio::write32(rd + GICR_ISENABLER0, 0xFFFF | (1u32 << ppi));
+    if deadline_ppi() != 0 {
+        mmio::write8(rd + GICR_IPRIORITYR + deadline_ppi() as usize, V3_PRIORITY);
+    }
+    mmio::write32(rd + GICR_ISENABLER0, banked_enable());
     core::arch::asm!("msr s3_0_c4_c6_0, {}", in(reg) V3_PRIORITY_MASK, options(nomem, nostack));
     core::arch::asm!("msr s3_0_c12_c12_7, {}", "isb", in(reg) 1u64, options(nomem, nostack));
 }
@@ -718,8 +743,11 @@ pub unsafe fn init_secondary() {
     let gicc = gicc_base();
     let ppi = timer_ppi();
     learn_cpu_interface(gicd);
-    mmio::write32(gicd + GICD_ISENABLER, 0xFFFF | (1u32 << ppi));
+    mmio::write32(gicd + GICD_ISENABLER, banked_enable());
     mmio::write8(gicd + GICD_IPRIORITYR + ppi as usize, 0);
+    if deadline_ppi() != 0 {
+        mmio::write8(gicd + GICD_IPRIORITYR + deadline_ppi() as usize, 0);
+    }
     mmio::write32(gicc + GICC_PMR, 0xFF); // unmask every priority
     mmio::write32(gicc + GICC_CTLR, 1);
 }

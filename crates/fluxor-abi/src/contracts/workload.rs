@@ -5,7 +5,7 @@
 // One contract for "run an isolated workload with a declared capability
 // envelope," realized by two backends chosen by placement, never by the
 // consumer:
-//   * fmod-graph backend    — MPU/EL0 + owner/lease (bare metal),
+//   * fmod-graph backend    — MPU/EL0 + owner (bare metal),
 //   * host-process backend  — OS process isolation (Linux).
 //
 // The consumer (e.g. a workload manager) says WHAT to run and THE ENVELOPE, never
@@ -18,8 +18,8 @@
 //
 //   NATIVE CORE (every backend implements; the Fluxor lifecycle model):
 //     CREATE / START / WAIT / SIGNAL(portable subset) / DESTROY / PAUSE /
-//     RESUME / CAPS / OPTIONS, plus the CREATE header (identity, posture,
-//     resource envelope, network identity/endpoints). Native semantics: a
+//     RESUME / LANE / LOOKUP / CAPS / OPTIONS, plus the CREATE header
+//     (identity, posture, resource envelope). Native semantics: a
 //     workload is an owned execution context with a reversible frozen
 //     state; "exit" means the owner is gone; SIG_TERM means drain, SIG_KILL
 //     means reclaim. `compute_milli` is the native envelope unit (milli
@@ -28,7 +28,8 @@
 //   HOST-PROCESS MECHANICS ARE NOT HERE: command execution, PTY sessions,
 //     stdout/stderr drains, and rootfs bundles are one backend's
 //     implementation vocabulary. They live in the host-scoped class
-//     `abi::platform::linux::host_process` (0x1B) — registered only where a
+//     `abi::platform::linux::host_process`, which takes this contract's
+//     handles in its handle slot — registered only where a
 //     host platform exists; an unregistered class returns ENOSYS. The
 //     `source_kind` byte here defines only the native artifacts
 //     (`SOURCE_FMOD_GRAPH = 0`, `SOURCE_FMOD_PACK = 2`); other kinds are
@@ -36,7 +37,8 @@
 //
 // A CREATE has two parts:
 //   * the header — typed portable fields: identity, posture,
-//     resource envelope, network endpoints. Every backend maps them.
+//     resource envelope. Every backend maps them. A workload's network is
+//     the node's net provider's to realize, told by the node agent.
 //   * the options — a backend-opaque envelope (the trailing TLV section):
 //     hardening knobs with no portable meaning. fluxor defines only the
 //     envelope MECHANISM — it validates shape and routes a namespace to the
@@ -71,8 +73,8 @@
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
 /// `workload.create` grant.
-/// Identity in the spec is mapped to an owner and lease-gated before any
-/// backend mechanism runs. The null identity names no one and is refused
+/// Identity in the spec is mapped to an owner before any backend mechanism
+/// runs. The null identity names no one and is refused
 /// (`EINVAL`). One identity is one workload: a `CREATE` for an identity that
 /// already has a live workload answers `EEXIST`.
 ///
@@ -101,7 +103,7 @@ pub use super::super::registry::workload::WAIT;
 /// `0` or a negative errno.
 pub use super::super::registry::workload::SIGNAL;
 
-/// `DESTROY` — stop (graceful → forced), reap, release the owner/lease and any
+/// `DESTROY` — stop (graceful → forced), reap, release the owner and any
 /// backend resources (isolation region, arena). Idempotent. Returns `0`.
 ///
 /// With `handle = -1` and `arg` = the 16-byte identity, destroys by identity:
@@ -143,70 +145,6 @@ pub use super::super::registry::workload::RESUME;
 /// Most caller lanes one workload holds.
 pub const MAX_CALLER_LANES: usize = 8;
 
-// ---- network lanes served by a provider module ----
-//
-// A staged workload joins the node's network through lanes (`Endpoint::Net`
-// edges): a command channel it writes and an event channel it reads. The
-// kernel hands each lane to the node's net provider. A provider built into
-// the kernel is called directly; a provider that is a module (the bare-metal
-// `ip`) claims the role with `NET_PROVIDE` and takes the lane changes the
-// kernel queues for it with `NET_LANE_TAKE`. Only the provider may call
-// `NET_LANE_TAKE` and `NET_LANE_ADMIT`; none of the three creates anything,
-// so they need `workload.net`, not `workload.create`.
-
-/// `NET_LANE_ADMIT` — may a lane's owner bind a new endpoint? `arg` is a
-/// [`net_lane::ADMIT_LEN`]-byte request: `[owner slot:u16 LE][0:u16]
-/// [owner generation:u32 LE][protocol:u8][0:u8][port:u16 LE]`, protocol
-/// [`NET_PROTO_TCP`] or [`NET_PROTO_UDP`]. Returns 0; -1 (`EPERM`) when the
-/// owner is gone or draining (it admits nothing new); `EACCES` when the node's
-/// committed plan grants that owner no lease on the port, or for a caller
-/// that is not the provider. The same gate a native provider applies.
-pub use super::super::registry::workload::NET_LANE_ADMIT;
-/// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
-/// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).
-/// Returns `RECORD_LEN`, 0 when none is queued, or `EACCES` for a caller
-/// that is not the provider. A lane's detach is queued after its attach and
-/// before any attach that reuses its channels, so a provider that takes every
-/// queued change before touching a lane never writes a channel the kernel
-/// has handed to someone else.
-pub use super::super::registry::workload::NET_LANE_TAKE;
-/// `NET_PROVIDE` — claim the net-provider role for workload lanes, stating
-/// how many lanes the provider holds. `handle` = -1, `arg` =
-/// `[lanes:u8]` ([`net_lane::PROVIDE_LEN`] bytes): the provider's lane
-/// capacity, 1..=255 (a lane id is a `u8`). The kernel sizes its lane tables
-/// to it and refuses an attach past it (`ENOSPC`), so every lane it queues is
-/// one the provider has room for. Returns 0, `EINVAL` (no capacity, or 0),
-/// `ENOSPC` (the kernel cannot hold that many), or `EBUSY` when another
-/// provider holds the role (a node has one network). Claiming it again from
-/// the same module is 0; a larger capacity then grows the tables, and a
-/// smaller one keeps them.
-pub use super::super::registry::workload::NET_PROVIDE;
-
-/// `NET_RESOLVER` — the name-service context of a lane's owner, for the
-/// net provider. `arg` is `[owner slot:u16 LE][0:u16][owner generation:u32
-/// LE]` followed by room for the answer; the context the owner's CREATE
-/// carried ([`resolver`]) is written over it from offset 0. Returns its
-/// length, `ENOENT` when the owner carried none (the node's own upstream
-/// serves it), `ERANGE` when `arg` is too short, or `EACCES` for a caller
-/// that is not the provider. Like the lane ops it creates nothing and needs
-/// `workload.net`, not `workload.create`.
-pub use super::super::registry::workload::NET_RESOLVER;
-
-/// The per-owner name-service context: an options entry on [`CREATE`],
-/// namespace [`resolver::NS`], key [`resolver::KEY`], whose value is
-/// `[family:u8][server:16][n_search:u8]` then `n_search × ([len:u8][name])`
-/// — the server the owner's queries go to (`NET_FAM_IPV4`, the address in
-/// the first four bytes), and the search list a short name is tried under,
-/// in order. A backend that realizes it lists it in [`OPTIONS`]; one that does not answers a required entry `ENOSYS`.
-pub mod resolver {
-    pub const NS: &[u8] = b"net";
-    pub const KEY: &[u8] = b"resolver";
-    /// Bytes before the search list.
-    pub const HEAD: usize = 1 + 16 + 1;
-    /// Longest context value: the server and a search list of names.
-    pub const MAX: usize = 256;
-}
-
 /// The workload's environment: an options entry on [`CREATE`], namespace
 /// [`env::NS`], key [`env::KEY`], value `NAME=VALUE` (the name up to the
 /// first `=`, never empty; the value may be empty), repeatable, a later
@@ -215,70 +153,31 @@ pub mod resolver {
 /// `ENOSYS`.
 ///
 /// A host process takes the entries into its environment, over the source's
-/// own. A graph workload (`SOURCE_FMOD_GRAPH`, `SOURCE_FMOD_PACK`) takes
-/// them into its modules' params: a module param the graph binds to a name
-/// is an **env bind record** in the module's params TLV, entry tag
-/// [`env::BIND_TAG`] in the basic section, which the backend replaces, in
-/// its own copy of the subgraph and before any module is instantiated, with
-/// the param's entries carrying the value. The record's value:
-/// ```text
-/// off  size  field
-///   0    1   target    the param's own TLV tag (below env::BIND_TAG)
-///   1    1   kind      KIND_U8 | KIND_U16 | KIND_U32 | KIND_STR | KIND_STR_CHUNKED
-///   2    1   flags     FLAG_REQUIRED | FLAG_DEFAULT (at most one)
-///   3    1   name_len  1..=MAX_NAME
-///   4    n   name
-///   4+n  ..  default   with FLAG_DEFAULT: an integer kind's value LE in its
-///                      width, a string kind's bytes
-/// ```
-/// The value an entry names is written as the param's packer writes it: an
-/// integer (decimal, `0x` hex, `true`/`false`) LE in the kind's width, out
-/// of range `EINVAL`; a string as one entry (`KIND_STR`, at most 255 bytes,
-/// longer `EINVAL`) or 255-byte chunks under the one tag
-/// (`KIND_STR_CHUNKED`); an empty string as no entry. A name no entry gives
-/// takes the default; with none and `FLAG_REQUIRED` the `CREATE` fails
-/// `EINVAL`, and an optional one leaves the param out (the module's own
-/// default). A subgraph the values do not fit (a module's params past a
-/// `u16`, the graph past a source's `u16`) fails `E2BIG`; a
-/// malformed record `EINVAL`. A bind record never reaches a module: an add
-/// that still carries one is refused `EINVAL`.
+/// own; the host-process backend lists the entry in [`OPTIONS`]. A graph
+/// workload (`SOURCE_FMOD_GRAPH`, `SOURCE_FMOD_PACK`) has no environment of
+/// its own and the graph backend lists no options entry: its creator binds
+/// the values into the modules' params before `CREATE`
+/// (`fluxor_contracts::graph::env_bind`), and the backend refuses an add that
+/// still carries an env bind record (`EINVAL`).
 pub mod env {
     pub const NS: &[u8] = b"env";
     pub const KEY: &[u8] = b"var";
-    /// The params TLV tag of an env bind record: reserved, below the kernel's
-    /// metadata tags (0xEE..=0xFF) and above every module param's.
-    pub const BIND_TAG: u8 = 0xED;
-    /// Longest name a bind record or an entry carries.
-    pub const MAX_NAME: usize = 128;
-    /// Bytes of a bind record before its name.
-    pub const HEAD: usize = 4;
-    pub const KIND_U8: u8 = 0;
-    pub const KIND_U16: u8 = 1;
-    pub const KIND_U32: u8 = 2;
-    pub const KIND_STR: u8 = 3;
-    pub const KIND_STR_CHUNKED: u8 = 6;
-    /// No entry for the name fails the `CREATE` (`EINVAL`).
-    pub const FLAG_REQUIRED: u8 = 0x01;
-    /// The record carries a default after its name.
-    pub const FLAG_DEFAULT: u8 = 0x02;
 }
 
-/// A volume lent to a workload: an options entry on [`CREATE`], namespace
-/// [`volume::NS`], key [`volume::KEY`], value `<src>\0<dst>\0<ro>` — `src`
-/// an absolute host directory, `dst` the path the workload names it by, `ro`
-/// `1` (read-only) or `0` (left out with its `\0`: writable). Repeatable, at
-/// most [`volume::MAX`] per workload.
+/// A volume lent to a host-process workload: an options entry on [`CREATE`],
+/// namespace [`volume::NS`], key [`volume::KEY`], value `<src>\0<dst>\0<ro>`
+/// — `src` an absolute host directory, `dst` the path the workload names it
+/// by, `ro` `1` (read-only) or `0` (left out with its `\0`: writable).
+/// Repeatable, at most [`volume::MAX`] per workload.
 ///
-/// A host process has `src` bind-mounted at `dst` in its root. A graph
-/// workload's `fs` paths at or under `dst` resolve beneath `src` (no path,
-/// symlink or magic link leads out of it); on a read-only volume nothing
-/// is created, written, renamed or removed (`EACCES`, and `OPEN` is
-/// read-only). A volume is lent, not owned: what it holds is never charged
-/// to the owner's storage, it is reachable whatever the owner's storage
-/// grant, and the owner's release leaves it as it was. A rename between a
-/// volume and anything else is `EXDEV`. A backend that realizes it lists it
-/// in [`OPTIONS`]; one that does not answers a required entry `ENOSYS`, so a
-/// consumer marks every volume required.
+/// A host process has `src` bind-mounted at `dst` in its root; on a
+/// read-only volume nothing is created, written, renamed or removed. A
+/// volume is lent, not owned: what it holds is never charged to the owner's
+/// storage line, and the owner's release leaves it as it was. A graph
+/// workload is lent volumes by the node's workload `fs` layer, not by its
+/// `CREATE`: the graph backend does not list this entry in [`OPTIONS`] and
+/// answers a required one `ENOSYS`, so a consumer marks every volume
+/// required.
 pub mod volume {
     pub const NS: &[u8] = b"mount";
     pub const KEY: &[u8] = b"bind";
@@ -286,62 +185,27 @@ pub mod volume {
     pub const MAX: usize = 16;
 }
 
-/// A workload's own vault: an options entry on [`CREATE`], namespace
-/// [`vault::NS`], key [`vault::KEY`], value `<dir>\0<seal_key>` — `dir` a
-/// path the workload names (at or beneath the `dst` of one of the CREATE's
-/// writable [`volume`]s; made when absent), `seal_key` 64 hex digits, the 32
-/// bytes the workload's owner supplies (a Secret it holds, say). At most one.
+/// An endpoint a graph workload's owner may listen on: an options entry on
+/// [`CREATE`], namespace [`endpoint::NS`], key [`endpoint::KEY`], value
+/// `[protocol u8][port u16 LE]` (`protocol` an IP protocol number,
+/// `net_proto::grant::PROTO_TCP` or `PROTO_UDP`; `port` nonzero).
+/// Repeatable, at most `net_proto::grant::MAX_ADMITTED_ENDPOINTS` per
+/// workload, each once.
 ///
-/// Every key a module of the workload persists by label (`key_vault`
-/// `PERSIST`) is sealed with ChaCha20-Poly1305 under `seal_key` and kept as
-/// one file per label in `dir`, never in the node's store: the keys follow
-/// the volume and the seal key, not the node — the same volume and key
-/// given to the workload on another node open the same keys, and nothing
-/// else opens them. Their custody is `SOFTWARE` (`DESCRIBE`), whatever the
-/// node's sealing key is worth: whoever holds the volume and `seal_key`
-/// holds the keys. Without this option a workload's labelled keys are its
-/// own still — a workload's labels live in its realm, its owner uid, and no
-/// other workload's nor the node's reach them — but are kept in the node's
-/// store under the node's sealing key, and so stay with the node.
-///
-/// A backend that realizes it lists it in [`OPTIONS`] (the graph backend on a
-/// Linux host); one that does not answers a required entry `ENOSYS`, so a
-/// consumer marks it required.
-pub mod vault {
-    pub const NS: &[u8] = b"vault";
-    pub const KEY: &[u8] = b"store";
-    /// Bytes of the owner's sealing key (64 hex digits in the option).
-    pub const SEAL_KEY_LEN: usize = 32;
-}
-
-/// The record [`NET_LANE_TAKE`] writes, little-endian:
-/// ```text
-/// off  size  field
-///   0    1   op          OP_ATTACH or OP_DETACH
-///   1    1   key         the lane's `Endpoint::Net` key (attach)
-///   2    2   0
-///   4    2   owner slot
-///   6    2   0
-///   8    4   owner generation
-///  12    4   commands    channel the provider reads (attach; -1 on detach)
-///  16    4   events      channel the provider writes (attach; -1 on detach)
-/// ```
-/// A detach names the owner only: every lane of that owner is gone, and the
-/// provider closes every endpoint they opened.
-pub mod net_lane {
-    pub const RECORD_LEN: usize = 20;
-    pub const OP_ATTACH: u8 = 1;
-    pub const OP_DETACH: u8 = 2;
-    pub const OFF_OP: usize = 0;
-    pub const OFF_KEY: usize = 1;
-    pub const OFF_OWNER_SLOT: usize = 4;
-    pub const OFF_OWNER_GEN: usize = 8;
-    pub const OFF_COMMANDS: usize = 12;
-    pub const OFF_EVENTS: usize = 16;
-    /// [`super::NET_LANE_ADMIT`]'s request length.
-    pub const ADMIT_LEN: usize = 12;
-    /// [`super::NET_PROVIDE`]'s argument length: `[lanes:u8]`.
-    pub const PROVIDE_LEN: usize = 1;
+/// The entries are the owner's `net.endpoint` grants (`OWNER_GRANTS`): a
+/// workload's lane listens on a port only where its owner holds one, so a
+/// graph workload created with none listens nowhere. The creator grants
+/// them, so only a creator acting with the node's authority may (`EACCES`
+/// otherwise), and an endpoint another live owner holds is `EEXIST`.
+/// The graph backend lists the entry in [`OPTIONS`]; the host-process
+/// backend does not (a host process's sockets are the host's, not a lane's)
+/// and answers a required one `ENOSYS`, so a creator marks every endpoint
+/// required.
+pub mod endpoint {
+    pub const NS: &[u8] = b"net";
+    pub const KEY: &[u8] = b"endpoint";
+    /// Bytes of an entry's value.
+    pub const LEN: usize = 3;
 }
 
 /// `CAPS` — backend capability discovery. `handle = -1` (or a bound handle);
@@ -369,7 +233,19 @@ pub use super::super::registry::workload::OPTIONS;
 /// No isolation — same address space / null sandbox (PROC semantics).
 pub const POSTURE_SHARED: u8 = 0;
 /// Memory + resource isolation, realized by the platform's strongest
-/// available protection mechanism.
+/// available protection mechanism. On a metal node (the graph backend) it
+/// means exactly: each module the workload brings runs unprivileged under
+/// its own translation regime (an EL0 page table and ASID, or an MPU
+/// region), with no access to the kernel's or another owner's memory,
+/// reaching the kernel only through the gateway, and a step that runs past
+/// its deadline is forced out and faulted. It does not cover cache or timing
+/// side channels or memory bandwidth, and not a provider the workload
+/// composes from the node's own image (`workload_instantiable`): that code is
+/// the node's, runs privileged and is not contained — a hang inside it is
+/// the node's fault, as for any node module. A workload that keeps faulting
+/// is restarted under the node's fault backoff, so its availability is
+/// bounded by its deadline times its restart rate. A metal backend realizes
+/// a `SHARED` request at this posture (a posture is a floor).
 pub const POSTURE_ISOLATED: u8 = 1;
 /// `isolated` + reduced attack surface (Linux: reduced syscall + privilege
 /// surface; metal: strongest isolation-region config). Backend refinements
@@ -422,14 +298,221 @@ pub mod pack_ref {
 /// the identity's `CREATE` is still being staged (continue it with the same
 /// spec, or abandon it with [`DESTROY`] by identity), or `ENOENT`.
 pub use super::super::registry::workload::LOOKUP;
-/// `MODULE_DIGESTS` — what the node's own image holds, so an orchestrator can
-/// pin a workload against it: writes `[count:u16 LE][0:u16]` then `count`
-/// records `[name_hash:u32 LE][sha256 of the module's full .fmod bytes:32]`
-/// into `data`, as many as fit; returns the total count. Not
-/// workload-scoped (handle -1).
-pub use super::super::registry::workload::MODULE_DIGESTS;
-/// One [`MODULE_DIGESTS`] record.
-pub const MODULE_DIGEST_RECORD: usize = 36;
+
+/// `OWNERS` — the node's owner facts: every workload owner the kernel holds
+/// and every drained one the applied owner plan still lists, as fixed binary
+/// records (layout in [`owners`]). `handle = -1`, no `arg`; `data` out =
+/// the answer. Returns its length, `ERANGE` when `data` cannot hold it,
+/// `EACCES` for a caller not acting with the node's authority. The same
+/// read on every target: rendering, history and retention are the reader's.
+pub use super::super::registry::workload::OWNERS;
+
+/// The [`OWNERS`] answer, little-endian: a [`owners::HEADER_LEN`]-byte head
+/// `[count:u16][record_len:u16][_:u32][plan_generation:u64]
+/// [plan_digest:32]`, then `count` records of `record_len` bytes, by owner
+/// slot. A reader takes `record_len` from the head and the fields it knows
+/// from each record's front.
+pub mod owners {
+    /// Bytes of the answer's head.
+    pub const HEADER_LEN: usize = 48;
+    /// Bytes of one record.
+    pub const RECORD_LEN: usize = 64;
+
+    /// Head: the record count, `u16`.
+    pub const H_COUNT: usize = 0;
+    /// Head: the record length, `u16`.
+    pub const H_RECORD_LEN: usize = 2;
+    /// Head: the generation of the owner plan last applied, `u64` (0: none).
+    pub const H_PLAN_GENERATION: usize = 8;
+    /// Head: that plan's digest, 32 bytes.
+    pub const H_PLAN_DIGEST: usize = 16;
+
+    /// The owner's identity, 16 bytes.
+    pub const UID: usize = 0;
+    /// Its owner slot, `u16`.
+    pub const SLOT: usize = 16;
+    /// Its state, `u8` (`STATE_*`).
+    pub const STATE: usize = 18;
+    /// The fault kind of its most recent terminated module, `u8` (0: none).
+    pub const FAULT_KIND: usize = 19;
+    /// Its owner generation, `u32`.
+    pub const GENERATION: usize = 20;
+    /// Modules the owner stamps, `u16`.
+    pub const MODULES: usize = 24;
+    /// Of those, instantiated, `u16`.
+    pub const LOADED: usize = 26;
+    /// Of those, ended cleanly, `u16`.
+    pub const FINISHED: usize = 28;
+    /// Of those, terminated by the fault policy, `u16`.
+    pub const TERMINATED: usize = 30;
+    /// Of those, faulted and being retried by the fault policy, `u16`.
+    pub const RECOVERING: usize = 32;
+    /// How a drain ended, `u8` (`DRAIN_*`).
+    pub const DRAIN: usize = 34;
+    /// How many times this kernel instantiated the owner's modules, `u32`:
+    /// 1 for its first activation, one more for each rebuild that
+    /// instantiates them again.
+    pub const ACTIVATIONS: usize = 36;
+    /// When its most recent terminated module faulted, ms of kernel uptime,
+    /// `u64` (0: none).
+    pub const FAULT_MS: usize = 40;
+    /// The drain deadline the plan's revocation states, unix seconds, `u64`
+    /// (0: not revoked).
+    pub const DRAIN_DEADLINE: usize = 48;
+    /// When the kernel freed the drained owner, unix seconds of the clock
+    /// the platform drives the drain with, `u64` (0: not freed by a drain
+    /// this kernel ran).
+    pub const DRAINED_AT: usize = 56;
+
+    /// `STATE`: running.
+    pub const STATE_ACTIVE: u8 = 0;
+    /// `STATE`: draining before its revocation; admits nothing new.
+    pub const STATE_DRAINING: u8 = 1;
+    /// `STATE`: paused (reversible).
+    pub const STATE_PAUSED: u8 = 2;
+    /// `STATE`: drained and freed; the record stays while the plan lists
+    /// the revocation.
+    pub const STATE_GONE: u8 = 3;
+
+    /// `FAULT_KIND`: no module terminated.
+    pub const FAULT_NONE: u8 = 0;
+    /// `FAULT_KIND`: a step overran its deadline.
+    pub const FAULT_TIMEOUT: u8 = 1;
+    /// `FAULT_KIND`: a step returned an error.
+    pub const FAULT_STEP_ERROR: u8 = 2;
+    /// `FAULT_KIND`: a module faulted on memory protection.
+    pub const FAULT_MPU: u8 = 4;
+    /// `FAULT_KIND`: a module did not drain within its deadline.
+    pub const FAULT_DRAIN_TIMEOUT: u8 = 5;
+
+    /// `DRAIN`: not drained.
+    pub const DRAIN_NONE: u8 = 0;
+    /// `DRAIN`: freed once every module it stamps ended and its edges ran
+    /// dry.
+    pub const DRAIN_QUIESCED: u8 = 1;
+    /// `DRAIN`: freed at the deadline, still running.
+    pub const DRAIN_DEADLINE_PASSED: u8 = 2;
+    /// `DRAIN`: freed without a drain this kernel ran: a rebuild dropped it
+    /// mid-drain, or this kernel never held it (it started after the owner
+    /// was revoked).
+    pub const DRAIN_FORFEITED: u8 = 3;
+
+    /// One record, read.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub struct Record {
+        pub uid: [u8; 16],
+        pub slot: u16,
+        pub state: u8,
+        pub fault_kind: u8,
+        pub generation: u32,
+        pub modules: u16,
+        pub loaded: u16,
+        pub finished: u16,
+        pub terminated: u16,
+        pub recovering: u16,
+        pub drain: u8,
+        pub activations: u32,
+        pub fault_ms: u64,
+        pub drain_deadline: u64,
+        pub drained_at: u64,
+    }
+
+    fn u16_at(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+    fn u32_at(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+    fn u64_at(b: &[u8], o: usize) -> u64 {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&b[o..o + 8]);
+        u64::from_le_bytes(v)
+    }
+
+    impl Record {
+        /// Write the record into `out`'s first [`RECORD_LEN`] bytes; `false`
+        /// when `out` is shorter.
+        pub fn write(&self, out: &mut [u8]) -> bool {
+            let Some(b) = out.get_mut(..RECORD_LEN) else {
+                return false;
+            };
+            b.fill(0);
+            b[UID..UID + 16].copy_from_slice(&self.uid);
+            b[SLOT..SLOT + 2].copy_from_slice(&self.slot.to_le_bytes());
+            b[STATE] = self.state;
+            b[FAULT_KIND] = self.fault_kind;
+            b[GENERATION..GENERATION + 4].copy_from_slice(&self.generation.to_le_bytes());
+            for (o, v) in [
+                (MODULES, self.modules),
+                (LOADED, self.loaded),
+                (FINISHED, self.finished),
+                (TERMINATED, self.terminated),
+                (RECOVERING, self.recovering),
+            ] {
+                b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            b[DRAIN] = self.drain;
+            b[ACTIVATIONS..ACTIVATIONS + 4].copy_from_slice(&self.activations.to_le_bytes());
+            for (o, v) in [
+                (FAULT_MS, self.fault_ms),
+                (DRAIN_DEADLINE, self.drain_deadline),
+                (DRAINED_AT, self.drained_at),
+            ] {
+                b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            true
+        }
+
+        /// Read a record from `b`'s first [`RECORD_LEN`] bytes.
+        pub fn read(b: &[u8]) -> Option<Record> {
+            let b = b.get(..RECORD_LEN)?;
+            let mut uid = [0u8; 16];
+            uid.copy_from_slice(&b[UID..UID + 16]);
+            Some(Record {
+                uid,
+                slot: u16_at(b, SLOT),
+                state: b[STATE],
+                fault_kind: b[FAULT_KIND],
+                generation: u32_at(b, GENERATION),
+                modules: u16_at(b, MODULES),
+                loaded: u16_at(b, LOADED),
+                finished: u16_at(b, FINISHED),
+                terminated: u16_at(b, TERMINATED),
+                recovering: u16_at(b, RECOVERING),
+                drain: b[DRAIN],
+                activations: u32_at(b, ACTIVATIONS),
+                fault_ms: u64_at(b, FAULT_MS),
+                drain_deadline: u64_at(b, DRAIN_DEADLINE),
+                drained_at: u64_at(b, DRAINED_AT),
+            })
+        }
+    }
+
+    /// The answer's head, read: `(count, record_len, plan_generation,
+    /// plan_digest)`. `None` when `b` is shorter than the head, a record is
+    /// shorter than [`RECORD_LEN`], or the records overrun `b`.
+    pub fn read_head(b: &[u8]) -> Option<(usize, usize, u64, [u8; 32])> {
+        let h = b.get(..HEADER_LEN)?;
+        let count = usize::from(u16_at(h, H_COUNT));
+        let len = usize::from(u16_at(h, H_RECORD_LEN));
+        if len < RECORD_LEN || HEADER_LEN + count * len > b.len() {
+            return None;
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&h[H_PLAN_DIGEST..H_PLAN_DIGEST + 32]);
+        Some((count, len, u64_at(h, H_PLAN_GENERATION), digest))
+    }
+
+    /// Write the head into `out`'s first [`HEADER_LEN`] bytes.
+    pub fn write_head(out: &mut [u8], count: u16, plan_generation: u64, plan_digest: &[u8; 32]) {
+        let h = &mut out[..HEADER_LEN];
+        h.fill(0);
+        h[H_COUNT..H_COUNT + 2].copy_from_slice(&count.to_le_bytes());
+        h[H_RECORD_LEN..H_RECORD_LEN + 2].copy_from_slice(&(RECORD_LEN as u16).to_le_bytes());
+        h[H_PLAN_GENERATION..H_PLAN_GENERATION + 8].copy_from_slice(&plan_generation.to_le_bytes());
+        h[H_PLAN_DIGEST..H_PLAN_DIGEST + 32].copy_from_slice(plan_digest);
+    }
+}
 // Every other source kind is backend-defined (the linux host-process source kind is
 // `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`).
 
@@ -448,8 +531,8 @@ pub const SIG_TERM: u32 = 1;
 /// Force kill.
 pub const SIG_KILL: u32 = 2;
 
-/// Fixed size of the `CREATE` typed header, in bytes. The variable-length
-/// source-ref, endpoint, and options sections follow at this offset.
+/// Fixed size of the `CREATE` typed header, in bytes. The source-ref and
+/// options sections follow at this offset.
 ///
 /// Layout (all little-endian):
 /// ```text
@@ -457,69 +540,113 @@ pub const SIG_KILL: u32 = 2;
 ///   0    16  identity        owner_uid: the one owner the workload runs as
 ///  16     1  posture         POSTURE_*
 ///  17     1  source_kind     SOURCE_*
-///  18     1  net_iso         NET_ISO_* — workload-level network isolation;
-///                            OWN here or on any endpoint puts the workload in its
-///                            own network domain (a workload can have an identity
-///                            and no declared endpoints)
-///  19     1  storage         STORAGE_* — what the workload is granted of the
-///                            node's storage
+///  18     1  storage         STORAGE_* — whether the owner holds a storage
+///                            line
+///  19     1  0
 ///  20     4  compute_milli   milli core-equivalents (0 = unlimited)
 ///  24     8  memory_bytes    memory quota           (0 = unlimited)
 ///  32     4  max_tasks       max concurrent tasks   (0 = unlimited)
 ///  36     2  io_weight       relative IO share 1..=10000 (0 = unset)
-///  38     2  _reserved
+///  38     2  0
 ///  40     2  source_ref_len  bytes of source-ref section that follows
-///  42     2  endpoint_count  number of NetEndpoint entries after source-ref
+///  42     2  0
 ///  44     4  options_len     bytes of the TLV options envelope (last section)
-///  48     1  net_family      NET_FAM_* — network identity; NONE = unassigned
-///  49     1  net_prefix_len  address prefix length in bits (family-scoped)
-///  50     2  net_segment     segment/lane id the identity belongs to (0 = default)
-///  52    16  net_addr        address bytes (IPv4 in bytes 0..4, rest zero)
-///  68     8  storage_bytes   storage quota: the bytes the workload may hold
-///                            in the node's storage, its files and its store
-///                            (0 = unlimited)
+///  48     8  storage_bytes   the storage line's cap: the bytes the workload
+///                            may hold through the node's workload `fs` layer
+///                            (0 = uncapped)
 /// ```
-/// Then: `source_ref[source_ref_len]`, `endpoints[endpoint_count]` (each
-/// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (the TLV envelope, [`opt`]).
+/// Then: `source_ref[source_ref_len]`, `options[options_len]` (the TLV
+/// envelope, [`opt`]). Bytes past the options are refused.
 ///
-/// The network identity is a header *input*: the orchestrator's address
-/// policy (IPAM on Linux, lane addressing on metal) computes it upstream and
-/// the backend realizes it — the field names an address, never the host
-/// mechanism that carries it. `NET_FAM_NONE` means no identity was assigned;
-/// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
-/// host/system network namespace.
-pub const CREATE_HEADER_SIZE: usize = 76;
+/// The header names no network: a workload's address and the name service
+/// it asks are given by the node agent to the node's net provider
+/// (`net::identity`'s `ADDR_ADD` and `OWNER_RESOLVER` on its `addr_ctl`)
+/// before `START`, and the endpoints it may listen on are its creator's
+/// [`endpoint`] options.
+pub const CREATE_HEADER_SIZE: usize = 56;
 
-/// Storage grant values (`storage`). A workload reaches the node's storage
-/// only through its grant: the platform's `fs`, `storage.object` and
-/// `storage.namespace` contracts serve it inside what the grant names, and
-/// nothing else of the node's. Any other value is `EINVAL`.
+/// A `CREATE` header, read: [`CreateHeader::parse`] is the one reader every
+/// backend and tool uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateHeader {
+    pub identity: [u8; 16],
+    pub posture: u8,
+    pub source_kind: u8,
+    pub storage: u8,
+    pub compute_milli: u32,
+    pub memory_bytes: u64,
+    pub max_tasks: u32,
+    pub io_weight: u16,
+    pub source_ref_len: u16,
+    pub options_len: u32,
+    pub storage_bytes: u64,
+}
+
+impl CreateHeader {
+    /// The header of `spec` and where its sections lie: `(header, source
+    /// range, options range)`. `None` for a spec shorter than its header or
+    /// its sections, one with a reserved byte set, or bytes past the
+    /// options.
+    pub fn parse(spec: &[u8]) -> Option<(Self, core::ops::Range<usize>, core::ops::Range<usize>)> {
+        let h = spec.get(..CREATE_HEADER_SIZE)?;
+        let u16_at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+        let u64_at = |o: usize| u64::from(u32_at(o)) | (u64::from(u32_at(o + 4)) << 32);
+        if h[19] != 0 || u16_at(38) != 0 || u16_at(42) != 0 {
+            return None;
+        }
+        let mut identity = [0u8; 16];
+        identity.copy_from_slice(&h[..16]);
+        let hdr = Self {
+            identity,
+            posture: h[16],
+            source_kind: h[17],
+            storage: h[18],
+            compute_milli: u32_at(20),
+            memory_bytes: u64_at(24),
+            max_tasks: u32_at(32),
+            io_weight: u16_at(36),
+            source_ref_len: u16_at(40),
+            options_len: u32_at(44),
+            storage_bytes: u64_at(48),
+        };
+        let src = CREATE_HEADER_SIZE..CREATE_HEADER_SIZE + usize::from(hdr.source_ref_len);
+        let opts = src.end..src.end.checked_add(hdr.options_len as usize)?;
+        if opts.end != spec.len() {
+            return None;
+        }
+        Some((hdr, src, opts))
+    }
+
+    /// The header's bytes.
+    pub fn write(&self, out: &mut [u8; CREATE_HEADER_SIZE]) {
+        out.fill(0);
+        out[..16].copy_from_slice(&self.identity);
+        out[16] = self.posture;
+        out[17] = self.source_kind;
+        out[18] = self.storage;
+        out[20..24].copy_from_slice(&self.compute_milli.to_le_bytes());
+        out[24..32].copy_from_slice(&self.memory_bytes.to_le_bytes());
+        out[32..36].copy_from_slice(&self.max_tasks.to_le_bytes());
+        out[36..38].copy_from_slice(&self.io_weight.to_le_bytes());
+        out[40..42].copy_from_slice(&self.source_ref_len.to_le_bytes());
+        out[44..48].copy_from_slice(&self.options_len.to_le_bytes());
+        out[48..56].copy_from_slice(&self.storage_bytes.to_le_bytes());
+    }
+}
+
+/// Storage line values (`storage`). A workload reaches the node's storage
+/// only through the node graph's workload-scoped `fs` layer (`owner_fs`), which
+/// roots it beneath a directory of its own and charges what it holds to the
+/// owner's storage line (`resource::OWNER_LINE_STORAGE`). Any other value is
+/// `EINVAL`.
 ///
-/// A root of the workload's own, made on first use, charged to
-/// `storage_bytes`, and removed when the workload is destroyed. The default.
+/// A storage line installed, capped at `storage_bytes`. The default.
 pub const STORAGE_OWN_ROOT: u8 = 0;
-/// No node storage: those contracts answer the workload `EACCES`. What it
-/// keeps, it keeps in a provider of its own, over a volume lent to it.
+/// No storage line: the workload layer's every charge for the workload is
+/// refused (`EACCES`), so it makes no root. What it keeps, it keeps in a
+/// provider of its own.
 pub const STORAGE_NONE: u8 = 1;
-
-/// Network-identity family values (`net_family`).
-pub const NET_FAM_NONE: u8 = 0;
-pub const NET_FAM_IPV4: u8 = 4;
-pub const NET_FAM_IPV6: u8 = 6;
-
-/// One header network endpoint the workload exports: `[proto:u8]
-/// [net_iso:u8][port:u16 LE]`. `proto` is a `NET_PROTO_*`; `net_iso` selects
-/// [`NET_ISO_SHARED`]/[`NET_ISO_OWN`]. Realized by the owner endpoint-lease
-/// machinery (metal → NIC-ring; Linux → host-process network machinery).
-pub const NET_ENDPOINT_SIZE: usize = 4;
-
-pub const NET_PROTO_TCP: u8 = 6;
-pub const NET_PROTO_UDP: u8 = 17;
-
-/// Endpoint shares the host/system network namespace.
-pub const NET_ISO_SHARED: u8 = 0;
-/// Endpoint gets its own network identity (metal lane; Linux network namespace).
-pub const NET_ISO_OWN: u8 = 1;
 
 /// TLV options envelope. fluxor validates this shape and routes a whole
 /// namespace to the matching backend **without interpreting keys**. Entry:
@@ -533,6 +660,98 @@ pub const NET_ISO_OWN: u8 = 1;
 pub mod opt {
     /// The entry is required: fail `CREATE` if the backend cannot honor it.
     pub const OPT_REQUIRED: u8 = 0x01;
+
+    /// One options entry.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Entry<'a> {
+        pub ns: &'a [u8],
+        pub key: &'a [u8],
+        pub flags: u8,
+        pub val: &'a [u8],
+    }
+
+    impl Entry<'_> {
+        /// Whether the entry is [`OPT_REQUIRED`].
+        pub fn required(&self) -> bool {
+            self.flags & OPT_REQUIRED != 0
+        }
+    }
+
+    /// The entries of an options envelope, in order: the one parser of the
+    /// envelope. An entry that overruns the envelope yields `Err(())` and
+    /// ends the walk.
+    pub fn iter(opts: &[u8]) -> Iter<'_> {
+        Iter { opts, at: 0 }
+    }
+
+    /// See [`iter`].
+    pub struct Iter<'a> {
+        opts: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Iter<'a> {
+        fn entry(&self) -> Option<(Entry<'a>, usize)> {
+            let (o, at) = (self.opts, self.at);
+            let ns_len = usize::from(*o.get(at)?);
+            let ns = o.get(at + 1..at + 1 + ns_len)?;
+            let k = at + 1 + ns_len;
+            let key_len = usize::from(*o.get(k)?);
+            let key = o.get(k + 1..k + 1 + key_len)?;
+            let f = k + 1 + key_len;
+            let flags = *o.get(f)?;
+            let vl = usize::from(u16::from_le_bytes([*o.get(f + 1)?, *o.get(f + 2)?]));
+            let val = o.get(f + 3..f + 3 + vl)?;
+            Some((
+                Entry {
+                    ns,
+                    key,
+                    flags,
+                    val,
+                },
+                f + 3 + vl,
+            ))
+        }
+    }
+
+    impl<'a> Iterator for Iter<'a> {
+        type Item = Result<Entry<'a>, ()>;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.at >= self.opts.len() {
+                return None;
+            }
+            match self.entry() {
+                Some((e, next)) => {
+                    self.at = next;
+                    Some(Ok(e))
+                }
+                None => {
+                    self.at = self.opts.len();
+                    Some(Err(()))
+                }
+            }
+        }
+    }
+
+    /// Write one entry into `out` at `at`; the offset past it, or `None`
+    /// when it does not fit or a field passes its width.
+    pub fn put(out: &mut [u8], at: usize, e: &Entry<'_>) -> Option<usize> {
+        let ns_len = u8::try_from(e.ns.len()).ok()?;
+        let key_len = u8::try_from(e.key.len()).ok()?;
+        let vl = u16::try_from(e.val.len()).ok()?;
+        let end = at + 1 + e.ns.len() + 1 + e.key.len() + 3 + e.val.len();
+        let b = out.get_mut(at..end)?;
+        b[0] = ns_len;
+        b[1..1 + e.ns.len()].copy_from_slice(e.ns);
+        let k = 1 + e.ns.len();
+        b[k] = key_len;
+        b[k + 1..k + 1 + e.key.len()].copy_from_slice(e.key);
+        let f = k + 1 + e.key.len();
+        b[f] = e.flags;
+        b[f + 1..f + 3].copy_from_slice(&vl.to_le_bytes());
+        b[f + 3..].copy_from_slice(e.val);
+        Some(end)
+    }
 }
 
 /// [`CAPS`] bits. One `u32` of four bytes: the postures realized (bits
@@ -578,12 +797,4 @@ pub mod caps {
     /// Backend answers [`super::LOOKUP`] and [`super::DESTROY`] by identity,
     /// and its `CREATE` may answer `EINPROGRESS` between batches.
     pub const LOOKUP: u32 = 1 << 18;
-
-    // header network fields. A CREATE that asks for an unadvertised bit
-    // fails admission (`ENOSYS`), never runs with silently-weaker network
-    // isolation.
-    /// Backend realizes `NET_ISO_OWN` (own network identity per workload).
-    pub const NET_ISO_OWN: u32 = 1 << 24;
-    /// Backend realizes a `NET_FAM_*` network identity (address/segment).
-    pub const NET_IDENTITY: u32 = 1 << 25;
 }

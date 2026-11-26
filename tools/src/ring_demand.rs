@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 
 use fluxor_contracts::graph::plan::{
-    self as rings, Fan, FanDir, FrameKind, PlanError, PlanModule, PlanPort, RingNode, RingPlatform,
+    self as rings, Fan, FanDir, PlanError, PlanModule, PlanPort, RingNode, RingPlatform,
 };
 use fluxor_contracts::graph::{
     ComposedGraph, EdgeClass, EdgeRecord, Endpoint, MERGE_NAME_HASH, TEE_NAME_HASH,
@@ -34,7 +34,6 @@ use fluxor_contracts::ring_size;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::hash::fnv1a_hash;
 use crate::manifest::Manifest;
 use crate::target::TargetDescriptor;
 
@@ -79,14 +78,6 @@ pub fn platform_of(runtime: &str, project: &std::path::Path) -> RingPlatform {
     }
 }
 
-/// The module types a platform keeps one channel per edge for, in and out,
-/// by name hash: the hosted network provider on the Linux runtime, which
-/// drains one inbound lane per wired edge and keeps one events channel per
-/// consumer that is also its producer.
-pub fn multi_channel(runtime: &str, name_hash: u32) -> bool {
-    runtime == "linux" && name_hash == fnv1a_hash(b"linux_net")
-}
-
 /// A refusal of the plan, said in the graph's names: `names` are the
 /// declared modules' instance names by index, `manifests` their manifests
 /// by name (for port names), `runtime` the kernel the graph is for.
@@ -125,12 +116,14 @@ pub fn refusal(
             port,
             edges,
         } => {
-            let (node, direction) = match dir {
-                FanDir::Out => (RingNode::Module(of), rings::DIR_OUT),
-                FanDir::In if port & rings::PORT_KEY_CTRL != 0 => {
-                    (RingNode::Module(of), rings::DIR_CTRL)
-                }
-                FanDir::In => (RingNode::Module(of), rings::DIR_IN),
+            let node = match of {
+                Endpoint::New(m) => RingNode::Module(m),
+                end => RingNode::External(end),
+            };
+            let direction = match dir {
+                FanDir::Out => rings::DIR_OUT,
+                FanDir::In if port & rings::PORT_KEY_CTRL != 0 => rings::DIR_CTRL,
+                FanDir::In => rings::DIR_IN,
             };
             format!(
                 "{} is wired to {edges} ports, and the fan that joins them has {}: \
@@ -217,24 +210,6 @@ impl Graph {
     }
 }
 
-/// The frame kind a fan's params name (tag 1), a stream where they name
-/// none.
-fn fan_kind(params: &[u8]) -> FrameKind {
-    let mut kind = FrameKind::Stream;
-    fluxor_contracts::params_tlv::walk_declared(params, |tag, value| {
-        if tag == rings::fan_param::FRAME_KIND {
-            kind = match value.first() {
-                Some(1) => FrameKind::Eth,
-                Some(2) => FrameKind::Net,
-                Some(3) => FrameKind::Telemetry,
-                Some(4) => FrameKind::Record,
-                _ => FrameKind::Stream,
-            };
-        }
-    });
-    kind
-}
-
 /// The graph `composed` (a compiled config's graph section) holds, with
 /// each declared module's facts. Its declared modules are those before its
 /// fans: the composer appends one `tee` or `merge` module per fan, and one
@@ -282,24 +257,31 @@ fn decode(
         } else {
             (FanDir::In, edges.iter().find(|e| e.from == node))
         };
+        // The fanned end: a declared module's port, or a lane.
         let joined = |e: &EdgeRecord| match dir {
-            FanDir::Out => e.from.new_index().map(|of| (of, e.from_port)),
-            FanDir::In => e.to.new_index().map(|of| {
+            FanDir::Out => Some((e.from, e.from_port)),
+            FanDir::In => {
                 let ctrl = if e.to_ctrl { rings::PORT_KEY_CTRL } else { 0 };
-                (of, e.to_port | ctrl)
-            }),
+                Some((e.to, e.to_port | ctrl))
+            }
         };
-        let Some((of, port)) = join.and_then(joined).filter(|&(of, _)| of < declared) else {
+        let Some((of, port)) = join.and_then(joined).filter(|&(of, _)| match of {
+            Endpoint::New(m) => usize::from(m) < declared,
+            Endpoint::Lane { .. } => true,
+            _ => false,
+        }) else {
             return Err(Error::Config(format!(
-                "compiled fan {} joins no declared module",
+                "compiled fan {} joins no declared module or lane",
                 declared + k
             )));
         };
         fans.push(Fan {
             dir,
-            of: of as u16,
+            of,
             port,
-            kind: fan_kind(record.params),
+            // A mailbox fan's joining edge is grouped, as every edge
+            // around it is.
+            mailbox: join.is_some_and(|e| e.buffer_group != 0),
             domain: record.domain,
         });
     }
@@ -335,8 +317,21 @@ struct Namer<'a> {
 impl Namer<'_> {
     fn port(&self, module: usize, direction: u8, index: u8) -> String {
         let name = &self.names[module];
-        self.manifests
-            .get(name)
+        let manifest = self.manifests.get(name);
+        // A module a host provider serves runs as a `host_lane`, and its
+        // port edges are renumbered onto the lane's one static pair
+        // (`config::realize_host_providers`), address control; its socket
+        // traffic is lanes, which name no port.
+        if manifest.is_some_and(|m| m.host_provider.is_some()) {
+            return match (direction, index) {
+                (rings::DIR_OUT, 0) => "addr_evt".to_string(),
+                (rings::DIR_CTRL, i) => format!("ctrl{i}"),
+                (_, 0) => "addr_ctl".to_string(),
+                (rings::DIR_OUT, i) => format!("out{i}"),
+                (_, i) => format!("in{i}"),
+            };
+        }
+        manifest
             .and_then(|m| m.find_port_spec(direction, index))
             .and_then(|p| p.name.clone())
             .unwrap_or_else(|| {
@@ -355,24 +350,35 @@ impl Namer<'_> {
                 let m = usize::from(m);
                 format!("{}.{}", self.names[m], self.port(m, direction, port))
             }
-            RingNode::Tee { of, port: p } => {
-                let of = usize::from(of);
-                format!(
+            RingNode::Tee { of, port: p } => match of.new_index() {
+                Some(of) => format!(
                     "tee({}.{})",
                     self.names[of],
                     self.port(of, rings::DIR_OUT, p)
-                )
-            }
-            RingNode::Merge { of, port: p } => {
-                let of = usize::from(of);
-                let dir = if p & rings::PORT_KEY_CTRL != 0 {
-                    rings::DIR_CTRL
-                } else {
-                    rings::DIR_IN
-                };
-                format!("merge({}.{})", self.names[of], self.port(of, dir, p & 0x0F))
-            }
-            RingNode::External(end) => format!("{end:?}"),
+                ),
+                None => format!("tee({})", Self::lane(of)),
+            },
+            RingNode::Merge { of, port: p } => match of.new_index() {
+                Some(of) => {
+                    let dir = if p & rings::PORT_KEY_CTRL != 0 {
+                        rings::DIR_CTRL
+                    } else {
+                        rings::DIR_IN
+                    };
+                    format!("merge({}.{})", self.names[of], self.port(of, dir, p & 0x0F))
+                }
+                None => format!("merge({})", Self::lane(of)),
+            },
+            RingNode::External(end) => Self::lane(end),
+        }
+    }
+
+    /// An end outside the graph: a lane by its key and target, as the
+    /// wiring names it.
+    fn lane(end: Endpoint) -> String {
+        match end {
+            Endpoint::Lane { key, target } => format!("lane {key} to {target:#010x}"),
+            other => format!("{other:?}"),
         }
     }
 
@@ -475,15 +481,20 @@ fn check_composed(
         modules: (graph.modules.len() + graph.fans.len()) as u64,
         edges: compiled.len() as u64,
         fans: crate::capacity::fan_count(&compiled),
+        // A lane is never split across cores.
         crossings: crate::capacity::crossing_count(
             &target.smp,
-            graph.edges.iter().map(|e| {
-                (
-                    domain(e.from),
-                    domain(e.to),
-                    e.class == EdgeClass::CrossCore,
-                )
-            }),
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.from.lane_target().is_none() && e.to.lane_target().is_none())
+                .map(|e| {
+                    (
+                        domain(e.from),
+                        domain(e.to),
+                        e.class == EdgeClass::CrossCore,
+                    )
+                }),
         ),
         ..Default::default()
     };
@@ -575,6 +586,7 @@ fn check_composed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::fnv1a_hash;
     use crate::manifest::PortSpec;
     use fluxor_contracts::graph::{GraphSpec, ModuleRecord};
 
@@ -738,6 +750,38 @@ mod tests {
         assert!(e.contains("src0.p1_0 -> dst0.p0_0"), "{e}");
     }
 
+    /// A module a host provider serves runs as a `host_lane`, its port edges
+    /// on the lane's one static pair: pair 0 is named by its role, not by
+    /// the module's own port at that index, any other pair as the carrier's
+    /// bare index, and a lane by its key and target.
+    #[test]
+    fn a_host_provider_module_s_static_pair_is_named_by_its_role() {
+        let (_, _, net, _) = graph(1, 1 << 10);
+        let mut net = net.clone();
+        net.host_provider = Some(crate::manifest::HostProvider {
+            runtime: "fluxor-provider-net".to_string(),
+            serves: Vec::new(),
+        });
+        let names = vec!["linux_net".to_string()];
+        let manifests = HashMap::from([("linux_net".to_string(), net)]);
+        let namer = Namer {
+            names: &names,
+            manifests: &manifests,
+        };
+        assert_eq!(namer.port(0, rings::DIR_OUT, 0), "addr_evt");
+        assert_eq!(namer.port(0, rings::DIR_OUT, 1), "out1");
+        assert_eq!(namer.port(0, rings::DIR_IN, 0), "addr_ctl");
+        assert_eq!(namer.port(0, rings::DIR_IN, 2), "in2");
+        let lane = Endpoint::Lane {
+            key: 3,
+            target: 0x0102_0304,
+        };
+        assert_eq!(
+            namer.end(RingNode::External(lane), 0, rings::DIR_IN),
+            "lane 3 to 0x01020304"
+        );
+    }
+
     #[test]
     fn a_native_module_s_ports_are_unsized() {
         // No facts for either type: the kernel holds no manifest for a
@@ -890,65 +934,6 @@ mod tests {
         assert!(e.contains("buffer arena is 65536 B"), "{e}");
         config["capacity"] = serde_json::json!({"buffer_arena": 256 * 1024});
         check(&config).expect("the entry places a 256 KiB arena");
-    }
-
-    #[test]
-    fn the_hosted_network_provider_keeps_a_channel_per_edge_on_linux_only() {
-        // `linux_net` (1) feeds two consumers (2, 3) that both feed it back:
-        // composed for Linux it keeps an edge each, with no tee or merge.
-        let hash = fnv1a_hash(b"linux_net");
-        let edge = |f: u16, t: u16| EdgeRecord {
-            from: Endpoint::New(f),
-            to: Endpoint::New(t),
-            ..EdgeRecord::default()
-        };
-        let edges = [edge(1, 2), edge(1, 3), edge(2, 1), edge(3, 1)];
-        // The expanded graph names no types: the hash alone decides.
-        let config = serde_json::json!({ "modules": [] });
-        let rings_on = |runtime: &str, target: &TargetDescriptor| {
-            let modules: Vec<crate::add_subgraph::GraphModule> = (0..4u32)
-                .map(|i| {
-                    let h = if i == 1 { hash } else { 0x1000 + i };
-                    crate::add_subgraph::GraphModule {
-                        name: format!("m{i}"),
-                        name_hash: h,
-                        multi_channel: multi_channel(runtime, h),
-                        ..Default::default()
-                    }
-                })
-                .collect();
-            let composition = crate::add_subgraph::compose(
-                &modules,
-                &edges,
-                crate::add_subgraph::Placement {
-                    platform: platform(target),
-                    accept_cycles: true,
-                    domain_names: &[],
-                },
-                &crate::add_subgraph::Composer {
-                    describe: &|e| format!("{e:?}"),
-                    fan_params: &|f, scratch| {
-                        Ok(
-                            rings::fan_params(f.kind, rings::FRAMES_PER_STEP_DEFAULT, scratch)
-                                .to_vec(),
-                        )
-                    },
-                },
-            )
-            .unwrap();
-            let records = composition.records();
-            let blob = fluxor_contracts::graph::encode(&composition.spec(&records)).unwrap();
-            let composed = fluxor_contracts::graph::decode(&blob).unwrap();
-            let graph = decode(&config, &composed, &HashMap::new()).unwrap();
-            (
-                graph.fans.len(),
-                graph.plan(platform(target)).unwrap().rings.len(),
-            )
-        };
-        let pi5 = crate::target::load_target("pi5", &root()).unwrap();
-        assert_eq!(rings_on("linux", &linux()), (0, 4));
-        // Elsewhere: a tee and a merge, each with its joining edge.
-        assert_eq!(rings_on("bcm2712", &pi5), (2, 6));
     }
 
     #[test]

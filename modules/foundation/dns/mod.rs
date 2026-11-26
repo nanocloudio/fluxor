@@ -46,7 +46,9 @@
 //! `MAX_ZONE_RRS` records and served authoritatively. Every UPDATE must carry
 //! a valid `hmac-sha256` TSIG under a key named in `update_allow`; the key
 //! lives in the kernel vault under the label `dns/tsig/<keyname>` and is
-//! opened — never generated — at construct. Unsigned requests are REFUSED;
+//! opened — never generated — from the first steps, asked again while the
+//! vault answers `EAGAIN` (nothing is served meanwhile); a key the vault
+//! refuses fails the step. Unsigned requests are REFUSED;
 //! a bad key, signature or time answers NOTAUTH with the RFC 8945 TSIG error
 //! (BADKEY / BADSIG / BADTIME). The time check uses the kernel's trusted
 //! calendar time and fails closed when the clock is untrusted. Prerequisites
@@ -517,13 +519,13 @@ mod params_def {
         // because a
         // dial needs a destination — the check is that it is present, not
         // that it is a name.
-        14, upstream_authority, str, 0
+        14, upstream_authority, str, 0, max super::UPSTREAM_AUTHORITY_MAX
             => |s, d, len| { super::parse_upstream_authority(s, d, len); };
 
         // The DoH endpoint's path. RFC 8484 makes this server-specific:
         // `/dns-query` is what the well-known resolvers answer on and the
         // default here, but it is not a constant anyone may assume.
-        15, upstream_path, str, 0
+        15, upstream_path, str, 0, max super::UPSTREAM_PATH_MAX
             => |s, d, len| { super::parse_upstream_path(s, d, len); };
 
         // Validate the DNSSEC signatures on forwarded answers.
@@ -865,6 +867,9 @@ struct DnsState {
     /// The DoH endpoint's path; empty means `/dns-query`.
     upstream_path: [u8; UPSTREAM_PATH_MAX],
     upstream_path_len: u8,
+    /// An `upstream_authority` or `upstream_path` longer than its field: the
+    /// instance refuses to construct rather than dial a clipped one.
+    upstream_oversize: bool,
 
     // ── DNSSEC ──
     /// `off` or `validate`.
@@ -1011,6 +1016,7 @@ impl DnsState {
         self.upstream_transport = TRANSPORT_UDP;
         self.upstream_authority_len = 0;
         self.upstream_path_len = 0;
+        self.upstream_oversize = false;
         self.dnssec = 0;
         self.anchor_count = 0;
         self.unserved = 0;
@@ -1979,9 +1985,14 @@ fn dotted_to_canonical_wire(text: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(at + 1)
 }
 
-/// Record the DoH endpoint path from the parameter.
+/// Record the DoH endpoint path from the parameter; one longer than
+/// `UPSTREAM_PATH_MAX` is marked, never clipped.
 unsafe fn parse_upstream_path(s: &mut DnsState, d: *const u8, len: usize) {
-    let n = len.min(UPSTREAM_PATH_MAX);
+    if len > UPSTREAM_PATH_MAX {
+        s.upstream_oversize = true;
+        return;
+    }
+    let n = len;
     let mut i = 0usize;
     while i < n {
         s.upstream_path[i] = *d.add(i);
@@ -1990,11 +2001,16 @@ unsafe fn parse_upstream_path(s: &mut DnsState, d: *const u8, len: usize) {
     s.upstream_path_len = n as u8;
 }
 
-/// Record the upstream's authority from the parameter, truncated to
-/// `UPSTREAM_AUTHORITY_MAX` bytes. The shape is not judged here: a value
-/// `net_proto::Target::parse` cannot read simply never dials.
+/// Record the upstream's authority from the parameter; one longer than
+/// `UPSTREAM_AUTHORITY_MAX` is marked, never clipped. The shape is not
+/// judged here: a value `net_proto::Target::parse` cannot read simply never
+/// dials.
 unsafe fn parse_upstream_authority(s: &mut DnsState, d: *const u8, len: usize) {
-    let n = len.min(UPSTREAM_AUTHORITY_MAX);
+    if len > UPSTREAM_AUTHORITY_MAX {
+        s.upstream_oversize = true;
+        return;
+    }
+    let n = len;
     let mut i = 0usize;
     while i < n {
         s.upstream_authority[i] = *d.add(i);
@@ -4139,21 +4155,34 @@ unsafe fn parse_update_allow(s: &mut DnsState, data: *const u8, len: usize) {
     s.key_count += 1;
 }
 
-/// Open every admitted key by label (`dns/tsig/<keyname>`) — never
-/// generating one. A key the vault does not hold leaves its entry with
-/// handle -1, and every request under it is refused BADKEY.
-unsafe fn open_tsig_keys(s: &mut DnsState) {
+/// An admitted key whose vault slot is still to be opened.
+const TSIG_PENDING: i32 = -2;
+
+/// Open every admitted key still pending by label (`dns/tsig/<keyname>`) —
+/// never generating one — from the step, since the vault may not answer at
+/// construction (its store still loading). `Ok(true)` once every key is
+/// open; `Ok(false)` while the vault answers `EAGAIN` for one, which is
+/// asked again on the next step. A refusal (the vault holds no such key, or
+/// the label does not fit) fails the step and the key stays pending, so no
+/// UPDATE is answered as though the key were absent by choice.
+unsafe fn tsig_keys_step(s: &mut DnsState) -> Result<bool, i32> {
     use abi::contracts::key_vault as kv;
     let sys = &*s.syscalls;
     let mut i = 0;
     while i < s.key_count as usize {
         let key = &mut *s.keys.as_mut_ptr().add(i);
+        if key.handle != TSIG_PENDING {
+            i += 1;
+            continue;
+        }
         let name_len = key.name_len as usize;
         let label_len = TSIG_LABEL_PREFIX.len() + name_len;
         if label_len > MAX_VAULT_LABEL {
-            key.handle = -1;
-            i += 1;
-            continue;
+            log_info(
+                s,
+                b"[dns] update key name too long for a vault label: requests under it are refused",
+            );
+            return Err(abi::errno::EINVAL);
         }
         let mut label = [0u8; MAX_VAULT_LABEL];
         label[..TSIG_LABEL_PREFIX.len()].copy_from_slice(TSIG_LABEL_PREFIX);
@@ -4174,19 +4203,22 @@ unsafe fn open_tsig_keys(s: &mut DnsState) {
             Some(n) => {
                 (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
             }
-            None => -1,
+            None => abi::errno::EINVAL,
         };
+        if rc == abi::errno::EAGAIN {
+            return Ok(false);
+        }
         if rc < 0 {
-            key.handle = -1;
             log_info(
                 s,
                 b"[dns] update key absent from vault: requests under it are refused",
             );
-        } else {
-            key.handle = rc;
+            return Err(rc);
         }
+        key.handle = rc;
         i += 1;
     }
+    Ok(true)
 }
 
 /// Index of the admitted key named `name`.
@@ -5913,7 +5945,12 @@ pub unsafe extern "C" fn module_new(
                     b"[dns] update zone: no update_allow key, every UPDATE is refused",
                 );
             }
-            open_tsig_keys(s);
+            // Opened from the step: the vault may still be loading.
+            let mut k = 0;
+            while k < s.key_count as usize {
+                (*s.keys.as_mut_ptr().add(k)).handle = TSIG_PENDING;
+                k += 1;
+            }
         } else if s.update_durability != DURABILITY_UNSET || s.key_count != 0 {
             log_info(
                 s,
@@ -5928,6 +5965,13 @@ pub unsafe extern "C" fn module_new(
         // forwards are private — refused here rather than discovered at
         // the first query. What this cannot check is the far end of the
         // leg: an instance that verifies no peer satisfies both tests.
+        if s.upstream_oversize {
+            log_info(
+                s,
+                b"[dns] refusing to construct: upstream_authority or upstream_path is longer than its field",
+            );
+            return -1;
+        }
         if s.upstream_transport != TRANSPORT_UDP {
             if s.upstream_authority_len == 0 {
                 log_info(
@@ -5966,6 +6010,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op
         // when the telemetry port is unwired.
         maybe_emit_telemetry(s);
+
+        // Nothing is served until every update key is open: an UPDATE taken
+        // meanwhile would be refused as though its key were absent.
+        match tsig_keys_step(s) {
+            Ok(true) => {}
+            Ok(false) => return StepReturn::Continue,
+            Err(rc) => return StepReturn::error(rc),
+        }
 
         // Durable mode serves updates only once the storage provider has
         // answered for its write surface and the committed generation is loaded.

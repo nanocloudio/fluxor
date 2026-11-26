@@ -129,13 +129,6 @@ pub struct WorkloadTable {
     pub version: String,
     #[serde(default = "default_role")]
     pub role: String,
-    /// `store_dir = "state"` — where this workload's control-plane store
-    /// lives, relative to the installed package unless absolute. Carried
-    /// into `workload.json` and set for the runtime at launch, so an
-    /// applet's storage does not depend on the environment its caller
-    /// exported.
-    #[serde(default)]
-    pub store_dir: Option<String>,
 }
 
 fn default_role() -> String {
@@ -362,6 +355,145 @@ fn kind_of(path: &Path, project_root: &Path) -> Kind {
     }
 }
 
+// ============================================================================
+// Applet builds
+// ============================================================================
+//
+// An applet's graph is checked when its package is emitted, and every
+// `fluxor exec` of it composes the image it runs. What differs per
+// operator is given to that image at exec: the operator's client identity
+// (`--identity`, else `$HOME/.config/<name>/client.der` + `client.key.der`)
+// and the applet's own data directory, which the graph names with
+// [`APPLET_DATA_DIR`]. The composer learns that the graph it composes is an
+// applet's from [`with_applet`], which the package emission and each
+// launch's composition wrap around the build: the rules that hold only for
+// an applet's graph key on it.
+
+/// The applet's own data directory, as a graph names it: a string param
+/// whose value is this placeholder, or begins with it and a `/`, is given
+/// the directory [`applet_data_dir`] resolves when `fluxor exec` runs the
+/// applet. Only an applet's graph names it.
+pub const APPLET_DATA_DIR: &str = "${applet:data_dir}";
+
+/// What every applet placeholder begins with.
+const APPLET_PLACEHOLDER: &str = "${applet:";
+
+thread_local! {
+    /// The applet whose graph is being built; `None` outside [`with_applet`].
+    static APPLET: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (the build of applet `name`'s graph) as an applet build.
+pub fn with_applet<R>(name: &str, f: impl FnOnce() -> R) -> R {
+    let outer = APPLET.with(|a| a.replace(Some(name.to_string())));
+    let r = f();
+    APPLET.with(|a| a.replace(outer));
+    r
+}
+
+/// The applet whose graph is being built, inside [`with_applet`].
+pub fn applet_being_built() -> Option<String> {
+    APPLET.with(|a| a.borrow().clone())
+}
+
+/// Refuse an applet placeholder `doc` may not carry: any, outside an applet
+/// build; inside one, any but [`APPLET_DATA_DIR`] at the start of a value,
+/// alone or followed by a `/`.
+pub fn check_applet_placeholders(doc: &serde_json::Value) -> Result<(), String> {
+    fn walk(v: &serde_json::Value, applet: Option<&str>) -> Result<(), String> {
+        match v {
+            serde_json::Value::String(s) => check(s, applet),
+            serde_json::Value::Array(a) => a.iter().try_for_each(|x| walk(x, applet)),
+            serde_json::Value::Object(o) => o.iter().try_for_each(|(k, x)| {
+                if k.contains(APPLET_PLACEHOLDER) {
+                    return Err(format!(
+                        "`{k}`: an applet placeholder names a value, never a key"
+                    ));
+                }
+                walk(x, applet)
+            }),
+            _ => Ok(()),
+        }
+    }
+    fn check(s: &str, applet: Option<&str>) -> Result<(), String> {
+        if !s.contains(APPLET_PLACEHOLDER) {
+            return Ok(());
+        }
+        if applet.is_none() {
+            return Err(format!(
+                "\"{s}\": `{APPLET_PLACEHOLDER}…}}` is given by `fluxor exec` to a cli applet, \
+                 and this graph is not built as one: only the graph of a `role = \"cli\"` \
+                 package, built from its workload.toml (`fluxor build`, `fluxor install` or \
+                 `fluxor exec` of the package), may name `{APPLET_DATA_DIR}`"
+            ));
+        }
+        let well_placed = s.strip_prefix(APPLET_DATA_DIR).is_some_and(|rest| {
+            (rest.is_empty() || rest.starts_with('/')) && !rest.contains(APPLET_PLACEHOLDER)
+        });
+        if !well_placed {
+            return Err(format!(
+                "\"{s}\": the one applet placeholder is `{APPLET_DATA_DIR}`, at the start of a \
+                 value: `{APPLET_DATA_DIR}` or `{APPLET_DATA_DIR}/<path>`"
+            ));
+        }
+        Ok(())
+    }
+    let applet = applet_being_built();
+    walk(doc, applet.as_deref())
+}
+
+/// The data directory of applet `name`, from the environment `var` reads:
+/// `$XDG_DATA_HOME/<name>` when that is an absolute path, else
+/// `$HOME/.local/share/<name>`. No trailing separator.
+pub fn applet_data_dir(
+    name: &str,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(format!(
+            "applet name '{name}' cannot name a directory of its own"
+        ));
+    }
+    let absolute = |k: &str| {
+        var(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(xdg) = absolute("XDG_DATA_HOME") {
+        return Ok(xdg.join(name));
+    }
+    match absolute("HOME") {
+        Some(home) => Ok(home.join(".local/share").join(name)),
+        None => Err(format!(
+            "applet '{name}' names `{APPLET_DATA_DIR}`, and neither $XDG_DATA_HOME nor $HOME \
+             is an absolute path to put it under"
+        )),
+    }
+}
+
+/// [`applet_data_dir`], made on first use: its parents as the umask has
+/// them, the directory itself readable by its owner alone. One that exists
+/// is kept as it is.
+pub fn ensure_applet_data_dir(
+    name: &str,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = applet_data_dir(name, var)?;
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(dir),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +636,102 @@ mod tests {
         );
         let e = check_package(&root.join("packaging/applet/tool/workload.toml"), root).unwrap_err();
         assert!(e.contains("an applet takes argv"), "{e}");
+    }
+
+    /// `${applet:data_dir}` is `$XDG_DATA_HOME/<name>` when that is
+    /// absolute, else `$HOME/.local/share/<name>`; a relative or empty
+    /// variable is passed over, and a name that is no single directory
+    /// component is refused.
+    #[test]
+    fn an_applets_data_dir_follows_the_xdg_base_directories() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        let both = env(&[("XDG_DATA_HOME", "/x/data"), ("HOME", "/home/op")]);
+        assert_eq!(
+            applet_data_dir("phasor", both).unwrap(),
+            PathBuf::from("/x/data/phasor")
+        );
+        let home = env(&[("HOME", "/home/op")]);
+        assert_eq!(
+            applet_data_dir("phasor", home).unwrap(),
+            PathBuf::from("/home/op/.local/share/phasor")
+        );
+        let relative = env(&[("XDG_DATA_HOME", "data"), ("HOME", "/home/op")]);
+        assert_eq!(
+            applet_data_dir("phasor", relative).unwrap(),
+            PathBuf::from("/home/op/.local/share/phasor")
+        );
+        let empty = env(&[("XDG_DATA_HOME", ""), ("HOME", "/home/op")]);
+        assert_eq!(
+            applet_data_dir("phasor", empty).unwrap(),
+            PathBuf::from("/home/op/.local/share/phasor")
+        );
+        let e = applet_data_dir("phasor", env(&[])).unwrap_err();
+        assert!(e.contains("neither $XDG_DATA_HOME nor $HOME"), "{e}");
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(
+                applet_data_dir(bad, env(&[("HOME", "/h")])).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The directory is made on first use, owner-only, and one that exists
+    /// is kept as it is.
+    #[test]
+    fn an_applets_data_dir_is_made_owner_only_on_first_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("share").into_os_string();
+        let var = move |k: &str| (k == "XDG_DATA_HOME").then(|| base.clone());
+        let dir = ensure_applet_data_dir("tool", &var).unwrap();
+        assert_eq!(dir, tmp.path().join("share/tool"));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(dir.join("kept"), b"x").unwrap();
+        assert_eq!(ensure_applet_data_dir("tool", &var).unwrap(), dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "an existing directory is kept as it is");
+        assert!(dir.join("kept").is_file());
+    }
+
+    /// Outside an applet build any applet placeholder is refused, naming why;
+    /// inside one only `${applet:data_dir}` at the start of a value is
+    /// taken.
+    #[test]
+    fn applet_placeholders_are_an_applet_graphs_alone() {
+        let graph = |dir: &str| serde_json::json!({"modules": [{"name": "store", "dir": dir, "params": {}}]});
+        let e = check_applet_placeholders(&graph("${applet:data_dir}")).unwrap_err();
+        assert!(e.contains("this graph is not built as one"), "{e}");
+        assert!(check_applet_placeholders(&graph("/var/lib/x")).is_ok());
+        with_applet("tool", || {
+            assert_eq!(applet_being_built().as_deref(), Some("tool"));
+            for ok in ["${applet:data_dir}", "${applet:data_dir}/store", "/plain"] {
+                assert!(check_applet_placeholders(&graph(ok)).is_ok(), "{ok}");
+            }
+            for bad in [
+                "${applet:config_dir}",
+                "/x/${applet:data_dir}",
+                "${applet:data_dir}store",
+                "${applet:data_dir}/${applet:data_dir}",
+            ] {
+                let e = check_applet_placeholders(&graph(bad)).unwrap_err();
+                assert!(e.contains("the one applet placeholder"), "{bad}: {e}");
+            }
+            let key = serde_json::json!({"modules": [{"${applet:data_dir}": 1}]});
+            assert!(check_applet_placeholders(&key).is_err());
+        });
+        assert_eq!(
+            applet_being_built(),
+            None,
+            "the context ends with the build"
+        );
     }
 }

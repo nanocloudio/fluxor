@@ -193,9 +193,9 @@ flash_program_size = "0x100"
 # (`flash_layout::graph_flash`) leaves it before it splits the rest three
 # ways: two slots and the firmware region's own graph. The gate holds every
 # board's kernel image under it; raising it costs each board that much slot.
-# 528 KiB since the key vault's store (`vault_store`, kept by a module over a
-# block source) put the kernel ~11 KiB past 512: each slot gives up a third of
-# the 16 KiB.
+# 528 KiB: each slot gives up a third of the 16 KiB past 512. The kernel
+# image is ~414 KiB now that the key vault is a module; lowering the reserve
+# moves every slot and is the owner's call.
 kernel_flash_reserve = "0x84000"
 ram_base = "0x20000000"
 # The striped 256 KiB the linker's RAM region covers, where the kernel's
@@ -239,8 +239,8 @@ telemetry_ring_kb = 4
 # from the stack, which the composer then admits modules against.
 ram_static_max_kb = 212
 # The kernel's own frames at a module call: the scheduler under the step,
-# the deepest syscall above it (an add that checks a signature, the key
-# vault) and an interrupt on top. The firmware build measures that sum in
+# the deepest syscall above it (an add that checks a signature) and an
+# interrupt on top. The firmware build measures that sum in
 # the linked image and refuses an image over it. The stack less this,
 # 32 KiB, is the deepest a module may go; the scheduler fences every step
 # there and reports the measured depths.

@@ -42,8 +42,9 @@ graph = "linux.yaml"
 
 The workload name is ASCII letters, digits, `.`, `_` and `-`, starting
 with a letter or digit, at most 64 bytes: it becomes a directory name and a
-store tag. `[workload] store_dir` names where the workload's control-plane
-store lives, relative to the installed package unless absolute.
+store tag. A workload that keeps state composes a `store` module in its
+graph and names its directory with the `store` instance's `dir` param (a
+`${param:<name>}` when a run chooses it); nothing in the environment moves it.
 `[[export]]`, `[resources]` and `[health]` declare what the graph cannot:
 an endpoint's binding, a capacity override, the health signals. Unknown
 keys anywhere in the manifest are refused. A `[params]` table is refused
@@ -116,9 +117,10 @@ An applet's graph declares no params: an applet takes argv.
 is carried with its includes expanded, its `params:` kept and every
 placeholder it forwards into an include left for a run to render, so its
 module references and state sum cover the stacks' modules
-([stacks.md](../architecture/stacks.md#workload-packages)). A native module the
-graph names (`cli_in`, `cli_out`, `linux_net`, …) is built into every
-runtime: the package pins no `.fmod` for it.
+([stacks.md](../architecture/stacks.md#workload-packages)). A built-in the
+graph names (`cli_in`, `cli_out`, `linux_net`, …) is part of every runtime
+— a native module, or a host provider beside the runtime (`linux_net`'s
+`fluxor-provider-net`): the package pins no `.fmod` for it.
 
 ## Publish, reference, run
 
@@ -158,12 +160,48 @@ path. The graph is rendered with the run's values and built against the
 package's own `modules/` when it has them (a pinned, materialised package),
 else the project's module directory; every module the package pins is
 checked against its digest first, and a rendered graph that loads a module
-the package does not pin is refused. The rendered graph and blobs live in a
-private scratch directory under `target/fluxor/run/` that is removed when
+the package does not pin is refused. Every run composes the image it runs
+this way, against the runtime it runs: the image pins the host providers
+beside that binary. The rendered graph and image live in a private per-user
+directory (`$XDG_RUNTIME_DIR/fluxor-run/`, else `fluxor-run-<uid>` in the
+system temporary directory), never in a project's tree, and are removed when
 the run ends. Its exit code is the run's.
 
 `fluxor install <name>` registers an applet the same way: the project's
 own, else the one it pins.
+
+## What `fluxor exec` gives an applet
+
+An applet's graph is checked when its package is emitted, and every
+`fluxor exec` composes its image as `fluxor run` does. Both of the applet's
+streams are the program's: the composition prints nothing unless it fails,
+or `-v` asks, and then on stderr. What belongs to the operator running it is
+given to this run's copy of the image, never to the package:
+
+- **A client identity.** Every client-mode `tls` that names no identity of
+  its own (no `cert_file`, `key_file` or `identity_label`) is given the
+  operator's: `--identity CERT,KEY` (DER files), else
+  `$HOME/.config/<name>/client.der` and `client.key.der` when both exist.
+  The key is taken by the key vault, so the applet's graph composes
+  `key_vault` beside such a `tls`; one that does not is refused when the
+  package is built, naming the instance.
+- **A data directory.** A string param whose value is `${applet:data_dir}`,
+  or begins with `${applet:data_dir}/`, is given the applet's own data
+  directory: `$XDG_DATA_HOME/<name>` when that is an absolute path, else
+  `$HOME/.local/share/<name>`, with no trailing separator. It is made, readable
+  by its owner alone, the first time a run needs it; one that exists is kept
+  as it is. `<name>` is the name the applet is executed under (its
+  `fluxor install` name, else its package name). It is how an applet keeps
+  state across runs, for example a `store` with
+  `dir: "${applet:data_dir}/store"`. The resolved value must still fit what
+  the module takes (`store` refuses a `dir` over 96 bytes when it is
+  constructed).
+
+`${applet:data_dir}` is the one applet placeholder, and only an applet's
+graph may name it: built from a `role = "cli"` package's `workload.toml`
+(`fluxor build`, `fluxor install`, `fluxor exec` or the publish that emits
+it). A graph built any other way — a service, an example, the applet's graph
+file built on its own — that names it is refused at build.
 
 ## Values
 

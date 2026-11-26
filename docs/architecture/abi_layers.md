@@ -74,7 +74,6 @@ can reach them without declaring anything in its manifest.
 | `CHANNEL` | `0x0001` | `open` (ring size), `close`, `flush`, `set_hup`, `writable`, `record_len`, `facts`, `port`, and the mailbox record's lends `acquire_write` / `release_write` / `acquire_read` / `release_read` / `acquire_inplace`; read, write, peek, discard and poll are the syscall table's own entries |
 | `TIMER` | `0x0002` | `millis`, `micros`, `create`, `set`, `cancel`, `destroy` |
 | `EVENT` | `0x0004` | Signalable/pollable flags + IRQ binding |
-| `KEY_VAULT` | `0x0005` | P-256 + Ed25519 slots — ECDH, sign, verify, generate; raw material stays backend-side. Backend is platform-overridable (see below). |
 
 #### Kernel service backends — platform-overridable
 
@@ -82,24 +81,18 @@ A kernel service contract has one *default* implementation in
 `src/kernel/`, and a platform may re-register the class dispatch and
 vtable at platform boot with an alternate backend. The consumer-visible
 surface never changes; backends differ only in what the contract's own
-discovery opcodes report (for `KEY_VAULT`: `CUSTODY` and `DESCRIBE_SUITE`).
+discovery opcodes report.
 
-Current backends of `KEY_VAULT`:
-
-| Backend | Source | CUSTODY | Selection |
-|---------|--------|------|-----------|
-| Software (default) | `src/kernel/security/key_vault.rs` | `SOFTWARE` | Always available |
-| PKCS#11 HSM (Linux) | `src/platform/linux/hsm_key_vault.rs` | `PROCESS_HW` | `FLUXOR_HSM_PKCS11_MODULE` env at platform boot |
-
-`KEY_VAULT` backends do not replace each other: the router
-(`src/kernel/security/key_vault_router.rs`) is the one registered provider,
-and a hardware backend registers behind it beside the software one. Each
-handle names its backend ([security.md](security.md#backends-and-the-router)).
+`KEY_VAULT` is not a kernel service: it is served by the `key_vault`
+module a graph composes (a module-provided contract, claimed with
+`requires_contract = "key_vault"`), and hardware custody is the
+`key_custody` contract that module calls, served by a host provider
+([security.md](security.md#hardware-custody)).
 
 Rules for adding a backend: it must sit behind an **existing** kernel
 service contract (a backend never introduces opcodes consumers must
 know about), it must advertise its honest discovery answers so consumers
-can adapt, and it must be visible — a row in this table plus a
+can adapt, and it must be visible — documented here plus a
 descriptor under `modules/platform/<platform>/<name>/` (manifest-only,
 not graph-placeable) so the inventory of kernel-resident code stays
 complete. A hardware token reached over a fluxor bus (e.g. a secure
@@ -115,14 +108,14 @@ platform) implements the vtable, and consumers reach it through
 
 | Contract | Id | Provider | Notes |
 |----------|----|----------|-------|
-| `FS` | `0x000D` | PIC (`fat32`, `linux_fs_dispatch`) | Filesystem dispatch: open/read/write/seek/stat/close. |
+| `FS` | `0x000D` | PIC (`fat32`, `owner_fs`), platform (`linux_fs_dispatch`, node-only) | Filesystem dispatch: open/read/write/seek/stat/close. |
 | `PLATFORM_NIC_RING` | `0x001D` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. A privileged module only. |
 | `PLATFORM_DMA` | `0x001E` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
 | `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Opcodes under `dma_raw::fd::*`; its handle polls ready when a transfer completes. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
 | `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding. A privileged module only. |
 | `METAL_DEVICE` | `0x0024` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access needs `metal_device.mmio`, a PCIe rescan or config access `metal_device.pcie`, DMA and cache ops `metal_device.dma`. |
-| `STORAGE_NAMESPACE` | `0x000E` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
-| `STORAGE_OBJECT` | `0x000F` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
+| `STORAGE_NAMESPACE` | `0x000E` | PIC (platform on wasm) | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
+| `STORAGE_OBJECT` | `0x000F` | PIC (platform on wasm) | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `IMAGE_DECODE` | `0x002C` | Platform (wasm) / PIC | Decode a byte range of a `storage.object` object, named by key, to raw pixels at a caller-named size (opcode class 0x2Cxx): `DECODE` mints a job, `RECV` drains its pixels into `data` (`EAGAIN` while decoding), `CLOSE` releases it. |
 | `USB_HOST` | `0x001B` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
 | `WORKLOAD` | `0x0017` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x17xx): run an isolated workload with a declared capability envelope. |
@@ -223,14 +216,23 @@ bare-metal RP the clock is a property of the active PIO stream, so no
 provider is registered and the query falls back to `HAL_PIO`.
 
 `HOST_PROCESS` (`0x0018`) is host-scoped, not stable: Linux
-host-process mechanics (exec, PTY, read, the host-process source),
+host-process mechanics (a workload's output, exec and PTY sessions in a
+workload, the commands the node runs itself, the host-process source),
 registered only by
 the Linux platform, with semantic constants at
 `abi::platform::linux::host_process`. Unregistered platforms return
-`ENOSYS`, which doubles as discovery. A terminal session belongs to the
-module that opened it, under that module's owner: any other caller is
-answered `EACCES`, and the session closes when its opener's owner is
-released or its workload destroyed.
+`ENOSYS`, which doubles as discovery. Every op names what it acts on in
+the handle slot: an op on a workload takes the caller's `workload` handle
+(the contract declares `accepts = ["workload"]`, so the kernel resolves
+that handle for its owner and hands the provider serving both contracts
+its index); a terminal session and a node command are `host_process`
+handles the contract mints. A terminal session belongs to the module that
+opened it, under that module's owner: any other caller is answered
+`EACCES`, and the session closes when its opener's owner is released or
+its workload destroyed. A node command runs with the node's authority, so
+only the node and an owner acting with it spawn one; what it may run is
+the operator's configuration of the runtime (`FLUXOR_PROC_ALLOW`, empty
+unless set).
 
 `HOST_MOUNT` (`0x0019`) is host-scoped the same way: mounting a block
 device onto a directory under the operator's mount root
@@ -356,12 +358,13 @@ trust class or name bypasses it.
 | `metal_device.mmio` | Read and write device registers | bare-metal drivers |
 | `metal_device.pcie` | Rescan PCIe, read or write config space | `nvme`, `pcie_scan` |
 | `metal_device.dma` | Allocate DMA memory and maintain its cache | DMA-owning drivers |
-| `seal_key` | Keep the key vault's durable image | `vault_store` |
+| `seal_key` | Derive the module's own sealing key from the platform's (`SEAL_KEY_DERIVE`) | `key_vault` with `seal: hardware` |
 
 The kernel's own contracts are granted by name: `reconfigure`, `monitor`,
-`bridge`, `flash`, `diag`, `telemetry` and `key_vault` are contracts no
-provider is selected for, so a module that calls them lists them in
-`grants`. Every grant is the registry's (`crates/fluxor-abi/registry/registry.toml`),
+`bridge`, `flash`, `diag` and `telemetry` are contracts no provider is
+selected for, so a module that calls them lists them in `grants`. A
+contract a module provides (`key_vault`) is claimed, never granted: the
+composer refuses a grant naming one. Every grant is the registry's (`crates/fluxor-abi/registry/registry.toml`),
 which also marks the ones a gated module may not hold (`reach = "kernel"`);
 the composer refuses such a module and the kernel refuses to add one as a
 workload.
@@ -473,8 +476,16 @@ Validation runs at config-build time, in `fluxor build` and
   rules are mirrored, so nested objects (`eq: { low_freq: 100 }`), the
   transparent `params: { ... }` wrapper, and `_envelope`/`_config`/
   `_settings`/`_params` suffix-stripping all resolve correctly.
-- **Range**: `range = [min, max]` checks numeric YAML values;
-  out-of-range values fail the build with the manifest's bounds.
+- **Bounds**: `range = [min, max]` bounds a numeric param's value,
+  `max = N` a numeric value or a `str`'s bytes; a PIC module states the
+  same in `define_params!` (`, max N` or `, range A..=B`), and its
+  schema (`fluxor_abi::wire::param_schema`) carries them, every param
+  bounded (its type's ceiling when it declares none: an integer's
+  largest value, a `str`'s 255 bytes, a `blob`'s 65,535). The composer
+  checks the packed value — YAML, a `${file:}` source and an injected
+  default alike — and fails the build naming the param; `fluxor exec`
+  checks the values it rewrites, and an env bind record carries the
+  bounds its binder enforces.
 - **Required**: `required = true` makes YAML omission a hard error —
   use this for params with no safe default (e.g.
   `host_asset_source.path`). Mutually exclusive with `default`.
@@ -512,10 +523,6 @@ and so the subset there is anything to cross-check:
 
 The error message names the exact `cargo build` invocation that adds
 the missing feature.
-
-`host-hsm` is reported but has no row: the PKCS#11 `key_vault` backend
-is chosen by environment at platform boot, not by a config field, so
-there is nothing in the YAML to check it against.
 
 ## Capacity profiles — `abi::config`
 
@@ -665,6 +672,14 @@ none is not a provider. Only contracts the registry marks
 HAL contracts, FS, the storage namespace/object contracts and the runtime
 parameter store. The packer and the kernel both refuse any other.
 
+A provider's manifest may say `provider_scope = "workloads"` (manifest flag
+`FLAG_WORKLOAD_SCOPE`): its layers then serve every workload and not the
+node, rather than its own owner. Only a node-owned module registers one,
+and only for a contract the registry marks `workload_served` (`fs`); the
+kernel refuses anything else `EACCES`. Inside such a layer's frame the
+module may charge the caller's owner's storage line
+(`resource::LEDGER_CHARGE`, grant `resource.owner_charge`).
+
 An instance-keyed provider (a fat32 with a `volume:` param) also defines
 `module_provider_selector(state) -> u32`, the selector it registers under,
 computed from its own config.
@@ -750,7 +765,7 @@ The platform subdirectory makes the binding explicit:
 
 | Subtree                 | Binding                                                                                  | Examples                                                |
 |-------------------------|------------------------------------------------------------------------------------------|---------------------------------------------------------|
-| `modules/platform/linux/` | Linux-host APIs (winit, CPAL/ALSA, libc syscalls) plus host-agnostic `std` native modules   | `linux_net`, `linux_display`, `linux_audio`, `host_asset_source`, `host_image_codec` |
+| `modules/platform/linux/` | Linux-host APIs (winit, CPAL/ALSA, libc syscalls) plus host-agnostic `std` native modules, and native modules a host provider serves (`[host_provider]`) | `host_lane`, `linux_display`, `linux_audio`, `host_asset_source`, `host_image_codec`; `linux_net` (served by `fluxor-provider-net`) |
 | `modules/platform/wasm/`  | Browser APIs (Canvas, WebAudio, DOM, fetch)                                            | `wasm_browser_canvas`, `wasm_browser_audio`, `wasm_browser_keyboard`, `host_browser_fetch` |
 
 Native vs PIC is a **deployment** distinction: native modules compile
@@ -785,9 +800,9 @@ compile into the kernel binary; everything else is a PIC module:
    PCIe binding, DMA, NIC rings, GPIO, MMU/GIC/boot code in
    `src/platform/<chip>/`.
 2. **Kernel service contract implementations** and their
-   platform-overridable backends (CHANNEL, TIMER, EVENT,
-   KEY_VAULT) — each backend documented in the backends table above
-   with a descriptor under `modules/platform/<platform>/`.
+   platform-overridable backends (CHANNEL, TIMER, EVENT) — each
+   backend documented above with a descriptor under
+   `modules/platform/<platform>/`.
 3. **Native modules** — host-API drivers that are manifest-declared
    under `modules/platform/<platform>/<name>/` and therefore visible to
    the config tool and inventory.
@@ -881,9 +896,8 @@ handle table).
 
 Kernel source lives under area directories that consolidate similar
 concerns: `src/kernel/{boot,exec,ipc,mem,module,pcie,security,sys,usb,workload}`.
-The kernel root holds only `mod.rs`, the capacity profiles (`config.rs`)
-and the two kernel-served network contracts (`net_policy.rs`,
-`net_route.rs`). The SDK is three crates, each organised by what it
+The kernel root holds only `mod.rs` and the capacity profiles
+(`config.rs`). The SDK is three crates, each organised by what it
 holds: `crates/fluxor-abi` (`contracts`, `internal`, `platform`, `wire`,
 the registry, and the ABI-surface pin machinery `abi_surface.rs` /
 `abi_surface/srcpin.rs`, path-referenced by `tools/src/abi_pin.rs` — see
@@ -922,11 +936,12 @@ The stable workload contract (`0x0017`) carries only the native core
 LOOKUP / MODULE_DIGESTS / OPTIONS / CAPS, the network-lane ops `LANE` /
 `NET_PROVIDE` / `NET_LANE_TAKE` / `NET_LANE_ADMIT` / `NET_RESOLVER`, plus
 the header). Host-process mechanics — READ / EXEC /
-TTY_* opcodes, SOURCE_HOST_PROCESS and the process-executor class — live
+TTY_* / PROC_* opcodes and SOURCE_HOST_PROCESS — live
 in the host-scoped class `abi::platform::linux::host_process`, registered
 only by the Linux platform; unregistered = `ENOSYS` = discovery.
-Workload-targeting ops name the workload by its 16-byte identity at the
-head of `arg`, since a handle is of one contract and these ops are another's.
+Workload-targeting ops take the workload's handle in the handle slot: a
+handle is of one contract, and `host_process` declares that it accepts
+`workload` handles, which the kernel resolves as that contract's.
 The workload `CAPS` word holds the postures in byte
 0, the source kinds in byte 1 (bit 8 an fmod graph, bit 10 a graph with
 its own modules, bit 9 the host-process source the Linux backend

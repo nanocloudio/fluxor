@@ -25,8 +25,8 @@
 //!    one step and programs it a few pages per step after; it completes
 //!    `LocalDurable`, since the flash keeps no volatile cache, so `FUA` and
 //!    `FLUSH` cost nothing. Its buffer is lent until reaped. `EXEC` is not
-//!    served: an erase takes as long as the flash takes. Where `vault_store`
-//!    keeps the key vault's image slots.
+//!    served: an erase takes as long as the flash takes. Where a `key_vault`
+//!    keeps its record image's slots.
 //!
 //! **Params (from config):**
 //! - `debounce_ms`: debounce window in ms (default 50)
@@ -679,14 +679,14 @@ pub unsafe extern "C" fn flash_store_dispatch(
         return -38;
     }
     // The caller's module index: the store keys its overrides by it.
-    let mut caller = [0u8; 8];
+    let mut caller = [0u8; 12];
     let rc = (sys.provider_query)(
         -1,
         abi::kernel_abi::query_key::CALLER_MODULE,
         caller.as_mut_ptr(),
         caller.len(),
     );
-    if rc != 8 {
+    if rc != 12 {
         return if rc < 0 { rc } else { -22 };
     }
     let module_id = match u8::try_from(u16::from_le_bytes([caller[0], caller[1]])) {

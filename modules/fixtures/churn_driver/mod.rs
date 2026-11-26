@@ -220,9 +220,9 @@ fn compose_into(
     all.get_mut(..edges.len())?.copy_from_slice(edges);
     let mut fans = [plan::Fan {
         dir: plan::FanDir::Out,
-        of: 0,
+        of: Endpoint::New(0),
         port: 0,
-        kind: plan::FrameKind::Stream,
+        mailbox: false,
         domain: 0,
     }; 1];
     let groups = fluxor_contracts::ring_size::buffer_groups(edges.len());

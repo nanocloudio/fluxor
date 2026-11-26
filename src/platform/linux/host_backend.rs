@@ -53,11 +53,12 @@
 // process that execs is inside its pid namespace (`enter_pid_namespace`),
 // and is bound to the runtime's dispatch thread.
 //
-// Network: when the workload spec asks for its own network domain
-// (`NET_ISO_OWN` on any endpoint), NEWNET joins the unshare set (orthogonal to
-// `isolate` — a null sandbox can have its own netns too), and the sibling
-// `net_identity` module realizes the header's network fields (lo up; veth +
-// identity address when one is assigned) before START releases the barrier.
+// Network: when the source asks for a network namespace of its own
+// (`SRC_OWN_NETWORK`), NEWNET joins the unshare set, and `lo` is brought up
+// inside it before START releases the barrier ([`own_netns_ready`]); the
+// workload's address is the node's net provider's to give it, through the
+// `NETLINK_ROUTE` socket the runtime opens in that namespace
+// (`host_lane::owner_facts`).
 //
 // Spawn inputs are EXPLICIT parameters, never an on-disk bundle/OCI format —
 // this backend is a generic isolation primitive. `build_plan` takes:
@@ -158,28 +159,13 @@ const HP_STATE_PAUSED: u8 = 3;
 /// slot, and the reserve on top seats finished sandboxes, by default only as
 /// far as this domain leaves room. What this bounds is what an index may be at all: the
 /// workload provider's slot space below the graph backend's
-/// (`workload::GRAPH_SLOT_BASE`), and the `fx<stem>w<idx>` link name, which
-/// must fit IFNAMSIZ. A plan past it is refused at boot naming `sandboxes`.
+/// (`workload::GRAPH_SLOT_BASE`). A plan past it is refused at boot naming
+/// `sandboxes`.
 pub const MAX_SANDBOXES: usize = 4096;
 const _: () = assert!(
     MAX_SANDBOXES >= crate::kernel::workload::owner::MAX_OWNERS,
     "the sandbox domain must seat every owner"
 );
-// `fx` + stem + `w` + the largest index's digits fit a link name's 15.
-const _: () = assert!(
-    2 + super::instance::STEM_MAX + 1 + digits(MAX_SANDBOXES - 1) <= 15,
-    "fx<stem>w<idx> must fit IFNAMSIZ for every sandbox index"
-);
-
-/// Decimal digits of `n`.
-const fn digits(mut n: usize) -> usize {
-    let mut d = 1;
-    while n >= 10 {
-        n /= 10;
-        d += 1;
-    }
-    d
-}
 
 struct HpSlot {
     in_use: bool,
@@ -309,8 +295,7 @@ pub struct SpawnPlan {
     /// Make the root read-only, last, before the identity change.
     root_read_only: bool,
     /// Unshare NEWNET so the workload gets its own network domain
-    /// (`workload` header `NET_ISO_OWN`). Set by the caller from the spec;
-    /// network isolation is contract intent.
+    /// (`SRC_OWN_NETWORK`).
     own_netns: bool,
     /// cgroup.v2 resource limits from the portable `ResourceEnvelope`, applied
     /// best-effort by the parent after the container pid is known. Verbatim
@@ -2599,11 +2584,9 @@ unsafe fn proc_mask(m: i32, name: &core::ffi::CStr) -> bool {
 /// negative errno. The core of the `workload` host-process backend;
 /// owner-binding is the caller's concern (the `workload` provider records it).
 /// `env` carries the portable resource intents from a `workload` spec — the
-/// sole source of cgroup limits (this backend reads no files). `own_netns` +
-/// `ident` carry the header's network fields: with `own_netns` the container
-/// gets its own netns (lo up); with `ident` also a veth pair carrying the
-/// identity address (see `net_identity`). A network-realization failure fails
-/// the spawn — header fields are never silently dropped.
+/// sole source of cgroup limits (this backend reads no files). With
+/// `own_netns` the container gets its own network namespace, `lo` up; a
+/// failure to make it fails the spawn.
 /// # Safety
 /// Single-threaded platform dispatch only: mutates the process-global
 /// sandbox slot table without synchronization, and forks — no other
@@ -2614,7 +2597,6 @@ pub unsafe fn hp_spawn(
     isolate: bool,
     env: &ResourceEnvelope,
     own_netns: bool,
-    ident: Option<&super::net_identity::NetIdentity>,
 ) -> i32 {
     hp_spawn_with_binds(
         argv_tokens,
@@ -2622,7 +2604,6 @@ pub unsafe fn hp_spawn(
         isolate,
         env,
         own_netns,
-        ident,
         &[],
         &ProcessParams::default(),
     )
@@ -2646,7 +2627,6 @@ pub unsafe fn hp_spawn_with_binds(
     isolate: bool,
     env: &ResourceEnvelope,
     own_netns: bool,
-    ident: Option<&super::net_identity::NetIdentity>,
     binds: &[VolumeBind],
     proc: &ProcessParams,
 ) -> i32 {
@@ -2808,11 +2788,11 @@ pub unsafe fn hp_spawn_with_binds(
     let (cgrouped, contained) = hp_apply_cgroup(idx, container_pid, &plan);
     slot.cgrouped = cgrouped;
     slot.contained = contained;
-    // Realize the network domain before START releases the container. Unlike
-    // cgroups this is NOT best-effort: the network fields are in the spec header, so
-    // a failure fails the spawn rather than running with weaker networking.
+    // The network namespace, before START releases the container. Unlike
+    // cgroups this is NOT best-effort: the source asked for it, so a failure
+    // fails the spawn rather than running in the host's network.
     if own_netns {
-        let rc = super::net_identity::realize(idx, container_pid, ident);
+        let rc = own_netns_ready(container_pid);
         if rc != 0 {
             hp_destroy(idx as i32);
             return rc;
@@ -2920,7 +2900,10 @@ pub unsafe fn hp_read(raw: i32, out: &mut [u8]) -> i32 {
 // liveness), and the caller relays those bytes. A session belongs to the
 // module that opened it, under that module's owner: step, resize and close
 // from any other caller answer EACCES. The opener's owner release
-// (`hp_tty_release_owner`) and the workload's DESTROY close it.
+// (`hp_tty_release_owner`) and the workload's DESTROY close it. A session is
+// named by a `host_process` handle: the provider's index of session `sid` is
+// [`TTY_HANDLE_BASE`]` + sid`, and a session closed any way retires the
+// handles naming it.
 
 /// The session-id RANGE, not a table size: the table is sized at boot to
 /// the plan's `tty_sessions` ceiling (`size_kernel_tables`) — interactive
@@ -2928,6 +2911,34 @@ pub unsafe fn hp_read(raw: i32, out: &mut [u8]) -> i32 {
 /// sandbox, each a pseudo-terminal and a child pumped every step; a one-shot
 /// `EXEC` takes none. A plan past it is refused at boot naming the pool.
 pub const MAX_TTY_SESSIONS: usize = 4096;
+
+/// The `host_process` provider's index of session 0: sessions sit above the
+/// node's own commands (`providers::MAX_PROCS`) in that provider's index
+/// space.
+pub const TTY_HANDLE_BASE: i32 = 0x1_0000;
+
+/// The session a `host_process` index names, if it names one.
+fn tty_sid(index: i32) -> Option<usize> {
+    index
+        .checked_sub(TTY_HANDLE_BASE)
+        .and_then(|sid| usize::try_from(sid).ok())
+        .filter(|&sid| sid < MAX_TTY_SESSIONS)
+}
+
+/// Close session `sid` and retire every handle naming it. Returns its exit
+/// code.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global session table).
+unsafe fn close_session_at(sid: usize) -> i32 {
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    let code = close_session(&mut sessions[sid]);
+    crate::kernel::module::provider::retire_routes_naming(
+        crate::abi::registry::host_process::ID,
+        TTY_HANDLE_BASE + sid as i32,
+    );
+    code
+}
 
 struct TtySession {
     in_use: bool,
@@ -3006,8 +3017,9 @@ pub fn tty_capacity() -> usize {
 /// HP_TTY_OPEN: start an interactive PTY session running `argv` inside the
 /// sandbox. Allocates a pseudo-terminal, sets its window size, forks a session
 /// leader whose controlling tty is the PTY slave (setns-joining the container's
-/// namespaces when isolated), and execs. Returns a session id (>= 0) for the
-/// step/resize/close ops, or a negative errno.
+/// namespaces when isolated), and execs. Returns the session's index
+/// ([`TTY_HANDLE_BASE`]` + sid`) for the step/resize/close ops, or a negative
+/// errno.
 ///
 /// `arg` = `[rows:u16 LE][cols:u16 LE]`; `data` = the command line
 /// (NUL-bounded within it).
@@ -3151,26 +3163,28 @@ pub unsafe fn hp_tty_open(raw: i32, a: &[u8], cmd: &[u8]) -> i32 {
         owner,
         module,
     };
-    sid as i32
+    TTY_HANDLE_BASE + sid as i32
 }
 
-/// HP_TTY_STEP: one pump step of a session — write pending stdin to the PTY,
-/// drain its output, and poll the child's liveness. `arg` in =
-/// `[sid:u32 LE][wlen:u32 LE]`, `data` in = the stdin bytes in its first
-/// `wlen`; `arg` out = `[sid:u32 LE][rlen:u32 LE][state:u8][code:i32 LE]`
-/// (state 0 = running, 1 = exited), `data` out = the output in its first
-/// `rlen`. Returns 0, `EINVAL` for no such session, `EACCES` for one
-/// another module or owner opened.
+/// HP_TTY_STEP: one pump step of the session `index` names — write pending
+/// stdin to the PTY, drain its output, and poll the child's liveness. `arg`
+/// in = `[wlen:u32 LE]`, `data` in = the stdin bytes in its first `wlen`;
+/// `arg` out = `[rlen:u32 LE][state:u8][code:i32 LE]` (state 0 = running,
+/// 1 = exited), `data` out = the output in its first `rlen`. Returns 0,
+/// `EINVAL` for no such session, `EACCES` for one another module or owner
+/// opened.
 ///
 /// # Safety
 /// Single-threaded platform dispatch only.
-pub unsafe fn hp_tty_step(arg: &mut [u8], data: &mut [u8]) -> i32 {
+pub unsafe fn hp_tty_step(index: i32, arg: &mut [u8], data: &mut [u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.len() < 13 {
+    if arg.len() < 9 {
         return errno::EINVAL;
     }
-    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
-    let wlen = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]) as usize;
+    let Some(sid) = tty_sid(index) else {
+        return errno::EINVAL;
+    };
+    let wlen = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
 
     let session = match tty_session(sid) {
         Ok(s) => s,
@@ -3234,24 +3248,26 @@ pub unsafe fn hp_tty_step(arg: &mut [u8], data: &mut [u8]) -> i32 {
             (0u8, 0)
         }
     };
-    arg[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
-    arg[8] = state;
-    arg[9..13].copy_from_slice(&code.to_le_bytes());
+    arg[0..4].copy_from_slice(&(rn as u32).to_le_bytes());
+    arg[4] = state;
+    arg[5..9].copy_from_slice(&code.to_le_bytes());
     0
 }
 
-/// HP_TTY_RESIZE: set a session's window size. `arg` =
-/// `[sid:u32 LE][rows:u16 LE][cols:u16 LE]`. Refusals as [`hp_tty_step`].
+/// HP_TTY_RESIZE: set the window size of the session `index` names. `arg`
+/// = `[rows:u16 LE][cols:u16 LE]`. Refusals as [`hp_tty_step`].
 /// # Safety
 /// Single-threaded platform dispatch only.
-pub unsafe fn hp_tty_resize(arg: &[u8]) -> i32 {
+pub unsafe fn hp_tty_resize(index: i32, arg: &[u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.len() < 8 {
+    if arg.len() < 4 {
         return errno::EINVAL;
     }
-    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
-    let rows = u16::from_le_bytes([arg[4], arg[5]]);
-    let cols = u16::from_le_bytes([arg[6], arg[7]]);
+    let Some(sid) = tty_sid(index) else {
+        return errno::EINVAL;
+    };
+    let rows = u16::from_le_bytes([arg[0], arg[1]]);
+    let cols = u16::from_le_bytes([arg[2], arg[3]]);
     let session = match tty_session(sid) {
         Ok(s) => s,
         Err(e) => return e,
@@ -3266,19 +3282,18 @@ pub unsafe fn hp_tty_resize(arg: &[u8]) -> i32 {
     0
 }
 
-/// HP_TTY_CLOSE: kill (if still running) + reap the session, close the master,
-/// free the slot. `arg` = `[sid:u32 LE]`. Returns the child's exit code;
-/// refusals as [`hp_tty_step`].
+/// HP_TTY_CLOSE: kill (if still running) + reap the session `index` names,
+/// close the master, free the slot. Returns the child's exit code; refusals
+/// as [`hp_tty_step`].
 /// # Safety
 /// Single-threaded platform dispatch only.
-pub unsafe fn hp_tty_close(arg: &[u8]) -> i32 {
+pub unsafe fn hp_tty_close(index: i32) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.len() < 4 {
+    let Some(sid) = tty_sid(index) else {
         return errno::EINVAL;
-    }
-    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
+    };
     match tty_session(sid) {
-        Ok(s) => close_session(s),
+        Ok(_) => close_session_at(sid),
         Err(e) => e,
     }
 }
@@ -3325,24 +3340,24 @@ unsafe fn close_session(session: &mut TtySession) -> i32 {
 /// # Safety
 /// Single-threaded platform dispatch only (process-global session table).
 pub unsafe fn hp_tty_release_owner(owner: crate::kernel::workload::owner::OwnerHandle) -> usize {
-    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
-    let mut n = 0;
-    for s in sessions.iter_mut() {
-        if s.in_use && s.owner == owner {
-            close_session(s);
-            n += 1;
-        }
+    let sessions = &*core::ptr::addr_of!(LINUX_TTYS);
+    let mine: Vec<usize> = (0..sessions.len())
+        .filter(|&sid| sessions[sid].in_use && sessions[sid].owner == owner)
+        .collect();
+    for &sid in &mine {
+        close_session_at(sid);
     }
-    n
+    mine.len()
 }
 
 /// Close every session joined to sandbox `raw` (its DESTROY).
 unsafe fn close_sandbox_sessions(raw: i32) {
-    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
-    for s in sessions.iter_mut() {
-        if s.in_use && s.sandbox == raw {
-            close_session(s);
-        }
+    let sessions = &*core::ptr::addr_of!(LINUX_TTYS);
+    let joined: Vec<usize> = (0..sessions.len())
+        .filter(|&sid| sessions[sid].in_use && sessions[sid].sandbox == raw)
+        .collect();
+    for sid in joined {
+        close_session_at(sid);
     }
 }
 
@@ -3598,7 +3613,7 @@ pub unsafe fn hp_signal(raw: i32, arg: &[u8]) -> i32 {
     };
     // An intermediate reaped here is gone with its init; one not yet reaped
     // keeps its pid, so the request below reaches it and no stranger.
-    hp_poll_reap(raw, slot);
+    hp_poll_reap(slot);
     if slot.reaped {
         return errno::OK; // already gone
     }
@@ -3618,8 +3633,9 @@ pub unsafe fn hp_signal(raw: i32, arg: &[u8]) -> i32 {
 /// Non-blocking reap poll: latch the terminal state once the child is gone.
 /// Shared by WAIT (state reporting) and PAUSE (a terminal workload must be
 /// refused, so PAUSE needs the same freshness as WAIT). A workload that
-/// exited on its own releases its address here, as DESTROY would.
-unsafe fn hp_poll_reap(raw: i32, slot: &mut HpSlot) {
+/// exited on its own is told gone to the host providers here, as DESTROY
+/// would: its address leaves the node.
+unsafe fn hp_poll_reap(slot: &mut HpSlot) {
     if slot.reaped {
         return;
     }
@@ -3627,7 +3643,7 @@ unsafe fn hp_poll_reap(raw: i32, slot: &mut HpSlot) {
     let r = libc::waitpid(slot.pid, &mut status, libc::WNOHANG);
     if r == slot.pid {
         slot.reaped = true;
-        super::net_identity::released(raw as usize);
+        super::host_lane::owner_facts::process_ended(slot.container_pid as u32);
         if libc::WIFEXITED(status) {
             slot.exit_state = HP_STATE_EXITED;
             slot.exit_code = libc::WEXITSTATUS(status);
@@ -3637,6 +3653,19 @@ unsafe fn hp_poll_reap(raw: i32, slot: &mut HpSlot) {
         }
     }
     // r == 0 → still running; r < 0 → already reaped elsewhere (leave running/unknown).
+}
+
+/// The host pid of sandbox `raw`'s init, while it runs: what a host
+/// provider maps the sandbox's owner to.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global slot table).
+pub unsafe fn hp_container_pid(raw: i32) -> Option<u32> {
+    let slot = slot_for(raw)?;
+    if slot.reaped || slot.container_pid <= 0 {
+        return None;
+    }
+    u32::try_from(slot.container_pid).ok()
 }
 
 /// HP_WAIT: non-blocking; returns [state:u8][code:i32 LE]. Caches the result.
@@ -3650,7 +3679,7 @@ pub unsafe fn hp_wait(raw: i32, buf: &mut [u8]) -> i32 {
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
-    hp_poll_reap(raw, slot);
+    hp_poll_reap(slot);
     if !slot.reaped && slot.paused {
         // Frozen and not exited → PAUSED, live, not terminal.
         // A workload that died BEFORE the freeze latched terminal in the
@@ -3682,7 +3711,7 @@ pub unsafe fn hp_pause(raw: i32) -> i32 {
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
-    hp_poll_reap(raw, slot);
+    hp_poll_reap(slot);
     if slot.reaped {
         return errno::EINVAL; // terminal — ESTATE-class refusal
     }
@@ -3749,7 +3778,7 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
     }
     // As for SIGNAL: a container whose intermediate already exited is not
     // signalled.
-    hp_poll_reap(raw, slot);
+    hp_poll_reap(slot);
     if !slot.reaped && slot.pid > 0 {
         // Through the intermediate, to the init's process group: SIGKILL to
         // PID 1 of a pid ns tears the whole namespace down, and a null
@@ -3781,8 +3810,8 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
     if slot.pidfd >= 0 {
         libc::close(slot.pidfd);
     }
-    // Its address leaves the node: flows discarded, attachment unguarded.
-    super::net_identity::released(raw as usize);
+    // Its address leaves the node: the host providers are told it is gone.
+    super::host_lane::owner_facts::process_ended(slot.container_pid as u32);
     if slot.out_r >= 0 {
         libc::close(slot.out_r);
     }
@@ -3793,4 +3822,110 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
         hp_remove_cgroup(raw as usize);
     }
     errno::OK
+}
+
+// ---- the network namespace ---------------------------------------------------
+
+/// SIOCSIFFLAGS IFF_UP on `name` using `sock`. Returns 0 or -1.
+///
+/// # Safety
+/// `sock` is an open socket; async-signal-safe (ioctls only).
+unsafe fn if_up(sock: i32, name: &[u8; 16]) -> i32 {
+    let mut req: libc::ifreq = core::mem::zeroed();
+    for (i, b) in name.iter().enumerate() {
+        req.ifr_name[i] = *b as libc::c_char;
+    }
+    if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut req) != 0 {
+        return -1;
+    }
+    req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+    if libc::ioctl(sock, libc::SIOCSIFFLAGS, &req) != 0 {
+        return -1;
+    }
+    0
+}
+
+/// Wait until `container_pid` is in its own network namespace (its
+/// `/proc/<pid>/ns/net` differs from ours: the child unshares after the
+/// fork), then bring its `lo` up from a short-lived helper that joins the
+/// namespace — the dispatch thread's own namespace never changes. Doubles as
+/// the fail-closed gate: a child that died (an unprivileged unshare) or
+/// never diverged fails the spawn. Returns 0 or a negative errno.
+fn own_netns_ready(container_pid: i32) -> i32 {
+    use crate::kernel::sys::errno;
+    // Our own namespace link must be readable — without it divergence cannot
+    // be verified, and an unverifiable gate must refuse, not wave through.
+    let Ok(own) = std::fs::read_link("/proc/self/ns/net") else {
+        return errno::ERROR;
+    };
+    let path = format!("/proc/{container_pid}/ns/net");
+    // ~1 s ceiling: 2000 × 500 µs. The divergence normally lands in the first
+    // few iterations; the ceiling only bounds the failure path.
+    let mut diverged = false;
+    for _ in 0..2000 {
+        match std::fs::read_link(&path) {
+            Ok(theirs) if theirs != own => {
+                diverged = true;
+                break;
+            }
+            Ok(_) => {}
+            // Child gone (died before/at unshare) — fail fast.
+            Err(_) => return errno::ERROR,
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    if !diverged {
+        return errno::ERROR;
+    }
+    // Everything the helper needs is made before the fork: it touches only
+    // its stack and libc between fork and _exit.
+    let path_z = format!("{path}\0");
+    let mut lo = [0u8; 16];
+    lo[..2].copy_from_slice(b"lo");
+    // SAFETY: fork + setns run in a short-lived helper child that only makes
+    // libc calls and _exits; the parent only waitpids it. Called from
+    // single-threaded platform dispatch.
+    unsafe {
+        let child = libc::fork();
+        if child < 0 {
+            return errno::ERROR;
+        }
+        if child == 0 {
+            let fd = libc::open(
+                path_z.as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                libc::_exit(10);
+            }
+            if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
+                libc::_exit(11);
+            }
+            libc::close(fd);
+            let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+            if sock < 0 {
+                libc::_exit(12);
+            }
+            if if_up(sock, &lo) != 0 {
+                libc::_exit(13);
+            }
+            libc::_exit(0);
+        }
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = libc::waitpid(child, &mut status, 0);
+            if r == child {
+                break;
+            }
+            if r < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            return errno::ERROR;
+        }
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            0
+        } else {
+            errno::ERROR
+        }
+    }
 }

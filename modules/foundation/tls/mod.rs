@@ -1113,6 +1113,14 @@ struct TlsState {
     custody_job: CustodyAttest,
     custody_held: [u8; CUSTODY_ATTEST_CMD_LEN],
     custody_held_len: u8,
+    /// A command waiting for the vault to make the continuity master
+    /// durable (`hold_for_vault`), held whole (`vault_held_len` bytes, 0
+    /// for none, of command `vault_held_type`) since `vault_held_since`
+    /// (ms, 0 when none is held).
+    vault_held: [u8; VAULT_HELD_MAX],
+    vault_held_len: u16,
+    vault_held_type: u8,
+    vault_held_since: u64,
     /// Standby shadows a checkpoint imports into (continuity.rs).
     shadows: [TlsShadow; MAX_TLS_SHADOWS],
     /// Frame assembly for everything the continuity surface emits.
@@ -1350,6 +1358,11 @@ struct TlsState {
     /// vault is unavailable. When >= 0, CertificateVerify signs via the
     /// vault and falls back to the in-module `key` on ENOSYS.
     key_vault_handle: i32,
+    /// The embedded identity key waits for the vault: deposited from the
+    /// first step (the vault is a provider of the graph, reachable once the
+    /// graph is instantiated), and again each step while the vault answers
+    /// `EAGAIN`. Nothing is served until it is in.
+    identity_deposit_pending: bool,
 
     /// The identity named by `identity_label` (identity.rs): its key in the
     /// vault, its certificate from `identity_cert`. Inert without a label.
@@ -1839,6 +1852,7 @@ pub unsafe extern "C" fn module_new(
     s.alpn_cfg_bad = 0;
     s.last_peer_auth_error = 0;
     s.key_vault_handle = -1;
+    s.identity_deposit_pending = false;
     s.rsa_owner = -1;
     s.sign_steps = 0;
     s.hs_pending_conn = 0;
@@ -1916,6 +1930,8 @@ pub unsafe extern "C" fn module_new(
     s.custody_signer_open = false;
     s.custody_job = NO_CUSTODY_ATTEST;
     s.custody_held_len = 0;
+    s.vault_held_len = 0;
+    s.vault_held_since = 0;
     s.redeliver_len = 0;
     s.redeliver_off = 0;
     s.redeliver_trim = 0;
@@ -2056,31 +2072,60 @@ pub unsafe extern "C" fn module_new(
     }
 
     // An identity key read from `key_file` at runtime is deposited when it
-    // is read (`creds_install`); an embedded one here.
-    if !identity_key_deposit(s) {
-        let msg = b"[tls] refusing to construct: the key vault did not take the identity key";
-        dev_log(sys, 1, msg.as_ptr(), msg.len());
-        return -1;
-    }
+    // is read (`creds_install`); an embedded one from the first step
+    // (`identity_deposit_step`).
+    s.identity_deposit_pending = s.key_len > 0;
 
     0
 }
 
+/// Deposit the embedded identity key while it waits for the vault. True
+/// once it is in (or this identity is one the module holds itself); false
+/// while the vault answers `EAGAIN`. A refusal leaves no identity to serve:
+/// the instance stops with an error.
+unsafe fn identity_deposit_step(s: &mut TlsState) -> Result<bool, i32> {
+    if !s.identity_deposit_pending {
+        return Ok(true);
+    }
+    match identity_key_deposit(s) {
+        Ok(()) => {
+            s.identity_deposit_pending = false;
+            Ok(true)
+        }
+        Err(abi::errno::EAGAIN) => Ok(false),
+        Err(rc) => {
+            s.identity_deposit_pending = false;
+            identity_key_wipe(s);
+            let msg = b"[tls] the key vault did not take the identity key: no identity to serve";
+            dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
+            Err(rc)
+        }
+    }
+}
+
+/// Wipe the module's copy of the identity key.
+fn identity_key_wipe(s: &mut TlsState) {
+    zeroize(&mut s.key[..s.key_len]);
+    s.key_len = 0;
+}
+
 /// Deposit the identity key in `s.key` into the key vault and wipe the
 /// module's copy: an RSA or P-256 identity signs CertificateVerify only
-/// through the vault's resumable `SIGN`. False when the vault refuses the
-/// key (a target whose vault does not hold RSA, a malformed scalar): such
-/// an identity cannot serve. A P-384 or Ed25519 identity stays in the
-/// module, which signs it itself.
-unsafe fn identity_key_deposit(s: &mut TlsState) -> bool {
+/// through the vault's resumable `SIGN`. The vault's refusal when it does
+/// not take the key (a target whose vault does not hold RSA, a malformed
+/// scalar, no vault): such an identity cannot serve, and the module's copy
+/// is wiped. `EAGAIN` (the vault not reachable yet) keeps the copy for the
+/// identical repeat. A P-384 or Ed25519 identity stays in the module, which
+/// signs it itself.
+unsafe fn identity_key_deposit(s: &mut TlsState) -> Result<(), i32> {
     let sys = &*s.syscalls;
     s.identity_rsa_suite = 0;
     if s.key_len == 0 {
-        return true;
+        return Ok(());
     }
     let rsa = rsa_identity_suite(&s.key[..s.key_len]);
     if rsa.is_none() && !identity_is_p256(s) {
-        return true;
+        return Ok(());
     }
     // STORE: arg [suite][usage], the key in `data`. The mask is SIGN only:
     // this key exists to sign CertificateVerify and nothing else — not to
@@ -2108,7 +2153,7 @@ unsafe fn identity_key_deposit(s: &mut TlsState) -> bool {
     };
     let mut arg = kv::store::encode(suite, kv::usage::SIGN);
     let handle = if n == 0 {
-        -1
+        abi::errno::EINVAL
     } else {
         (sys.provider_call)(
             -1,
@@ -2120,19 +2165,21 @@ unsafe fn identity_key_deposit(s: &mut TlsState) -> bool {
         )
     };
     zeroize(&mut key);
+    if handle == abi::errno::EAGAIN {
+        return Err(handle);
+    }
     // The vault holds the authoritative copy, or nothing does: the module's
     // is wiped either way, so CertificateVerify cannot silently sign with a
     // plaintext key.
-    zeroize(&mut s.key[..s.key_len]);
-    s.key_len = 0;
+    identity_key_wipe(s);
     if handle < 0 {
-        return false;
+        return Err(handle);
     }
     s.key_vault_handle = handle;
     if let Some(suite) = rsa {
         s.identity_rsa_suite = suite;
     }
-    true
+    Ok(())
 }
 
 /// The vault suite of a `key_file` that is a PKCS#1 RSAPrivateKey, or
@@ -2300,6 +2347,11 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = &mut *(state as *mut TlsState);
     s.step_count = s.step_count.wrapping_add(1);
+    match identity_deposit_step(s) {
+        Ok(true) => {}
+        Ok(false) => return StepReturn::Continue,
+        Err(rc) => return StepReturn::error(rc),
+    }
     if s.transport == TRANSPORT_UDP {
         dtls_module_step(s)
     } else {
@@ -4832,8 +4884,8 @@ unsafe fn pump_ecdh_refill(s: &mut TlsState) {
     if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0 {
         return; // CSPRNG hiccup — retry next tick, slot stays consumed
     }
-    // Same per-step chunking the handshake ECDH uses. `>= 256` (run-to-
-    // completion / vault mode) maps to 0 = finish in one `step()`.
+    // Same per-step chunking the handshake ECDH uses. `>= 256` (run to
+    // completion) maps to 0 = finish in one `step()`.
     let bps: u8 = if s.ecdh_bits_per_step == 0 || s.ecdh_bits_per_step >= 256 {
         0
     } else {

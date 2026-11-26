@@ -174,17 +174,6 @@ pub struct WorkloadManifest {
     /// schema ([`crate::params`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamSpec>,
-    /// Where this workload's control-plane store lives, relative to the
-    /// package directory unless absolute.
-    ///
-    /// A workload that keeps state says where it keeps it, and what it
-    /// says beats `FLUXOR_STORE_DIR` in the launching process's
-    /// environment: the deployment knows what its own state is and the
-    /// caller does not, so the same applet run from two shells reaches the
-    /// same store. The variable serves a node-wide store no single
-    /// workload owns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store_dir: Option<String>,
 }
 
 /// The resource-footprint document referenced by an implementation's

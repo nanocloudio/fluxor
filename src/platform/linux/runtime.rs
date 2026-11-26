@@ -67,113 +67,13 @@ fn linux_clock_sync_status() -> Option<(bool, u64)> {
     fluxor::platform::linux::clock::sync_status()
 }
 
-/// Where sealed key blobs live on Linux: one file per label under
-/// `$FLUXOR_VAULT_DIR`, or `$FLUXOR_STORE_DIR/vault` when only the store dir
-/// is set.
-///
-/// Unset means NO durable vault, and the hooks below then answer `false` /
-/// `None`. That is deliberate: a process that was not told where to keep
-/// keys should not invent a location and start writing key material into it.
-fn linux_vault_dir() -> Option<std::path::PathBuf> {
-    if let Ok(d) = std::env::var("FLUXOR_VAULT_DIR") {
-        return Some(std::path::PathBuf::from(d));
-    }
-    std::env::var("FLUXOR_STORE_DIR")
-        .ok()
-        .map(|d| std::path::PathBuf::from(d).join("vault"))
-}
-
-/// A label's filename: its bytes, hex-encoded.
-///
-/// Hex rather than the label itself, because a label is an opaque byte string
-/// chosen by a module and a filename is not. `../../etc/whatever` is a
-/// perfectly legal label and must not become a path.
-fn linux_vault_path(label: &[u8]) -> Option<std::path::PathBuf> {
-    let dir = linux_vault_dir()?;
-    let mut name = String::with_capacity(label.len() * 2);
-    for b in label {
-        use core::fmt::Write as _;
-        let _ = write!(name, "{b:02x}");
-    }
-    Some(dir.join(name))
-}
-
-/// Write a sealed blob so it outlives the process. See
-/// [`HalOps::seal_blob_write`].
-///
-/// The blob arrives ALREADY SEALED — this decides where it lives, nothing
-/// more. Written to a temporary, flushed, renamed over the old one, and the
-/// directory flushed, so the answer is `true` only once the new blob would
-/// survive a power cut, and a crash at any point leaves the previous blob
-/// whole rather than a truncated one: a half-written key reads back as a
-/// key that does not open.
-fn linux_seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
-    use std::io::Write as _;
-    let Some(path) = linux_vault_path(label) else {
-        return false;
-    };
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let tmp = path.with_extension("tmp");
-    let written =
-        std::fs::File::create(&tmp).and_then(|mut f| f.write_all(blob).and_then(|()| f.sync_all()));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-    linux_sync_dir(dir)
-}
-
-/// Flush a directory, so a rename or removal inside it is durable.
-fn linux_sync_dir(dir: &std::path::Path) -> bool {
-    std::fs::File::open(dir).and_then(|d| d.sync_all()).is_ok()
-}
-
-/// Whether sealed blobs have somewhere durable to live. See
-/// [`HalOps::seal_blob_store`].
-fn linux_seal_blob_store() -> bool {
-    linux_vault_dir().is_some()
-}
-
-/// Remove a sealed blob durably. See [`HalOps::seal_blob_delete`].
-fn linux_seal_blob_delete(label: &[u8]) -> bool {
-    let Some(path) = linux_vault_path(label) else {
-        return true;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => path.parent().is_none_or(linux_sync_dir),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-/// Read a sealed blob back. See [`HalOps::seal_blob_read`].
-fn linux_seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
-    let path = linux_vault_path(label)?;
-    let data = std::fs::read(path).ok()?;
-    // Too large is "no key here", not a partial read: half a sealed blob does
-    // not unseal, and returning part of one invites the caller to try.
-    if data.len() > out.len() {
-        return None;
-    }
-    out[..data.len()].copy_from_slice(&data);
-    Some(data.len())
-}
-
 /// Where the Linux sealing key comes from.
 ///
 /// `HostReadable`, and that is the honest answer rather than a placeholder.
-/// The key is derived from `FLUXOR_SEAL_KEY` or a file under the store
-/// directory — both readable by anything running as this user. Sealing
-/// therefore protects a stored key from a compromised MODULE and not from a
-/// compromised HOST, and the vault's custody stays `SOFTWARE` because of it.
+/// The key is `FLUXOR_SEAL_KEY`, readable by anything running as this user.
+/// Sealing under it protects a stored key from a compromised MODULE and not
+/// from a compromised HOST, and the vault's custody stays `SOFTWARE`
+/// because of it.
 ///
 /// A Linux box with a TPM could report `DeviceUnique` by sealing to the
 /// storage root key. That is a real path and deliberately not taken here on
@@ -208,76 +108,6 @@ fn linux_seal_key() -> Option<[u8; 32]> {
         key[i] = ((hi << 4) | lo) as u8;
     }
     Some(key)
-}
-
-/// Seal with ChaCha20-Poly1305 under the platform key.
-///
-/// Layout: `[nonce:12][ciphertext][tag:16]`. The nonce is fresh per seal
-/// from the kernel CSPRNG — a repeated nonce under one key breaks
-/// confidentiality outright for a stream cipher, so it is generated rather
-/// than derived from anything the caller controls.
-fn linux_seal(aad: &[u8], plain: &[u8], out: &mut [u8]) -> Option<usize> {
-    let key = linux_seal_key()?;
-    let total = 12 + plain.len() + 16;
-    if out.len() < total {
-        return None;
-    }
-    let mut nonce = [0u8; 12];
-    getrandom_bytes(&mut nonce)?;
-    out[..12].copy_from_slice(&nonce);
-    out[12..12 + plain.len()].copy_from_slice(plain);
-    let tag = fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
-        &key,
-        &nonce,
-        aad,
-        &mut out[12..12 + plain.len()],
-    );
-    out[12 + plain.len()..total].copy_from_slice(&tag);
-    Some(total)
-}
-
-fn linux_unseal(aad: &[u8], sealed: &[u8], out: &mut [u8]) -> Option<usize> {
-    let key = linux_seal_key()?;
-    if sealed.len() < 12 + 16 {
-        return None;
-    }
-    let body_len = sealed.len() - 12 - 16;
-    if out.len() < body_len {
-        return None;
-    }
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&sealed[..12]);
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&sealed[12 + body_len..]);
-    out[..body_len].copy_from_slice(&sealed[12..12 + body_len]);
-    // A tag that does not verify means the blob was altered or sealed
-    // under a different key. Either way it is not a key, and `out` is
-    // wiped rather than returned half-decrypted.
-    if fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
-        &key,
-        &nonce,
-        aad,
-        &mut out[..body_len],
-        &tag,
-    ) {
-        Some(body_len)
-    } else {
-        for b in &mut out[..body_len] {
-            // SAFETY: `b` is a live, exclusively-borrowed byte of `out`.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-        None
-    }
-}
-
-fn getrandom_bytes(buf: &mut [u8]) -> Option<()> {
-    // SAFETY: `buf` is a live, exclusively-borrowed slice of `buf.len()`.
-    let rc = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
-    if rc as usize == buf.len() {
-        Some(())
-    } else {
-        None
-    }
 }
 
 fn linux_now_micros() -> u64 {
@@ -394,47 +224,29 @@ fn linux_module_timer_start(_period_us: u32) {}
 fn linux_module_timer_stop() {}
 fn linux_module_timer_poll() {}
 
-/// The platform's owner-release hook, fired by the kernel on every owner it
-/// frees: what the owner holds through the library's providers
-/// (`owner_release`: network endpoints, host-process workloads and terminal
-/// sessions, its root), then the host namespace and HTTP object handles an
-/// owner acting with the node's authority opened.
-fn linux_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
-    fluxor::platform::linux::owner_release::release_owner(owner);
-    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
-    unsafe {
-        ns_release_opener(owner);
-        obj_release_opener(owner);
-    }
-}
-
-/// The handles this platform's provider tables can hand modules at once:
-/// the library's tables and the host object and namespace tables.
+/// The handles this platform's provider tables can hand modules at once.
 fn linux_handle_slots() -> usize {
-    fluxor::platform::linux::providers::handle_slots() + OBJ_MAX_OPEN + NS_MAX_OPEN
+    fluxor::platform::linux::providers::handle_slots()
 }
 
 fn linux_init_providers() {
-    // Instance scoping first: `FLUXOR_STATE_DIR` (this instance's own state
-    // directory, locked for the runtime's life; distinct from
-    // `FLUXOR_STORE_DIR`) and `FLUXOR_INSTANCE` (the tag naming this runtime
-    // in the host registry, default a digest of the state directory). A
-    // state directory or tag another live runtime holds stops the runtime
-    // here, before it touches anything host-global.
-    if let Err(e) = fluxor::platform::linux::instance::init_from_env() {
+    // `FLUXOR_STATE_DIR` first: this instance's own state directory, locked
+    // for the runtime's life. One another live runtime holds stops the
+    // runtime here, before it touches anything host-global. (The instance
+    // tag and the host registry are the network provider's.)
+    if let Err(e) = fluxor::platform::linux::state_dir::lock_from_env() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
-    // Override the default stub FS provider with one backed by real
-    // libc I/O. The dispatcher also answers
-    // `contracts::fence::QUERY_OP`, surfacing the per-handle fence
-    // through `provider_query(handle, query_key::LAST_FENCE, …)`.
+    // The host filesystem, for the node alone: a workload reaches node
+    // storage through the node graph's workload `fs` layer (`owner_fs`), which
+    // roots it and reaches this provider in its own frame. The dispatcher
+    // also answers `contracts::fence::QUERY_OP`, surfacing the per-handle
+    // fence through `provider_query(handle, query_key::LAST_FENCE, …)`.
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
-    provider::register(dev_class::FS, linux_fs_dispatch);
+    provider::register_node_only(dev_class::FS, linux_fs_dispatch);
     provider::register_platform_handle_slots(linux_handle_slots);
-    // What an owner holds of the platform goes with the owner.
-    provider::register_owner_release_hook(linux_owner_released);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
     // The platform's verdict on a certificate chain. Registered only where
     // the verifier is built in; without it nothing answers class `trust` and a
@@ -442,67 +254,15 @@ fn linux_init_providers() {
     // quietly composing against some other trust source.
     #[cfg(feature = "trust-system")]
     provider::register(dev_class::TRUST, trust_provider::dispatch);
-    // Packet policy and service NAT: nftables tables, applied atomically.
-    provider::register(
-        dev_class::NET_POLICY,
-        fluxor::platform::linux::net_policy::dispatch,
-    );
-    // How the node's workloads reach each other and the outside world:
-    // segments, peer routes and held addresses realized in the host's
-    // network domain under this instance's tag. Probes the host at start
-    // (privilege, tunables, the rule tool, an active forwarding probe) and
-    // again periodically; with no FLUXOR_STATE_DIR it realizes nothing and
-    // says so.
-    provider::register(
-        dev_class::NET_ROUTE,
-        fluxor::platform::linux::net_route::dispatch,
-    );
-    fluxor::platform::linux::net_route::init();
-    // storage.object over HTTP `Range:` — wasm peer in
-    // `src/platform/wasm/object.rs`; shared windowing in
-    // `abi::contracts::storage::object::range`.
-    provider::register(dev_class::STORAGE_OBJECT, linux_object_dispatch);
-    // storage.namespace over the real filesystem (std::fs read_dir/metadata)
-    // — the directory-enumeration sibling of the FS provider; wasm peer in
-    // `src/platform/wasm/namespace.rs`. Lets a scanner walk a host library on
-    // Linux exactly as it walks the manifest-backed index in the browser.
-    provider::register(dev_class::STORAGE_NAMESPACE, linux_namespace_dispatch);
-    // Control-plane store: if FLUXOR_STORE_DIR is set, the two storage providers
-    // above route to an in-runtime versioned watchable store instead of
-    // HTTP/filesystem. A no-op when the env is unset.
-    // SAFETY: single-threaded startup, before any provider dispatch — the
-    // store singleton is initialised exactly once with no concurrent access.
-    // NOT discarded. A store that was asked for and could not be opened leaves
-    // every store-backed module in the graph talking to a provider that is not
-    // there — and a module with no provider does not fail, it just never
-    // produces anything, which from outside looks like a module with nothing
-    // to do. Saying so here is the difference between a one-line diagnosis and
-    // an afternoon.
-    match unsafe { fluxor::platform::linux::store::store_init_from_env() } {
-        fluxor::platform::linux::store::StoreInit::NotConfigured
-        | fluxor::platform::linux::store::StoreInit::Opened => {}
-        fluxor::platform::linux::store::StoreInit::Failed => {
-            log::error!(
-                "[store] FLUXOR_STORE_DIR is set but the control-plane store \
-                 could not be opened; every storage.object and \
-                 storage.namespace call on this node will be answered without \
-                 it. Check the directory exists, is writable, and that its \
-                 append log is not corrupt."
-            );
-        }
-    }
-    // The impure boundary: host process executor (sector `do`). Gated by
-    // `requires_contract="proc"`; only registered on host-linux (a PIC module
-    // can't fork/exec, so a "worker" is by definition a Linux node).
-    provider::register(
-        fluxor::abi::platform::linux::host_process::PROC_CLASS,
-        linux_proc_dispatch,
-    );
     // Platform-neutral isolated-workload surface: parses the spec header, binds
     // to a plan-allocated owner + lease, enforces the options envelope
     // fail-closed, and delegates to the owner-bound host-process backend.
     // Host-linux; gated by the `workload.create` and `host_process.exec` grants.
     provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
+    // What an owner holds of the host (network endpoints, host processes,
+    // terminals) goes with the owner: the workload provider hears every
+    // release.
+    provider::observe_owner_release(dev_class::WORKLOAD);
     provider::register(
         dev_class::HOST_PROCESS,
         fluxor::platform::linux::workload::host_process_dispatch,
@@ -513,13 +273,6 @@ fn linux_init_providers() {
         dev_class::HOST_MOUNT,
         fluxor::platform::linux::host_mount::host_mount_dispatch,
     );
-    // KEY_VAULT hardware override: when a PKCS#11 token is configured,
-    // re-register both KEY_VAULT dispatch paths over the kernel software
-    // default. Runs after the kernel-core registrations, so the override
-    // wins; unconfigured or failed, the software backend stays live and
-    // reports CUSTODY=SOFTWARE.
-    #[cfg(feature = "host-hsm")]
-    fluxor::platform::linux::hsm_key_vault::try_register_from_env();
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///
@@ -567,15 +320,8 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     now_unix_millis: linux_now_unix_millis,
     clock_sync_status: linux_clock_sync_status,
     seal_provenance: linux_seal_provenance,
+    seal_key: linux_seal_key,
     signing_root: fluxor::kernel::security::root::image_root,
-    seal_blob_write: linux_seal_blob_write,
-    seal_blob_store: linux_seal_blob_store,
-    seal_blob_delete: linux_seal_blob_delete,
-    seal_blob_read: linux_seal_blob_read,
-    // The vault directory is a filesystem path: readable whenever it exists.
-    seal_blob_ready: || true,
-    seal: linux_seal,
-    unseal: linux_unseal,
     now_micros: linux_now_micros,
     tick_count: linux_tick_count,
     flash_base: linux_flash_base,

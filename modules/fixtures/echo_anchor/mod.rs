@@ -898,6 +898,10 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                 && (s.handoff == HandoffPhase::DrainWait || s.handoff == HandoffPhase::ImportWait)
             {
                 if msg_type == SC_CMD_EXPORT_BEGIN {
+                    // The worker wrote its output before it declared
+                    // DRAINED; relay what is still queued so `relayed`
+                    // stands where the blob's `out_produced` does.
+                    while s.client_conn_id != NO_CONN && relay_output(s, w) {}
                     let off = SESSION_ID_BYTES + EPOCH_BYTES + 4;
                     let cursors = if payload_len >= off + CURSOR_PAIR_LEN {
                         SessionCursors::decode(core::slice::from_raw_parts(
@@ -971,7 +975,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                     &*sys_ptr,
                     3,
                     b"[echo_anc] handoff refused, session kept".as_ptr(),
-                    39,
+                    40,
                 );
                 return;
             }
@@ -1060,25 +1064,13 @@ unsafe fn poll_data_in(s: &mut AnchorState) {
     if s.phase != AnchorPhase::Active || s.client_conn_id == NO_CONN {
         return;
     }
-    let sys_ptr = s.syscalls;
 
     if s.handoff == HandoffPhase::RetireDrain {
         // After the swap flip, the retiring worker is the standby slot.
         let retiring = s.standby_w();
-        let chan = s.data_in[retiring];
-        if chan >= 0 {
-            let poll = ((*sys_ptr).channel_poll)(chan, POLL_IN);
-            if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
-                let buf = s.data_buf.as_mut_ptr();
-                let read = ((*sys_ptr).channel_read)(chan, buf, DATA_BUF_SIZE);
-                if read > 0 {
-                    let client = s.client_conn_id;
-                    net_send_data(s, client, buf, read as usize);
-                    s.relayed = s.relayed.wrapping_add(read as u64);
-                }
-                // More may remain — keep retiring next step.
-                return;
-            }
+        if relay_output(s, retiring) {
+            // More may remain — keep retiring next step.
+            return;
         }
         // Retiring channel empty (or unwired): the old worker is
         // detached and can produce nothing further. Release the held
@@ -1088,22 +1080,34 @@ unsafe fn poll_data_in(s: &mut AnchorState) {
         return;
     }
 
-    let mut w = 0;
-    while w < 2 {
-        let chan = s.data_in[w];
-        if chan >= 0 {
-            let poll = ((*sys_ptr).channel_poll)(chan, POLL_IN);
-            if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
-                let buf = s.data_buf.as_mut_ptr();
-                let read = ((*sys_ptr).channel_read)(chan, buf, DATA_BUF_SIZE);
-                if read > 0 {
-                    let client = s.client_conn_id;
-                    net_send_data(s, client, buf, read as usize);
-                }
-            }
-        }
-        w += 1;
+    relay_output(s, 0);
+    relay_output(s, 1);
+}
+
+/// Relay one read of worker `w`'s output (its data_in) to the client,
+/// counting what was sent in `relayed`, the outbound delivery cursor
+/// EXPORT_BEGIN is checked against. Returns whether there was output to
+/// read.
+unsafe fn relay_output(s: &mut AnchorState, w: usize) -> bool {
+    let chan = s.data_in[w];
+    if chan < 0 {
+        return false;
     }
+    let sys_ptr = s.syscalls;
+    let poll = ((*sys_ptr).channel_poll)(chan, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return false;
+    }
+    let buf = s.data_buf.as_mut_ptr();
+    let read = ((*sys_ptr).channel_read)(chan, buf, DATA_BUF_SIZE);
+    if read <= 0 {
+        return false;
+    }
+    let client = s.client_conn_id;
+    if net_send_data(s, client, buf, read as usize) {
+        s.relayed = s.relayed.wrapping_add(read as u64);
+    }
+    true
 }
 
 /// Kick a worker swap when the byte-count trigger fires (demo stand-in

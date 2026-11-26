@@ -1,0 +1,67 @@
+# Vault stack — the key vault, keeping its labelled keys where the board has
+# a place for them.
+#
+# A graph whose modules claim `key_vault` writes `platform: { vault: {} }`
+# instead of wiring a vault and its block source by hand. The vault runs in
+# its callers' execution domain (a provider runs in its caller's frame), so a
+# graph that places its callers outside the primary domain names the vault's
+# `domain:` itself. `image` (bytes per A/B slot) may be set as a field.
+
+[stack]
+name = "vault"
+
+# ── Linux: an image file in the runtime's working directory ──────────────
+# Sealed under a key derived from the host's FLUXOR_SEAL_KEY. `image_file`
+# names another path; `fluxor vault import|identity` provision the same file.
+[[variant]]
+match = { family = "linux" }
+modules = [
+  { name = "vault_disk", type = "file_block", params = { path = "user:image_file|vault.img", volume = "platform", blocks = "user:image_blocks|32" } },
+  { name = "key_vault", params = { image = "user:image|8192" } },
+]
+wiring = [
+  "vault_disk.blocks -> key_vault.blocks",
+]
+
+# ── Pi 5: a window of the NVMe the board boots beside ───────────────────
+# The first 32 KiB of the NVMe's External backing space, which every arena
+# leaves free: two 16 KiB slots, sealed under the board's OTP key. A graph
+# that already serves a filesystem on `nvme.blocks` keeps the image in a file
+# on it instead (`file_block`), since a block source serves one client.
+[[variant]]
+match = { board = "pi5" }
+modules = [
+  { name = "nvme", params = { bind = "m2_primary", namespace = "1" } },
+  { name = "key_vault", params = { image = "user:image|16384", start_sector = "2097152", sector_count = "64" } },
+]
+wiring = [
+  "nvme.blocks -> key_vault.blocks",
+]
+
+# ── RP2350: the flash data store ─────────────────────────────────────────
+# The 16 KiB below the parameter store, which a UF2 reflash never reaches:
+# two 8 KiB slots, sealed under the OTP seal key once provisioned.
+[[variant]]
+match = { silicon = "rp2350" }
+modules = [
+  { name = "flash_rp" },
+  { name = "key_vault", params = { image = "user:image|8192" } },
+]
+wiring = [
+  "flash_rp.store -> key_vault.blocks",
+]
+
+# ── No sealing key: keys live as long as the instance ───────────────────
+# An RP2040 and a UEFI guest have no platform sealing key, so nothing is
+# kept: the vault seals nothing and persists nothing.
+[[variant]]
+match = { silicon = "rp2040" }
+modules = [
+  { name = "key_vault", params = { seal = "none" } },
+]
+
+[[variant]]
+match = { family = "uefi" }
+modules = [
+  { name = "key_vault", params = { seal = "none" } },
+]

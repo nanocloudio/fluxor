@@ -1,5 +1,6 @@
 //! The native modules' wire facts, generated from their manifests into the
-//! ABI crate: `crates/fluxor-abi/src/platform/native.rs`, one module per
+//! ABI crate (a built-in a host provider serves is none: its instances are
+//! `host_lane`s): `crates/fluxor-abi/src/platform/native.rs`, one module per
 //! native module under its platform (`linux`, `wasm`), each with its name
 //! hash, a `TAG_<PARAM>` per `[[params]]` entry, a `PORT_<NAME>: (u8, u8)`
 //! per `[[ports]]` entry at the `(direction, index)` the packer binds it, and
@@ -31,6 +32,10 @@ const PLATFORMS: [&str; 2] = ["linux", "wasm"];
 struct Manifest {
     #[serde(default)]
     builtin: bool,
+    /// A built-in a host provider serves: the kernel instantiates a
+    /// `host_lane` for it, so it has no native of its own.
+    #[serde(default)]
+    host_provider: Option<toml::Value>,
     #[serde(default)]
     state_bytes_64: Option<u32>,
     #[serde(default)]
@@ -245,7 +250,7 @@ pub fn generate(repo: &Path) -> Result<String> {
                 .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
             let m: Manifest = toml::from_str(&text)
                 .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-            if !m.builtin {
+            if !m.builtin || m.host_provider.is_some() {
                 continue;
             }
             let name = p

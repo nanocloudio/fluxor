@@ -1,5 +1,5 @@
 //! The owner plan: which owner holds which module and edge ranges, which
-//! owners are draining out, and which endpoints each owner may bind. The
+//! owners are draining out, and what each owner is granted. The
 //! composer encodes it, the kernel decodes and applies it; this is the one
 //! codec both link.
 //!
@@ -9,7 +9,7 @@
 //! digest   SHA-256 over every byte before it
 //! ```
 //!
-//! Every field is little-endian. The three sections `ASGN`, `RVOK` and `LEAS`
+//! Every field is little-endian. The three sections `ASGN`, `RVOK` and `GRNT`
 //! each appear exactly once, in any order; an empty section has count 0. An
 //! unknown, repeated or missing section, a length that disagrees with its
 //! count, or any byte between the last section and the digest refuses the
@@ -20,8 +20,13 @@
 //!       | module_count u16 | edge_base u16 | edge_count u16
 //!       | state_cap u32 | buffer_cap u32                          (38 B)
 //! RVOK  an ASGN record | grace_secs u16 | deadline_unix u64       (48 B)
-//! LEAS  slot u16 | generation u32 | protocol u8 | port u16        (9 B)
+//! GRNT  slot u16 | generation u32 | kind u16 | len u16 | bytes[len]   (10 B + len)
 //! ```
+//!
+//! A grant is opaque here and to the kernel, which hands an owner's grants
+//! to the module serving that owner's lanes (`OWNER_GRANTS`); its `kind`
+//! and bytes are defined by the contract that module serves
+//! (`net_proto::grant`).
 //!
 //! The crate links no hash: the caller passes the SHA-256 it already has to
 //! [`decode`] and [`encode`]. Decoding allocates nothing; a [`Plan`] reads
@@ -50,28 +55,26 @@ pub mod tag {
     pub const ASSIGNMENTS: u32 = u32::from_le_bytes(*b"ASGN");
     /// Owners draining out.
     pub const REVOCATIONS: u32 = u32::from_le_bytes(*b"RVOK");
-    /// Endpoint grants.
-    pub const LEASES: u32 = u32::from_le_bytes(*b"LEAS");
+    /// Per-owner grants.
+    pub const GRANTS: u32 = u32::from_le_bytes(*b"GRNT");
 
     /// Every section a plan carries, each exactly once.
-    pub const ALL: [u32; 3] = [ASSIGNMENTS, REVOCATIONS, LEASES];
+    pub const ALL: [u32; 3] = [ASSIGNMENTS, REVOCATIONS, GRANTS];
 }
 
 /// Bytes of one assignment record.
 pub const ASSIGNMENT_LEN: usize = 38;
 /// Bytes of one revocation record.
 pub const REVOCATION_LEN: usize = ASSIGNMENT_LEN + 10;
-/// Bytes of one lease record.
-pub const LEASE_LEN: usize = 9;
+/// Bytes of a grant record before its bytes.
+pub const GRANT_HEAD: usize = 10;
 
-/// The most leases a plan grants: one per `(protocol, port)` a node can
-/// lease, tcp and udp, nonzero ports.
-pub const MAX_LEASES: usize = 2 * u16::MAX as usize;
+/// The most bytes one grant carries.
+pub const MAX_GRANT_BYTES: usize = 255;
 
-/// Lease `protocol`: TCP.
-pub const PROTOCOL_TCP: u8 = 1;
-/// Lease `protocol`: UDP.
-pub const PROTOCOL_UDP: u8 = 2;
+/// The most grants a plan carries: one per `(protocol, port)` a node can
+/// grant, tcp and udp, nonzero ports.
+pub const MAX_GRANTS: usize = 2 * u16::MAX as usize;
 
 /// One owner placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,13 +98,51 @@ pub struct Revocation {
     pub deadline_unix: u64,
 }
 
-/// Owner `(slot, generation)` may bind `(protocol, port)`.
+/// A grant to owner `(slot, generation)`: `kind` and its bytes, opaque here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Lease {
+pub struct Grant<'a> {
     pub slot: u16,
     pub generation: u32,
-    pub protocol: u8,
-    pub port: u16,
+    pub kind: u16,
+    pub bytes: &'a [u8],
+}
+
+/// The grant records in `section`, in order. The decoder has walked them
+/// already, so a short tail cannot occur; it ends the walk.
+fn grant_records(section: &[u8]) -> impl Iterator<Item = Grant<'_>> + Clone + '_ {
+    let mut at = 0usize;
+    core::iter::from_fn(move || {
+        let len = le16(section, at + 8) as usize;
+        let body = section.get(at + GRANT_HEAD..at + GRANT_HEAD + len)?;
+        let g = Grant {
+            slot: le16(section, at),
+            generation: le32(section, at + 2),
+            kind: le16(section, at + 6),
+            bytes: body,
+        };
+        at += GRANT_HEAD + len;
+        Some(g)
+    })
+}
+
+/// The bytes `count` grant records take at the head of `records`, or `None`
+/// when they run past it or one carries more than [`MAX_GRANT_BYTES`].
+fn grants_len(records: &[u8], count: usize) -> Option<usize> {
+    let mut at = 0usize;
+    for _ in 0..count {
+        if records.len() < at + GRANT_HEAD {
+            return None;
+        }
+        let len = le16(records, at + 8) as usize;
+        if len > MAX_GRANT_BYTES {
+            return None;
+        }
+        at += GRANT_HEAD + len;
+        if at > records.len() {
+            return None;
+        }
+    }
+    Some(at)
 }
 
 /// Why a plan was refused.
@@ -226,7 +267,7 @@ pub struct Plan<'a> {
     pub digest: [u8; 32],
     assignments: &'a [u8],
     revocations: &'a [u8],
-    leases: &'a [u8],
+    grants: &'a [u8],
 }
 
 impl<'a> Plan<'a> {
@@ -244,14 +285,31 @@ impl<'a> Plan<'a> {
         })
     }
 
-    /// The lease grants, in plan order.
-    pub fn leases(&self) -> impl ExactSizeIterator<Item = Lease> + Clone + 'a {
-        crate::records::<LEASE_LEN>(self.leases).map(|r| Lease {
-            slot: le16(r, 0),
-            generation: le32(r, 2),
-            protocol: r[6],
-            port: le16(r, 7),
-        })
+    /// The grants, in plan order.
+    pub fn grants(&self) -> impl Iterator<Item = Grant<'a>> + Clone + 'a {
+        grant_records(self.grants)
+    }
+
+    /// Owner `(slot, generation)`'s grants as `[kind u16][len u16][bytes]`
+    /// records, written into `out` from 0; the bytes they take, which may
+    /// exceed `out` (then only the records that fit are written whole).
+    pub fn owner_grants(&self, slot: u16, generation: u32, out: &mut [u8]) -> usize {
+        let mut need = 0usize;
+        for g in self.grants() {
+            if g.slot != slot || g.generation != generation {
+                continue;
+            }
+            let end = need + 4 + g.bytes.len();
+            if let Some(d) = out.get_mut(need..end) {
+                let k = g.kind.to_le_bytes();
+                let l = (g.bytes.len() as u16).to_le_bytes();
+                for (d, v) in d.iter_mut().zip(k.iter().chain(&l).chain(g.bytes)) {
+                    *d = *v;
+                }
+            }
+            need = end;
+        }
+        need
     }
 }
 
@@ -311,33 +369,37 @@ pub fn decode(
                 offset: off,
             });
         }
-        let (rec_len, max) = match t {
-            tag::ASSIGNMENTS => (ASSIGNMENT_LEN, max_assignments),
-            tag::REVOCATIONS => (REVOCATION_LEN, max_assignments),
-            _ => (LEASE_LEN, MAX_LEASES),
+        let max = match t {
+            tag::ASSIGNMENTS | tag::REVOCATIONS => max_assignments,
+            _ => MAX_GRANTS,
         };
         if count > max {
             return Err(PlanError::TooMany { tag: t, count, max });
         }
-        if len != 4 + count * rec_len {
-            return Err(PlanError::LengthMismatch { tag: t });
-        }
         let start = off + SECTION_HEAD_LEN;
         let end = off + 8 + len;
-        if end > body_end {
+        if len < 4 || end > body_end {
             return Err(PlanError::Truncated);
+        }
+        let records_len = match t {
+            tag::ASSIGNMENTS => Some(count * ASSIGNMENT_LEN),
+            tag::REVOCATIONS => Some(count * REVOCATION_LEN),
+            _ => grants_len(&bytes[start..end], count),
+        };
+        if records_len != Some(len - 4) {
+            return Err(PlanError::LengthMismatch { tag: t });
         }
         found[slot] = Some(&bytes[start..end]);
         off = end;
     }
-    let [assignments, revocations, leases] = found;
+    let [assignments, revocations, grants] = found;
     let assignments = assignments.ok_or(PlanError::MissingSection {
         tag: tag::ASSIGNMENTS,
     })?;
     let revocations = revocations.ok_or(PlanError::MissingSection {
         tag: tag::REVOCATIONS,
     })?;
-    let leases = leases.ok_or(PlanError::MissingSection { tag: tag::LEASES })?;
+    let grants = grants.ok_or(PlanError::MissingSection { tag: tag::GRANTS })?;
 
     let computed = sha256(&bytes[..body_end]);
     if computed[..] != bytes[body_end..] {
@@ -348,7 +410,7 @@ pub fn decode(
         digest: computed,
         assignments,
         revocations,
-        leases,
+        grants,
     })
 }
 
@@ -358,7 +420,7 @@ pub struct PlanSpec<'a> {
     pub generation: u64,
     pub assignments: &'a [Assignment],
     pub revocations: &'a [Revocation],
-    pub leases: &'a [Lease],
+    pub grants: &'a [Grant<'a>],
 }
 
 #[cfg(feature = "alloc")]
@@ -402,7 +464,36 @@ fn push_section<T>(
     Ok(())
 }
 
-/// Encode a plan: header, `ASGN`, `RVOK`, `LEAS`, then the digest `sha256`
+#[cfg(feature = "alloc")]
+fn push_grants(out: &mut Vec<u8>, grants: &[Grant<'_>]) -> Result<(), PlanError> {
+    let t = tag::GRANTS;
+    if grants.len() > MAX_GRANTS {
+        return Err(PlanError::TooMany {
+            tag: t,
+            count: grants.len(),
+            max: MAX_GRANTS,
+        });
+    }
+    if grants.iter().any(|g| g.bytes.len() > MAX_GRANT_BYTES) {
+        return Err(PlanError::LengthMismatch { tag: t });
+    }
+    let bytes: usize = grants.iter().map(|g| GRANT_HEAD + g.bytes.len()).sum();
+    let count = u32::try_from(grants.len()).map_err(|_| PlanError::LengthMismatch { tag: t })?;
+    let len = u32::try_from(4 + bytes).map_err(|_| PlanError::LengthMismatch { tag: t })?;
+    out.extend_from_slice(&t.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for g in grants {
+        out.extend_from_slice(&g.slot.to_le_bytes());
+        out.extend_from_slice(&g.generation.to_le_bytes());
+        out.extend_from_slice(&g.kind.to_le_bytes());
+        out.extend_from_slice(&(g.bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(g.bytes);
+    }
+    Ok(())
+}
+
+/// Encode a plan: header, `ASGN`, `RVOK`, `GRNT`, then the digest `sha256`
 /// returns over all of it.
 ///
 /// # Errors
@@ -437,19 +528,7 @@ pub fn encode(
             o.extend_from_slice(&r.deadline_unix.to_le_bytes());
         },
     )?;
-    push_section(
-        &mut out,
-        tag::LEASES,
-        LEASE_LEN,
-        spec.leases,
-        MAX_LEASES,
-        |o, l| {
-            o.extend_from_slice(&l.slot.to_le_bytes());
-            o.extend_from_slice(&l.generation.to_le_bytes());
-            o.push(l.protocol);
-            o.extend_from_slice(&l.port.to_le_bytes());
-        },
-    )?;
+    push_grants(&mut out, spec.grants)?;
     let digest = sha256(&out);
     out.extend_from_slice(&digest);
     Ok(out)

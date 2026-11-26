@@ -134,18 +134,21 @@ mod params_def {
         7, record_bytes, u32, RECORD_BYTES_DEFAULT
             => |s, d, len| { s.record_bytes = p_u32(d, len, 0, RECORD_BYTES_DEFAULT); };
         8, surface_bytes, u32, 0 => |s, d, len| { s.surface_bytes = p_u32(d, len, 0, 0); };
-        9, pack0, str, 0 => |s, d, len| { keep_pack(s, 0, d, len); };
-        10, pack1, str, 0 => |s, d, len| { keep_pack(s, 1, d, len); };
-        11, pack2, str, 0 => |s, d, len| { keep_pack(s, 2, d, len); };
-        12, pack3, str, 0 => |s, d, len| { keep_pack(s, 3, d, len); };
+        9, pack0, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 0, d, len); };
+        10, pack1, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 1, d, len); };
+        11, pack2, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 2, d, len); };
+        12, pack3, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 3, d, len); };
     }
 }
 
 /// Keep the value of `pack<i>`. One too long to be a program reference is
-/// kept as its first bytes, which `asset::open` then answers as a path:
-/// `module_new` refuses it.
+/// marked, never clipped: `module_new` refuses it.
 unsafe fn keep_pack(s: &mut State, i: usize, d: *const u8, len: usize) {
-    let n = len.min(PACK_PARAM);
+    if len > PACK_PARAM {
+        s.pack_lens[i] = u8::MAX;
+        return;
+    }
+    let n = len;
     let mut k = 0;
     while k < n {
         s.pack_params[i][k] = *d.add(k);
@@ -241,6 +244,8 @@ pub unsafe extern "C" fn module_new(
         Some(b"[draw_raster] refusing to construct: width, height and band_bytes must be non-zero")
     } else if s.frame_bytes == 0 || (s.record_bytes as usize) < vd::HEADER + vd::BORDER_LEN {
         Some(b"[draw_raster] refusing to construct: frame_bytes must be non-zero and record_bytes at least 84")
+    } else if s.pack_lens.iter().any(|&n| usize::from(n) > PACK_PARAM) {
+        Some(b"[draw_raster] refusing to construct: a pack param is longer than 16 bytes")
     } else {
         None
     };

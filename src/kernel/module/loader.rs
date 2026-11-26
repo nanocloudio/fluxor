@@ -142,6 +142,14 @@ pub enum LoaderError {
     /// The module's signed manifest does not name this kernel's runtime:
     /// it shares the module ABI, not the contracts.
     WrongRuntime { allowed: u16 },
+    /// The manifest's claim bytes or conditions block are malformed
+    /// (`fmod::validate_conditions`).
+    BadConditions,
+    /// The module serves lanes and the kernel cannot hold them: a workload
+    /// module (only a node module serves lanes), another target under its
+    /// name, or more lanes or targets than the kernel holds
+    /// (`lanes::declare`'s errno).
+    LanesRefused(i32),
 }
 impl LoaderError {
     /// Log the error with appropriate level.
@@ -192,6 +200,12 @@ impl LoaderError {
                 "[loader] {context}: the manifest declares no {what}; rebuild it with \
                  `fluxor_rt::module_facts!`"
             ),
+            Self::BadConditions => {
+                log::error!("[loader] {context}: the manifest's claims or conditions are malformed")
+            }
+            Self::LanesRefused(rc) => {
+                log::error!("[loader] {context}: the lanes it serves are refused (rc={rc})")
+            }
             Self::BadProvides => log::error!(
                 "[loader] {context}: the manifest's provided contracts cannot be registered \
                  (more than the limit, or no module_provider_dispatch)"
@@ -328,7 +342,34 @@ struct ProviderAutoRegister {
     /// The resource ledger asks the provider for the in-use figure of a pool
     /// it serves (`resource::POOL_SAMPLE`).
     samples_pool: bool,
+    /// Whom its layers serve.
+    scope: crate::kernel::module::provider::LayerScope,
 }
+/// Declare the lanes a module serves as its construction succeeds, before
+/// it is committed: a node module only, since a workload's modules are
+/// reached by lanes, never serve them. 0, or the errno that refuses the
+/// module ([`LoaderError::LanesRefused`]), so a graph never runs with lanes
+/// nothing serves.
+#[inline(never)]
+fn declare_lanes(idx: usize, name: &str, lanes: Option<usize>) -> i32 {
+    let Some(cap) = lanes.filter(|&c| c > 0) else {
+        return 0;
+    };
+    if !crate::kernel::exec::scheduler::module_owner(idx).is_node() {
+        log::error!("[inst] {name} declares lanes, which only a node module serves");
+        return crate::kernel::sys::errno::EACCES;
+    }
+    let rc = crate::kernel::workload::lanes::declare(
+        idx,
+        crate::abi::wire::fnv1a32(name.as_bytes()),
+        cap,
+    );
+    if rc != 0 {
+        log::error!("[inst] {name} lanes ({cap}) refused: rc={rc}");
+    }
+    rc
+}
+
 impl ProviderAutoRegister {
     /// The module's provider registration; `Ok(None)` when its manifest names
     /// no contract. A manifest that names contracts without a dispatch entry
@@ -362,6 +403,7 @@ impl ProviderAutoRegister {
             selector_fn,
             observes_owner_release: flags & flag::OBSERVES_OWNER_RELEASE != 0,
             samples_pool: flags & flag::SAMPLES_POOL != 0,
+            scope: module.manifest_provider_scope(),
         }))
     }
     /// Register this module as a provider. Called after module_new() Ready.
@@ -378,6 +420,7 @@ impl ProviderAutoRegister {
                 self.dispatch_fn,
                 state_ptr,
                 selector,
+                self.scope,
             );
             if rc != 0 {
                 log::warn!(
@@ -1144,11 +1187,13 @@ pub fn zero_totals() -> (u64, u64) {
 //   * the arena base is page-aligned (so an aligned offset is an aligned addr),
 //   * no isolated allocation shares a page with a non-isolated one,
 //   * the kernel's own globals never share a page with an EL0-RW mapping.
-// Bump-allocated; reclaimed wholesale by `reset_state_arena` on reconfigure.
-// `mmu::build_table` independently REFUSES to map any non-page-clean region, so
-// a sizing shortfall here fails closed (the module is never run) rather than
-// leaking. Sized for a small number of special isolated modules; a module that
-// needs more fails closed loudly.
+// The arena is a pool of pages with a bitmap: an allocation takes the first
+// run of free pages that holds it, and a free returns its pages zeroed, so a
+// workload's modules can come and go for the node's whole life and the next
+// owner of a page never reads the last one's bytes. A graph rebuild zeroes
+// whatever is still held and empties the map. `mmu::build_table`
+// independently REFUSES to map any non-page-clean region, so a sizing
+// shortfall here fails closed (the module is never run) rather than leaking.
 /// Page granule for isolated allocations (matches the EL0 4 KiB page size).
 #[cfg(feature = "kernel-vm")]
 use fluxor_contracts::state_arena::{iso_carve_bytes, ISO_PAGE};
@@ -1158,64 +1203,167 @@ use fluxor_contracts::state_arena::{iso_carve_bytes, ISO_PAGE};
 #[cfg(feature = "kernel-vm")]
 const ISO_ARENA_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(feature = "kernel-vm")]
+const ISO_PAGES: usize = ISO_ARENA_SIZE / ISO_PAGE;
+#[cfg(feature = "kernel-vm")]
 #[repr(C, align(4096))]
 struct IsoArena([u8; ISO_ARENA_SIZE]);
 #[cfg(feature = "kernel-vm")]
 static mut ISO_ARENA: IsoArena = IsoArena([0; ISO_ARENA_SIZE]);
+/// Which arena pages an allocation holds. Touched only under `STATE_LOCK`.
 #[cfg(feature = "kernel-vm")]
-static mut ISO_ARENA_OFFSET: usize = 0;
+static mut ISO_MAP: crate::kernel::mem::page_map::PageMap<{ ISO_PAGES / 64 }> =
+    crate::kernel::mem::page_map::PageMap::new();
 
 /// Allocate a page-aligned, page-padded region for an isolated module from the
 /// dedicated ISO arena. Returns `(ptr, mapped_size)` where `ptr` is
 /// page-aligned, a `STATE_CANARY` is written at `ptr + size`, and `mapped_size`
 /// is the page-rounded footprint to register with the MMU (so the EL0 mapping
 /// covers only pages this allocation owns). The caller keeps the *user* `size`
-/// for canary validation / free. Memory is zeroed.
+/// for canary validation / free ([`free_isolated`]). The pages are zero: the
+/// arena starts zeroed and every free zeroes what it returns.
 #[cfg(feature = "kernel-vm")]
 pub fn alloc_isolated(size: usize) -> Result<(*mut u8, usize), LoaderError> {
-    // SAFETY: single-threaded prepare-graph/instantiation path; bump allocator
-    // on the dedicated ISO arena with checked arithmetic against its cap.
+    let mapped = iso_carve_bytes(size).ok_or(LoaderError::StatePoolExhausted)?;
+    let ptr = alloc_isolated_pages(mapped / ISO_PAGE).ok_or(LoaderError::StatePoolExhausted)?;
+    // SAFETY: `mapped` covers `size` plus the canary.
+    unsafe { core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY) };
+    Ok((ptr, mapped))
+}
+
+/// `pages` zeroed, page-aligned pages of the isolated arena, or `None` when
+/// no run of free pages holds them: an isolated module's state, heap, or its
+/// EL0 stack slab.
+#[cfg(feature = "kernel-vm")]
+pub fn alloc_isolated_pages(pages: usize) -> Option<*mut u8> {
+    // SAFETY: the page map is touched only under `STATE_LOCK`; the pages
+    // held are this caller's alone until freed.
     unsafe {
-        let off = (ISO_ARENA_OFFSET + ISO_PAGE - 1) & !(ISO_PAGE - 1);
-        // Pad the (user + canary) footprint up to a whole number of pages so
-        // the region the MMU maps is exclusively this allocation's.
-        let mapped = iso_carve_bytes(size).ok_or(LoaderError::StatePoolExhausted)?;
-        let next = match off.checked_add(mapped) {
-            Some(n) if n <= ISO_ARENA_SIZE => n,
-            _ => {
-                log::error!(
-                    "[loader] ISO ARENA EXHAUSTED — need={mapped} used={off} cap={ISO_ARENA_SIZE} \
-                     (isolated module too large; raise ISO_ARENA_SIZE or shrink the module). \
-                     Module will FAIL CLOSED."
-                );
-                return Err(LoaderError::StatePoolExhausted);
-            }
+        let _lock = StateLock::acquire();
+        let map = &mut *core::ptr::addr_of_mut!(ISO_MAP);
+        let Some(first) = map.alloc(pages) else {
+            log::error!(
+                "[loader] ISO ARENA EXHAUSTED — need {pages} pages, {} of {ISO_PAGES} held \
+                 (isolated modules' state, heap and stacks; raise ISO_ARENA_SIZE or shrink \
+                 them). Module will FAIL CLOSED.",
+                map.in_use()
+            );
+            return None;
         };
-        let ptr = core::ptr::addr_of_mut!(ISO_ARENA.0).cast::<u8>().add(off);
-        // Zero the ENTIRE mapped (page-rounded) span, not just `size`. The full
-        // span is mapped EL0-RW into the module's page table; the arena is
-        // reset by rewinding the offset (no clear), so a later isolated module
-        // reusing this region would otherwise read the PREVIOUS module's stale
-        // state/heap bytes from the page-padding tail. Zeroing `mapped` closes
-        // that cross-reconfiguration leak.
-        core::ptr::write_bytes(ptr, 0, mapped);
-        core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
-        ISO_ARENA_OFFSET = next;
-        Ok((ptr, mapped))
+        Some(
+            core::ptr::addr_of_mut!(ISO_ARENA.0)
+                .cast::<u8>()
+                .add(first * ISO_PAGE),
+        )
+    }
+}
+
+/// Return `pages` pages at `ptr` (from [`alloc_isolated_pages`]) to the
+/// isolated arena, zeroed.
+///
+/// # Safety
+/// `ptr` and `pages` are exactly an `alloc_isolated_pages` allocation, and
+/// nothing references it any more.
+#[cfg(feature = "kernel-vm")]
+pub unsafe fn free_isolated_pages(ptr: *mut u8, pages: usize) {
+    let base = core::ptr::addr_of!(ISO_ARENA.0) as usize;
+    let off = (ptr as usize).wrapping_sub(base);
+    let bytes = pages * ISO_PAGE;
+    if !off.is_multiple_of(ISO_PAGE) || off.checked_add(bytes).is_none_or(|e| e > ISO_ARENA_SIZE) {
+        log::error!(
+            "[loader] free_isolated_pages: {ptr:p}+{pages} pages is no isolated allocation"
+        );
+        return;
+    }
+    let _lock = StateLock::acquire();
+    // SAFETY: under `STATE_LOCK`.
+    let map = unsafe { &mut *core::ptr::addr_of_mut!(ISO_MAP) };
+    let first = off / ISO_PAGE;
+    if !map.holds(first, pages) {
+        log::error!("[loader] free_isolated_pages: {ptr:p}+{pages} pages is not held");
+        return;
+    }
+    // Zeroed before the pages are free again, so no later holder reads them.
+    // SAFETY: the caller's region, referenced by nothing any more.
+    unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
+    map.free(first, pages);
+}
+
+/// Return an [`alloc_isolated`] region of user size `size` to the pool,
+/// zeroed.
+///
+/// # Safety
+/// `ptr` is a region `alloc_isolated(size)` returned, and nothing references
+/// it any more.
+#[cfg(feature = "kernel-vm")]
+unsafe fn free_isolated(ptr: *mut u8, size: usize) {
+    if let Some(mapped) = iso_carve_bytes(size) {
+        // SAFETY: the caller's contract.
+        unsafe { free_isolated_pages(ptr, mapped / ISO_PAGE) };
+    }
+}
+
+/// Pages of the isolated arena held now, and the arena's pages.
+#[cfg(feature = "kernel-vm")]
+pub fn isolated_pages_in_use() -> (usize, usize) {
+    let _lock = StateLock::acquire();
+    // SAFETY: under `STATE_LOCK`.
+    let map = unsafe { &*core::ptr::addr_of!(ISO_MAP) };
+    (map.in_use(), ISO_PAGES)
+}
+
+/// Empty the isolated arena for a new graph: every page still held is zeroed
+/// and the map cleared. Called with `STATE_LOCK` held.
+#[cfg(feature = "kernel-vm")]
+unsafe fn reset_isolated() {
+    // SAFETY: the caller holds `STATE_LOCK`; nothing runs from the arena
+    // while a graph is rebuilt.
+    unsafe {
+        let map = &mut *core::ptr::addr_of_mut!(ISO_MAP);
+        let base = core::ptr::addr_of_mut!(ISO_ARENA.0).cast::<u8>();
+        for page in 0..ISO_PAGES {
+            if map.held(page) {
+                core::ptr::write_bytes(base.add(page * ISO_PAGE), 0, ISO_PAGE);
+            }
+        }
+        map.clear();
     }
 }
 
 /// Allocate a gated module's private region from the state arena: `size`
-/// bytes at an `align`-aligned address (the planner's shape), zeroed. The
-/// alignment pad below it stays in the arena until the next graph reset.
+/// bytes at an `align`-aligned address (the planner's shape), zeroed. A hole
+/// on the free list that holds the aligned region is used first; otherwise
+/// the region is bumped, and the alignment pad below it goes on the free list,
+/// so a module coming and going leaves nothing behind.
 #[cfg(feature = "kernel-mpu")]
 pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> {
-    // SAFETY: bump allocation on the state arena under `STATE_LOCK`, with
-    // checked arithmetic against its compiled capacity and the deployment
-    // envelope.
+    // SAFETY: allocation on the state arena under `STATE_LOCK`, with checked
+    // arithmetic against its compiled capacity and the deployment envelope.
     unsafe {
         let _lock = StateLock::acquire();
         let base = arena_ptr() as usize;
+        // 1. A free hole that holds the aligned region.
+        let free_list = free_list();
+        let mut i = 0;
+        while i < FREE_COUNT {
+            let r = (&(*free_list))[i];
+            let start = (base + r.offset).next_multiple_of(align) - base;
+            if start + size <= r.offset + r.size {
+                (&mut (*free_list)).copy_within(i + 1..FREE_COUNT, i);
+                FREE_COUNT -= 1;
+                if start > r.offset {
+                    insert_clean(r.offset, start - r.offset);
+                }
+                let end = start + size;
+                if end < r.offset + r.size {
+                    insert_clean(end, r.offset + r.size - end);
+                }
+                let ptr = (base + start) as *mut u8;
+                core::ptr::write_bytes(ptr, 0, size);
+                return Ok(ptr);
+            }
+            i += 1;
+        }
+        // 2. Bump.
         let cur = base + STATE_ARENA_OFFSET;
         let start = cur.next_multiple_of(align);
         let end = start
@@ -1244,8 +1392,12 @@ pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> 
         }
         let ptr = start as *mut u8;
         core::ptr::write_bytes(ptr, 0, size);
+        let pad = (cur - base, start - cur);
         STATE_ARENA_OFFSET = used;
         CLEAN_MARK = CLEAN_MARK.max(used);
+        if pad.1 > 0 {
+            insert_clean(pad.0, pad.1);
+        }
         Ok(ptr)
     }
 }
@@ -1349,8 +1501,8 @@ impl ModuleMemory {
 }
 
 /// True if `ptr` was handed out by [`alloc_isolated`] (lives in the ISO arena).
-/// `free_state_range` uses this to skip the STATE_ARENA free-list bookkeeping
-/// for isolated allocations (which are reclaimed wholesale at reset).
+/// `free_state_range` uses this to hand isolated allocations back to the
+/// arena's page map rather than the STATE_ARENA free list.
 #[cfg(feature = "kernel-vm")]
 fn is_iso_ptr(ptr: *const u8) -> bool {
     // SAFETY: address comparison only; no dereference.
@@ -1602,13 +1754,13 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
              module overran its state buffer",
         );
     }
-    // Isolated allocations live in the dedicated ISO arena, not STATE_ARENA.
-    // They have no free-list entry (the arena is bump-only, reclaimed wholesale
-    // by reset_state_arena), so there is nothing to release here — just return
-    // after the canary check above. Computing a STATE_ARENA offset from an ISO
-    // pointer would corrupt the free list.
+    // Isolated allocations live in the dedicated ISO arena, not STATE_ARENA:
+    // their pages go back to its map. Computing a STATE_ARENA offset from an
+    // ISO pointer would corrupt the free list.
     #[cfg(feature = "kernel-vm")]
     if is_iso_ptr(ptr as *const u8) {
+        // SAFETY: the caller's contract: an `alloc_isolated(size)` region.
+        unsafe { free_isolated(ptr, size) };
         return;
     }
     let base = arena_ptr();
@@ -1741,9 +1893,7 @@ pub fn reset_state_arena() {
         // Reclaim the isolated arena too; the next graph rebuilds its isolated
         // tables from scratch (mmu::reset_isolation runs in the same pass).
         #[cfg(feature = "kernel-vm")]
-        {
-            ISO_ARENA_OFFSET = 0;
-        }
+        reset_isolated();
         // Elsewhere content is not zeroed here; an allocation below the mark
         // zeroes what it takes.
     }
@@ -1884,24 +2034,42 @@ impl LoadedModule {
             Some((p, manifest_size, flags, layout))
         }
     }
-    /// The module's conditional-grant block (`FLAG_COND_GRANTS`), or `None`
-    /// when it declares no condition — which is every module packed before
-    /// the block existed, and every one whose grants are unconditional.
-    ///
-    /// The bytes are part of the signed manifest, which is why admission may
-    /// decide with them: a workload supplying its own conditions would be
-    /// declaring its own privileges.
-    pub fn manifest_cond_grants(&self) -> Option<&[u8]> {
-        use crate::abi::wire::fmod::FLAG_COND_GRANTS;
-        let (p, size, flags, layout) = self.manifest_view()?;
-        if flags & FLAG_COND_GRANTS == 0 || layout.cond_grants >= size {
-            return None;
+    /// The module's conditions block (`FLAG_CONDITIONS`), empty when it
+    /// declares none: the params under which each conditional grant and
+    /// claim holds. Part of the signed manifest, which is why admission may
+    /// decide with it: a workload supplying its own conditions would be
+    /// declaring its own privileges. The loader checked it whole.
+    pub fn manifest_conditions(&self) -> &[u8] {
+        use crate::abi::wire::fmod::FLAG_CONDITIONS;
+        let Some((p, size, flags, layout)) = self.manifest_view() else {
+            return &[];
+        };
+        if flags & FLAG_CONDITIONS == 0 || layout.conditions >= size {
+            return &[];
         }
         // SAFETY: `manifest_view` established the manifest spans `size`
-        // bytes from `p` inside the mapping, and `cond_grants < size`.
-        Some(unsafe {
-            core::slice::from_raw_parts(p.add(layout.cond_grants), size - layout.cond_grants)
-        })
+        // bytes from `p` inside the mapping, and `conditions < size`.
+        unsafe { core::slice::from_raw_parts(p.add(layout.conditions), size - layout.conditions) }
+    }
+
+    /// The module's resource records (`fmod::RESOURCE_RECORD_SIZE` bytes
+    /// each: contract, access, instance, claim). Empty without a manifest.
+    pub fn manifest_resources(&self) -> &[u8] {
+        use crate::abi::wire::fmod::{MANIFEST_HEADER_SIZE, RESOURCE_RECORD_SIZE};
+        let Some((p, ..)) = self.manifest_view() else {
+            return &[];
+        };
+        // SAFETY: `manifest_view` checked the head is in bounds; the port
+        // and resource records lie before `layout.capacity <= layout.hash`,
+        // which it checked is within the manifest.
+        unsafe {
+            let ports = *p.add(5) as usize;
+            let n = *p.add(6) as usize;
+            core::slice::from_raw_parts(
+                p.add(MANIFEST_HEADER_SIZE + ports * 4),
+                n * RESOURCE_RECORD_SIZE,
+            )
+        }
     }
 
     /// The module's grants (`MANIFEST_GRANTS_AT`): word 0 a bit per contract
@@ -1918,46 +2086,7 @@ impl LoadedModule {
             None => [0; 2],
         }
     }
-    /// Look up a port's `content_type` byte by direction and the
-    /// per-direction index resolved at manifest-pack time.
-    ///
-    /// `direction`: 0 = input, 1 = output, 2 = ctrl_input, 3 = ctrl_output.
-    /// `index`: matches `PortSpec.index` in `tools::manifest` — the
-    /// resolved index that respects explicit `index = N` declarations
-    /// on the manifest TOML. The packed manifest stores it in byte 3
-    /// of each port record.
-    ///
-    /// Returns `None` if the manifest is missing/truncated or no port
-    /// matches. Consumers (e.g. `port_frame_kind_from_content_type`)
-    /// match the byte against the `CONTENT_TYPES` table in
-    /// `tools::manifest`.
-    pub fn port_content_type(&self, direction: u8, index: u8) -> Option<u8> {
-        self.port_spec(direction, index)
-            .map(|(content_type, _)| content_type)
-    }
 
-    /// A port's `content_type` byte and its flags byte, by direction and the
-    /// per-direction index — the two halves of the port record a fan needs to
-    /// decide whether the port carries records that state no length (flags
-    /// bit 1 is the port's own `framed = true`). Same lookup and same `None`
-    /// cases as [`Self::port_content_type`].
-    pub fn port_spec(&self, direction: u8, index: u8) -> Option<(u8, u8)> {
-        use crate::abi::wire::fmod::MANIFEST_HEADER_SIZE;
-        let (p, ..) = self.manifest_view()?;
-        // SAFETY: the port records sit between the head and the capacity
-        // block, inside a manifest `manifest_view` has bounds-checked.
-        unsafe {
-            let port_count = *p.add(5) as usize;
-            for i in 0..port_count {
-                // Each record is [direction, content_type, flags, index].
-                let entry = p.add(MANIFEST_HEADER_SIZE + i * 4);
-                if *entry == direction && *entry.add(3) == index {
-                    return Some((*entry.add(1), *entry.add(2)));
-                }
-            }
-            None
-        }
-    }
     /// The module's worst-case stack depth in bytes, from the manifest's stack
     /// block: measured by the build, or declared where it cannot measure. 0
     /// without a manifest. Covered by the signing envelope.
@@ -2008,6 +2137,16 @@ impl LoadedModule {
         }
     }
 
+    /// The manifest's lanes block: the tag of the param holding the module's
+    /// workload-lane capacity and that param's default, or `None` for a
+    /// module that serves no lanes.
+    pub fn manifest_lanes(&self) -> Option<(u8, u8)> {
+        let (p, _, _, l) = self.manifest_view()?;
+        // SAFETY: the lanes block lies before `layout.hash`.
+        let (tag, default) = unsafe { (*p.add(l.lanes), *p.add(l.lanes + 1)) };
+        (tag != 0).then_some((tag, default))
+    }
+
     /// The contracts the manifest says the module provides, and how many
     /// (at most `MAX_PROVIDES`; a manifest naming more is refused at load).
     pub fn manifest_provides(&self) -> ([u16; crate::abi::wire::fmod::MAX_PROVIDES], usize) {
@@ -2018,7 +2157,8 @@ impl LoadedModule {
         };
         // SAFETY: the count is in the head; the ids lie before `layout.hash`.
         unsafe {
-            let n = (*p.add(MANIFEST_PROVIDES_AT) as usize).min(MAX_PROVIDES);
+            let n = crate::abi::wire::fmod::provides_count(*p.add(MANIFEST_PROVIDES_AT))
+                .min(MAX_PROVIDES);
             for (i, slot) in out.iter_mut().enumerate().take(n) {
                 let at = l.provides + i * 2;
                 *slot = u16::from_le_bytes([*p.add(at), *p.add(at + 1)]);
@@ -2027,14 +2167,41 @@ impl LoadedModule {
         }
     }
 
+    /// Whom the module's provider layers serve: its own owner, or every
+    /// workload (`FLAG_WORKLOAD_SCOPE`).
+    pub fn manifest_provider_scope(&self) -> crate::kernel::module::provider::LayerScope {
+        use crate::kernel::module::provider::LayerScope;
+        match self.manifest_view() {
+            Some((_, _, flags, _)) if flags & crate::abi::wire::fmod::FLAG_WORKLOAD_SCOPE != 0 => {
+                LayerScope::Workloads
+            }
+            _ => LayerScope::Owner,
+        }
+    }
+
     /// How many contracts the manifest names, before any cap.
     pub fn manifest_provides_count(&self) -> usize {
         match self.manifest_view() {
             // SAFETY: the count is in the head.
             Some((p, ..)) => unsafe {
-                *p.add(crate::abi::wire::fmod::MANIFEST_PROVIDES_AT) as usize
+                crate::abi::wire::fmod::provides_count(
+                    *p.add(crate::abi::wire::fmod::MANIFEST_PROVIDES_AT),
+                )
             },
             None => 0,
+        }
+    }
+
+    /// Whether the signed manifest declares the module `workload_instantiable`
+    /// (`PROVIDES_WORKLOAD_INSTANTIABLE`).
+    pub fn manifest_workload_instantiable(&self) -> bool {
+        use crate::abi::wire::fmod::{MANIFEST_PROVIDES_AT, PROVIDES_WORKLOAD_INSTANTIABLE};
+        match self.manifest_view() {
+            // SAFETY: the byte is in the head.
+            Some((p, ..)) => unsafe {
+                *p.add(MANIFEST_PROVIDES_AT) & PROVIDES_WORKLOAD_INSTANTIABLE != 0
+            },
+            None => false,
         }
     }
 
@@ -2341,6 +2508,11 @@ impl ModuleLoader {
         Ok(())
     }
     /// Get number of modules in table
+    /// Where the loaded module table starts: what names one loaded table.
+    pub fn table_base(&self) -> *const u8 {
+        self.table_base
+    }
+
     pub fn module_count(&self) -> usize {
         self.header.map(|h| h.module_count as usize).unwrap_or(0)
     }
@@ -2542,8 +2714,8 @@ impl ModuleLoader {
             let mh = unsafe { read_module_header(offset_ptr(blob, off)) };
             // Full on-disk footprint: header + code + data + export table +
             // schema tail + manifest tail. The schema and manifest sizes MUST
-            // be included — `manifest_permissions()`, `port_content_type()`
-            // and `validate_module()` later compute `manifest_offset` from
+            // be included — `manifest_permissions()` and
+            // `validate_module()` later compute `manifest_offset` from
             // these same header fields and do raw typed reads (the worst being
             // a `from_raw_parts(manifest_ptr, manifest_size)` slice). Omitting
             // the tails here would let a crafted `schema_size`/`manifest_size`
@@ -2822,23 +2994,33 @@ fn check_attestation(
         return Err(e);
     }
     let attn_offset = manifest_layout.attestation;
-    // The conditional-grant block follows the attestation, so
-    // the canonical size includes it. Its length is walked from
-    // its own count, which keeps this an EXACT check: anything
-    // appended past the block's end leaves the manifest the
-    // wrong size and is refused here, as a second attestation
-    // copy would be.
-    let cond_len = if flags & crate::abi::wire::fmod::FLAG_COND_GRANTS != 0 {
-        let block = manifest_data.get(manifest_layout.cond_grants..);
-        match block.and_then(crate::abi::wire::fmod::cond_grants_block_len) {
-            Some(n) => n,
-            None => {
-                log::error!("[loader] {name}: conditional-grant flag with no whole block");
-                return Err(LoaderError::Unattested);
+    // The conditions block follows the attestation, so the canonical size
+    // includes it. Its length is walked from its own count, which keeps
+    // this an EXACT check: anything appended past the block's end leaves
+    // the manifest the wrong size and is refused here, as a second
+    // attestation copy would be. The records it conditions are checked
+    // with it: a claim byte past CONDITIONAL, a CONDITIONAL record no entry
+    // conditions, an entry naming a record or bit the manifest lacks.
+    let cond_len = {
+        use crate::abi::wire::fmod::{validate_conditions, FLAG_CONDITIONS, RESOURCE_RECORD_SIZE};
+        let ports = manifest_data[5] as usize;
+        let records = manifest_data
+            .get(crate::abi::wire::fmod::MANIFEST_HEADER_SIZE + ports * 4..)
+            .and_then(|r| r.get(..manifest_data[6] as usize * RESOURCE_RECORD_SIZE));
+        let block = if flags & FLAG_CONDITIONS != 0 {
+            manifest_data.get(manifest_layout.conditions..)
+        } else {
+            None
+        };
+        let checked = records.ok_or(crate::abi::wire::fmod::ConditionsError::Malformed);
+        match checked.and_then(|r| validate_conditions(r, block)) {
+            Ok(n) => n,
+            Err(_) => {
+                let e = LoaderError::BadConditions;
+                e.log(name);
+                return Err(e);
             }
         }
-    } else {
-        0
     };
     if manifest_size != attn_offset + 32 + cond_len {
         log::error!("[loader] {name}: attestation flag with non-canonical manifest size");
@@ -3256,6 +3438,9 @@ pub struct DynamicModulePending {
     name: &'static str,
     drain_fn: Option<ModuleDrainFn>,
     auto_register: Option<ProviderAutoRegister>,
+    /// The workload lanes the module serves (its manifest's `[lanes]`, the
+    /// capacity read from its params), declared once it is in.
+    lanes: Option<usize>,
     module_idx: ModuleId,
     /// Carried through from `ModuleExports` so the completed
     /// `DynamicModule` exposes the `irq` ISR entry. See
@@ -3313,6 +3498,10 @@ impl DynamicModulePending {
         };
         match status? {
             NewStatus::Ready => {
+                let rc = declare_lanes(self.module_idx as usize, self.name, self.lanes);
+                if rc != 0 {
+                    return Err(LoaderError::LanesRefused(rc));
+                }
                 log::info!("[inst] loaded {}", self.name);
                 self.construction.commit();
                 let state_ptr = self.construction.state;
@@ -3494,6 +3683,7 @@ impl DynamicModule {
         channels: ChannelHandles,
         params: ParamSlice,
         name: &'static str,
+        level: fluxor_contracts::isolation::Level,
     ) -> Result<StartNewResult, LoaderError> {
         // 1. Lookup and validate exports (safe)
         module.log_header_info();
@@ -3505,11 +3695,12 @@ impl DynamicModule {
             // caller validated the pointer covers `params.len` bytes.
             unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
         };
-        // Peek the protection TLV BEFORE anything else: a gated module
-        // (contained or isolated) never has its code run privileged, so its
-        // sizes come from the manifest and its memory from where its
-        // protection regions can cover it. (The full parse follows heap init.)
-        let gated = crate::kernel::exec::scheduler::params_level(params_slice).is_gated();
+        // The level admission set (a node module's from its params, a
+        // workload module's by the kernel) decides before anything else: a
+        // gated module (contained or isolated) never has its code run
+        // privileged, so its sizes come from the manifest and its memory from
+        // where its protection regions can cover it.
+        let gated = level.is_gated();
         // The signature sets a floor the graph cannot lower: where this
         // kernel carries a signing root, a module that does not verify
         // against it runs gated or not at all.
@@ -3557,6 +3748,13 @@ impl DynamicModule {
         // anything is allocated: a manifest that names contracts it cannot
         // serve is refused here, not after module_new() has run.
         let auto_register = ProviderAutoRegister::resolve(module)?;
+        // The lanes it serves: the capacity is the instance's param, else its
+        // schema default.
+        let lanes = module.manifest_lanes().map(|(tag, default)| {
+            usize::from(
+                crate::kernel::exec::scheduler::params_u8(params_slice, tag).unwrap_or(default),
+            )
+        });
         // An isolated module runs on a fixed stack above a guard page. The
         // composer admits its declared depth against that stack; this refuses a
         // blob that reached the device without going through the composer.
@@ -3859,6 +4057,10 @@ impl DynamicModule {
         };
         match status? {
             NewStatus::Ready => {
+                let rc = declare_lanes(inst_idx, name, lanes);
+                if rc != 0 {
+                    return Err(LoaderError::LanesRefused(rc));
+                }
                 log::info!("[inst] loaded {name}");
                 built.commit();
                 if let Some(ar) = auto_register.as_ref() {
@@ -3895,6 +4097,7 @@ impl DynamicModule {
                     name,
                     drain_fn,
                     auto_register,
+                    lanes,
                     module_idx: inst_idx as ModuleId,
                     isr_entry_fn: exports.isr_entry_fn,
                     stack_bytes: module.manifest_stack_bytes(),

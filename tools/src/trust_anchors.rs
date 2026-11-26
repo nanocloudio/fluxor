@@ -329,6 +329,19 @@ pub fn append_operator_anchors(
 /// and the private key, as `cert_file` / `key_file` put them.
 pub const TAG_CERT: u8 = 10;
 pub const TAG_KEY: u8 = 11;
+
+/// The extended tags under which the builder (`${file:..}`) or a launch
+/// (`fluxor exec --identity` / `--ca`) gives a value of credential param
+/// `param`, in place of the param's own entry: its claims are exercised by
+/// either (`Manifest::conditions_for`). Empty for any other param.
+pub fn embedded_tags(param: &str) -> &'static [u8] {
+    match param {
+        "cert_file" => &[TAG_CERT],
+        "key_file" => &[TAG_KEY],
+        "trust" => &[TAG_TRUST, TAG_OPERATOR_TRUST],
+        _ => &[],
+    }
+}
 /// The longest certificate chain a tls instance holds (its
 /// `MAX_CERT_CHAIN_BYTES`); a longer one refuses to construct.
 pub const MAX_CHAIN_DER: usize = 3072;
@@ -371,7 +384,6 @@ pub fn append_operator_identity(
             key.len()
         ));
     }
-    let tls_hash = fnv1a_hash(b"tls");
     let mut ext = Vec::with_capacity(8 + cert.len() + key.len());
     for (tag, bytes) in [(TAG_CERT, cert), (TAG_KEY, key)] {
         ext.push(tag);
@@ -381,17 +393,130 @@ pub fn append_operator_identity(
         ext.extend_from_slice(bytes);
     }
     extend_entries(blob, &mut |name_hash, _id, params| {
-        let client = name_hash == tls_hash && basic_param_u8(params, 1).unwrap_or(0) == 0;
-        let named = ext_blob(params, TAG_CERT).is_some()
-            || ext_blob(params, TAG_KEY).is_some()
-            || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0
-            || basic_param_len(params, TAG_CERT_PATH).unwrap_or(0) > 0
-            || basic_param_len(params, TAG_KEY_PATH).unwrap_or(0) > 0
-            || basic_entries(params, TAG_ENV_BIND).any(|r| {
-                r.first()
-                    .is_some_and(|t| *t == TAG_CERT_PATH || *t == TAG_KEY_PATH)
-            });
-        Ok((client && !named).then(|| ext.clone()))
+        Ok(takes_operator_identity(name_hash, params).then(|| ext.clone()))
+    })
+}
+
+/// Whether [`append_operator_identity`] gives the module named by
+/// `name_hash`, with packed params `params`, the operator's identity: a
+/// client-mode `tls` that names no identity of its own.
+pub fn takes_operator_identity(name_hash: u32, params: &[u8]) -> bool {
+    let client = name_hash == fnv1a_hash(b"tls") && basic_param_u8(params, 1).unwrap_or(0) == 0;
+    let named = ext_blob(params, TAG_CERT).is_some()
+        || ext_blob(params, TAG_KEY).is_some()
+        || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0
+        || basic_param_len(params, TAG_CERT_PATH).unwrap_or(0) > 0
+        || basic_param_len(params, TAG_KEY_PATH).unwrap_or(0) > 0
+        || basic_entries(params, TAG_ENV_BIND).any(|r| {
+            r.first()
+                .is_some_and(|t| *t == TAG_CERT_PATH || *t == TAG_KEY_PATH)
+        });
+    client && !named
+}
+
+/// Give the applet's data directory `dir` to every string param of a built
+/// config blob that names it: a basic TLV entry whose value is
+/// [`crate::packaging::APPLET_DATA_DIR`], or begins with it and a `/`, has
+/// the placeholder replaced by `dir`. The re-sealed blob and the module ids
+/// given it; none when the graph names no data directory. A value the
+/// directory makes longer than one entry holds (255 bytes) is refused.
+///
+/// `bound` answers the byte bounds the module's schema declares for a param
+/// (`(type hash, tag)`, `fluxor_abi::wire::param_schema`); a rewritten value
+/// outside them is refused, as the composer refuses one at build.
+pub fn give_applet_data_dir(
+    blob: &[u8],
+    dir: &[u8],
+    bound: &dyn Fn(u32, u8) -> Option<(u32, u32)>,
+) -> Result<(Vec<u8>, Widened), String> {
+    rewrite_entries(blob, &mut |name_hash, id, params| {
+        let Some(end) = basic_end(params) else {
+            return Ok(None);
+        };
+        let mut out = params[..4].to_vec();
+        let mut given = false;
+        let mut pos = 4usize;
+        while pos + 2 <= end {
+            let tag = params[pos];
+            if tag == 0xFF {
+                break;
+            }
+            let len = params[pos + 1] as usize;
+            let Some(value) = params.get(pos + 2..pos + 2 + len) else {
+                return Ok(None);
+            };
+            pos += 2 + len;
+            let Some(rest) = data_dir_rest(value) else {
+                out.extend_from_slice(&params[pos - 2 - len..pos]);
+                continue;
+            };
+            let n = dir.len() + rest.len();
+            if n > usize::from(u8::MAX) {
+                return Err(format!(
+                    "module id {id}: param tag {tag} would be {n} bytes with the data \
+                     directory '{}', over the 255 one param holds",
+                    String::from_utf8_lossy(dir)
+                ));
+            }
+            if let Some((min, max)) = bound(name_hash, tag) {
+                if (n as u64) < u64::from(min) || (n as u64) > u64::from(max) {
+                    return Err(format!(
+                        "module id {id}: param tag {tag} would be {n} bytes with the data \
+                         directory '{}', outside the {min}..={max} bytes its schema bounds it to",
+                        String::from_utf8_lossy(dir)
+                    ));
+                }
+            }
+            out.extend_from_slice(&[tag, n as u8]);
+            out.extend_from_slice(dir);
+            out.extend_from_slice(rest);
+            given = true;
+        }
+        if !given {
+            return Ok(None);
+        }
+        // The header's advisory length covers the basic section through its
+        // terminator; the terminator and every extended entry after it are
+        // carried over as they were.
+        let payload = u16::try_from(out.len() + 2 - 4).unwrap_or(u16::MAX);
+        out[2..4].copy_from_slice(&payload.to_le_bytes());
+        out.extend_from_slice(&params[pos..]);
+        Ok(Some(out))
+    })
+}
+
+/// Whether any module of a built config blob names the applet's data
+/// directory (see [`give_applet_data_dir`]).
+pub fn names_applet_data_dir(blob: &[u8]) -> Result<bool, String> {
+    let cfg = boot_config::decode(blob).map_err(|e| format!("config blob refused: {e}"))?;
+    let section = cfg.graph();
+    let named = section
+        .composed()
+        .modules()
+        .any(|m| basic_values(m.params).any(|v| data_dir_rest(v).is_some()));
+    Ok(named)
+}
+
+/// What follows the data-directory placeholder in a param value that names
+/// it: nothing, or a path from a `/`.
+fn data_dir_rest(value: &[u8]) -> Option<&[u8]> {
+    value
+        .strip_prefix(crate::packaging::APPLET_DATA_DIR.as_bytes())
+        .filter(|rest| rest.is_empty() || rest[0] == b'/')
+}
+
+/// Every basic TLV entry's value, in order.
+fn basic_values(params: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let end = basic_end(params).unwrap_or(0);
+    let mut pos = 4;
+    core::iter::from_fn(move || {
+        if pos + 2 > end || params[pos] == 0xFF {
+            return None;
+        }
+        let len = params[pos + 1] as usize;
+        let v = params.get(pos + 2..pos + 2 + len)?;
+        pos += 2 + len;
+        Some(v)
     })
 }
 
@@ -399,13 +524,27 @@ pub fn append_operator_identity(
 /// and params in; the extended entry to append (or `None`) out.
 type Extend<'a> = dyn FnMut(u32, u16, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
 
-/// Rewrite the module records of a built config blob and re-seal it.
+/// Append to the module records of a built config blob and re-seal it.
 /// `extend` sees each record's module type, index and params, and answers the
 /// bytes to append to that record's params (an extended TLV entry), or
-/// `None` to leave it as it was. The blob is decoded and re-encoded by the
-/// codec the kernel boots with: every other record and section is carried
-/// over as decoded, and the new blob has its own length and checksum.
+/// `None` to leave it as it was.
 fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Widened), String> {
+    rewrite_entries(blob, &mut |hash, id, params| {
+        Ok(extend(hash, id, params)?.map(|ext| {
+            let mut p = params.to_vec();
+            p.extend_from_slice(&ext);
+            p
+        }))
+    })
+}
+
+/// Rewrite the module records of a built config blob and re-seal it.
+/// `rewrite` sees each record's module type, index and params, and answers
+/// the record's new params, or `None` to leave it as it was. The blob is
+/// decoded and re-encoded by the codec the kernel boots with: every other
+/// record and section is carried over as decoded, and the new blob has its
+/// own length and checksum.
+fn rewrite_entries(blob: &[u8], rewrite: &mut Extend<'_>) -> Result<(Vec<u8>, Widened), String> {
     let cfg = boot_config::decode(blob).map_err(|e| format!("config blob refused: {e}"))?;
     let section = cfg.graph();
     let composed = section.composed();
@@ -413,12 +552,13 @@ fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Wide
     let mut params: Vec<Vec<u8>> = Vec::with_capacity(usize::from(composed.module_count()));
     for (i, m) in composed.modules().enumerate() {
         let id = i as u16;
-        let mut p = m.params.to_vec();
-        if let Some(ext) = extend(m.name_hash, id, m.params)? {
-            p.extend_from_slice(&ext);
-            widened.instances.push(id);
+        match rewrite(m.name_hash, id, m.params)? {
+            Some(p) => {
+                params.push(p);
+                widened.instances.push(id);
+            }
+            None => params.push(m.params.to_vec()),
         }
-        params.push(p);
     }
     let modules: Vec<ModuleRecord<'_>> = composed
         .modules()
@@ -710,6 +850,7 @@ mod tests {
         let order = order(modules.len());
         let workloads = [boot_config::WorkloadRecord {
             idle_safe: true,
+            endpoints: &[],
             blob: &WORKLOAD,
         }];
         boot_config::encode(&BootConfigSpec {
@@ -752,6 +893,7 @@ mod tests {
             w,
             [boot_config::WorkloadRecord {
                 idle_safe: true,
+                endpoints: &[],
                 blob: &WORKLOAD
             }]
         );
@@ -935,5 +1077,89 @@ mod tests {
         let err = append_operator_anchors(&before, &[seq(2, 9)]).unwrap_err();
         assert!(err.contains("module id 1"), "{err}");
         assert!(err.contains("exceed"), "{err}");
+    }
+
+    /// An entry with string-valued basic params and extended bytes after
+    /// the terminator.
+    fn str_entry(type_name: &str, id: u16, basic: &[(u8, &[u8])], ext: &[u8]) -> Entry {
+        let mut body = Vec::new();
+        for (tag, v) in basic {
+            body.extend_from_slice(&[*tag, v.len() as u8]);
+            body.extend_from_slice(v);
+        }
+        body.extend_from_slice(&[0xFF, 0x00]);
+        let mut params = vec![0xFE, 0x01];
+        params.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        params.extend_from_slice(&body);
+        params.extend_from_slice(ext);
+        Entry {
+            name_hash: fnv1a_hash(type_name.as_bytes()),
+            id,
+            params,
+        }
+    }
+
+    /// `${applet:data_dir}` is replaced by the directory in every string
+    /// param that names it, alone or before a `/`, and nowhere else; the
+    /// header's advisory length follows the basic section, the extended
+    /// entries after it are kept, and an entry the directory makes too long
+    /// is refused.
+    #[test]
+    fn an_applets_data_dir_is_given_where_the_graph_names_it() {
+        let ext = encode_ext(TAG_TRUST, &[seq(4, 1)]);
+        let store = str_entry(
+            "store",
+            1,
+            &[(1, b"${applet:data_dir}/store"), (2, b"keep")],
+            &[],
+        );
+        let alone = str_entry("other", 2, &[(3, b"${applet:data_dir}")], &ext);
+        let near_miss = str_entry(
+            "other",
+            3,
+            &[(3, b"${applet:data_dir}x"), (4, b"/a/${applet:data_dir}")],
+            &[],
+        );
+        let untouched = near_miss.params.clone();
+        let before = blob(&[store, alone, near_miss]);
+        let dir = b"/home/op/.local/share/tool";
+        let (after, given) = give_applet_data_dir(&before, dir, &|_, _| None).unwrap();
+        assert_eq!(given.instances, vec![1, 2]);
+        assert!(names_applet_data_dir(&before).unwrap());
+        let p = reseal_kept_the_rest(&after, &[1, 2, 3]);
+        let want_store = b"/home/op/.local/share/tool/store".to_vec();
+        assert_eq!(basic_param(&p[0].1, 1), Some(&want_store[..]));
+        assert_eq!(basic_param(&p[0].1, 2), Some(&b"keep"[..]));
+        let end = basic_end(&p[0].1).unwrap();
+        assert_eq!(
+            usize::from(u16::from_le_bytes([p[0].1[2], p[0].1[3]])),
+            end - 4,
+            "the header's length is the basic section's"
+        );
+        assert_eq!(basic_param(&p[1].1, 3), Some(&dir[..]));
+        assert_eq!(ext_blob(&p[1].1, TAG_TRUST), Some(&seq(4, 1)[..]));
+        assert_eq!(p[2].1, untouched, "a value that only resembles it is kept");
+
+        // Nothing to give: no instance is touched.
+        let plain = blob(&[str_entry("store", 1, &[(1, b"/var/lib/x")], &[])]);
+        assert!(!names_applet_data_dir(&plain).unwrap());
+        assert!(give_applet_data_dir(&plain, dir, &|_, _| None)
+            .unwrap()
+            .1
+            .instances
+            .is_empty());
+
+        // A directory that makes a value longer than one entry holds.
+        let long = vec![b'd'; 250];
+        let e = give_applet_data_dir(&before, &long, &|_, _| None).unwrap_err();
+        assert!(e.contains("over the 255 one param holds"), "{e}");
+
+        // A rewrite past the param's schema bound is refused, naming it.
+        let store_hash = fnv1a_hash(b"store");
+        let bound = move |h: u32, tag: u8| (h == store_hash && tag == 1).then_some((0, 30));
+        let e = give_applet_data_dir(&before, dir, &bound).unwrap_err();
+        assert!(e.contains("outside the 0..=30 bytes"), "{e}");
+        let fits = move |h: u32, tag: u8| (h == store_hash && tag == 1).then_some((0, 96));
+        assert!(give_applet_data_dir(&before, dir, &fits).is_ok());
     }
 }

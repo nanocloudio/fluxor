@@ -17,9 +17,10 @@
 //! owner until a plan is applied.
 
 use fluxor_contracts::owner_plan as codec;
-pub use fluxor_contracts::owner_plan::{Assignment, Lease, Plan, Revocation};
+pub use fluxor_contracts::owner_plan::{Assignment, Grant, Plan, Revocation};
 
-use crate::kernel::workload::owner::MAX_OWNERS;
+use crate::abi::contracts::workload::owners;
+use crate::kernel::workload::owner::{OwnerHandle, OwnerState, MAX_OWNERS};
 
 /// At most one assignment per owner slot: the owner-slot range. A slot past
 /// the live owner table is refused when the plan is validated.
@@ -143,6 +144,18 @@ pub fn apply(plan: &Plan<'_>) -> usize {
     }
     // The owners the plan did not bring back are gone, and their rings.
     table.release_free_rings();
+    // A revoked owner this kernel did not free by a drain — the reset just
+    // dropped it mid-drain, or this kernel never held it — keeps the outcome
+    // it already has or is recorded forfeited.
+    for rev in plan.revocations() {
+        let (slot, generation) = (rev.assignment.slot, rev.assignment.generation);
+        let decided = table
+            .entry_at(slot as usize)
+            .is_some_and(|e| e.generation == generation && e.drain != owners::DRAIN_NONE);
+        if !decided {
+            table.record_drain(slot, generation, owners::DRAIN_FORFEITED, 0);
+        }
+    }
     installed
 }
 
@@ -166,14 +179,25 @@ static mut LAST_APPLIED_GENERATION: u64 = 0;
 /// Digest of the last successfully-applied plan: all zero until one is.
 static mut LAST_APPLIED_DIGEST: [u8; 32] = [0; 32];
 
-/// The last successfully-applied plan, retained so a graph rebuild (which runs
-/// `prepare_graph`, resetting every module to the node owner) can RE-apply it
-/// without a fresh staged blob. `None` until the first plan is applied. A view
-/// over the staged bytes, which live for the run ([`set_staged_plan`]).
-static mut RETAINED_PLAN: Option<Plan<'static>> = None;
+/// The bytes of the last successfully-applied plan, retained so a graph
+/// rebuild (which runs `prepare_graph`, resetting every module to the node
+/// owner) can RE-apply it without a fresh staged blob, and `OWNER_GRANTS`
+/// can answer from it (`endpoints::owner_grants`). `None` until the first
+/// plan is applied. The staged bytes live for the run ([`set_staged_plan`]);
+/// the plan is read from them as a view ([`retained`]).
+static mut RETAINED_PLAN: Option<(*const u8, usize)> = None;
 
-/// The staged bytes [`RETAINED_PLAN`] is a view over.
-static mut RETAINED_BYTES: *const u8 = core::ptr::null();
+/// The retained plan, as a view over its bytes. They were decoded, verified
+/// and checked when the plan was applied, so the carried digest stands in
+/// for hashing them again.
+fn retained() -> Option<Plan<'static>> {
+    // SAFETY: scheduler-thread read of a scalar pair.
+    let (ptr, len) = unsafe { *core::ptr::addr_of!(RETAINED_PLAN) }?;
+    // SAFETY: `set_staged_plan`'s caller keeps the bytes valid for the run.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let carried: [u8; 32] = bytes.get(len.checked_sub(32)?..)?.try_into().ok()?;
+    codec::decode(bytes, MAX_PLAN_ASSIGNMENTS, |_| carried).ok()
+}
 
 /// Generation of the last successfully-applied plan (0 = none yet). Lets the
 /// platform's owner-status writer stamp which plan generation the live state
@@ -208,8 +232,7 @@ pub unsafe fn set_staged_plan(ptr: *const u8, len: usize) {
 /// that owns its staged buffers keeps them while the kernel reads them.
 pub fn retained_plan_bytes() -> Option<*const u8> {
     // SAFETY: scheduler-thread read of a scalar.
-    let p = unsafe { *core::ptr::addr_of!(RETAINED_BYTES) };
-    (!p.is_null()).then_some(p)
+    unsafe { *core::ptr::addr_of!(RETAINED_PLAN) }.map(|(p, _)| p)
 }
 
 /// Test-only: clear all staged/retained plan state so a test starts from a
@@ -226,7 +249,6 @@ pub fn reset_staged_plan_for_test() {
         *lg = 0;
         *ld = [0; 32];
         *rp = None;
-        *core::ptr::addr_of_mut!(RETAINED_BYTES) = core::ptr::null();
     }
 }
 
@@ -239,72 +261,22 @@ fn take_staged_plan() -> Option<(*const u8, usize)> {
     }
 }
 
-/// Hand each of the retained plan's revocations to `f`. The platform uses
-/// this at boot to synthesize drain-timeout-by-restart terminal records for
-/// owners that were mid-drain when the previous process died — they are
-/// absent from the assignment section, so nothing re-instantiates them; the
-/// record is the only trace.
-pub fn retained_revocations(mut f: impl FnMut(Revocation)) {
-    let retained = &raw const RETAINED_PLAN;
-    // SAFETY: scheduler-thread read.
-    if let Some(plan) = unsafe { &*retained } {
-        plan.revocations().for_each(&mut f);
-    }
+/// Owner `(slot, generation)`'s grant records in the retained plan, written
+/// into `out` from 0: the bytes they take, which may exceed `out` (then only
+/// the records that fit are written whole). 0 when no plan is retained: a
+/// plan grants nothing it does not carry. Scheduler thread only.
+pub fn plan_grants(slot: u16, generation: u32, out: &mut [u8]) -> usize {
+    retained().map_or(0, |plan| plan.owner_grants(slot, generation, out))
 }
 
-/// Bind-gate verdict for `(slot, generation, protocol, port)` against the
-/// retained plan's lease grants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeaseGate {
-    /// No enforcement: no plan is retained, or the bind is an ephemeral port-0
-    /// source. A retained plan that simply grants nothing still enforces — it
-    /// refuses undeclared nonzero binds.
-    Ungated,
-    /// The bind matches a granted lease.
-    Granted,
-    /// The plan is lease-aware and no grant covers this bind.
-    Refused,
-}
-
-/// Consult the retained plan's grants for a bind by owner `(slot, generation)`.
-/// Scheduler thread only.
-pub fn lease_gate(slot: u16, generation: u32, protocol: u8, port: u16) -> LeaseGate {
-    // Port 0 is an ephemeral-source bind ("give me any port"), not an
-    // endpoint claim: it exports nothing, can collide with nothing, and no
-    // lease could name it. Gating it would break every module that opens an
-    // outbound datagram endpoint (e.g. dns upstream forwarding) the moment
-    // ANY admitted workload on the node declares an export. Admission
-    // (Draining refusal) still applies upstream of this gate.
-    if port == 0 {
-        return LeaseGate::Ungated;
-    }
-    let retained = &raw const RETAINED_PLAN;
-    // SAFETY: scheduler-thread read.
-    let Some(plan) = (unsafe { (*retained).as_ref() }) else {
-        return LeaseGate::Ungated;
-    };
-    // A retained plan is lease-aware; enforcement is mandatory. An owner may
-    // bind only a nonzero port it was granted — every other nonzero bind is
-    // refused, whether or not the plan grants any endpoints at all.
-    if plan.leases().any(|l| {
-        l.slot == slot && l.generation == generation && l.protocol == protocol && l.port == port
-    }) {
-        LeaseGate::Granted
-    } else {
-        LeaseGate::Refused
-    }
-}
-
-/// One drain to arm: the platform converts `deadline_unix` to its own clock
-/// and drives quiescence/deadline against it (the kernel never reads wall
-/// clock).
-#[derive(Clone, Copy)]
-pub struct DrainArm {
-    pub owner_uid: [u8; 16],
-    pub slot: u16,
-    pub generation: u32,
-    pub grace_secs: u16,
-    pub deadline_unix: u64,
+/// Whether the retained plan grants `(kind, bytes)` to an owner other than
+/// `(slot, generation)`. Scheduler thread only.
+pub fn plan_grants_elsewhere(slot: u16, generation: u32, kind: u16, bytes: &[u8]) -> bool {
+    retained().is_some_and(|plan| {
+        plan.grants().any(|g| {
+            (g.slot, g.generation) != (slot, generation) && g.kind == kind && g.bytes == bytes
+        })
+    })
 }
 
 /// Attempt to apply the staged plan as a **pure-drain delta** — the one plan
@@ -317,14 +289,15 @@ pub struct DrainArm {
 /// closes; its modules keep stepping until the platform's drain driver frees
 /// it at quiescence or deadline).
 ///
-/// Returns `Some(n)`, the drains handed to `arm` (0 when every revocation
-/// names an already-gone owner), after consuming the staged plan and updating
-/// the retained-plan bookkeeping — the caller must NOT rebuild.
+/// Returns `Some(n)`, the drains begun (0 when every revocation names an
+/// already-gone owner), after consuming the staged plan and updating the
+/// retained-plan bookkeeping — the caller must NOT rebuild. [`drain_tick`]
+/// frees each at quiescence or its deadline.
 /// Returns `None` — leaving the staged plan in place for the ordinary
 /// `apply_staged` rebuild path — when there is no staged plan, no retained
 /// plan (boot), a decode/rollback failure (the rebuild path reports it), or a
 /// structural change.
-pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
+pub fn try_apply_drain_delta() -> Option<usize> {
     // Peek without consuming: an ineligible plan must stay staged for the
     // rebuild path.
     // SAFETY: scheduler-thread single accessor.
@@ -332,9 +305,7 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
         let p = &raw const STAGED_PLAN;
         (*p)?
     };
-    let retained_ptr = &raw const RETAINED_PLAN;
-    // SAFETY: scheduler-thread single accessor.
-    let retained = unsafe { (*retained_ptr).as_ref()? };
+    let retained = retained()?;
 
     // SAFETY: `set_staged_plan`'s caller upheld the validity contract: the
     // bytes live for the run.
@@ -365,10 +336,9 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
         }
     }
     // …and every retained revocation whose owner is still installed must be
-    // carried forward verbatim. The retained revocation is the only DURABLE
-    // trace of the pending drain terminal — restart synthesis reads it
-    // to report a drain forfeited by a process death — so a plan may drop it
-    // only once the drain driver has freed the owner.
+    // carried forward verbatim. The retained revocation states the drain's
+    // deadline and keeps its outcome readable (`owners`), so a plan may drop
+    // it only once [`drain_tick`] has freed the owner.
     {
         let table = crate::kernel::exec::scheduler::owners_mut();
         for rev in retained.revocations() {
@@ -384,7 +354,7 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
 
     // Eligible: consume the staged plan and apply the delta in place.
     let _ = take_staged_plan();
-    let armed = arm_revocations(&plan, arm);
+    let armed = begin_revocation_drains(&plan);
 
     let generation = plan.generation;
     // SAFETY: scheduler-thread single accessor; retain for rebuild re-apply.
@@ -392,49 +362,39 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
     unsafe {
         LAST_APPLIED_GENERATION = generation;
         LAST_APPLIED_DIGEST = plan.digest;
-        RETAINED_PLAN = Some(plan);
-        *core::ptr::addr_of_mut!(RETAINED_BYTES) = ptr;
+        RETAINED_PLAN = Some((ptr, len));
     }
     log::info!("[owner] drain delta applied: {armed} drains armed (gen {generation})");
     Some(armed)
 }
 
 /// `begin_drain` every still-installed owner named in `plan`'s revocation
-/// section and hand each its drain arm; the count armed. An already-revoked /
-/// never-installed owner is a no-op; `begin_drain` is idempotent for an
-/// already-Draining owner, and the platform re-arms with the record's original
-/// deadline, so a replayed record never resets the clock.
-fn arm_revocations(plan: &Plan<'_>, mut arm: impl FnMut(DrainArm)) -> usize {
+/// section; the count begun. An already-revoked / never-installed owner is a
+/// no-op, and `begin_drain` is idempotent for an already-Draining owner. The
+/// deadline is the revocation's own, so a replayed record never resets the
+/// clock.
+fn begin_revocation_drains(plan: &Plan<'_>) -> usize {
     let table = crate::kernel::exec::scheduler::owners_mut();
-    let mut armed = 0;
+    let mut begun = 0;
     for rev in plan.revocations() {
-        let handle = crate::kernel::workload::owner::OwnerHandle {
+        let handle = OwnerHandle {
             slot: rev.assignment.slot,
             generation: rev.assignment.generation,
         };
         if table.lookup(handle).is_some() && table.begin_drain(handle) {
-            arm(DrainArm {
-                owner_uid: rev.assignment.owner_uid,
-                slot: rev.assignment.slot,
-                generation: rev.assignment.generation,
-                grace_secs: rev.grace_secs,
-                deadline_unix: rev.deadline_unix,
-            });
-            armed += 1;
+            begun += 1;
         }
     }
-    armed
+    begun
 }
 
-/// Arm drains for the staged plan's revocations without consuming it or
+/// Begin drains for the staged plan's revocations without consuming it or
 /// requiring delta-eligibility. The structural rebuild path calls this: a plan
 /// that adds or changes owners is not a pure-drain delta, but any owner it
-/// revokes must still drain — `begin_drain` plus a terminal record — rather than
-/// being dropped untracked by the rebuild's `reset_workloads`. The staged plan
-/// stays in place for `apply_staged`; the arms handed to `arm` outlive the
-/// table reset, so the drain driver finalises each freed owner. The count
-/// armed.
-pub fn arm_staged_revocation_drains(arm: impl FnMut(DrainArm)) -> usize {
+/// revokes stops admitting before the rebuild, whose apply then records it
+/// forfeited (the rebuild's `reset_workloads` drops it). The staged plan
+/// stays in place for `apply_staged`. The count begun.
+pub fn begin_staged_revocation_drains() -> usize {
     // SAFETY: scheduler-thread single accessor; scalar read by value.
     let Some((ptr, len)) = (unsafe { STAGED_PLAN }) else {
         return 0;
@@ -451,7 +411,152 @@ pub fn arm_staged_revocation_drains(arm: impl FnMut(DrainArm)) -> usize {
     if plan.generation < last {
         return 0;
     }
-    arm_revocations(&plan, arm)
+    begin_revocation_drains(&plan)
+}
+
+/// Drive every drain the retained plan's revocations state: an owner still
+/// draining is freed (`scheduler::free_owner`: drain hooks, stop, unsplice,
+/// close edges, reclaim, revoke) once every module it stamps ended and its
+/// edges ran dry, or once `now_unix` reaches the revocation's
+/// `deadline_unix`, and how it ended is recorded on its slot for
+/// [`owners_answer`]. `now_unix` is the platform's wall clock: the kernel
+/// keeps none. Returns how many owners were freed. Scheduler thread only.
+pub fn drain_tick(now_unix: u64) -> usize {
+    let Some(plan) = retained() else {
+        return 0;
+    };
+    let mut freed = 0;
+    for rev in plan.revocations() {
+        let handle = OwnerHandle {
+            slot: rev.assignment.slot,
+            generation: rev.assignment.generation,
+        };
+        let draining = crate::kernel::exec::scheduler::owners()
+            .lookup(handle)
+            .is_some_and(|e| matches!(e.state, OwnerState::Draining));
+        if !draining {
+            continue;
+        }
+        let quiescent = crate::kernel::exec::scheduler::owner_modules_quiescent(handle);
+        if !quiescent && now_unix < rev.deadline_unix {
+            continue;
+        }
+        // `free_owner`'s release edge closes what the owner holds of the
+        // platform before it returns, so a reader never sees the outcome
+        // below while the owner still runs anything.
+        if let Err(e) = crate::kernel::exec::scheduler::free_owner(handle) {
+            log::warn!(
+                "[drain] free_owner slot {} gen {}: {e:?}",
+                handle.slot,
+                handle.generation
+            );
+        }
+        let outcome = if quiescent {
+            owners::DRAIN_QUIESCED
+        } else {
+            owners::DRAIN_DEADLINE_PASSED
+        };
+        crate::kernel::exec::scheduler::owners_mut().record_drain(
+            handle.slot,
+            handle.generation,
+            outcome,
+            now_unix,
+        );
+        log::info!(
+            "[drain] owner slot {} gen {} revoked ({})",
+            handle.slot,
+            handle.generation,
+            if quiescent {
+                "quiesced"
+            } else {
+                "deadline exceeded"
+            }
+        );
+        freed += 1;
+    }
+    freed
+}
+
+/// `workload::OWNERS`: the node's owner facts into `out` — every workload
+/// owner the table holds, then every freed owner whose revocation the
+/// retained plan still lists, by slot (`workload::owners` has the layout).
+/// Returns the answer's length, `ERANGE` when `out` cannot hold it.
+/// Scheduler thread only.
+pub fn owners_answer(out: &mut [u8]) -> i32 {
+    use crate::kernel::sys::errno;
+    let plan = retained();
+    let revocation_of = |slot: u16, generation: u32| {
+        plan.as_ref().and_then(|p| {
+            p.revocations()
+                .find(|r| r.assignment.slot == slot && r.assignment.generation == generation)
+        })
+    };
+    let table = crate::kernel::exec::scheduler::owners();
+    let mut count: usize = 0;
+    let mut at = owners::HEADER_LEN;
+    for slot in 1..table.slot_count() {
+        let Some(e) = table.entry_at(slot) else {
+            continue;
+        };
+        let handle = OwnerHandle {
+            slot: slot as u16,
+            generation: e.generation,
+        };
+        let rev = revocation_of(handle.slot, handle.generation);
+        let mut rec = owners::Record {
+            uid: e.owner_uid,
+            slot: handle.slot,
+            generation: e.generation,
+            activations: e.activations,
+            drain: e.drain,
+            drained_at: e.drained_at,
+            drain_deadline: rev.map_or(0, |r| r.deadline_unix),
+            ..owners::Record::default()
+        };
+        match crate::kernel::exec::scheduler::owner_live_status(handle) {
+            Some(live) => {
+                rec.state = match e.state {
+                    OwnerState::Draining => owners::STATE_DRAINING,
+                    OwnerState::Paused => owners::STATE_PAUSED,
+                    _ => owners::STATE_ACTIVE,
+                };
+                rec.modules = live.modules_total;
+                rec.loaded = live.modules_loaded;
+                rec.finished = live.modules_finished;
+                rec.terminated = live.modules_terminated;
+                rec.recovering = live.modules_recovering;
+                rec.fault_kind = live.last_fault_kind;
+                rec.fault_ms = live.last_fault_ms;
+            }
+            None => {
+                // Freed: listed while the plan lists its revocation.
+                let Some(r) = rev else {
+                    continue;
+                };
+                if e.drain == owners::DRAIN_NONE {
+                    continue;
+                }
+                rec.state = owners::STATE_GONE;
+                rec.uid = r.assignment.owner_uid;
+            }
+        }
+        if let Some(b) = out.get_mut(at..at + owners::RECORD_LEN) {
+            rec.write(b);
+        }
+        count += 1;
+        at += owners::RECORD_LEN;
+    }
+    let need = owners::HEADER_LEN + count * owners::RECORD_LEN;
+    if out.len() < need {
+        return errno::ERANGE;
+    }
+    owners::write_head(
+        out,
+        count as u16,
+        last_applied_generation(),
+        &last_applied_digest(),
+    );
+    need as i32
 }
 
 /// Establish plan ownership for the graph. Called by the platform BEFORE module
@@ -474,10 +579,8 @@ pub fn apply_staged() -> Result<usize, PlanError> {
     let Some((ptr, len)) = take_staged_plan() else {
         // No newly-staged plan: re-apply the retained one so a rebuild does not
         // drop isolation (prepare_graph reset ownership). None ⇒ no plan ever.
-        let retained = &raw const RETAINED_PLAN;
-        // SAFETY: scheduler-thread (boot/rebuild) single accessor.
-        return Ok(match unsafe { &*retained } {
-            Some(plan) => apply(plan),
+        return Ok(match retained() {
+            Some(plan) => apply(&plan),
             None => 0,
         });
     };
@@ -510,8 +613,7 @@ pub fn apply_staged() -> Result<usize, PlanError> {
     unsafe {
         *last_mut = generation;
         *digest_mut = plan.digest;
-        *retained = Some(plan);
-        *core::ptr::addr_of_mut!(RETAINED_BYTES) = ptr;
+        *retained = Some((ptr, len));
     }
     log::info!("[owner] applied staged plan: {n} owners (gen {generation})");
     Ok(n)

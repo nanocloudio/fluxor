@@ -8,7 +8,6 @@
 // (observe, otel, owner status) name pools from this registry.
 //
 // Units are per-pool: arena pools count bytes; table pools count slots.
-// Ids are append-only — a pool id, once published, is never reused.
 
 // ── Resource classes ───────────────────
 
@@ -20,83 +19,28 @@ pub const CLASS_ID: u8 = 2;
 /// R3: hardware units — datasheet-finite, declared per silicon.
 pub const CLASS_UNIT: u8 = 3;
 
-// ── Kernel pool ids ─────────────────────────────────────────────────
+// ── Pool ids ────────────────────────────────────────────────────────
 //
-// The kernel's own accounted capacities. Ids 0x0001..=0x00FF are reserved
-// for kernel pools; 0x0100.. is reserved for module-declared pools.
+// Declared in the registry (`registry::pool`): kernel pools are
+// `1..=KERNEL_POOL_COUNT`, module-served pools `POOL_MODULE_BASE..`, each
+// dense.
 
-/// Per-module state arena (bytes; backs `loader::alloc_state`).
-pub const POOL_STATE_ARENA: u16 = 0x0001;
-/// Shared channel buffer-pool arena (bytes).
-pub const POOL_BUFFER_ARENA: u16 = 0x0002;
-/// Boot configuration (bytes): the module params the graph borrows from its
-/// config blob in place, against the blob's mapped length. Observed, never
-/// allocated from, so it is not sizable by a capacity envelope.
-pub const POOL_CONFIG_ARENA: u16 = 0x0003;
-/// Channel slot table (slots).
-pub const POOL_CHANNELS: u16 = 0x0004;
-/// Event slot table (slots).
-pub const POOL_EVENTS: u16 = 0x0005;
-/// Timer-fd slot table (slots).
-pub const POOL_TIMERS: u16 = 0x0006;
-/// Workload owner table (slots).
-pub const POOL_OWNERS: u16 = 0x0007;
-/// Scheduler module slot table (slots).
-pub const POOL_MODULE_SLOTS: u16 = 0x0008;
-/// Kernel elastic region (bytes) — chunk grants (`ELASTIC_ALLOC`).
-pub const POOL_ELASTIC_REGION: u16 = 0x0009;
-/// Control-plane store subscriptions (slots): one per watched prefix per
-/// module. Derived from what the graph's store consumers declare.
-pub const POOL_STORE_SUBS: u16 = 0x000A;
-/// Control-plane store `GET` read slots open at once (slots).
-pub const POOL_STORE_READS: u16 = 0x000B;
-/// Control-plane store streamed writes open at once (slots).
-pub const POOL_STORE_WRITES: u16 = 0x000C;
-/// Capability grants presented to a guarded store at once (slots).
-pub const POOL_STORE_GRANTS: u16 = 0x000D;
-/// Host-process sandboxes held at once, finished ones included (slots).
-pub const POOL_SANDBOXES: u16 = 0x000E;
-/// Interactive terminal sessions open at once (slots).
-pub const POOL_TTY_SESSIONS: u16 = 0x000F;
-/// Provider handles the kernel tracks for teardown at once (slots).
-pub const POOL_HANDLES: u16 = 0x0010;
-/// State-arena free-list entries: the holes freed modules leave below the
-/// bump mark (slots).
-pub const POOL_STATE_FREE_LIST: u16 = 0x0011;
-/// `net.policy` tables held at once (slots).
-pub const POOL_NET_POLICY_TABLES: u16 = 0x0012;
-/// Rule bytes one `net.policy` table holds (bytes).
-pub const POOL_NET_POLICY_TABLE_BYTES: u16 = 0x0013;
-/// Subscriptions one workload's own store holds (slots).
-pub const POOL_OWNER_STORE_SUBS: u16 = 0x0014;
-/// `GET` read slots one workload's own store holds (slots).
-pub const POOL_OWNER_STORE_READS: u16 = 0x0015;
-/// Streamed writes one workload's own store holds (slots).
-pub const POOL_OWNER_STORE_WRITES: u16 = 0x0016;
-/// `net.route` segments held at once (slots).
-pub const POOL_NET_ROUTE_SEGMENTS: u16 = 0x0017;
-/// `net.route` peer routes held at once (slots).
-pub const POOL_NET_ROUTE_PEERS: u16 = 0x0018;
-/// `net.route` held addresses at once (slots).
-pub const POOL_NET_ROUTE_HELD: u16 = 0x0019;
-/// Lends open at once (slots): spans a module registered for the provider
-/// of one of its sessions to use past a call.
-pub const POOL_LENDS: u16 = 0x001A;
-
-/// Number of kernel pools — the ledger table size and the count of `POOL`
-/// records in one PSTATUS round.
-pub const KERNEL_POOL_COUNT: usize = 26;
-
-/// First id of the module-declared pool range.
-pub const POOL_MODULE_BASE: u16 = 0x0100;
+pub use super::super::registry::pool::{
+    BUFFER_ARENA as POOL_BUFFER_ARENA, CHANNELS as POOL_CHANNELS,
+    CONFIG_ARENA as POOL_CONFIG_ARENA, ELASTIC_REGION as POOL_ELASTIC_REGION,
+    EVENTS as POOL_EVENTS, HANDLES as POOL_HANDLES, ISOLATED_SLOTS as POOL_ISOLATED_SLOTS,
+    KERNEL_COUNT as KERNEL_POOL_COUNT, LENDS as POOL_LENDS, MODULE_BASE as POOL_MODULE_BASE,
+    MODULE_COUNT as MODULE_POOL_COUNT, MODULE_SLOTS as POOL_MODULE_SLOTS, OWNERS as POOL_OWNERS,
+    SANDBOXES as POOL_SANDBOXES, STATE_ARENA as POOL_STATE_ARENA,
+    STATE_FREE_LIST as POOL_STATE_FREE_LIST, STORE_SUBS as POOL_STORE_SUBS, TIMERS as POOL_TIMERS,
+    TTY_SESSIONS as POOL_TTY_SESSIONS,
+};
 
 /// Class of a kernel pool id. Every kernel pool is a memory pool; a pool of
 /// another class takes an id of its own.
 pub const fn kernel_pool_class(_pool: u16) -> u8 {
     CLASS_MEMORY
 }
-
-const _: () = assert!(KERNEL_POOL_COUNT == POOL_LENDS as usize);
 
 /// An arena entry with this bit set is in KiB, not bytes. Arena sizes below
 /// 2 GiB are written in exact bytes, so a byte-precise budget stays exact; a
@@ -106,10 +50,7 @@ pub const ENTRY_KIB: u32 = 1 << 31;
 
 /// Whether `pool` is an arena, whose entries may carry [`ENTRY_KIB`].
 pub const fn is_arena(pool: u16) -> bool {
-    matches!(
-        pool,
-        POOL_STATE_ARENA | POOL_BUFFER_ARENA | POOL_ELASTIC_REGION
-    )
+    super::super::registry::pool::is_arena(pool)
 }
 
 /// The figure an envelope (or declared-demand) entry `n` states for `pool`:
@@ -149,10 +90,11 @@ pub use super::super::registry::resource::ELASTIC_ALLOC;
 
 // ── Module-provided pools ─
 //
-// A pool can be served by a module provider rather than a kernel table: the
-// store's subscriptions, when a module provides `storage.namespace` (the
-// composer then plans the demand into that provider's heap, not the host
-// table). The ledger keeps no counters of its own: it PULLS the pool's
+// A pool in the module range is served by module providers rather than a
+// kernel table: the store's subscriptions, held by the graph's
+// `storage.namespace` providers, whose heap the composer plans from the
+// demand the graph declares. The ledger keeps no counters of its own: it
+// PULLS the pool's
 // in-use figure from that provider, and the provider tells it of each
 // refusal, so the pool's `POOL` record reads the same whoever serves it.
 //
@@ -190,12 +132,53 @@ pub const POOL_SAMPLE_ARG_LEN: usize = 2;
 /// `EINVAL` for a pool no module provides. Answers 0.
 pub use super::super::registry::resource::LEDGER_DENY;
 
+// ── Owner lines ─
+//
+// Each workload owner holds one ledger line per kind of thing it is charged
+// for: `{used, cap}` in bytes, cap 0 = uncapped. The kernel charges the
+// state and buffer lines itself as it places modules and channels. The
+// storage line is charged by the module that roots the owner's storage (a
+// provider registered `provider_scope = "workloads"`), for bytes it alone can
+// measure; the kernel knows a cap and a count, never what a byte of storage
+// is. An owner whose admission installed no storage line holds no storage:
+// every charge against it is refused.
+
+/// Module state the owner's modules hold (bytes).
+pub const OWNER_LINE_STATE: u16 = 0;
+/// Channel buffers the owner's edges hold (bytes).
+pub const OWNER_LINE_BUFFER: u16 = 1;
+/// Storage the owner holds through a workload-scoped provider (bytes).
+pub const OWNER_LINE_STORAGE: u16 = 2;
+/// Lines each owner holds.
+pub const OWNER_LINE_COUNT: usize = 3;
+
+/// Charge `bytes` to the owner of the module calling the provider:
+/// `arg = [line u16][bytes u64][flags u8]`, all LE, `handle = -1`.
+/// [`LEDGER_HELD`] charges bytes the owner already holds (found on media),
+/// past its cap if need be: an owner over its cap can shrink but not grow.
+///
+/// Admitted only inside a provider frame of a module holding a workload-scoped
+/// layer, for a caller acting with its own authority, and only for
+/// [`OWNER_LINE_STORAGE`]: `EACCES` otherwise, and `EACCES` for an owner
+/// with no storage line. `ENOSPC` past the cap. Answers 0. The charged owner
+/// is never an argument: it is the frame's caller, so a provider charges
+/// only an owner it is serving.
+pub use super::super::registry::resource::LEDGER_CHARGE;
+
+/// Give `bytes` back to the calling owner's line, under the rules of
+/// [`LEDGER_CHARGE`]: `arg = [line u16][bytes u64]`. Saturating. Answers 0.
+pub use super::super::registry::resource::LEDGER_RELEASE;
+
+/// [`LEDGER_CHARGE`] flag: the bytes are already held; charge past the cap.
+pub const LEDGER_HELD: u8 = 0x01;
+/// Byte length of the [`LEDGER_CHARGE`] argument.
+pub const LEDGER_CHARGE_ARG_LEN: usize = 11;
+/// Byte length of the [`LEDGER_RELEASE`] argument.
+pub const LEDGER_RELEASE_ARG_LEN: usize = 10;
+
 /// The contract whose module provider serves `pool`, as a contract id
 /// (`requires_contract` class byte), or `None` for a pool only the kernel
-/// serves. `POOL_STORE_SUBS` → `storage.namespace`.
+/// serves.
 pub const fn module_provided_pool_contract(pool: u16) -> Option<u16> {
-    match pool {
-        POOL_STORE_SUBS => Some(super::super::registry::storage_namespace::ID),
-        _ => None,
-    }
+    super::super::registry::pool::served_by(pool)
 }

@@ -4,7 +4,8 @@
 //! - [`fan_pass`]: a port with more than one edge gets a fan — a tee on an
 //!   output, a merge on an input — whose frame kind is the fanned port's
 //!   declared kind or, where it declares a stream or nothing, the kind every
-//!   peer across the fan agrees on. A record fan gives every edge around it
+//!   peer across the fan agrees on. A lane end is a port of its own: edges
+//!   into one lane share a merge, and edges out of it a tee. A record fan gives every edge around it
 //!   a mailbox group of its own; any other fan leaves its edges ungrouped. A
 //!   multi-inbound module's data inputs, and a multi-outbound module's output
 //!   whose consumers are exactly the modules feeding it, stay unfanned.
@@ -44,45 +45,16 @@ pub const PORT_FLAG_FRAMED: u8 = 0x02;
 /// A fanned input's port key bit: the input is a control input.
 pub const PORT_KEY_CTRL: u8 = 0x10;
 
-/// What a port carries, as a fan over it moves it. The discriminant is the
-/// fan's `frame_kind` param.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FrameKind {
-    /// Bytes, moved as they come.
-    #[default]
-    Stream = 0,
-    /// `[len u16][payload]` Ethernet frames.
-    Eth = 1,
-    /// `[msg_type u8][len u16][payload]` network-protocol records.
-    Net = 2,
-    /// Self-sizing telemetry records.
-    Telemetry = 3,
-    /// Records that state no length: one channel record each, on mailboxes.
-    Record = 4,
-}
-
-/// The frame kind of a port of content type `content_type` and manifest
-/// flags `flags`.
+/// Whether a port of content type `content_type` and manifest flags `flags`
+/// carries mailbox records: its edges, and a fan over it, are mailboxes
+/// rather than rings. Every channel keeps write boundaries either way; this
+/// only picks the buffer.
 #[must_use]
-pub fn port_frame(content_type: u8, flags: u8) -> FrameKind {
+pub fn port_mailbox(content_type: u8, flags: u8) -> bool {
     let framed = crate::CONTENT_FRAMING
         .get(usize::from(content_type))
         .is_some_and(|f| *f == crate::Framing::Framed);
-    if framed || flags & PORT_FLAG_FRAMED != 0 {
-        return FrameKind::Record;
-    }
-    // By wire byte, never by name: the name table is a table of pointers,
-    // which a module cannot carry.
-    const ETH: u8 = crate::content_type_byte("EthernetFrame");
-    const NET: u8 = crate::content_type_byte("NetProto");
-    const TELEMETRY: u8 = crate::content_type_byte("Telemetry");
-    match content_type {
-        ETH => FrameKind::Eth,
-        NET => FrameKind::Net,
-        TELEMETRY => FrameKind::Telemetry,
-        _ => FrameKind::Stream,
-    }
+    framed || flags & PORT_FLAG_FRAMED != 0
 }
 
 /// One port record of a module's manifest. A lookup takes the first record
@@ -96,7 +68,8 @@ pub struct PlanPort {
     /// The largest single write the port issues (`max_record`); 0
     /// undeclared.
     pub max_record: u32,
-    pub frame: FrameKind,
+    /// The port carries mailbox records ([`port_mailbox`]).
+    pub mailbox: bool,
 }
 
 /// A declared module, as composition sees it.
@@ -137,13 +110,18 @@ pub enum FanDir {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fan {
     pub dir: FanDir,
-    /// The fanned module.
-    pub of: u16,
+    /// The fanned end: a declared module (`Endpoint::New`), or a lane
+    /// (`Endpoint::Lane`), whose commands a merge feeds and whose events a
+    /// tee carries out.
+    pub of: Endpoint,
     /// The fanned port: an output index, or an input index with
-    /// [`PORT_KEY_CTRL`] for a control input.
+    /// [`PORT_KEY_CTRL`] for a control input; 0 on a lane.
     pub port: u8,
-    pub kind: FrameKind,
-    /// The fanned module's domain, which the fan steps in.
+    /// Its edges are mailboxes: the fanned port, or every peer that says,
+    /// carries mailbox records.
+    pub mailbox: bool,
+    /// The domain the fan steps in: the fanned module's, or on a lane the
+    /// first peer's across the fan.
     pub domain: u8,
 }
 
@@ -154,6 +132,21 @@ impl Fan {
         match self.dir {
             FanDir::Out => TEE_NAME_HASH,
             FanDir::In => MERGE_NAME_HASH,
+        }
+    }
+
+    /// The node its rings name it by.
+    #[must_use]
+    pub const fn ring_node(&self) -> RingNode {
+        match self.dir {
+            FanDir::Out => RingNode::Tee {
+                of: self.of,
+                port: self.port,
+            },
+            FanDir::In => RingNode::Merge {
+                of: self.of,
+                port: self.port,
+            },
         }
     }
 
@@ -174,42 +167,34 @@ impl Fan {
 
 /// The params TLV tags of a fan module.
 pub mod fan_param {
-    /// `u8`: the [`super::FrameKind`] the fan moves.
-    pub const FRAME_KIND: u8 = 1;
-    /// `u16`: frames moved per step.
-    pub const FRAMES_PER_STEP: u8 = 2;
-    /// `u32`: bytes of scratch, the largest ring adjacent to the fan.
-    pub const SCRATCH_BYTES: u8 = 3;
+    /// `u16`: records moved per step.
+    pub const FRAMES_PER_STEP: u8 = 1;
+    /// `u32`: bytes of scratch, the largest record the fan moves
+    /// ([`super::Composed::fan_scratch`]).
+    pub const SCRATCH_BYTES: u8 = 2;
 }
 
-/// Frames a fan moves per step unless the composer says otherwise.
+/// Records a fan moves per step unless the composer says otherwise.
 pub const FRAMES_PER_STEP_DEFAULT: u16 = 64;
 
 /// Bytes of a fan's params TLV.
-pub const FAN_PARAMS_LEN: usize = 4 + (2 + 1) + (2 + 2) + (2 + 4) + 2;
+pub const FAN_PARAMS_LEN: usize = 4 + (2 + 2) + (2 + 4) + 2;
 
 /// A fan's params TLV.
 #[must_use]
-pub fn fan_params(
-    kind: FrameKind,
-    frames_per_step: u16,
-    scratch_bytes: u32,
-) -> [u8; FAN_PARAMS_LEN] {
+pub fn fan_params(frames_per_step: u16, scratch_bytes: u32) -> [u8; FAN_PARAMS_LEN] {
     let mut p = [0u8; FAN_PARAMS_LEN];
     p[0] = crate::params_tlv::TLV_MAGIC;
     p[1] = crate::params_tlv::TLV_VERSION;
-    // The payload, terminator included: 15 bytes.
+    // The payload, terminator included: 12 bytes.
     p[2] = (FAN_PARAMS_LEN - 4) as u8;
-    p[4] = fan_param::FRAME_KIND;
-    p[5] = 1;
-    p[6] = kind as u8;
-    p[7] = fan_param::FRAMES_PER_STEP;
-    p[8] = 2;
-    p[9..11].copy_from_slice(&frames_per_step.to_le_bytes());
-    p[11] = fan_param::SCRATCH_BYTES;
-    p[12] = 4;
-    p[13..17].copy_from_slice(&scratch_bytes.to_le_bytes());
-    p[17] = crate::params_tlv::TLV_END;
+    p[4] = fan_param::FRAMES_PER_STEP;
+    p[5] = 2;
+    p[6..8].copy_from_slice(&frames_per_step.to_le_bytes());
+    p[8] = fan_param::SCRATCH_BYTES;
+    p[9] = 4;
+    p[10..14].copy_from_slice(&scratch_bytes.to_le_bytes());
+    p[14] = crate::params_tlv::TLV_END;
     p
 }
 
@@ -229,12 +214,12 @@ pub enum PlanError {
     /// A record fan or record edge needs a mailbox group and none is left.
     GroupsExhausted,
     /// A port carries more edges than a fan has ports on its many side
-    /// ([`MAX_PORT_INDEX`] + 1): output `port` of module `of` for a tee, or
+    /// ([`MAX_PORT_INDEX`] + 1): output `port` of end `of` for a tee, or
     /// its input `port` ([`PORT_KEY_CTRL`] set for a control input) for a
     /// merge.
     FanWidth {
         dir: FanDir,
-        of: u16,
+        of: Endpoint,
         port: u8,
         edges: usize,
     },
@@ -282,6 +267,45 @@ impl Nodes<'_, '_> {
             .map_or((0, 0), |p| (p.buffer_size, p.max_record))
     }
 
+    /// The `(buffer_size, max_record)` an edge's producer end writes with:
+    /// a module's port, or for a fan the largest record any of its inbound
+    /// producers declares (a fan copies records whole, so it writes what it
+    /// reads). 0 where any inbound producer leaves it undeclared.
+    fn producer_cap(&self, end: Endpoint, port: u8, edges: &[EdgeRecord]) -> (u32, u32) {
+        if self.fan(end).is_none() {
+            return self.cap(end, DIR_OUT, port);
+        }
+        (0, self.fan_inbound_max_record(end, edges, 2))
+    }
+
+    /// The largest record an inbound producer of fan `end` declares; 0 when
+    /// one declares none. `depth` bounds a fan feeding a fan.
+    fn fan_inbound_max_record(&self, end: Endpoint, edges: &[EdgeRecord], depth: u8) -> u32 {
+        let mut max = 0u32;
+        let mut any = false;
+        for e in edges.iter().filter(|e| e.to == end) {
+            let m = if self.fan(e.from).is_some() {
+                if depth == 0 {
+                    0
+                } else {
+                    self.fan_inbound_max_record(e.from, edges, depth - 1)
+                }
+            } else {
+                self.cap(e.from, DIR_OUT, e.from_port).1
+            };
+            if m == 0 {
+                return 0;
+            }
+            any = true;
+            max = max.max(m);
+        }
+        if any {
+            max
+        } else {
+            0
+        }
+    }
+
     fn domain(&self, end: Endpoint) -> Option<u8> {
         self.module(end)
             .map(|m| m.domain)
@@ -327,12 +351,17 @@ const fn port_key(e: &EdgeRecord, dir: FanDir) -> u8 {
     }
 }
 
-fn touches(e: &EdgeRecord, m: usize, dir: FanDir) -> bool {
-    let end = match dir {
+/// The end of `e` the side `dir` looks at: its producer for a tee, its
+/// consumer for a merge.
+const fn side(e: &EdgeRecord, dir: FanDir) -> Endpoint {
+    match dir {
         FanDir::Out => e.from,
         FanDir::In => e.to,
-    };
-    end.new_index() == Some(m)
+    }
+}
+
+fn touches(e: &EdgeRecord, site: Endpoint, dir: FanDir) -> bool {
+    side(e, dir) == site
 }
 
 /// What the fan pass inserted.
@@ -355,19 +384,31 @@ struct FanPass<'a, 'm> {
 }
 
 impl FanPass<'_, '_> {
-    /// The frame kind an end's port declares; `None` where the end is no
-    /// declared module or the module declares no such port.
-    fn declared(&self, end: Endpoint, dir: FanDir, key: u8) -> Option<FrameKind> {
+    /// Whether an end's port carries mailbox records; `None` where the end
+    /// is no declared module or the module declares no such port.
+    fn declared(&self, end: Endpoint, dir: FanDir, key: u8) -> Option<bool> {
         let module = end.new_index().and_then(|i| self.modules.get(i))?;
         let direction = match dir {
             FanDir::Out => DIR_OUT,
             FanDir::In => in_direction(key),
         };
-        module.port(direction, key & 0x0F).map(|p| p.frame)
+        module.port(direction, key & 0x0F).map(|p| p.mailbox)
     }
 
-    fn in_group(&self, j: usize, m: usize, dir: FanDir, key: u8) -> bool {
-        touches(&self.edges[j], m, dir) && port_key(&self.edges[j], dir) == key
+    fn in_group(&self, j: usize, site: Endpoint, dir: FanDir, key: u8) -> bool {
+        touches(&self.edges[j], site, dir) && port_key(&self.edges[j], dir) == key
+    }
+
+    /// The domain an end steps in: a declared module's, or a fan's the
+    /// pass inserted; `None` for an end outside the graph.
+    fn domain_of(&self, end: Endpoint) -> Option<u8> {
+        let i = end.new_index()?;
+        match self.modules.get(i) {
+            Some(m) => Some(m.domain),
+            None => self.fans[..self.nfans]
+                .get(i - self.modules.len())
+                .map(|f| f.domain),
+        }
     }
 
     /// The lowest group at or above [`RECORD_FAN_GROUP_FIRST`] no edge uses.
@@ -392,7 +433,7 @@ impl FanPass<'_, '_> {
                 .iter()
                 .any(|e| e.from == c && e.to == me && !e.to_ctrl)
         };
-        let group = || (first..scan).filter(|&j| self.in_group(j, m, FanDir::Out, key));
+        let group = || (first..scan).filter(|&j| self.in_group(j, me, FanDir::Out, key));
         for j in group() {
             let c = edges[j].to;
             if !feeds(c) || group().take_while(|&i| i < j).any(|i| edges[i].to == c) {
@@ -404,16 +445,15 @@ impl FanPass<'_, '_> {
             .all(|e| e.to != me || e.to_ctrl || group().any(|j| edges[j].to == e.from))
     }
 
-    /// The frame kind of the fan on `m`'s port `key`: the port's declared
-    /// kind, or where it declares a stream or nothing, the kind every peer
-    /// that declares one agrees on (a stream where they disagree).
-    fn kind(&self, m: usize, first: usize, scan: usize, dir: FanDir, key: u8) -> FrameKind {
-        match self.declared(Endpoint::New(m as u16), dir, key) {
-            Some(k) if k != FrameKind::Stream => return k,
-            _ => {}
+    /// Whether the fan on `m`'s port `key` moves mailbox records: the port
+    /// declares records, or where it declares rings or nothing, every peer
+    /// that declares its port agrees on records (rings where they disagree).
+    fn record(&self, site: Endpoint, first: usize, scan: usize, dir: FanDir, key: u8) -> bool {
+        if self.declared(site, dir, key) == Some(true) {
+            return true;
         }
         let mut agreed = None;
-        for j in (first..scan).filter(|&j| self.in_group(j, m, dir, key)) {
+        for j in (first..scan).filter(|&j| self.in_group(j, site, dir, key)) {
             let e = &self.edges[j];
             let peer = match dir {
                 FanDir::Out => self.declared(e.to, FanDir::In, port_key(e, FanDir::In)),
@@ -423,57 +463,78 @@ impl FanPass<'_, '_> {
                 (_, None) => {}
                 (None, Some(k)) => agreed = Some(k),
                 (Some(a), Some(k)) if a == k => {}
-                (Some(_), Some(_)) => return FrameKind::Stream,
+                (Some(_), Some(_)) => return false,
             }
         }
-        agreed.unwrap_or(FrameKind::Stream)
+        agreed.unwrap_or(false)
     }
 
     fn run(&mut self, dir: FanDir) -> Result<(), PlanError> {
         for m in 0..self.modules.len() {
-            let scan = self.count;
-            for first in 0..scan {
-                if !touches(&self.edges[first], m, dir) {
-                    continue;
-                }
-                let key = port_key(&self.edges[first], dir);
-                // A key is fanned, or left alone, at its first edge.
-                if (0..first).any(|j| self.in_group(j, m, dir, key)) {
-                    continue;
-                }
-                let size = (first..scan)
-                    .filter(|&j| self.in_group(j, m, dir, key))
-                    .count();
-                if size < 2 {
-                    continue;
-                }
-                if size > usize::from(MAX_PORT_INDEX) + 1 {
-                    return Err(PlanError::FanWidth {
-                        dir,
-                        of: m as u16,
-                        port: key,
-                        edges: size,
-                    });
-                }
-                let module = &self.modules[m];
-                let exempt = match dir {
-                    FanDir::Out => {
-                        module.multi_outbound && self.pairs_with_inputs(m, first, scan, key)
-                    }
-                    FanDir::In => key & PORT_KEY_CTRL == 0 && module.multi_inbound,
-                };
-                if exempt {
-                    continue;
-                }
-                self.insert(m, first, scan, dir, key)?;
+            self.fan_site(Endpoint::New(m as u16), dir)?;
+        }
+        // Each lane end the declared edges name, in the order they first
+        // name it.
+        let scan = self.count;
+        for i in 0..scan {
+            let end = side(&self.edges[i], dir);
+            if matches!(end, Endpoint::Lane { .. })
+                && !(0..i).any(|j| side(&self.edges[j], dir) == end)
+            {
+                self.fan_site(end, dir)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Fan every port of `site` on side `dir` that carries two edges or
+    /// more, unless the module keeps one channel per edge there.
+    fn fan_site(&mut self, site: Endpoint, dir: FanDir) -> Result<(), PlanError> {
+        let scan = self.count;
+        for first in 0..scan {
+            if !touches(&self.edges[first], site, dir) {
+                continue;
+            }
+            let key = port_key(&self.edges[first], dir);
+            // A key is fanned, or left alone, at its first edge.
+            if (0..first).any(|j| self.in_group(j, site, dir, key)) {
+                continue;
+            }
+            let size = (first..scan)
+                .filter(|&j| self.in_group(j, site, dir, key))
+                .count();
+            if size < 2 {
+                continue;
+            }
+            if size > usize::from(MAX_PORT_INDEX) + 1 {
+                return Err(PlanError::FanWidth {
+                    dir,
+                    of: site,
+                    port: key,
+                    edges: size,
+                });
+            }
+            let exempt = match site.new_index() {
+                Some(m) if m < self.modules.len() => match dir {
+                    FanDir::Out => {
+                        self.modules[m].multi_outbound
+                            && self.pairs_with_inputs(m, first, scan, key)
+                    }
+                    FanDir::In => key & PORT_KEY_CTRL == 0 && self.modules[m].multi_inbound,
+                },
+                _ => false,
+            };
+            if exempt {
+                continue;
+            }
+            self.insert(site, first, scan, dir, key)?;
         }
         Ok(())
     }
 
     fn insert(
         &mut self,
-        m: usize,
+        site: Endpoint,
         first: usize,
         scan: usize,
         dir: FanDir,
@@ -486,30 +547,41 @@ impl FanPass<'_, '_> {
         if self.nfans >= self.fans.len() || node > usize::from(u16::MAX) {
             return Err(PlanError::FanCapacity);
         }
-        let kind = self.kind(m, first, scan, dir, key);
-        let record = kind == FrameKind::Record;
+        let record = self.record(site, first, scan, dir, key);
+        // A lane steps nowhere in the graph: its fan steps with the first
+        // peer across it.
+        let domain = self.domain_of(site).unwrap_or_else(|| {
+            let peer = |e: &EdgeRecord| match dir {
+                FanDir::Out => e.to,
+                FanDir::In => e.from,
+            };
+            (first..scan)
+                .filter(|&j| self.in_group(j, site, dir, key))
+                .find_map(|j| self.domain_of(peer(&self.edges[j])))
+                .unwrap_or(0)
+        });
         for j in first..scan {
-            if self.in_group(j, m, dir, key) {
+            if self.in_group(j, site, dir, key) {
                 self.edges[j].buffer_group = if record { self.fresh_group()? } else { 0 };
             }
         }
         self.fans[self.nfans] = Fan {
             dir,
-            of: m as u16,
+            of: site,
             port: key,
-            kind,
-            domain: self.modules[m].domain,
+            mailbox: record,
+            domain,
         };
         self.nfans += 1;
         let fan = Endpoint::New(node as u16);
-        let here = Endpoint::New(m as u16);
+        let here = site;
         let mut join = match dir {
             FanDir::Out => EdgeRecord {
                 from: here,
                 from_port: key,
                 to: fan,
                 retains_send: (first..scan)
-                    .filter(|&j| self.in_group(j, m, dir, key))
+                    .filter(|&j| self.in_group(j, site, dir, key))
                     .all(|j| self.edges[j].retains_send),
                 ..EdgeRecord::default()
             },
@@ -528,7 +600,7 @@ impl FanPass<'_, '_> {
         self.count += 1;
         let mut k = 0u8;
         for j in first..scan {
-            if !self.in_group(j, m, dir, key) {
+            if !self.in_group(j, site, dir, key) {
                 continue;
             }
             let e = &mut self.edges[j];
@@ -608,10 +680,10 @@ pub fn record_mailboxes(
         end.new_index()
             .and_then(|i| modules.get(i))
             .and_then(|m| m.port(direction, index))
-            .is_some_and(|p| p.frame == FrameKind::Record)
+            .is_some_and(|p| p.mailbox)
     };
     let excluded = |end: Endpoint| {
-        matches!(end, Endpoint::Tap(_) | Endpoint::Net(_))
+        matches!(end, Endpoint::Tap(_) | Endpoint::Lane { .. })
             || end.new_index().is_some_and(|i| i >= n)
     };
     let mut grouped = 0;
@@ -734,11 +806,12 @@ impl RingPlatform {
 pub enum RingNode {
     /// A declared module.
     Module(u16),
-    /// The tee on output `port` of module `of`.
-    Tee { of: u16, port: u8 },
+    /// The tee on output `port` of `of`: a declared module, or a lane's
+    /// events.
+    Tee { of: Endpoint, port: u8 },
     /// The merge on input `port` ([`PORT_KEY_CTRL`] set for a control input)
-    /// of module `of`.
-    Merge { of: u16, port: u8 },
+    /// of `of`: a declared module, or a lane's commands.
+    Merge { of: Endpoint, port: u8 },
     /// An end outside the graph.
     External(Endpoint),
 }
@@ -856,7 +929,7 @@ pub fn rings(
         })?;
         // A ring keeps each record's length beside it; a mailbox's record is
         // its whole buffer.
-        let (producer_cap, max_record) = nodes.cap(e.from, DIR_OUT, e.from_port);
+        let (producer_cap, max_record) = nodes.producer_cap(e.from, e.from_port, edges);
         let footprint = if group != 0 {
             u64::from(max_record)
         } else {
@@ -960,6 +1033,59 @@ impl Composed {
         plan.aliased = totals.aliased;
         Ok(plan)
     }
+
+    /// The scratch fan `k` (of [`Self::fans`]) is given: the largest record
+    /// it can be handed — what every producer feeding it declares as its
+    /// `max_record` — or, where one declares none, the largest ring beside
+    /// it in `rings`, which no record outgrows.
+    #[must_use]
+    pub fn fan_scratch(&self, k: usize, modules: &[PlanModule<'_>], rings: &RingPlan) -> u32 {
+        let Some(fan) = self.fans.get(k) else {
+            return 0;
+        };
+        let nodes = Nodes {
+            modules,
+            fans: &self.fans,
+        };
+        let end = Endpoint::New((self.declared_modules + k) as u16);
+        match nodes.fan_inbound_max_record(end, &self.edges, 2) {
+            0 => rings.largest_adjacent(fan.ring_node()),
+            m => m,
+        }
+    }
+}
+
+/// A fan moves each record whole, so every edge a fan writes asks for a ring
+/// that holds the largest record the fan can be handed: what its producers
+/// declare as their `max_record`, or, where one declares none, the largest
+/// request among the edges into it. The floor rides in the edge's
+/// `buffer_bytes`, which every consumer of the composed graph sizes its ring
+/// by. Edges of a mailbox group keep the group's buffer.
+pub fn size_fan_writes(modules: &[PlanModule<'_>], fans: &[Fan], edges: &mut [EdgeRecord]) {
+    let nodes = Nodes { modules, fans };
+    for i in 0..edges.len() {
+        let from = edges[i].from;
+        if edges[i].buffer_group != 0 || nodes.fan(from).is_none() {
+            continue;
+        }
+        let floor = match nodes.fan_inbound_max_record(from, edges, 2) {
+            0 => edges
+                .iter()
+                .filter(|x| x.to == from)
+                .map(|x| {
+                    let (producer, _) = nodes.cap(x.from, DIR_OUT, x.from_port);
+                    let to_dir = if x.to_ctrl { DIR_CTRL } else { DIR_IN };
+                    let (consumer, _) = nodes.cap(x.to, to_dir, x.to_port);
+                    edge_request(producer, consumer, x.buffer_bytes)
+                })
+                .max()
+                .unwrap_or(0),
+            m => u32::try_from(record_bytes(m)).unwrap_or(u32::MAX),
+        };
+        if floor > edges[i].buffer_bytes {
+            edges[i].buffer_bytes = floor;
+        }
+    }
 }
 
 /// Compose `edges` between `modules`: [`fan_pass`] then [`order`].
@@ -978,10 +1104,20 @@ pub fn compose(
     let mut buf = Vec::with_capacity(2 * edges.len());
     buf.extend_from_slice(edges);
     buf.resize(2 * edges.len(), EdgeRecord::default());
-    let mut fans = alloc::vec![Fan { dir: FanDir::Out, of: 0, port: 0, kind: FrameKind::Stream, domain: 0 }; edges.len()];
+    let mut fans = alloc::vec![
+        Fan {
+            dir: FanDir::Out,
+            of: Endpoint::New(0),
+            port: 0,
+            mailbox: false,
+            domain: 0,
+        };
+        edges.len()
+    ];
     let counts = fan_pass(modules, &mut buf, edges.len(), &mut fans, groups)?;
     buf.truncate(counts.edges);
     fans.truncate(counts.fans);
+    size_fan_writes(modules, &fans, &mut buf);
     let nodes = modules.len() + fans.len();
     let mut out = alloc::vec![0u16; nodes];
     let mut indeg = alloc::vec![0u16; nodes];

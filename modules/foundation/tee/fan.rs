@@ -1,28 +1,14 @@
 // The part of a fan module `tee` and `merge` share: the instance, its
-// params, and the whole-frame rule. Included by both (`include!`), so each
+// params, and the whole-record rule. Included by both (`include!`), so each
 // stays one crate.
 //
-// A fan moves what one port carries to several, or several to one, and
-// keeps the producer's units whole: the composer names the port's frame
-// kind in the fan's params, and the fan reads each frame's length from its
-// header before it consumes anything. A frame moves only when it is all
-// buffered and every side it goes to can take it whole; otherwise nothing
-// is consumed and the step ends, so back pressure reaches the producer and
-// the fan holds nothing between steps.
-
-/// The frame kinds, `fluxor_contracts::graph::plan::FrameKind`'s
-/// discriminants (the `frame_kind` param).
-///
-/// Bytes, moved as they come.
-pub const KIND_STREAM: u8 = 0;
-/// `[len u16 LE][payload]` Ethernet frames.
-pub const KIND_ETH: u8 = 1;
-/// `[msg_type u8][len u16 LE][payload]` network-protocol records.
-pub const KIND_NET: u8 = 2;
-/// Telemetry records, whose length their `signal` and `kind` bytes give.
-pub const KIND_TELEMETRY: u8 = 3;
-/// Records that state no length: one mailbox record each.
-pub const KIND_RECORD: u8 = 4;
+// A fan moves what one port carries to several, or several to one, one
+// record per transfer: every channel keeps its writes' boundaries, so the
+// fan asks the kernel how long the record at the head is (`RECORD_LEN`) and
+// never reads what is in it. A record moves only when every side it goes to
+// can take it whole; otherwise nothing is consumed and the step ends, so
+// back pressure reaches the producer and the fan holds nothing between
+// steps.
 
 /// The ports a fan has on its many side: the kernel's per-module port
 /// table.
@@ -44,11 +30,10 @@ const ARENA_BASE: u32 = 64;
 #[repr(C)]
 pub struct FanState {
     syscalls: *const SyscallTable,
-    /// The frame being moved, `scratch_len` bytes from the heap.
+    /// The record being moved, `scratch_len` bytes from the heap.
     scratch: *mut u8,
     scratch_len: u32,
     frames_per_step: u16,
-    frame_kind: u8,
     /// The ports in use on the many side.
     lanes_len: u8,
     /// The one side: a tee's input, a merge's output.
@@ -57,21 +42,14 @@ pub struct FanState {
     lanes: [i32; LANES],
     /// A merge's next input in its round robin.
     next: u8,
-    /// A merge of a stream: the input a transfer was cut short on, drained
-    /// to empty before another is read, so no other producer's bytes land
-    /// inside the unit the cut split; -1 when none is owed.
-    owed: i8,
 }
 
 mod params_def {
     use super::*;
     fluxor_rt::define_params! {
         FanState;
-        1, frame_kind, u8, 0,
-            enum { stream = 0, eth = 1, net = 2, telemetry = 3, record = 4 }
-            => |s, d, len| { s.frame_kind = p_u8(d, len, 0, 0); };
-        2, frames_per_step, u16, 64 => |s, d, len| { s.frames_per_step = p_u16(d, len, 0, 64); };
-        3, scratch_bytes, u32, SCRATCH_DEFAULT => |s, d, len| {
+        1, frames_per_step, u16, 64, range 1..=u16::MAX => |s, d, len| { s.frames_per_step = p_u16(d, len, 0, 64); };
+        2, scratch_bytes, u32, SCRATCH_DEFAULT, range 1..=u32::MAX => |s, d, len| {
             s.scratch_len = p_u32(d, len, 0, SCRATCH_DEFAULT);
         };
     }
@@ -79,80 +57,54 @@ mod params_def {
 
 fluxor_rt::module_facts! { state: FanState, arena: ARENA_BASE }
 
-/// Why a step fails. A fan that cannot move a frame whole faults rather than
-/// spin on it.
+/// Why a step fails. A fan that cannot move a record whole faults rather
+/// than spin on it.
 ///
-/// The frame is larger than the scratch: a topology the composer should not
+/// The record is larger than the scratch: a topology the composer should not
 /// have built.
-const E_FRAME_TOO_LARGE: i32 = abi::errno::EOVERFLOW;
-/// The frame header is malformed: a zero-length Ethernet frame, an
-/// unrecognised telemetry record.
-const E_MALFORMED: i32 = abi::errno::EINVAL;
+const E_RECORD_TOO_LARGE: i32 = abi::errno::EOVERFLOW;
 /// A transfer the checks before it said would land did not.
 const E_SHORT: i32 = abi::errno::EIO;
 
-/// Bytes of the header a frame's length is read from.
+/// The length of the record at the head of `chan`; 0 when none is waiting
+/// (or a mailbox's record is lent out).
 #[inline(always)]
-fn hdr_len(kind: u8) -> usize {
-    match kind {
-        KIND_ETH | KIND_TELEMETRY => 2,
-        KIND_NET => 3,
-        _ => 0,
+unsafe fn head(s: &FanState, chan: i32) -> usize {
+    dev_channel_record_len(&*s.syscalls, chan).max(0) as usize
+}
+
+/// Whether `chan` takes a `len`-byte record now: a ring with that much room,
+/// or a mailbox (which states no room) free to be written.
+#[inline(always)]
+unsafe fn takes(s: &FanState, chan: i32, len: usize) -> bool {
+    match writable(s, chan) {
+        0 => polls(s, chan, POLL_OUT),
+        room => room >= len,
     }
 }
 
-/// The bytes after the header, from the header.
-#[inline(always)]
-fn body_len(kind: u8, hdr: &[u8; 3]) -> usize {
-    match kind {
-        KIND_ETH => u16::from_le_bytes([hdr[0], hdr[1]]) as usize,
-        KIND_NET => u16::from_le_bytes([hdr[1], hdr[2]]) as usize,
-        KIND_TELEMETRY => abi::contracts::telemetry::record_len(hdr[0], hdr[1]).saturating_sub(2),
-        _ => 0,
-    }
-}
-
-/// The whole frame at the head of `chan`, read into the scratch only when
-/// it is all buffered and `room` says every side it goes to can take it:
-/// `Ok(Some(total))` once read, `Ok(None)` when it waits (nothing consumed).
-unsafe fn take_frame(
+/// The record at the head of `chan`, read into the scratch only when `room`
+/// says every side it goes to can take it: `Ok(Some(len))` once read,
+/// `Ok(None)` when it waits (nothing consumed).
+unsafe fn take(
     s: &FanState,
     chan: i32,
     room: impl Fn(usize) -> bool,
 ) -> Result<Option<usize>, i32> {
-    let sys = &*s.syscalls;
-    let h = hdr_len(s.frame_kind);
-    let mut hdr = [0u8; 3];
-    if (sys.channel_peek)(chan, hdr.as_mut_ptr(), h) < h as i32 {
+    let len = head(s, chan);
+    if len == 0 {
         return Ok(None);
     }
-    let body = body_len(s.frame_kind, &hdr);
-    let total = h + body;
-    if total > s.scratch_len as usize {
-        return Err(E_FRAME_TOO_LARGE);
+    if len > s.scratch_len as usize {
+        return Err(E_RECORD_TOO_LARGE);
     }
-    if body == 0 && (s.frame_kind == KIND_ETH || s.frame_kind == KIND_TELEMETRY) {
-        return Err(E_MALFORMED);
-    }
-    if (sys.channel_peek)(chan, s.scratch, total) < total as i32 || !room(total) {
+    if !room(len) {
         return Ok(None);
     }
-    if (sys.channel_read)(chan, s.scratch, total) != total as i32 {
+    if ((*s.syscalls).channel_read)(chan, s.scratch, len) != len as i32 {
         return Err(E_SHORT);
     }
-    Ok(Some(total))
-}
-
-/// The record at the head of a mailbox, read whole into the scratch:
-/// `Ok(Some(len))`, or `Ok(None)` when none is pending.
-unsafe fn take_record(s: &FanState, chan: i32) -> Result<Option<usize>, i32> {
-    let sys = &*s.syscalls;
-    let read = (sys.channel_read)(chan, s.scratch, s.scratch_len as usize);
-    if read == abi::errno::EINVAL {
-        // A mailbox refuses a read too small for its record and keeps it.
-        return Err(E_FRAME_TOO_LARGE);
-    }
-    Ok((read > 0).then_some(read as usize))
+    Ok(Some(len))
 }
 
 /// `len` bytes of the scratch to `chan`, whole.
@@ -215,7 +167,6 @@ unsafe fn construct(
         many_dir,
     } = wiring;
     s.one = one;
-    s.owed = -1;
     let mut k = 0;
     while k < LANES {
         let chan = if k == 0 {
@@ -231,8 +182,6 @@ unsafe fn construct(
     }
     let refuse: Option<&[u8]> = if s.one < 0 || s.lanes_len == 0 {
         Some(b"refusing to construct: a port of the fan is not wired")
-    } else if s.frame_kind > KIND_RECORD {
-        Some(b"refusing to construct: frame_kind is not a frame kind")
     } else if s.frames_per_step == 0 || s.scratch_len == 0 {
         Some(b"refusing to construct: frames_per_step and scratch_bytes must be non-zero")
     } else {

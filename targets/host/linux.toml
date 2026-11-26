@@ -80,5 +80,7 @@ cycles = "system"
 # otherwise answer ENOSYS at run time. `workload`, where present, is what the
 # platform answers a workload's modules; absent, the same as `platform`.
 [providers]
-platform = ["fs", "host_mount", "net_policy", "net_route", "proc",
-            "storage.namespace", "storage.object", "trust", "workload"]
+# `fs` is the host filesystem for the node's own modules alone; a workload
+# reaches node storage through the node graph's workload layer (`owner_fs`).
+platform = ["fs", "host_mount", "trust", "workload"]
+workload = ["host_mount", "trust", "workload"]

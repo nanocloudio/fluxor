@@ -172,6 +172,9 @@ pub mod contracts {
         pub mod object;
         pub mod runtime_params;
     }
+    /// P-256 keys held by a host-side token behind a host lane: the key
+    /// vault's hardware custody.
+    pub mod key_custody;
     pub mod key_vault;
     /// The mesh substrate's authority: capability tokens, delegation chains,
     /// local verification, and their presentation on a session.
@@ -232,7 +235,6 @@ pub mod internal {
     pub mod flash;
     pub mod monitor;
     pub mod reconfigure;
-    pub mod vault_store;
 }
 
 pub mod platform {
@@ -254,8 +256,10 @@ pub mod platform {
     }
     /// Linux host-platform mechanics (host-process ops; see the file header).
     pub mod linux {
+        pub mod bound_endpoints;
         pub mod host_mount;
         pub mod host_process;
+        pub mod owner_facts;
     }
     pub mod bcm2712 {
         pub mod nic_ring;

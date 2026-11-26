@@ -179,18 +179,16 @@ pub fn stats() -> (u32, [(bool, u32, u32); CONSUMERS]) {
     (head, slots)
 }
 
-/// Ring capacity in bytes (power of two). Exposed for sizing checks and the
-/// out-of-`src/` conformance tests (`tests/harness/tests/telemetry_ring.rs`).
+/// Ring capacity in bytes (power of two).
 pub fn capacity() -> usize {
     CAPACITY
 }
 
 /// Zero all ring state (head, per-slot tails/drops/active/filters, owners,
-/// enabled). The ring is a process-global static, so the harness tests
-/// (`tests/harness/tests/telemetry_ring.rs`) call this to isolate each case.
-/// Never invoked by firmware.
-#[doc(hidden)]
-pub fn reset_for_test() {
+/// enabled). A graph rebuild calls this: subscriptions are owned by module
+/// indices of the graph that made them, and the next graph's modules
+/// subscribe again as they instantiate.
+pub fn reset() {
     RING.reset();
     for slot in 0..CONSUMERS {
         FILTERS[slot].store(0, Ordering::Release);

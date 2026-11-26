@@ -116,14 +116,9 @@ pub struct OwnerLiveStatus {
     /// When that fault happened (the fault record's `last_fault_ms`), 0 when
     /// none terminated.
     pub last_fault_ms: u64,
-    /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or
-    /// [`OWNER_STATE_DRAINING`]. `Active` until the drain driver flips it.
+    /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`], [`OWNER_STATE_DRAINING`]
+    /// or [`OWNER_STATE_PAUSED`].
     pub owner_state: u8,
-    /// Wall-clock second at which a drain forfeits its grace, or 0 when not
-    /// draining. Set by the drain driver.
-    pub drain_deadline_unix: u64,
-    /// Seconds remaining in the drain window, or 0 when not draining.
-    pub drain_remaining_secs: u32,
 }
 
 /// `owner_state` code: the owner is running normally.
@@ -147,53 +142,10 @@ impl OwnerLiveStatus {
         last_fault_kind: fault_type::NONE,
         last_fault_ms: 0,
         owner_state: OWNER_STATE_ACTIVE,
-        drain_deadline_unix: 0,
-        drain_remaining_secs: 0,
     };
 }
 
-/// Snapshot the live per-owner runtime status: every non-free workload slot,
-/// with the fault/finish state of its stamped module range aggregated in.
-/// Writes into `out` — as many records as it holds; one per owner slot
-/// (`owners().slot_count()`) holds them all — and returns the record count.
-/// Scheduler-thread only (same access class as `module_fault_state`).
-///
-/// An owner table of the node owner's slot alone has no workload slots: 0.
-pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
-    // SAFETY: scheduler-thread read of the static owner table + fault state.
-    let sched = unsafe {
-        let p = &raw const SCHED;
-        &*p
-    };
-    let mut count = 0usize;
-    for slot in 1..sched.owners.slot_count() {
-        if count == out.len() {
-            break;
-        }
-        if let Some(rec) = owner_record(sched, slot) {
-            out[count] = rec;
-            count += 1;
-        }
-    }
-    // Fold each module's state into its owning record. A stale stamp (owner
-    // slot reused at a newer generation) attributes to nobody — the module
-    // belongs to the previous occupant, not the current one.
-    for idx in 0..module_slots() {
-        let owner = module_owner(idx);
-        if owner.is_node() {
-            continue;
-        }
-        if let Some(rec) = out[..count]
-            .iter_mut()
-            .find(|r| r.slot == owner.slot && r.generation == owner.generation)
-        {
-            fold_module(sched, rec, idx);
-        }
-    }
-    count
-}
-
-/// The live status of one owner, as [`owner_live_snapshot`] reports it;
+/// The live status of one owner, its modules folded in;
 /// `None` for a free slot or a stale handle. Scheduler-thread only.
 pub fn owner_live_status(handle: OwnerHandle) -> Option<OwnerLiveStatus> {
     // SAFETY: scheduler-thread read of the static owner table + fault state.
@@ -354,46 +306,9 @@ pub fn channel_facts(ch: i32, caller: usize) -> Option<(u16, u8)> {
     Some((channel_producer_owner(edge.channel).slot, flags))
 }
 
-/// The module that writes channel `ch`, if an edge names it.
-pub fn channel_producer_module(ch: i32) -> Option<usize> {
-    if ch < 0 {
-        return None;
-    }
-    // SAFETY: scheduler-thread read of the static edge table.
-    let sched = unsafe {
-        let p = &raw const SCHED;
-        &*p
-    };
-    sched
-        .edges
-        .iter()
-        .take(sched.edge_count)
-        .find(|e| e.channel == ch && e.from_module < module_slots())
-        .map(|e| e.from_module)
-}
-
-/// The module that reads channel `ch` (the edge's consuming end), if an edge
-/// names it.
-pub fn channel_consumer_module(ch: i32) -> Option<usize> {
-    if ch < 0 {
-        return None;
-    }
-    // SAFETY: scheduler-thread read of the static edge table.
-    let sched = unsafe {
-        let p = &raw const SCHED;
-        &*p
-    };
-    sched
-        .edges
-        .iter()
-        .take(sched.edge_count)
-        .find(|e| e.channel == ch && e.to_module < module_slots())
-        .map(|e| e.to_module)
-}
-
 /// Owner attribution for a module: `(owner_uid, slot, generation)`, or `None` if
 /// the module is node-owned or its owner stamp is stale (slot reused at a
-/// newer generation). Mirrors `owner_live_snapshot`'s stale-stamp rule. Used by
+/// newer generation): a stale stamp attributes to nobody. Used by
 /// the Linux log tee to attribute an on-step log record to its owner. Scheduler
 /// thread only.
 pub fn module_owner_attribution(module_idx: usize) -> Option<([u8; 16], u16, u32)> {

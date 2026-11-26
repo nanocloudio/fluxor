@@ -1,0 +1,22 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Does a graph reach a host provider's contract? Calls `key_custody` the way
+# the key vault does — through `provider_call`, repeating each call while it
+# answers EAGAIN — against whatever serves the contract in the graph
+# (`host_lane serves = "key_custody"` in front of `fluxor-provider-hsm`):
+# GENERATE an unnamed P-256 key, SIGN a fixed digest, read its PUBLIC half,
+# DESTROY it, and report once:
+#
+#   [custody_probe] ok waits=<EAGAIN answers> pub=<65 bytes, hex> sig=<64 bytes, hex>
+#   [custody_probe] FAIL op=<op> rc=-<errno>
+#
+# The digest is bytes 1, 8, 15, … (`7 i + 1`, i = 0..32); the test verifies
+# the signature under the reported public half.
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+
+[observability]
+exempt = "self-contained fixture; its ok/FAIL log line is the verdict"

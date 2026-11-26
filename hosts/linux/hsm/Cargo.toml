@@ -1,0 +1,20 @@
+[package]
+name              = "fluxor-provider-hsm"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+repository        = "https://github.com/nanocloudio/fluxor"
+description       = "Host provider of key_custody over a PKCS#11 token"
+
+[[bin]]
+name = "fluxor-provider-hsm"
+path = "src/main.rs"
+
+[dependencies]
+fluxor-abi = { path = "../../../crates/fluxor-abi" }
+fluxor-host-lane = { path = "../lane" }
+# The PKCS#11 bindings: the one third-party tree this provider exists to hold.
+cryptoki = "0.12.0"
+
+[lints]
+workspace = true

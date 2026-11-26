@@ -3,39 +3,37 @@
 // Generates from a single definition:
 //   - dispatch_param(): TLV tag dispatcher (match on tag → apply closure)
 //   - set_defaults(): applies the fixed-size defaults in declaration order
-//   - PARAM_SCHEMA: serialized schema bytes for .fmod embedding
+//   - PARAM_SCHEMA: the param schema (`abi::wire::param_schema`), exactly
+//     sized, for the `.fmod`
 //
 // The config tool reads PARAM_SCHEMA from the .fmod to learn param names,
-// types, defaults, and enum mappings — no module-specific code needed.
+// types, defaults, bounds and enum mappings — no module-specific code
+// needed.
 //
 // Usage:
 //
 //   define_params! {
 //       MyState;
 //
-//       1, sample_rate, u32, 8000
+//       1, sample_rate, u32, 8000, range 8000..=48000
 //           => |s, d, len| { s.sample_rate = p_u32(d, len, 0, 8000); };
 //
 //       2, waveform, u8, 1, enum { sine=0, saw=1 }
 //           => |s, d, len| { s.waveform = p_u8(d, len, 0, 1); };
+//
+//       3, root, str, 0, max ROOT_MAX
+//           => |s, d, len| { s.set_root(d, len); };
 //   }
+//
+// Bounds are inclusive: `max N` (any const expression, such as a const the
+// module names) or `range A..=B` (`A` a literal or one const name). An integer's bound is its value's; a `str`'s, a
+// `blob`'s and a `str_chunked`'s its bytes; a `u16_array`'s its elements.
+// A param declaring none takes its type's ceiling. The composer refuses a
+// value outside them at build.
 //
 // Params MUST be ordered so that dependencies come first (e.g., sample_rate
 // before envelope rates that depend on it), because set_defaults applies
 // them in declaration order.
-
-/// Maximum schema buffer size. Trailing zeros are trimmed by the packer,
-/// so this is only the compile-time staging cap — the packed on-wire
-/// schema (its trimmed used-length) is unaffected by this value. Raised to
-/// 4096 when the http module's param set (route slots + dynamic-route and
-/// dynamic-listener prefixes) crossed the prior 2048 staging ceiling.
-pub const SCHEMA_MAX: usize = 4096;
-
-/// Schema binary magic: "SP" (Schema Params)
-pub const SCHEMA_MAGIC: [u8; 2] = [0x53, 0x50];
-
-/// Schema version
-pub const SCHEMA_VERSION: u8 = 1;
 
 /// TLV magic byte
 pub const TLV_MAGIC: u8 = 0xFE;
@@ -45,15 +43,6 @@ pub const TLV_VERSION: u8 = 0x01;
 
 /// TLV end marker tag
 pub const TLV_END: u8 = 0xFF;
-
-// Type IDs used in the schema binary format.
-// Must match the config tool's ParamType enum.
-pub const PTYPE_U8: u8 = 0;
-pub const PTYPE_U16: u8 = 1;
-pub const PTYPE_U32: u8 = 2;
-pub const PTYPE_STR: u8 = 3;
-pub const PTYPE_U16_ARRAY: u8 = 4;
-pub const PTYPE_BLOB: u8 = 5;
 
 // Textually scoped, not `#[macro_export]`: every consumer `include!`s
 // this file before invoking the macro, so definition-order visibility
@@ -67,30 +56,12 @@ macro_rules! define_params {
         $state_type:ty;
         $(
             $tag:literal, $name:ident, $ptype:ident, $default:expr
+            $(, max $max:expr)?
+            $(, range $lo:tt ..= $hi:expr)?
             $(, enum { $($ename:tt = $eval:literal),+ $(,)? })?
             => |$s:ident, $d:ident, $len:ident| $apply:block
         );* $(;)?
     ) => {
-        // ================================================================
-        // One tag, one param. A value for either of two params on one tag
-        // is packed under that tag, and `dispatch_param` hands every entry
-        // to the first. The duplicate match arm only warns
-        // (`unreachable_patterns`, which a module crate may allow), so the
-        // macro refuses it here, at compile time.
-        // ================================================================
-        const _: () = {
-            let tags: &[u8] = &[$($tag),*];
-            let mut i = 0;
-            while i < tags.len() {
-                let mut j = i + 1;
-                while j < tags.len() {
-                    assert!(tags[i] != tags[j], "define_params!: two params declare the same tag");
-                    j += 1;
-                }
-                i += 1;
-            }
-        };
-
         // ================================================================
         // Dispatch: match on TLV tag, execute apply closure
         // ================================================================
@@ -194,87 +165,57 @@ macro_rules! define_params {
         }
 
         // ================================================================
-        // Schema bytes: serialized param metadata for .fmod embedding
+        // The param schema, exactly sized, for the `.fmod`. Its
+        // compile-time checks refuse two params on one tag and a bound the
+        // type cannot state.
         // ================================================================
+        const PARAM_SCHEMA_ENTRIES: &[$crate::abi::wire::param_schema::Entry<'static>] = &[
+            $(
+                $crate::abi::wire::param_schema::Entry {
+                    tag: $tag,
+                    ptype: $crate::define_params!(@type_id $ptype),
+                    default: ($default as u32),
+                    min: $crate::define_params!(@bounds $ptype $(; max $max)? $(; range $lo, $hi)?).0,
+                    max: $crate::define_params!(@bounds $ptype $(; max $max)? $(; range $lo, $hi)?).1,
+                    name: stringify!($name),
+                    enums: &[$($((stringify!($ename), $eval)),+)?],
+                },
+            )*
+        ];
+
         #[link_section = ".param_schema"]
         #[used]
-        #[allow(
-            unused_assignments,
-            unused_variables,
-            unused_mut,
-            reason = "macro iterates `pos`/`count` across param entries; modules that invoke `define_params!` with zero tag entries (mesh) never read these bindings, and even with entries the final `pos += 1` after the last entry has no subsequent reader"
-        )]
-        pub static PARAM_SCHEMA: [u8; $crate::SCHEMA_MAX] = {
-            let mut buf = [0u8; $crate::SCHEMA_MAX];
-            // Header
-            buf[0] = 0x53; // 'S'
-            buf[1] = 0x50; // 'P'
-            buf[2] = 1;    // version
-            // buf[3] = count (filled at end)
-            // `mut` is required for the macro-emitted `pos += 1` /
-            // `count += 1` increments. When a module invokes
-            // `define_params!` with no tag entries (mesh), the
-            // increments don't expand, so the bindings appear
-            // unused; the crate-level `#[allow(unused_mut,
-            // unused_variables, unused_assignments)]` above covers
-            // both cases.
-            let mut pos: usize = 4;
-            let mut count: u8 = 0;
-
-            $(
-                // Tag
-                buf[pos] = $tag;
-                pos += 1;
-
-                // Type
-                buf[pos] = $crate::define_params!(@type_id $ptype);
-                pos += 1;
-
-                // Default (4 bytes LE, zero-extended)
-                let db = ($default as u32).to_le_bytes();
-                buf[pos] = db[0]; buf[pos+1] = db[1];
-                buf[pos+2] = db[2]; buf[pos+3] = db[3];
-                pos += 4;
-
-                // Name
-                let nb = stringify!($name).as_bytes();
-                buf[pos] = nb.len() as u8;
-                pos += 1;
-                {
-                    let mut _ni: usize = 0;
-                    while _ni < nb.len() {
-                        buf[pos] = nb[_ni];
-                        pos += 1;
-                        _ni += 1;
-                    }
-                }
-
-                // Enums
-                $crate::define_params!(@schema_enums buf, pos $(, $($ename, $eval),+)?);
-
-                count += 1;
-            )*
-
-            buf[3] = count;
-            buf
-        };
+        pub static PARAM_SCHEMA: [u8; $crate::abi::wire::param_schema::encoded_len(PARAM_SCHEMA_ENTRIES)] =
+            $crate::abi::wire::param_schema::encode(PARAM_SCHEMA_ENTRIES);
     };
+
+    // ====================================================================
+    // Helper: a param's inclusive bounds, `(min, max)`
+    // ====================================================================
+    (@bounds $ptype:ident) => {
+        (
+            0u32,
+            $crate::abi::wire::param_schema::type_ceiling($crate::define_params!(@type_id $ptype)),
+        )
+    };
+    (@bounds $ptype:ident; max $max:expr) => { (0u32, ($max) as u32) };
+    (@bounds $ptype:ident; range $lo:tt, $hi:expr) => { (($lo) as u32, ($hi) as u32) };
 
     // ====================================================================
     // Helper: type ID for schema binary
     // ====================================================================
-    (@type_id u8) => { 0u8 };
-    (@type_id u16) => { 1u8 };
-    (@type_id u32) => { 2u8 };
-    (@type_id str) => { 3u8 };
-    (@type_id u16_array) => { 4u8 };
-    (@type_id blob) => { 5u8 };
+    (@type_id u8) => { $crate::abi::wire::param_schema::ty::U8 };
+    (@type_id u16) => { $crate::abi::wire::param_schema::ty::U16 };
+    (@type_id u32) => { $crate::abi::wire::param_schema::ty::U32 };
+    (@type_id str) => { $crate::abi::wire::param_schema::ty::STR };
+    (@type_id u16_array) => { $crate::abi::wire::param_schema::ty::U16_ARRAY };
+    (@type_id blob) => { $crate::abi::wire::param_schema::ty::BLOB };
     // A `str` whose handler APPENDS each chunk it is given. The packer
     // splits a value longer than one TLV entry across several entries
     // under the same tag; that only reassembles for a handler that
     // appends, so a plain `str` is refused past one entry at build time
     // and this type is the opt-in for the handlers that do accumulate.
-    (@type_id str_chunked) => { 6u8 };
+    (@type_id str_chunked) => { $crate::abi::wire::param_schema::ty::STR_CHUNKED };
 
     // ====================================================================
     // Helper: type size for set_defaults buffer (0 = skip for var-length)
@@ -286,41 +227,4 @@ macro_rules! define_params {
     (@type_size u16_array) => { 0usize };
     (@type_size blob) => { 0usize };
     (@type_size str_chunked) => { 0usize };
-
-    // ====================================================================
-    // Helper: serialize enum entries to schema buffer (no enums)
-    // ====================================================================
-    (@schema_enums $buf:ident, $pos:ident) => {
-        $buf[$pos] = 0;
-        $pos += 1;
-    };
-
-    // ====================================================================
-    // Helper: serialize enum entries to schema buffer (with enums)
-    // ====================================================================
-    (@schema_enums $buf:ident, $pos:ident, $($ename:tt, $eval:literal),+) => {
-        let _ecount_pos = $pos;
-        $buf[$pos] = 0; // placeholder
-        $pos += 1;
-        let mut _ec: u8 = 0;
-        $(
-            // enum value
-            $buf[$pos] = $eval;
-            $pos += 1;
-            // enum name
-            let _eb = stringify!($ename).as_bytes();
-            $buf[$pos] = _eb.len() as u8;
-            $pos += 1;
-            {
-                let mut _ei: usize = 0;
-                while _ei < _eb.len() {
-                    $buf[$pos] = _eb[_ei];
-                    $pos += 1;
-                    _ei += 1;
-                }
-            }
-            _ec += 1;
-        )+
-        $buf[_ecount_pos] = _ec;
-    };
 }

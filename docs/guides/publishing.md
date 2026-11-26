@@ -115,9 +115,12 @@ one `workloads:` entry — its modules and wiring written as a node graph's,
 — and writes `graph.flxa` (the subgraph as the kernel
 admits it), `modules/<name>.fmod` for every module it names, and
 `workload-image.json` (name, target, module ABI, ABI-surface digest,
-each module's `name_hash` and SHA-256, and under `env` every param bound to
+each module's `name_hash` and SHA-256, under `env` every param bound to
 the workload's environment with `{env: NAME}` — see
-[A workload's environment](../architecture/scheduler.md#a-workloads-environment)).
+[A workload's environment](../architecture/scheduler.md#a-workloads-environment) —
+and under `endpoints` the workload's `endpoints:`, what it listens on. The
+image grants none of them: whoever creates the workload grants each as a
+`CREATE` `net`/`endpoint` option, or that listen is refused).
 Each module's `step_deadline_us`,
 `step_deadline_burst_us` and `fault_policy` go in its module record, and the
 node admits them within its own ceiling (see
@@ -129,10 +132,11 @@ modules, one each. A module layer's digest is the SHA-256 of its bytes,
 which is exactly the pin the node's kernel admits it by, so a node pins
 what the manifest names. Its config blob
 (`application/vnd.nanocloud.fluxor.workload-image.config.v1+json`) is
-`{"env": [...]}`, the `env` list of `workload-image.json` (`name`,
-`module`, `param`, `required`), so a puller reads the names a workload must be
-given from the manifest and one blob and refuses a workload missing a
-required one
+`{"env": [...], "endpoints": [...]}`, the `env` list of
+`workload-image.json` (`name`, `module`, `param`, `required`) and its
+`endpoints` (`protocol`, `port`; left out when there are none), so a puller
+reads the names a workload must be given and the endpoints to grant it from
+the manifest and one blob and refuses a workload missing a required name
 before it asks a node; `fluxor inspect <ref>` lists them (`--json`:
 `workload.env`, `workload.required_env`). `fluxor store push` serves it onward like any
 other tag.

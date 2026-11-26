@@ -8,11 +8,13 @@ name     = "fluxor"
 version  = "0.0.1"
 # Runtime binaries this project owns. The `fluxor publish` runtime
 # sweep publishes only the binaries named here, plus the CLI itself; a
-# binary synced in from upstream is never swept up by it. A bare name is
+# binary synced in from upstream is never swept up by it. A host provider
+# (`hosts/linux/<provider>/`) is a runtime of its own, synced beside
+# `fluxor-linux`, where `host_lane` finds it. A bare name is
 # built for the host; `<triple>/<name>` for another triple. The browser
 # kernel is pinned like any runtime, so `fluxor sync` gives every
 # consumer the kernel that matches the SDK its modules build against.
-runtimes = ["fluxor-linux", "wasm32-unknown-unknown/fluxor.wasm"]
+runtimes = ["fluxor-linux", "fluxor-provider-hsm", "fluxor-provider-net", "wasm32-unknown-unknown/fluxor.wasm"]
 
 [required]
 # Wire-ABI pin checked by `fluxor ci`'s version-skew phase: it equals
@@ -189,6 +191,14 @@ reason = """The module runtime is the module side of the syscall table — raw \
 pointers in, raw pointers out — so unsafe_code is what it is; and every one of \
 its unsafe fns has the one contract its crate docs state once, so \
 missing_safety_doc is relaxed in favour of that statement."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "hosts/"
+reason = """The host lane and the host providers are the Linux runtime's process \
+boundary: shared-memory rings, descriptor passing and a forked child are \
+system calls with no safe std equivalent, so the lane crate relaxes \
+unsafe_code at its root; a provider is a process whose stderr is the \
+runtime's, so it relaxes print_stderr at its root."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "src/"

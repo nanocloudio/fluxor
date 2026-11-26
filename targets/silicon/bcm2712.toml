@@ -71,8 +71,11 @@ device_ranges = [
 # (`ISOLATED_STACK_BYTES`). The composer refuses an isolated module that
 # declares more.
 isolated_stack_kb = 64
-# Isolated modules at once: the kernel's static page-table slots (`MAX_ISO`).
-isolated_slots = 2
+# Isolated modules at once in the node graph: the isolation-slot pool's
+# default reserve (`isolated_slots`, `kernel::config::profile_bcm2712`), whose
+# slots workloads' gated modules also take theirs from. The kernel sizes the
+# pool at boot from the node graph's isolated modules plus this reserve.
+isolated_slots = 32
 
 # Kernel capacity for BCM2712 lives in `src/kernel/config.rs::profile_bcm2712`,
 # selected by the `chip-bcm2712` feature. build.rs does not emit a
@@ -107,9 +110,7 @@ icache = "core"
 # otherwise answer ENOSYS at run time. `workload`, where present, is what the
 # platform answers a workload's modules; absent, the same as `platform`.
 [providers]
-# `storage.*` is the board's key store (the node's own modules; a workload is
-# refused EACCES), `fs` is a workload's root on the node's volume (the node
-# reaches that volume through its module provider).
-platform = ["metal_device", "net_policy", "net_route", "pcie_device", "platform_nic_ring",
-            "storage.namespace", "storage.object", "workload"]
-workload = ["fs"]
+# A workload reaches none of these; its `fs` is the node graph's workload layer
+# (`owner_fs`).
+platform = ["metal_device", "pcie_device", "platform_nic_ring", "workload"]
+workload = []

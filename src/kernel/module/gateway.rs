@@ -158,7 +158,9 @@ pub fn is_registered(module: usize) -> bool {
     module < MAX_MODULES && GATED_ACTIVE[module].load(Ordering::Acquire)
 }
 
-/// Forget a module: its regions and every handle minted for it.
+/// Forget a module: its regions and every handle minted for it. A handle
+/// the module left open names a route nothing else can close: it is closed
+/// here, so a gated module torn down mid-session leaks no route.
 pub fn release(module: usize) {
     if module >= MAX_MODULES {
         return;
@@ -166,7 +168,9 @@ pub fn release(module: usize) {
     GATED_ACTIVE[module].store(false, Ordering::Release);
     // SAFETY: no longer published; the module is not running.
     unsafe { GATED[module] = Gated::NONE };
-    handles::release_all(module);
+    handles::release_all(module, |h| {
+        let _ = crate::kernel::module::provider::provider_close(h);
+    });
 }
 
 fn gated(module: usize) -> Option<Gated> {
@@ -181,13 +185,34 @@ fn gated(module: usize) -> Option<Gated> {
 
 /// Provider handles minted for gated callers. A gated module may name only a
 /// handle the kernel returned to it; guessing another module's handle number
-/// gets it nothing.
+/// gets it nothing. An entry is keyed by the module and the handle word,
+/// which names one kernel route — its provider instance, slot and generation
+/// — so a handle reissued after its route closed is a different key. The
+/// table is the `handles` pool's size: every entry names a live route.
 mod handles {
     use super::*;
+    use crate::abi::contracts::resource::POOL_HANDLES;
 
-    const SLOTS: usize = 128;
+    const MAX: usize = crate::kernel::config::static_slots(POOL_HANDLES);
     /// `(module + 1) << 32 | handle`; 0 is a free slot.
-    static MINTED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MINTED: crate::kernel::mem::table::Table<AtomicU64, MAX> =
+        crate::boot_table!(MAX, AtomicU64::new(0), POOL_HANDLES);
+
+    fn slots() -> &'static [AtomicU64] {
+        MINTED
+            .size_unplanned(|| crate::kernel::sys::resource_ledger::ceiling(POOL_HANDLES) as usize);
+        &MINTED
+    }
+
+    /// Size the table to `n` entries, all live.
+    ///
+    /// # Safety
+    /// Graph preparation: no gated module is running.
+    pub unsafe fn size(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+        // SAFETY: the caller's contract.
+        unsafe { MINTED.reserve(n)? };
+        MINTED.grow(n)
+    }
 
     fn key(module: usize, handle: i32) -> u64 {
         ((module as u64 + 1) << 32) | u64::from(handle as u32)
@@ -195,7 +220,7 @@ mod handles {
 
     pub fn mint(module: usize, handle: i32) -> bool {
         let k = key(module, handle);
-        for s in MINTED.iter() {
+        for s in slots() {
             if s.compare_exchange(0, k, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
@@ -207,24 +232,54 @@ mod handles {
 
     pub fn owns(module: usize, handle: i32) -> bool {
         let k = key(module, handle);
-        MINTED.iter().any(|s| s.load(Ordering::Acquire) == k)
+        slots().iter().any(|s| s.load(Ordering::Acquire) == k)
     }
 
     pub fn forget(module: usize, handle: i32) {
         let k = key(module, handle);
-        for s in MINTED.iter() {
+        for s in slots() {
             let _ = s.compare_exchange(k, 0, Ordering::AcqRel, Ordering::Relaxed);
         }
     }
 
-    pub fn release_all(module: usize) {
-        for s in MINTED.iter() {
+    /// Every handle minted for `module`, which is going: `(count)` forgotten,
+    /// each closed through `close` first.
+    pub fn release_all(module: usize, close: impl Fn(i32)) -> usize {
+        let mut n = 0;
+        for s in slots() {
             let v = s.load(Ordering::Acquire);
-            if v >> 32 == module as u64 + 1 {
-                let _ = s.compare_exchange(v, 0, Ordering::AcqRel, Ordering::Relaxed);
+            if v >> 32 == module as u64 + 1
+                && s.compare_exchange(v, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                close(v as u32 as i32);
+                n += 1;
             }
         }
+        n
     }
+
+    /// Entries held now.
+    pub fn in_use() -> usize {
+        slots()
+            .iter()
+            .filter(|s| s.load(Ordering::Acquire) != 0)
+            .count()
+    }
+}
+
+/// Size the minted-handle table to the `handles` pool's ceiling.
+///
+/// # Safety
+/// Graph preparation: no gated module is running.
+pub unsafe fn size_handles(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    // SAFETY: the caller's contract.
+    unsafe { handles::size(n) }
+}
+
+/// Handles minted for gated modules now.
+pub fn minted_in_use() -> usize {
+    handles::in_use()
 }
 
 // ── Operation rules ──────────────────────────────────────────────────
@@ -234,7 +289,7 @@ pub use crate::abi::registry::gate::{Bound, Dir, HandleUse, OpRule as Rule, ARG_
 /// The shape of `op`, if the registry declares one. Default deny: an opcode
 /// without a shape is refused with `EACCES`, whatever the caller's grants.
 pub fn rule_for(op: u32) -> Option<Rule> {
-    crate::abi::registry::gate::op_rule(op & !crate::abi::registry::CHAIN_NEXT)
+    crate::abi::registry::gate::op_rule(op)
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -295,7 +350,10 @@ fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> 
         HandleUse::Scoped | HandleUse::ScopedMints => handle == -1 || handles::owns(module, handle),
         HandleUse::Value => true,
         HandleUse::Channel => is_channel(handle),
-        HandleUse::Minted | HandleUse::MintedMints => handles::owns(module, handle),
+        HandleUse::Minted
+        | HandleUse::MintedMints
+        | HandleUse::Accepted
+        | HandleUse::AcceptedMints => handles::owns(module, handle),
     };
     if ok {
         Ok(())
@@ -307,7 +365,10 @@ fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> 
 fn mints(rule: &Rule) -> bool {
     matches!(
         rule.handle,
-        HandleUse::Mints | HandleUse::ScopedMints | HandleUse::MintedMints
+        HandleUse::Mints
+            | HandleUse::ScopedMints
+            | HandleUse::MintedMints
+            | HandleUse::AcceptedMints
     )
 }
 
@@ -550,7 +611,9 @@ fn heap_result(module: usize, p: *mut u8) -> isize {
 
 fn mint_result(module: usize, rc: i32) -> isize {
     if rc >= 0 && !handles::mint(module, rc) {
-        log::warn!("[gate] module {module}: handle table full, handle {rc} not minted");
+        // The caller will never hold it, so nothing else would close it.
+        let _ = crate::kernel::module::provider::provider_close(rc);
+        log::warn!("[gate] module {module}: handle table full, handle {rc} closed unminted");
         return errno::ENOSPC as isize;
     }
     rc as isize

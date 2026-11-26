@@ -36,6 +36,22 @@ pub struct Registry {
     pub msgset: Vec<Msgset>,
     #[serde(default)]
     pub entry_point: Vec<EntryPoint>,
+    /// Kernel pools; a module-served pool is declared under its contract.
+    #[serde(default)]
+    pub pool: Vec<Pool>,
+}
+
+/// An accounted capacity the resource ledger reports.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pool {
+    /// Its name as a capacity envelope (`capacity:`) spells it.
+    pub name: String,
+    pub id: u16,
+    /// Its figures are bytes, and an envelope entry may be in KiB.
+    #[serde(default)]
+    pub arena: bool,
+    pub doc: Option<String>,
 }
 
 /// A function the kernel calls in a module, found by the FNV-1a hash of its
@@ -88,8 +104,8 @@ pub struct Msg {
 pub struct Header {
     pub semantic_epoch: u32,
     pub max_contracts: u16,
-    /// Bit ORed onto an opcode to reach the provider below the caller.
-    pub chain_next: u32,
+    /// First id of the module-served pools; kernel pools are below it.
+    pub module_pool_base: u16,
     /// The handle word's fields, high to low below the clear sign bit:
     /// contract, generation, index. They fill the 31 bits.
     pub handle_contract_bits: u32,
@@ -142,11 +158,22 @@ pub struct Contract {
     /// kernel registers a module for no other contract.
     #[serde(default)]
     pub module_provided: bool,
+    /// A node-owned module may serve it to every workload through a
+    /// workload-scoped layer (`provider_scope = "workloads"`): the kernel
+    /// registers a workload layer of no other contract.
+    #[serde(default)]
+    pub workload_served: bool,
     /// The grant the contract's ops need unless an op says otherwise:
     /// `"none"`, or a `[[grant]]` name. Absent: the contract's own bit.
     pub grant: Option<String>,
     /// `"kernel"`: a gated module may not hold the contract's own bit.
     pub reach: Option<String>,
+    /// Contracts whose handles this contract's ops take in the handle slot
+    /// (an op whose gate handle is `"accepted"` or `"accepted_mints"`): the
+    /// kernel resolves such a handle as its own contract's, for its owner,
+    /// and hands the provider serving both what it calls the handle.
+    #[serde(default)]
+    pub accepts: Vec<String>,
     /// `"class"`: routed to the kernel by its opcode class ahead of any
     /// handle. `"edge"`: served by the module at the other end of a graph
     /// edge, reached only through a handle bound to that edge
@@ -155,6 +182,9 @@ pub struct Contract {
     pub route: Option<String>,
     #[serde(default)]
     pub op: Vec<Op>,
+    /// Pools this contract's module providers serve from their own heap.
+    #[serde(default)]
+    pub pool: Vec<Pool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +257,8 @@ const HANDLES: &[(&str, &str)] = &[
     ("scoped", "Scoped"),
     ("scoped_mints", "ScopedMints"),
     ("minted_mints", "MintedMints"),
+    ("accepted", "Accepted"),
+    ("accepted_mints", "AcceptedMints"),
 ];
 const ARGS: &[(&str, &str)] = &[
     ("none", "None"),
@@ -306,9 +338,7 @@ pub fn validate(r: &Registry) -> Result<()> {
             bad.push(format!("errno `{}` declared twice", e.name));
         }
     }
-    if r.registry.chain_next.count_ones() != 1 || r.registry.chain_next <= 0xFFFF {
-        bad.push("chain_next is one bit above the 16-bit opcode".to_string());
-    }
+    validate_pools(r, &mut bad);
     let mut seen = BTreeSet::new();
     let mut pbits = BTreeSet::new();
     for p in &r.poll {
@@ -368,6 +398,12 @@ pub fn validate(r: &Registry) -> Result<()> {
                 c.name
             ));
         }
+        if c.workload_served && (!c.module_provided || c.route.as_deref() == Some("edge")) {
+            bad.push(format!(
+                "contract `{}`: a workload-served contract is module-provided and not an edge",
+                c.name
+            ));
+        }
         match c.route.as_deref() {
             None | Some("class") => {}
             Some("edge") => {
@@ -382,6 +418,30 @@ pub fn validate(r: &Registry) -> Result<()> {
                 "contract `{}`: route is \"class\", \"edge\" or absent",
                 c.name
             )),
+        }
+        for a in &c.accepts {
+            match r.contract.iter().find(|o| o.name == *a) {
+                None => bad.push(format!(
+                    "contract `{}`: accepts unknown contract `{a}`",
+                    c.name
+                )),
+                Some(o) if o.name == c.name || o.route.is_some() => bad.push(format!(
+                    "contract `{}`: accepts `{a}`, which is itself or not routed by its handle",
+                    c.name
+                )),
+                Some(_) => {}
+            }
+        }
+        let takes_accepted = c.op.iter().any(|o| {
+            o.gate
+                .as_ref()
+                .is_some_and(|g| g.handle.starts_with("accepted"))
+        });
+        if takes_accepted == c.accepts.is_empty() {
+            bad.push(format!(
+                "contract `{}`: an op takes an accepted handle exactly when the contract accepts one",
+                c.name
+            ));
         }
         let mut op_names = BTreeSet::new();
         for op in &c.op {
@@ -575,6 +635,160 @@ pub fn validate(r: &Registry) -> Result<()> {
     }
 }
 
+/// Pool ids are dense in two ranges: kernel pools `1..`, below
+/// `module_pool_base`, and module-served pools from it, each under a contract
+/// a module may provide. Names are unique across both.
+fn validate_pools(r: &Registry, bad: &mut Vec<String>) {
+    let base = r.registry.module_pool_base;
+    let mut names = BTreeSet::new();
+    let mut kernel: Vec<u16> = Vec::new();
+    for p in &r.pool {
+        if !names.insert(p.name.as_str()) {
+            bad.push(format!("pool `{}` declared twice", p.name));
+        }
+        if p.id == 0 || p.id >= base {
+            bad.push(format!(
+                "pool `{}`: a kernel pool's id is in 1..{base:#06x}",
+                p.name
+            ));
+        }
+        kernel.push(p.id);
+    }
+    let mut module: Vec<u16> = Vec::new();
+    for c in &r.contract {
+        for p in &c.pool {
+            if !names.insert(p.name.as_str()) {
+                bad.push(format!("pool `{}` declared twice", p.name));
+            }
+            if !c.module_provided {
+                bad.push(format!(
+                    "pool `{}`: contract `{}` is not module-provided",
+                    p.name, c.name
+                ));
+            }
+            if p.id < base {
+                bad.push(format!(
+                    "pool `{}`: a module-served pool's id is {base:#06x} or above",
+                    p.name
+                ));
+            }
+            module.push(p.id);
+        }
+    }
+    kernel.sort_unstable();
+    module.sort_unstable();
+    let dense = |ids: &[u16], first: u16| {
+        ids.iter()
+            .enumerate()
+            .all(|(i, &id)| usize::from(id) == usize::from(first) + i)
+    };
+    if !dense(&kernel, 1) {
+        bad.push("kernel pool ids are not dense from 1".to_string());
+    }
+    if !dense(&module, base) {
+        bad.push(format!("module pool ids are not dense from {base:#06x}"));
+    }
+}
+
+/// The `pool` module: every pool id, the two ranges, and the lookups the
+/// ledger and the composer share.
+fn emit_pools(w: &mut String, r: &Registry) {
+    let mut all: Vec<(&Pool, Option<&Contract>)> = r.pool.iter().map(|p| (p, None)).collect();
+    for c in &r.contract {
+        all.extend(c.pool.iter().map(|p| (p, Some(c))));
+    }
+    all.sort_by_key(|(p, _)| p.id);
+    let module_count = all.iter().filter(|(_, c)| c.is_some()).count();
+    let _ = writeln!(
+        w,
+        "/// Accounted pools: kernel pools `1..=KERNEL_COUNT`, module-served pools\n\
+         /// `MODULE_BASE..MODULE_BASE + MODULE_COUNT`, each dense.\n\
+         pub mod pool {{"
+    );
+    for (p, c) in &all {
+        if let Some(d) = &p.doc {
+            let _ = writeln!(w, "    /// {d}");
+        }
+        if let Some(c) = c {
+            let _ = writeln!(w, "    ///\n    /// Served by `{}` providers.", c.name);
+        }
+        let _ = writeln!(w, "    pub const {}: u16 = {:#06x};", shout(&p.name), p.id);
+    }
+    let _ = writeln!(
+        w,
+        "\n    /// Kernel pools: ids `1..=KERNEL_COUNT`.\n\
+         \x20   pub const KERNEL_COUNT: usize = {};\n\
+         \x20   /// First module-served pool id.\n\
+         \x20   pub const MODULE_BASE: u16 = {:#06x};\n\
+         \x20   /// Module-served pools: ids `MODULE_BASE..MODULE_BASE + MODULE_COUNT`.\n\
+         \x20   pub const MODULE_COUNT: usize = {module_count};\n",
+        r.pool.len(),
+        r.registry.module_pool_base
+    );
+    let _ = writeln!(
+        w,
+        "    /// Whether a pool's figures are bytes (an envelope entry may be in KiB).\n\
+         \x20   pub const fn is_arena(id: u16) -> bool {{\n        matches!(id, {})\n    }}\n",
+        {
+            let a: Vec<String> = all
+                .iter()
+                .filter(|(p, _)| p.arena)
+                .map(|(p, _)| shout(&p.name))
+                .collect();
+            if a.is_empty() {
+                "0".to_string()
+            } else {
+                a.join(" | ")
+            }
+        }
+    );
+    let _ = writeln!(
+        w,
+        "    /// The contract whose module providers serve `id`; `None` for a kernel\n\
+         \x20   /// pool or an unknown id.\n\
+         \x20   pub const fn served_by(id: u16) -> Option<u16> {{\n        match id {{"
+    );
+    for (p, c) in &all {
+        if let Some(c) = c {
+            let _ = writeln!(
+                w,
+                "            {} => Some(super::{}::ID),",
+                shout(&p.name),
+                c.module()
+            );
+        }
+    }
+    let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
+    let _ = writeln!(
+        w,
+        "    /// A pool's name as a capacity envelope spells it.\n\
+         \x20   pub const fn name(id: u16) -> Option<&'static str> {{\n        match id {{"
+    );
+    for (p, _) in &all {
+        let _ = writeln!(w, "            {} => Some(\"{}\"),", shout(&p.name), p.name);
+    }
+    let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
+    let _ = writeln!(
+        w,
+        "    /// The pool a capacity envelope's name spells.\n\
+         \x20   pub fn of_name(name: &str) -> Option<u16> {{\n        match name {{"
+    );
+    for (p, _) in &all {
+        let _ = writeln!(w, "            \"{}\" => Some({}),", p.name, shout(&p.name));
+    }
+    let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
+    let _ = writeln!(
+        w,
+        "    /// Every pool id, kernel pools first, ascending.\n\
+         \x20   pub const ALL: [u16; {}] = [{}];\n}}\n",
+        all.len(),
+        all.iter()
+            .map(|(p, _)| shout(&p.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
 /// The generated file for a valid registry.
 pub fn emit(r: &Registry) -> String {
     let mut o = String::new();
@@ -600,17 +814,13 @@ pub fn emit(r: &Registry) -> String {
          pub const MAX_CONTRACTS: usize = {};",
         r.registry.max_contracts
     );
-    let _ = writeln!(
-        w,
-        "/// ORed onto an opcode: dispatch to the provider below the caller.\n\
-         pub const CHAIN_NEXT: u32 = {:#x};",
-        r.registry.chain_next
-    );
     let assigned = r.contract.len();
     let _ = writeln!(
         w,
         "/// Contract ids the registry assigns.\npub const CONTRACTS_ASSIGNED: usize = {assigned};\n"
     );
+
+    emit_pools(w, r);
 
     // Grants.
     let _ = writeln!(
@@ -776,6 +986,26 @@ pub fn emit(r: &Registry) -> String {
             providable.join(" | ")
         }
     );
+    let _ = writeln!(
+        w,
+        "/// Whether a node-owned module may serve the contract to every workload\n\
+         /// through a workload-scoped layer; the kernel registers one of no other.\n\
+         pub fn workload_servable(id: u16) -> bool {{\n    matches!(\n        id,"
+    );
+    let served: Vec<String> = by_id
+        .iter()
+        .filter(|c| c.workload_served)
+        .map(|c| format!("{:#06x}", c.id))
+        .collect();
+    let _ = writeln!(
+        w,
+        "        {}\n    )\n}}\n",
+        if served.is_empty() {
+            "_ if false".to_string()
+        } else {
+            served.join(" | ")
+        }
+    );
     let manifest: Vec<&Contract> = r.contract.iter().filter(|c| c.manifest).collect();
     let _ = writeln!(
         w,
@@ -840,6 +1070,31 @@ pub fn emit(r: &Registry) -> String {
             "_ if false".to_string()
         } else {
             edge.join(" | ")
+        }
+    );
+
+    let accepted: Vec<String> = r
+        .contract
+        .iter()
+        .flat_map(|c| {
+            c.accepts.iter().filter_map(move |a| {
+                r.contract
+                    .iter()
+                    .find(|o| o.name == *a)
+                    .map(|o| format!("({:#06x}, {:#06x})", c.id, o.id))
+            })
+        })
+        .collect();
+    let _ = writeln!(
+        w,
+        "/// Whether an op of contract `class` takes a handle of contract `of`\n\
+         /// in its handle slot (`accepts`): the kernel resolves it as a handle\n\
+         /// of `of`, for its owner, and hands the provider what it calls it.\n\
+         pub fn handle_accepted(class: u16, of: u16) -> bool {{\n    matches!((class, of), {})\n}}\n",
+        if accepted.is_empty() {
+            "_ if false".to_string()
+        } else {
+            accepted.join(" | ")
         }
     );
 
@@ -1154,6 +1409,62 @@ mod tests {
     #[test]
     fn the_registry_is_valid() {
         validate(&parse(&registry()).unwrap()).unwrap();
+    }
+
+    /// A contract takes another's handle in its handle slot only through a
+    /// declared `accepts`, of a contract routed by its handles, and declares
+    /// one only with an op that takes it; the relation reaches the kernel.
+    #[test]
+    fn an_accepted_handle_is_declared_on_both_sides() {
+        let text = registry();
+        let r = parse(&text).unwrap();
+        let hp = r
+            .contract
+            .iter()
+            .find(|c| c.name == "host_process")
+            .unwrap();
+        let wl = r.contract.iter().find(|c| c.name == "workload").unwrap();
+        let out = emit(&r);
+        assert!(
+            out.contains(&format!(
+                "matches!((class, of), ({:#06x}, {:#06x}))",
+                hp.id, wl.id
+            )),
+            "host_process accepts workload handles"
+        );
+        for (from, to, why) in [
+            (
+                "accepts = [\"workload\"]\n",
+                "",
+                "an accepted op with no accepts",
+            ),
+            (
+                "accepts = [\"workload\"]\n",
+                "accepts = [\"nope\"]\n",
+                "an unknown contract",
+            ),
+            (
+                "accepts = [\"workload\"]\n",
+                "accepts = [\"host_process\"]\n",
+                "itself",
+            ),
+            (
+                "accepts = [\"workload\"]\n",
+                "accepts = [\"counters\"]\n",
+                "a class-routed contract",
+            ),
+        ] {
+            let bad = text.replacen(from, to, 1);
+            assert_ne!(bad, text);
+            assert!(validate(&parse(&bad).unwrap()).is_err(), "{why} is refused");
+        }
+        let unused = text
+            .replace("handle = \"accepted_mints\"", "handle = \"mints\"")
+            .replace("handle = \"accepted\"", "handle = \"global\"");
+        assert!(
+            validate(&parse(&unused).unwrap()).is_err(),
+            "an accepts no op takes is refused"
+        );
     }
 
     /// A surface that declares ranges holds every value inside them, fills

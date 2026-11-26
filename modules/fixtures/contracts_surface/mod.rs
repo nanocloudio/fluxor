@@ -126,11 +126,12 @@ fn params(acc: &mut u32, b: &[u8], out: &mut [u8]) {
 fn graphs(acc: &mut u32, b: &[u8], out: &mut [u8]) {
     fold(acc, u64::from(graph::name_hash(b)));
     some(acc, graph::FaultPolicy::from_u8(byte(b, 0)));
-    let end = graph::Endpoint::from_wire(byte(b, 1), word(b, 2) as u16);
+    let end = graph::Endpoint::from_wire(byte(b, 1), word(b, 2) as u16, word(b, 4) as u32);
     if let Some(e) = end {
         let (k, i) = e.to_wire();
         fold(acc, u64::from(k) + u64::from(i));
         some(acc, e.new_index());
+        some(acc, e.lane_target());
     }
     ok(acc, graph::header(b));
     if let Ok(g) = graph::decode(b) {
@@ -179,17 +180,17 @@ fn graphs(acc: &mut u32, b: &[u8], out: &mut [u8]) {
 }
 
 fn plans(acc: &mut u32, b: &[u8]) {
-    let frame = plan::port_frame(byte(b, 0), byte(b, 1));
+    let mailbox = plan::port_mailbox(byte(b, 0), byte(b, 1));
     fold(
         acc,
-        plan::fan_params(frame, word(b, 2) as u16, word(b, 4) as u32).len() as u64,
+        plan::fan_params(word(b, 2) as u16, word(b, 4) as u32).len() as u64,
     );
     let ports = [plan::PlanPort {
         direction: byte(b, 8) & 1,
         index: byte(b, 9) & 15,
         buffer_size: word(b, 10) as u32,
         max_record: word(b, 14) as u32,
-        frame,
+        mailbox,
     }];
     let module = plan::PlanModule {
         ports: &ports,
@@ -217,9 +218,9 @@ fn plans(acc: &mut u32, b: &[u8]) {
     let groups = usize::from(byte(b, 25));
     let mut fans = [plan::Fan {
         dir: plan::FanDir::Out,
-        of: 0,
+        of: graph::Endpoint::New(0),
         port: 0,
-        kind: frame,
+        mailbox,
         domain: 0,
     }; 2];
     if let Ok(counts) = plan::fan_pass(&modules, &mut edges, 2, &mut fans, groups) {
@@ -358,7 +359,7 @@ fn owners(acc: &mut u32, b: &[u8]) {
     if let Ok(p) = owner_plan::decode(b, usize::from(byte(b, 0)), sha) {
         fold(acc, p.assignments().len() as u64);
         fold(acc, p.revocations().len() as u64);
-        fold(acc, p.leases().len() as u64);
+        fold(acc, p.grants().count() as u64);
     }
 }
 
@@ -369,6 +370,24 @@ fn telemetry(acc: &mut u32, b: &[u8]) {
         c::observability::Severity::Debug
     };
     fold(acc, u64::from(black_box(severity).number()));
+}
+
+fn tables(acc: &mut u32, b: &[u8]) {
+    use c::channel_table::{self, Entry};
+    let mut entries = [Entry::EMPTY; 4];
+    let text = b.get(..usize::from(byte(b, 0) & 127)).unwrap_or(&[]);
+    match channel_table::parse_into(text, word(b, 8) as u32, &mut entries) {
+        Ok(n) => {
+            for e in entries.iter().take(n) {
+                fold(acc, e.content_type().len() as u64 + e.header_len() as u64);
+                fold(acc, e.record_len(b));
+            }
+        }
+        Err(e) => fold(acc, e as u64),
+    }
+    some(acc, channel_table::parse_len_framing(text));
+    some(acc, Entry::mailbox(text, word(b, 16) as u32));
+    fold(acc, u64::from(channel_table::content_type_ok(text)));
 }
 
 fn probe(s: &mut State) {
@@ -385,6 +404,7 @@ fn probe(s: &mut State) {
     configs(&mut acc, input);
     owners(&mut acc, input);
     telemetry(&mut acc, input);
+    tables(&mut acc, input);
     s.acc = black_box(acc);
 }
 

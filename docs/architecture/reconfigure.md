@@ -99,16 +99,20 @@ to call and is refused. A module that does not say so is never notified, so a
 provider holding nothing per consumer pays nothing.
 
 The kernel then calls `module_provider_dispatch` with opcode `OWNER_RELEASED`
-(`0x2022`) and an 8-byte argument:
+(`0x2022`) and a 24-byte argument:
 
 ```
-[slot: u16 LE][reserved: u16 = 0][generation: u32 LE]
+[slot: u16 LE][reserved: u16 = 0][generation: u32 LE][uid: 16]
 ```
 
-Those are the same bytes `query_key::CALLER_OWNER` answers, so a provider
+The first 8 bytes are those `query_key::CALLER_OWNER` answers, so a provider
 compares an owner it stamped against the one being released without
 reformatting either. Compare BOTH fields: slots are reused, and matching on the
-slot alone closes the live resources of whoever replaced the dead owner.
+slot alone closes the live resources of whoever replaced the dead owner. The
+uid is the owner's durable identity (`query_key::CALLER_OWNER_UID`), so a
+provider can remove what the owner left on media without having seen it this
+boot (`owner_fs` removes its root by it); it is zero for an owner acting with
+the node's authority, which holds nothing on media as itself.
 
 The notification runs before any teardown, on the scheduler thread, inside a
 provider frame — the owner handle still resolves, the provider's state is still
@@ -121,25 +125,21 @@ Each subscriber is called once per released owner, whatever number of contracts
 it serves. The return value is ignored: a provider with nothing to release may
 answer `-ENOSYS`.
 
-After the subscribers, the platform's own hook runs with the same handle. On
-Linux it closes every file the owner holds open, drops its store with the
-reads, writes and watches on it, and removes its storage root. On bcm2712
-it closes the handles the owner holds through its root and queues the root
-for removal. The kernel keeps no table of storage handles: each platform
-provider records which owner opened each handle and refuses it to any other,
-so the hook alone is enough for nothing a workload opened to outlive it.
-
-An owner acting with the node's authority (below) has no root, and the hook
-removes nothing from the node's storage for it. It closes what the owner
-opened: on Linux its host files, host processes, host namespace and HTTP
-object handles, and its handles on the node's store; on bcm2712 its handles
-on the node's store.
+After the module subscribers, every platform provider registered to observe
+releases (`provider::observe_owner_release`) is called through its dispatch
+with the same opcode and record. On Linux that is the `workload` provider: it
+closes the owner's network endpoints, its host-process workloads and the
+terminals opened into them, and the host files and processes an owner acting
+with the node's authority opened. The kernel keeps no table of storage
+handles: each provider records which owner opened each handle and refuses it
+to any other, so the notification alone is enough for nothing a workload
+opened to outlive it.
 
 ## Reporting a Pool the Provider Serves
 
-A pool can be served by a module provider instead of a kernel table — the
-store's subscriptions (`POOL_STORE_SUBS`) when a module provides
-`storage.namespace` (`resource::module_provided_pool_contract`). The resource
+A pool can be served by module providers instead of a kernel table — the
+store's subscriptions (`POOL_STORE_SUBS`), served by each `store` module
+providing `storage.namespace` (`resource::module_provided_pool_contract`). The resource
 ledger keeps no counters; it samples each pool from its owner, so for such a
 pool it asks the provider. Opt in with a second manifest fact:
 
@@ -151,21 +151,23 @@ samples_pool = true
 
 As with the owner-release fact, the loader acts on it after provider
 registration succeeds, refuses it from a module that registers no contract,
-and drops it with the module's provider layers. The node's server of the pool
-is the node owner's top-most unkeyed layer of its contract.
+and drops it with the module's provider layers. The node's servers of the pool
+are the node owner's layers of its contract, keyed or not: a node may compose
+several stores.
 
-In each PSTATUS round (`resource_ledger::emit_all`) the kernel calls that
-provider's `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x1125`),
+In each PSTATUS round (`resource_ledger::emit_all`) the kernel calls each such
+provider that samples the pool through its `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x1125`),
 `handle = -1`, `arg = [pool: u16 LE]`. Answer the pool's in-use figure in its
-own unit (`>= 0`), or a negative errno when you cannot say (the pool then reads
-from its kernel table until a later answer). The handler runs on
+own unit (`>= 0`), or a negative errno when you cannot say. The pool reads the
+sum of the answers; with none, it reads from its kernel table until a later
+round. The handler runs on
 the scheduler thread in a provider frame and must be bounded — answer a count
 you keep. The ledger keeps the answer until the next round, so a refusal or a
 stats read between rounds never calls back into the provider.
 
 Count each refusal of the pool (a request answered `ENOMEM` for want of
 capacity) with `provider_call(-1, resource::LEDGER_DENY, [pool: u16 LE])`
-(`0x1124`). The kernel admits it only from the pool's current server
+(`0x1124`). The kernel admits it only from one of the pool's servers
 (`EACCES` from anyone else, `EINVAL` for a pool no module provides); it counts
 the denial and pushes the pool's `POOL` record like one of its own.
 

@@ -87,6 +87,9 @@ struct PosterState {
     /// The meta every request carries, `meta_len` bytes (param 3).
     meta: [u8; MAX_META],
     meta_len: u16,
+    /// A `path` or `content_type` longer than its field holds: the instance
+    /// refuses to construct rather than send a clipped one.
+    oversize: bool,
 
     /// Counter the exchange in flight was named from; `0` = idle.
     corr: u64,
@@ -122,6 +125,7 @@ impl PosterState {
         self.publish = 0;
         self.meta = [0; MAX_META];
         self.meta_len = 0;
+        self.oversize = false;
         self.corr = 0;
         self.next_corr = 1;
         self.aborts = [0; 2];
@@ -147,8 +151,12 @@ mod params_def {
 
     fluxor_rt::define_params! {
         PosterState;
-        1, path, str, 0 => |s, d, len| {
-            let n = len.min(MAX_PATH);
+        1, path, str, 0, max MAX_PATH => |s, d, len| {
+            if len > MAX_PATH {
+                s.oversize = true;
+                return;
+            }
+            let n = len;
             let mut i = 0usize;
             while i < n {
                 s.path[i] = *d.add(i);
@@ -159,8 +167,12 @@ mod params_def {
             }
         };
         2, method, u8, 3 => |s, d, len| { s.method = p_u8(d, len, 0, 3); };
-        3, content_type, str, 0 => |s, d, len| {
-            let n = len.min(MAX_CONTENT_TYPE);
+        3, content_type, str, 0, max MAX_CONTENT_TYPE => |s, d, len| {
+            if len > MAX_CONTENT_TYPE {
+                s.oversize = true;
+                return;
+            }
+            let n = len;
             if n > 0 {
                 let mut w = ex::MetaWriter::new(&mut s.meta);
                 w.put(ex::META_CONTENT_TYPE, core::slice::from_raw_parts(d, n));
@@ -423,6 +435,11 @@ pub unsafe extern "C" fn module_new(
             params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
+        }
+        if s.oversize {
+            let why = b"[exchange_poster] refusing to construct: `path` or `content_type` is longer than its field";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -22;
         }
         0
     }

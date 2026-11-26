@@ -205,34 +205,7 @@ fn csprng_fill(buf: &mut [u8]) -> i32 {
     0
 }
 
-fn net_policy_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: fluxor::kernel::module::user_span::UserSpan<'_>,
-) -> i32 {
-    use fluxor::abi::contracts::net::policy::caps;
-    let mut c = caps::FILTER | caps::EGRESS | caps::DNAT_LOCAL;
-    // SAFETY: provider dispatch runs on the scheduler thread.
-    if unsafe { fluxor::kernel::net_policy::enforcer_attached() } {
-        c |= caps::ENFORCED;
-    }
-    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, data)
-}
-
-fn net_route_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: fluxor::kernel::module::user_span::UserSpan<'_>,
-) -> i32 {
-    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, data)
-}
-
 fn init_providers() {
-    use fluxor::kernel::module::provider::{self, contract};
-    provider::register(contract::NET_POLICY, net_policy_dispatch);
-    provider::register(contract::NET_ROUTE, net_route_dispatch);
     fluxor::kernel::module::syscalls::register_system_extension(super::devices::dispatch);
     fluxor::kernel::module::provider::register_platform_handle_slots(super::devices::handle_slots);
 }
@@ -246,14 +219,8 @@ pub static HAL_OPS: HalOps = HalOps {
     now_unix_millis: || fluxor::kernel::sys::time_sync::unix_millis(now_micros()),
     clock_sync_status: || fluxor::kernel::sys::time_sync::status(now_micros()),
     seal_provenance: || hal::SealProvenance::None,
+    seal_key: || None,
     signing_root: fluxor::kernel::security::root::image_root,
-    seal: |_, _, _| None,
-    unseal: |_, _, _| None,
-    seal_blob_write: |_, _| false,
-    seal_blob_store: || false,
-    seal_blob_delete: |_| true,
-    seal_blob_read: |_, _| None,
-    seal_blob_ready: || true,
     tick_count: || now_millis() as u32,
     flash_base: || 0,
     flash_end: || 0,

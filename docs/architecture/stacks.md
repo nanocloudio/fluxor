@@ -198,8 +198,9 @@ so a list mixes no directions.
 
 Privacy holds against platform stacks too. A member of an included stack
 never satisfies a platform stack's module of the same type, so a stack
-carrying its own `linux_net` leaves `platform: { net: {} }` adding the one
-the graph wires as `linux_net.*`. A module the graph declares itself does
+carrying its own `linux_pointer` leaves `platform: { pointer: {} }` adding
+the one the graph names as `pointer`. (`linux_net` is one per graph: it
+serves the node's `net_route` and `net_policy`, so a second is refused.) A module the graph declares itself does
 satisfy it, and the platform's is then skipped. A platform module whose name
 an included member already has is refused, which `as:` resolves.
 

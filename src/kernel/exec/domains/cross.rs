@@ -560,13 +560,15 @@ pub fn bridge_edges() -> Result<usize, &'static str> {
     let sched = unsafe { scheduler::sched_mut() };
     let n_compiled_edges = sched.edge_count;
     // Size the ring and edge tables for this graph's cross-domain edges
-    // before any is registered.
+    // before any is registered. A lane's channels are the ones its target
+    // takes (`LANE_TAKE`): a lane edge is never split.
     let crosses = |edge: &scheduler::Edge| {
-        edge.edge_class == EdgeClass::CrossCore
-            || super::crosses_cores(
-                scheduler::module_domain_id(edge.from_module) as usize,
-                scheduler::module_domain_id(edge.to_module) as usize,
-            )
+        edge.lane == scheduler::LaneEnd::None
+            && (edge.edge_class == EdgeClass::CrossCore
+                || super::crosses_cores(
+                    scheduler::module_domain_id(edge.from_module) as usize,
+                    scheduler::module_domain_id(edge.to_module) as usize,
+                ))
     };
     let crossing = (0..n_compiled_edges)
         .filter(|&e| sched.edges[e].channel >= 0 && crosses(&sched.edges[e]))

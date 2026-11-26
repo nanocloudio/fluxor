@@ -1,0 +1,26 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# A read-only `storage.object` over `fs`: an object is a file beneath the
+# `root` param, its key the file's path relative to `root`, as
+# `fs_namespace` keys its entries -- so a graph composes the two side by
+# side and opens through one what it LISTs through the other. HEAD, GET,
+# RANGE_GET and CLOSE are served; PUT and DELETE are refused EACCES, and
+# CAPS says neither write nor listing.
+provides = ["storage.object"]
+provider_contracts = ["storage.object"]
+
+# No tick-based timekeeping: a pure provider_call surface.
+timer_class = "agnostic"
+# A metal node runs it privileged inside a workload that composes it from the
+# node's image: it holds no grant and touches no device.
+workload_instantiable = true
+
+observes_owner_release = true
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
+[observability]
+exempt = "a read-only view over `fs`: what it answers is the file system's, which reports for itself"

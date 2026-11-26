@@ -33,9 +33,6 @@ pub use abi::registry::errno::ENOSYS as E_NOSYS;
 /// NET_CMD_CONNECT_TO; datagram traffic uses the datagram surface.
 pub const SOCK_TYPE_STREAM: u8 = 1;
 
-/// Flag ORed onto opcode to dispatch to the next provider below the caller.
-pub use abi::registry::CHAIN_NEXT;
-
 // ============================================================================
 // Network Interface State (emitted as MSG_NETIF_STATE payload byte on the
 // driver's dedicated state output port; consumer modules read from the

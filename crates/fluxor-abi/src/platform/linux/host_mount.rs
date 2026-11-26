@@ -41,7 +41,7 @@
 // The writes need the `host_mount.mount` grant; CAPS and ROOT the contract
 // alone. Making a
 // filesystem and checking one are userland tools; run them through the
-// process executor (`host_process::PROC_CLASS`).
+// node's command runner (`host_process::PROC_SPAWN`).
 
 /// Provider contract class for host mounts.
 pub const CLASS: u16 = super::super::super::registry::host_mount::ID;

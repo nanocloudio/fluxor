@@ -382,7 +382,7 @@ pub mod store {
         }
 
         // Data store — the sectors below it (`flash_rp`'s `store` output,
-        // where a `vault_store` keeps the key vault's image slots).
+        // where a `key_vault` keeps its two record-image slots).
         if offset >= LAYOUT.data_store && end <= LAYOUT.data_store + flash_layout::DATA_STORE_SIZE {
             return true;
         }

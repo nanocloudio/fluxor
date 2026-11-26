@@ -5,5 +5,6 @@ pub mod carve;
 pub mod elastic;
 pub mod handles;
 pub mod heap;
+pub mod page_map;
 pub mod pool_plan;
 pub mod table;

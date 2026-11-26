@@ -106,10 +106,11 @@ sha256("fluxor.agent.activation\0" || owner_uid || workload_digest
        || applied_plan_digest || slot:u16 LE || owner_generation:u32 LE)
 ```
 
-`applied_plan_digest` is not the agent's belief. The runtime reports, in
-`owner_status.json`, the sha256 over the body of the plan it decoded and applied
-(`plan_digest`). The digest is non-zero only when all of these hold: the status
-file's writer is the same live process that wrote it; it reports the committed
+`applied_plan_digest` is not the agent's belief. The runtime reports, in its
+owner facts file ([owner facts](owner_facts.md)), the sha256 over the body of the
+plan the kernel decoded and applied (`plan_digest`). The digest is non-zero only
+when all of these hold: the facts file's writer is the same live process that
+wrote it; it reports the committed
 generation; its `plan_digest` equals the committed plan's; the owner it reports
 under the committed owner uid, slot and owner generation has every planned
 module loaded and none terminated (`RUNNING` or `UNREADY`). A commit the runtime
@@ -197,7 +198,7 @@ The runtime carrying the transport is not the runtime carrying the workloads. A
 structural plan rebuilds a runtime's graph, sockets included, so a transport under
 `FLUXOR_PLAN` would lose its session to the commit it was asked for. `serve` runs
 its runtime with no plan. The workload runtime is started separately on the
-publish path, and it writes the `owner_status.json` beside that path which `OBSERVE`
+publish path, and it writes the owner facts beside that path which `OBSERVE`
 reads.
 
 A call's runtime holds one session, for that call, and is stopped with it. Records

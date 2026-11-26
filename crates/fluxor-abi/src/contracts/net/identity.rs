@@ -2,30 +2,22 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// The control-plane contract by which a **workload backend** installs and
-// removes a workload's network identity (a secondary local address) on the
-// node's shared **net-identity provider** — the foundation module that owns the
-// node's IP stack. The provider exposes a dedicated single-writer control input
-// port (`addr_ctl`); the backend is its sole writer. On a `net=own` workload
-// CREATE the backend writes one `ADDR_ADD`; on DESTROY / KILL it writes the
-// matching `ADDR_DEL`.
+// The control-plane contract by which a workload's network identity (a
+// secondary local address) and its name-service context are installed on the
+// node's **net-identity provider** — the module that owns the node's IP stack
+// (`ip` on bare metal, the host net provider on Linux). The provider exposes a
+// single-writer control input port (`addr_ctl`) and an event output
+// (`addr_evt`); both are ordinary wired edges. On a node that admits
+// workloads the writer is the **workload creator** (the node agent): after
+// `CREATE` it writes the workload's `ADDR_ADD` (and `OWNER_RESOLVER`), waits
+// for `MSG_ADDR_ADDED` before `START`, and writes `ADDR_DEL` when it destroys
+// the workload. A coordinator that moves service addresses (a VIP
+// controller) is the writer on a node with no workload creator.
 //
-// This contract is the one source of truth for that exchange: the provider
-// module (`ip`) and the kernel workload backend both reference the constants
-// here, so the kernel moves contract-defined bytes to a provider it resolves
-// by role, and never embeds any one provider module's private protocol.
-//
-// ─── Provider discovery (self-registration) ─────────────────────────
-//
-// The provider SELF-REGISTERS at init via the `NET_IDENT_PROVIDER` syscall
-// (`kernel_abi::NET_IDENT_PROVIDER`), declaring its own `addr_ctl`
-// input-port index. The kernel therefore never knows the
-// provider's name or fixes its topology — any node-graph (node-owned)
-// module implementing this contract's `addr_ctl` receiver may register;
-// first-wins, workload modules are refused. A node where nothing registers
-// simply has no net-identity provider, and a `net=own` CREATE there fails
-// cleanly (`ENODEV`) rather than silently. This file carries only the
-// PROTOCOL: framing, opcodes, payload layout.
+// An `ADDR_ADD` of an address the same owner already holds is answered
+// `MSG_ADDR_ADDED` again (a writer re-issuing after its own restart); one that
+// would move an address another owner holds is refused, unless the writer
+// names the node (owner tag 0).
 //
 // ─── Framing ────────────────────────────────────────────────────────
 //
@@ -33,7 +25,7 @@
 // net_proto / datagram / packet / session_ctrl, so the shared SDK framing
 // helpers (`net_read_frame` / `net_write_frame`) work unchanged.
 //
-// These opcodes ride a dedicated single-writer control port (`addr_ctl`), and
+// These opcodes ride a single-writer control port (`addr_ctl`), and
 // the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
 // message type of every surface sharing this header a distinct value,
 // so a mis-wire cannot misparse.
@@ -41,14 +33,27 @@
 /// Frame header size (`msg_type` + `len`), identical to the other net contracts.
 pub const FRAME_HDR: usize = 3;
 
-// ─── Opcodes (backend → provider, over `addr_ctl`) ──────────────────
+// ─── Opcodes (writer → provider, over `addr_ctl`) ───────────────────
 
 /// Install a workload's secondary local address.
-/// Payload: `[addr: 16][prefix_len: 1][owner_tag: 2 LE]`
+/// Payload: `[addr: 16][prefix_len: 1][owner_tag: 2 LE]`, then optionally
+/// `[flags: u8]` ([`install`]) and, after the flags, `[segment: u16 LE]`
 /// (`addr` is a 16-byte address slot, IPv4 in bytes 0..4 in network order — the
 /// provider's `LocalAddr` layout, so it copies in with no re-order; `owner_tag`
-/// is the workload's owner slot). The address is live before the workload runs.
+/// is the workload's owner slot; `segment` ≥ 1 names the `net.route` segment
+/// the address joins, which must exist and hold it — otherwise the install is
+/// refused `refusal::SEGMENT` — and 0 or absent joins none).
 pub use super::super::super::registry::msg::identity::ADDR_ADD;
+
+/// A workload owner's name-service context: the resolver its lanes' name
+/// queries go to, and its search list. Payload:
+/// `[owner_slot: u16 LE][owner_gen: u32 LE][family: u8][server: 16]
+/// [n_search: u8]([len: u8][name])×n_search`. `family` 0 clears the
+/// owner's context (its queries go to the node's own upstream). Not
+/// answered; the provider keeps it until the owner's lanes detach. A writer
+/// sends it before `START`, with the `ADDR_ADD`, and again after its own
+/// restart (the same context again changes nothing).
+pub use super::super::super::registry::msg::identity::OWNER_RESOLVER;
 
 /// Remove a workload's secondary local address.
 /// Payload: `[addr: 16]`.
@@ -154,7 +159,7 @@ pub mod install {
     pub const FAMILY6: u8 = 0x02;
 }
 
-// ─── Events (provider → backend, over `addr_evt`) ───────────────────
+// ─── Events (provider → writer, over `addr_evt`) ───────────────────
 
 /// An address was installed and its token minted.
 /// Payload: `[addr: 16][token: 16][generation: u32 LE]`.
@@ -246,6 +251,11 @@ pub mod refusal {
     /// Not an address the provider can install: multicast, unspecified or
     /// loopback, or IPv6 on a provider built without IPv6.
     pub const NOT_UNICAST: u8 = 9;
+    /// The segment the install names does not exist, does not hold the
+    /// address, or the address is its gateway.
+    pub const SEGMENT: u8 = 10;
+    /// The address is held by another owner.
+    pub const OWNER: u8 = 11;
 }
 
 // ─── The VIP authority's token ──────────────────────────────────────
@@ -280,6 +290,9 @@ pub const ARM_AUTH_VERDICT_LEN: usize = 16 + 4 + 32 + 1;
 /// Byte length of an `ADDR_ADD` payload: `[addr:16][prefix_len:1][owner_tag:2]`.
 pub const ADDR_ADD_PAYLOAD_LEN: usize = 19;
 
+/// The longest `ADDR_ADD` payload: the flags byte and the segment after it.
+pub const ADDR_ADD_PAYLOAD_MAX: usize = ADDR_ADD_PAYLOAD_LEN + 1 + 2;
+
 /// Byte length of an `ADDR_DEL` payload: `[addr:16]`.
 pub const ADDR_DEL_PAYLOAD_LEN: usize = 16;
 
@@ -296,5 +309,19 @@ pub const ADD_PREFIX_LEN_OFF: usize = 16;
 pub const ADD_OWNER_TAG_OFF: usize = 17;
 /// Offset of the optional flags byte within an `ADDR_ADD` payload.
 pub const ADD_FLAGS_OFF: usize = 19;
+/// Offset of the optional segment (u16 LE) within an `ADDR_ADD` payload.
+pub const ADD_SEGMENT_OFF: usize = 20;
+
+/// `OWNER_RESOLVER` payload layout.
+pub mod owner_resolver {
+    /// Bytes before the context: `[owner_slot u16][owner_gen u32]`.
+    pub const OWNER: usize = 6;
+    /// Bytes of the context before its search list: family, server, count.
+    pub const HEAD: usize = 1 + 16 + 1;
+    /// The longest context: the server and a search list of names.
+    pub const CONTEXT_MAX: usize = 256;
+    /// The longest payload.
+    pub const PAYLOAD_MAX: usize = OWNER + CONTEXT_MAX;
+}
 /// Offset of the token within an `ADDR_ARM` / `ADDR_FENCE` payload.
 pub const TOKEN_OFF: usize = 16;

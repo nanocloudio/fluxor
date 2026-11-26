@@ -882,7 +882,6 @@ static PLATFORM: domains::Platform = domains::Platform {
     set_tick: fluxor::arch::aarch64::smp::set_tick,
     has_core: bcm_has_core,
     after_pass: bcm_after_pass,
-    after_step: bcm_after_step,
 };
 
 /// The `counters` contract's source: each core's own performance monitors.
@@ -913,20 +912,6 @@ fn bcm_after_pass(domain_id: usize, core_id: usize, mode: ExecMode, passes: u32)
         report_cross_domain();
     }
     domains::primary_upkeep(domain_id, passes, &PLATFORM);
-}
-
-/// Owner roots' background jobs (making, charging, removing a workload's
-/// root) ride the domain that steps the node's own `fs` provider, so they
-/// never race its step.
-fn bcm_after_step(domain_id: usize) {
-    let fs_domain = fluxor::kernel::module::provider::node_default_module(
-        fluxor::kernel::module::provider::contract::FS as usize,
-    )
-    .map(|m| scheduler::module_domain_id(m) as usize);
-    if fs_domain == Some(domain_id) {
-        // SAFETY: on the domain that steps the node's `fs` provider.
-        unsafe { fluxor::platform::owner_root::step() };
-    }
 }
 
 /// The cross-domain bridges' health, on the ~0.5 s `[xdom]` cadence: drops
@@ -1449,32 +1434,6 @@ fn bcm_module_timer_poll() {
     }
 }
 
-fn bcm_net_policy_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: fluxor::kernel::module::user_span::UserSpan<'_>,
-) -> i32 {
-    use fluxor::abi::contracts::net::policy::caps;
-    // `ip` judges filter rules and translates `scope = local` services for
-    // the node's own traffic; inbound translation is not realized here.
-    let mut c = caps::FILTER | caps::EGRESS | caps::DNAT_LOCAL;
-    // SAFETY: provider dispatch runs on the scheduler thread.
-    if unsafe { fluxor::kernel::net_policy::enforcer_attached() } {
-        c |= caps::ENFORCED;
-    }
-    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, data)
-}
-
-fn bcm_net_route_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: fluxor::kernel::module::user_span::UserSpan<'_>,
-) -> i32 {
-    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, data)
-}
-
 /// NIC rings are class-routed to the kernel bucket; the vtable gives a ring
 /// handle its close.
 static NIC_RING_VTABLE: fluxor::kernel::module::provider::ProviderVTable =
@@ -1502,13 +1461,9 @@ fn bcm_class_routed_call(
 }
 
 /// Handles the bcm2712 platform's own provider tables can hand out at once:
-/// its NIC rings, bound PCIe devices and MSI vectors, and the store's and the
-/// owner roots' slots.
+/// its NIC rings and bound PCIe devices and MSI vectors.
 fn bcm_platform_handle_slots() -> usize {
-    fluxor::platform::nic_ring::MAX_NIC_RINGS
-        + fluxor::platform::pcie::MAX_BOUND_HANDLES
-        + fluxor::platform::store::handle_slots()
-        + fluxor::platform::owner_root::handle_slots()
+    fluxor::platform::nic_ring::MAX_NIC_RINGS + fluxor::platform::pcie::MAX_BOUND_HANDLES
 }
 
 fn bcm_init_providers() {
@@ -1525,41 +1480,6 @@ fn bcm_init_providers() {
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
     provider::register_vtable(&NIC_RING_VTABLE);
     provider::register_platform_handle_slots(bcm_platform_handle_slots);
-    // net.policy (0x1E): the fluxor-native construct is the in-graph packet
-    // filter, which READs the tables and ATTACHes; until one has, CAPS leaves
-    // ENFORCED clear. Only `scope = local` DNAT is realized (`ip` translates
-    // the node's own traffic) — REPLACE refuses a `scope = any` record
-    // (ENOSYS) rather than dropping it.
-    provider::register(dev_class::NET_POLICY, bcm_net_policy_dispatch);
-    // net.route (0x20): the kernel holds the tables; the node's `ip` module
-    // realizes them, reading them with TAKE and stating each entry with
-    // REPORT (`kernel::net_route`, no platform realizer).
-    provider::register(dev_class::NET_ROUTE, bcm_net_route_dispatch);
-    // The versioned watchable key store: `storage.object` (0x14) +
-    // `storage.namespace` (0x13) over a fixed-capacity RAM store. A
-    // store-backed graph reaches its state through these two contracts, and a
-    // provider that is absent answers ENOSYS: the graph runs and produces
-    // nothing, which is the failure that looks like no failure.
-    // SAFETY: single-threaded boot, before any provider dispatch.
-    unsafe { fluxor::platform::store::init() };
-    // `fs` (0x09) for workloads: the node's own `fat32` layer serves the node
-    // alone, so a workload's call reaches this kernel provider, which serves
-    // it beneath the workload's own root on that volume, charges it to the
-    // workload's storage quota, and removes the root when the workload is
-    // released. Without it every workload `fs` call answers ENOSYS.
-    // SAFETY: single-threaded boot, before any provider dispatch.
-    unsafe { fluxor::platform::owner_root::init(fluxor::platform::owner_root::node_fs) };
-    // The board's owner-release hook: an owner's root, and the store handles
-    // an owner acting with the node's authority opened.
-    provider::register_owner_release_hook(bcm_owner_released);
-}
-
-/// Release what a released owner holds of the board's storage: its root
-/// (`owner_root`), and the store handles it opened (`store`).
-fn bcm_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
-    fluxor::platform::owner_root::release(owner);
-    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
-    unsafe { fluxor::platform::store::release_opener(owner) };
 }
 
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.
@@ -2002,7 +1922,7 @@ fn boot_fail_stop() -> ! {
 
 /// This board's sealing provenance, memoized on SUCCESS only.
 ///
-/// `key_vault` asks on every `CUSTODY` and every `DESCRIBE`, and each ask is a
+/// `SEAL_KEY_DERIVE` asks on every derivation, and each ask is a
 /// full cache-maintained mailbox round trip — plus, under concurrency, the
 /// busy-flag loser would transiently answer `None`, and a provenance
 /// check racing an unrelated `DESCRIBE` would refuse spuriously. A
@@ -2084,61 +2004,7 @@ fn bcm_seal_key() -> Option<[u8; 32]> {
     None
 }
 
-/// `HalOps::seal`: ChaCha20-Poly1305 under the OTP-derived key, a fresh
-/// nonce from the TRNG; `[nonce:12][ciphertext][tag:16]`. `None` on a board
-/// without a device key: nothing is sealed with anything weaker.
-fn bcm_seal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
-    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt;
-    let key = bcm_seal_key()?;
-    let n = input.len();
-    if out.len() < 12 + n + 16 {
-        return None;
-    }
-    let mut nonce = [0u8; 12];
-    if bcm_csprng_fill(&mut nonce) != 0 {
-        return None;
-    }
-    out[..12].copy_from_slice(&nonce);
-    out[12..12 + n].copy_from_slice(input);
-    let tag = chacha20_poly1305_encrypt(&key, &nonce, aad, &mut out[12..12 + n]);
-    out[12 + n..12 + n + 16].copy_from_slice(&tag);
-    Some(12 + n + 16)
-}
-
-/// `HalOps::unseal`: the inverse; `None` on any failure, a wrong `aad` among
-/// them, with nothing of a failed open left in `out`.
-fn bcm_unseal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
-    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt;
-    let key = bcm_seal_key()?;
-    if input.len() < 28 {
-        return None;
-    }
-    let n = input.len() - 28;
-    if out.len() < n {
-        return None;
-    }
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&input[..12]);
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&input[12 + n..]);
-    out[..n].copy_from_slice(&input[12..12 + n]);
-    if chacha20_poly1305_decrypt(&key, &nonce, aad, &mut out[..n], &tag) {
-        Some(n)
-    } else {
-        out[..n].fill(0);
-        None
-    }
-}
-
 static BCM2712_HAL_OPS: HalOps = HalOps {
-    // No store of its own: the vault's records live wherever the graph's
-    // `vault_store` module keeps them (`kernel::security::vault_store`), and
-    // a graph without one persists no key.
-    seal_blob_write: |_, _| false,
-    seal_blob_store: || false,
-    seal_blob_delete: |_| true,
-    seal_blob_read: |_, _| None,
-    seal_blob_ready: || true,
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,
@@ -2149,15 +2015,13 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     // cannot tell, which is a different fact from an unsynchronised clock.
     now_unix_millis: || fluxor::kernel::sys::time_sync::unix_millis(bcm_now_micros()),
     clock_sync_status: || fluxor::kernel::sys::time_sync::status(bcm_now_micros()),
-    // Sealing derives from the OTP's device key and nothing else: a sealing
-    // key stored beside the blob it seals protects nothing and would still
-    // read as `HostReadable`, a stronger claim than the truth. A board whose
-    // OTP holds no device key cannot seal (`None`), and its vault keeps keys
-    // in RAM only: the honest outcome, not a weaker stand-in.
+    // The sealing key derives from the OTP's device key and nothing else: a
+    // key stored beside the records it seals protects nothing and would
+    // still read as `HostReadable`, a stronger claim than the truth. A board
+    // whose OTP holds no device key has no sealing key (`None`).
     seal_provenance: bcm_seal_provenance,
+    seal_key: bcm_seal_key,
     signing_root: fluxor::kernel::security::root::image_root,
-    seal: bcm_seal,
-    unseal: bcm_unseal,
     now_micros: bcm_now_micros,
     tick_count: bcm_tick_count,
     flash_base: bcm_flash_base,

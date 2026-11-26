@@ -178,6 +178,9 @@ struct OtelState {
     /// kept whole and the table decoded from the start after each chunk.
     bounds_hex: [u8; BOUNDS_HEX_MAX],
     bounds_hex_len: u16,
+    /// The `bounds` text ran past `BOUNDS_HEX_MAX`: the instance refuses to
+    /// construct rather than export a clipped table.
+    bounds_oversize: bool,
     accum_len: u16,
     accum: [u8; ACCUM_MAX],
     out: [u8; OUT_MAX],
@@ -202,6 +205,7 @@ impl OtelState {
         self.bounds_n = [0; BOUNDS_ROWS];
         self.bounds_us = [[0; BOUNDS_MAX]; BOUNDS_ROWS];
         self.bounds_hex_len = 0;
+        self.bounds_oversize = false;
         self.last_flush_micros = 0;
         self.encoding = tlm::ENCODING_FXTL_COMPACT;
         self.awaiting_ack = false;
@@ -228,12 +232,15 @@ mod params_def {
         // builder splits it across TLV entries of at most 255 bytes under
         // this tag; each chunk is appended and the whole text decoded again
         // from the start, so a nibble straddling a chunk boundary completes
-        // when the next chunk lands. A row that does not fit is dropped
-        // whole (the encoder then skips that instrument — degraded, never
-        // wrong).
-        6, bounds, str_chunked, 0 => |s, d, len| {
+        // when the next chunk lands. Text past `BOUNDS_HEX_MAX` is refused at
+        // construction, never clipped.
+        6, bounds, str_chunked, 0, max super::BOUNDS_HEX_MAX => |s, d, len| {
             let have = s.bounds_hex_len as usize;
-            let n = len.min(super::BOUNDS_HEX_MAX - have);
+            if len > super::BOUNDS_HEX_MAX - have {
+                s.bounds_oversize = true;
+                return;
+            }
+            let n = len;
             let mut i = 0usize;
             while i < n {
                 s.bounds_hex[have + i] = *d.add(i);
@@ -857,6 +864,11 @@ pub unsafe extern "C" fn module_new(
             params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
+        }
+        if s.bounds_oversize {
+            let why = b"[otel] refusing to construct: `bounds` is longer than its table";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -22;
         }
         // Variant fail-closed: a `min` build carries no OTLP encoder, so a
         // graph that selects an OTLP `encoding` against it must fault at

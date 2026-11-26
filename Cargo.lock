@@ -830,10 +830,10 @@ version = "0.0.1"
 dependencies = [
  "cpal",
  "critical-section",
- "cryptoki",
  "env_logger",
  "fluxor-abi",
  "fluxor-contracts",
+ "fluxor-host-lane",
  "fluxor-sdk",
  "image",
  "libc",
@@ -860,11 +860,41 @@ name = "fluxor-contracts"
 version = "0.0.1"
 
 [[package]]
+name = "fluxor-host-lane"
+version = "0.0.1"
+dependencies = [
+ "fluxor-abi",
+ "fluxor-contracts",
+ "fluxor-sdk",
+ "libc",
+]
+
+[[package]]
 name = "fluxor-launcher"
 version = "0.0.1"
 dependencies = [
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "fluxor-provider-hsm"
+version = "0.0.1"
+dependencies = [
+ "cryptoki",
+ "fluxor-abi",
+ "fluxor-host-lane",
+]
+
+[[package]]
+name = "fluxor-provider-net"
+version = "0.0.1"
+dependencies = [
+ "fluxor-abi",
+ "fluxor-host-lane",
+ "fluxor-sdk",
+ "libc",
+ "log",
 ]
 
 [[package]]

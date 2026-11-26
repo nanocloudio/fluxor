@@ -5,7 +5,13 @@ timer_class = "wall_clock"
 # own TCP/IP stack (the transport-continuity surfaces need a stack that owns
 # its connections; `linux_net`'s host sockets cannot checkpoint one).
 hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "uefi"]
-grants = ["workload.net", "net_route.stack"]
+
+# The node's `net.route` and `net.policy` provider on bare metal: the node
+# agent writes segments, peer routes, held addresses and packet policy here,
+# and an in-graph enforcer (`pkt_filter`) attaches to the tables it applies.
+# A module provider and the modules it serves share an execution domain.
+provides = ["net_route", "net_policy"]
+provider_contracts = ["net_route", "net_policy"]
 
 # The emission fence (`ADDR_FENCE` on `addr_ctl`): a provable cutoff for a
 # local address, reported as the frame counter at the ring hand-off.
@@ -15,39 +21,27 @@ deferred_ready = true
 [capability_facts."fence.enforceable"]
 cutoff = "ring_handoff"
 
-# Workload network lanes (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT): on
-# a kernel with no native lane provider (bare metal), ip serves each staged
-# workload's `Net(key)` edges as a lane of its own. Where no workload backend
-# exists the claim fails and ip serves its own net_in/net_out alone.
-[[resources]]
-requires_contract = "workload"
-access = "write"
-optional = true
-
-# The node's segments, peer routes and held addresses (`net_route` TAKE /
-# REPORT): ip realizes them on bare metal. Both ops need `net_route.stack`
-# and are admitted from the registered net-identity provider alone. Where ip is
-# not that provider, or the node has no net_route provider, the poll is
-# refused and ip routes through its one gateway.
-[[resources]]
-requires_contract = "net_route"
-access = "read"
-optional = true
-
-# Packet policy and service translation (`net_policy` READ / ATTACH): with
-# `policy_tables` set, ip is the enforcer of those tables on bare metal and
-# translates their `scope = local` services for the node's own traffic.
-# Without the param it never calls the contract.
-[[resources]]
-requires_contract = "net_policy"
-access = "read"
-active_when_params = ["policy_tables"]
+# Lanes: every consumer reaches the stack over a `Lane { key, target = "ip" }`
+# of its own — a module of the node's graph under the node owner, a staged
+# workload's under its own — never a port. The `net_in`/`net_out` ports below
+# describe each lane's commands and events: the composer wires every edge to
+# them as a lane (one per edge into `net_in`, one shared by the edges marked
+# `edge_class: merge`) and adds the node graph's lanes to `lanes`. The kernel
+# reads the capacity from the `lanes` param as it instantiates the module,
+# queues each lane for it (`LANE_TAKE`), and answers a workload owner's
+# grants (`OWNER_GRANTS`). `lanes = 0` serves none.
+[lanes]
+capacity_param = "lanes"
 
 [[ports]]
 name = "frames_rx"
 direction = "input"
 content_type = "EthernetFrame"
 required = true
+# `net_route` and `net_policy` are answered from `ip`'s own store whatever
+# the NIC has delivered, so a filter in the frame path (`pkt_filter`) may
+# read `ip`'s tables while it feeds `ip` its frames.
+gates_readiness = false
 # ETH rings are the per-tick burst budget for the IP pipeline. aarch64 uses
 # 32 KiB (~21 MSS); rp2350/wasm keep 4 KiB.
 buffer_size = { default = 4096, aarch64 = 32768 }
@@ -91,17 +85,19 @@ buffer_size = { default = 2048, aarch64 = 16384 }
 # One command up to the send stash (`NET_IN_ACCEPTS_RECORD`).
 accepts_record = { default = 1603, aarch64 = 8195 }
 
-# Address-control port (in[2]). Single writer: the platform workload backend.
-# Carries IP_ADDR_ADD / IP_ADDR_DEL as net-proto-framed control messages.
-# Optional: a graph that doesn't wire it serves its single configured
-# address. Small ring — this is low-rate control, not a data path.
+# Address-control port (in[2]). Single writer: the workload creator, or an
+# address coordinator on a node without one. Carries ADDR_ADD / ADDR_DEL /
+# ADDR_ARM / ADDR_FENCE and owners' OWNER_RESOLVER contexts as
+# net-proto-framed control messages. Optional: a graph that doesn't wire it
+# serves its single configured address. Small ring — this is low-rate
+# control, not a data path.
 [[ports]]
 name = "addr_ctl"
 direction = "input"
 index = 2
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 512 }
-accepts_record = 197
+accepts_record = 265
 
 # Emission events back to the address-control writer (out[5]): the token
 # minted at each install (`MSG_ADDR_ADDED`), arm and fence outcomes, and
@@ -206,9 +202,12 @@ buffer_size = 1024
 # arena (`HEAP_DEFAULT_BYTES`), `default` the param's schema default
 # (`send_pool::POOL_DEFAULT`). The decision seam's holds (`packet_holds`) are
 # heap too, `HOLD_BYTES` each, declared only by a graph that turns the seam on.
-heap_per_param = { base = { default = 5152, aarch64 = 16777216 }, params = [
+# Each lane (`lanes`, the node graph's and its workloads') is heap on an
+# MCU-class target, `LANE_HEAP_BYTES` each at the declared defaults.
+heap_per_param = { base = { default = 1976, aarch64 = 16777216 }, params = [
     { tag = 34, default = { default = 2920, thumbv8m = 5840, aarch64 = 8388608 }, bytes_each = { default = 1, aarch64 = 0 } },
     { tag = 32, default = 0, bytes_each = { default = 1628, aarch64 = 0 } },
+    { tag = 12, default = { default = 0, aarch64 = 16 }, bytes_each = { default = 3548, aarch64 = 0 } },
 ] }
 
 [observability]

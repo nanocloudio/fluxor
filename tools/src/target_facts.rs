@@ -1,7 +1,7 @@
 //! Per-target facts about what the PLATFORM provides, as opposed to what a
-//! module declares: the calendar-time source its HAL can vouch for, the key
-//! suites its vault holds, the custody its vault can reach, and the
-//! step budget its scheduler grants a module.
+//! module declares: the calendar-time source its HAL can vouch for, the
+//! sealing key it can derive from, the custody a key vault can reach there,
+//! and the step budget its scheduler grants a module.
 //!
 //! These are properties of the kernel build and the silicon, so no manifest
 //! carries them and no graph wires them. The composer answers them from this
@@ -42,29 +42,51 @@ pub mod vault_custody {
     pub const DEVICE_HW: u8 = 2;
 }
 
-/// Suites every kernel vault holds. `AEAD_KEY` is here because it is
-/// ungated in `src/kernel/security/key_vault.rs` — unlike the ML-DSA
-/// suites it needs no polynomial scratch, so the smallest part carries it
-/// — and a resumption ticket cannot be sealed without it.
+/// Suites every `key_vault` build holds. `AEAD_KEY` needs no polynomial
+/// scratch, so the smallest build carries it, and a resumption ticket cannot
+/// be sealed without it.
 const SUITES_BASE: &[u16] = &[
     vault_suite::P256,
     vault_suite::ED25519,
     vault_suite::AEAD_KEY,
 ];
-/// Suites a kernel built with the `pq-vault` and `rsa-vault` features
-/// adds. The two are enabled together: both are a question of kernel
-/// static RAM, and every target with room for one has room for the other.
-const SUITES_PQ: &[u16] = &[
-    vault_suite::P256,
-    vault_suite::ED25519,
-    vault_suite::AEAD_KEY,
+/// What the `ml_dsa` feature of `key_vault` adds.
+const SUITES_ML_DSA: &[u16] = &[
     vault_suite::ML_DSA_44,
     vault_suite::ML_DSA_65,
     vault_suite::ML_DSA_87,
+];
+/// What the `rsa` feature of `key_vault` adds.
+const SUITES_RSA: &[u16] = &[
     vault_suite::RSA_2048,
     vault_suite::RSA_3072,
     vault_suite::RSA_4096,
 ];
+
+/// The suites a `key_vault` build with `features` holds
+/// (`modules/foundation/key_vault/manifest.toml`'s `[[variant]]`s): the base
+/// set, plus ML-DSA with `ml_dsa` and RSA with `rsa`. Which suites a graph
+/// can use is a fact of the vault variant it composes, not of the target.
+pub fn key_vault_suites(features: &[String]) -> Vec<u16> {
+    let mut suites = SUITES_BASE.to_vec();
+    if features.iter().any(|f| f == "ml_dsa") {
+        suites.extend_from_slice(SUITES_ML_DSA);
+    }
+    if features.iter().any(|f| f == "rsa") {
+        suites.extend_from_slice(SUITES_RSA);
+    }
+    suites
+}
+
+/// Where a target's sealing key comes from (`hal::seal_provenance`), which
+/// `SEAL_KEY_DERIVE` answers from.
+pub mod seal_provenance {
+    /// Read from the device's own one-time-programmable fuses.
+    pub const DEVICE_UNIQUE: &str = "device_unique";
+    /// Supplied by the host (`FLUXOR_SEAL_KEY`), readable to whoever
+    /// administers it.
+    pub const HOST_READABLE: &str = "host_readable";
+}
 
 /// The ip module's published ceilings on a target
 /// (`crates/fluxor-abi/src/config.rs::ip`, per arch profile).
@@ -128,9 +150,12 @@ pub struct TargetFacts {
     /// and a graph asking for one there is refused at compose rather than
     /// discovering it at the first handshake.
     pub trust_system: bool,
-    /// Key suites the kernel vault holds on this target.
-    pub vault_suites: &'static [u16],
-    /// The highest custody the kernel vault can report here: the custody
+    /// Where the platform's sealing key comes from
+    /// ([`seal_provenance`]), or `None` when the platform has none
+    /// (`SEAL_KEY_DERIVE` answers `ENOSYS`): a `key_vault` there cannot
+    /// seal its records under it (`seal = hardware`).
+    pub seal_provenance: Option<&'static str>,
+    /// The highest custody a key vault can report here: the custody
     /// `SealProvenance::DeviceUnique` raises it to where the platform reads
     /// a device-unique sealing key, `SOFTWARE` everywhere else.
     pub vault_custody_ceiling: u8,
@@ -171,7 +196,7 @@ impl TargetFacts {
     }
 
     /// Facts for a runtime id. Unknown names answer the weakest
-    /// row — no clock, base suites, software custody — so a requirement on an
+    /// row — no clock, no sealing key, software custody — so a requirement on an
     /// unregistered target fails closed.
     pub fn for_runtime(name: &str) -> Self {
         match name {
@@ -180,7 +205,7 @@ impl TargetFacts {
             "linux" => Self {
                 time_wall_source: Some("network_sync"),
                 trust_system: true,
-                vault_suites: SUITES_PQ,
+                seal_provenance: Some(seal_provenance::HOST_READABLE),
                 vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -195,7 +220,7 @@ impl TargetFacts {
             "bcm2712" => Self {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
-                vault_suites: SUITES_PQ,
+                seal_provenance: Some(seal_provenance::DEVICE_UNIQUE),
                 vault_custody_ceiling: vault_custody::DEVICE_HW,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -209,7 +234,7 @@ impl TargetFacts {
             "uefi" => Self {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
-                vault_suites: SUITES_PQ,
+                seal_provenance: None,
                 vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -217,25 +242,23 @@ impl TargetFacts {
                 counters: NO_COUNTERS,
             },
             // No RTC, but the kernel vouches for wall time once `sntp`
-            // anchors it, as on bcm2712; no room for the ML-DSA scratch; an
-            // OTP seal key when provisioned (`rp_otp_seal`, unproven on
+            // anchors it, as on bcm2712; an OTP seal key when provisioned (`rp_otp_seal`, unproven on
             // hardware).
             "rp2350" => Self {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
-                vault_suites: SUITES_BASE,
+                seal_provenance: Some(seal_provenance::DEVICE_UNIQUE),
                 vault_custody_ceiling: vault_custody::DEVICE_HW,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
                 counters: NO_COUNTERS,
             },
-            // No RTC and no `sntp` build, no room for the ML-DSA scratch, no
-            // OTP and so no sealing.
+            // No RTC and no `sntp` build, no OTP and so no sealing key.
             "rp2040" => Self {
                 time_wall_source: None,
                 trust_system: false,
-                vault_suites: SUITES_BASE,
+                seal_provenance: None,
                 vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -246,7 +269,7 @@ impl TargetFacts {
             "wasm" => Self {
                 time_wall_source: None,
                 trust_system: false,
-                vault_suites: SUITES_PQ,
+                seal_provenance: None,
                 vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_WASM,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -256,7 +279,7 @@ impl TargetFacts {
             _ => Self {
                 time_wall_source: None,
                 trust_system: false,
-                vault_suites: SUITES_BASE,
+                seal_provenance: None,
                 vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
@@ -341,13 +364,30 @@ pub enum ParamResolution {
 /// Refuses when every condition holds and the target does not provide the
 /// capability, or provides it with a fact the entry does not accept — and refuses when any condition cannot be resolved at all,
 /// since a requirement nobody can evaluate is not one that has been met.
+///
+/// `active` is one outcome per `active_when_params` name: whether the
+/// instance sets it non-empty (`None`, a param the schema does not
+/// declare). The entry holds when its `when` does and, naming any, one of
+/// them is set.
 pub fn check_requires_when(
     resolutions: &[ParamResolution],
+    active: &[Option<bool>],
     rw: &crate::manifest::RequiresWhen,
     facts: &TargetFacts,
     runtime: &str,
 ) -> Result<()> {
-    let mut triggered = true;
+    if let Some((param, _)) = rw
+        .active_when_params
+        .iter()
+        .zip(active)
+        .find(|(_, a)| a.is_none())
+    {
+        return Err(Error::Config(format!(
+            "`[[requires_when]]` names parameter `{param}` in `active_when_params`, which the \
+             module's schema does not declare"
+        )));
+    }
+    let mut triggered = rw.active_when_params.is_empty() || active.contains(&Some(true));
     for ((param, values), resolution) in rw.when.iter().zip(resolutions) {
         match resolution {
             ParamResolution::NoSchema => {
@@ -372,12 +412,20 @@ pub fn check_requires_when(
         ));
     }
     if triggered && !facts.provides(&rw.capability) {
-        let posture: Vec<String> = rw
+        let mut posture: Vec<String> = rw
             .when
             .iter()
             .map(|(p, v)| format!("`{p}` = {}", v.join(" | ")))
             .collect();
-        let params: Vec<&str> = rw.when.iter().map(|(p, _)| p.as_str()).collect();
+        if !rw.active_when_params.is_empty() {
+            posture.push(format!("`{}` set", rw.active_when_params.join("` or `")));
+        }
+        let params: Vec<&str> = rw
+            .when
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .chain(rw.active_when_params.iter().map(String::as_str))
+            .collect();
         return Err(Error::Config(format!(
             "{} requires target capability `{}`, which runtime `{}` does not provide. Either \
              place this module on a target that does, or choose a value of {} that does not \

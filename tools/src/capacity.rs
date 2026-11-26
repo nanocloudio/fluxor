@@ -143,10 +143,9 @@ pub fn kernel_pool_default_reserve(target: &str, pool: &str) -> Option<u64> {
 }
 
 /// Whether `target`'s kernel has a table for `pool` at all: a row in its
-/// profile's `STATIC_POOLS` or `DEFAULT_RESERVES`. The control-plane store's
-/// tables, host-process sandboxes and TTY sessions exist only where their
-/// platform does, and an envelope entry for a pool the kernel has no table
-/// for would bound nothing.
+/// profile's `STATIC_POOLS` or `DEFAULT_RESERVES`. Host-process sandboxes
+/// and TTY sessions exist only where their platform does, and an envelope
+/// entry for a pool the kernel has no table for would bound nothing.
 pub fn kernel_has_pool(target: &str, pool: &str) -> bool {
     ["STATIC_POOLS", "DEFAULT_RESERVES"].iter().any(|t| {
         profile_table(target, t)
@@ -410,6 +409,35 @@ pub fn kernel_max_owners(_target: &str) -> u64 {
     cfg_const(KERNEL_OWNER, None, "MAX_OWNERS").unwrap_or(1)
 }
 
+/// The kernel's lane tables, embedded for their bounds.
+const KERNEL_LANES: &str = include_str!("../../src/kernel/workload/lanes.rs");
+
+/// The most lanes one target serves (`LANE_CEILING`): a lane key is a byte.
+pub fn kernel_lane_ceiling() -> u64 {
+    cfg_const(KERNEL_LANES, None, "LANE_CEILING").unwrap_or(255)
+}
+
+/// Lane targets one graph holds (`MAX_TARGETS`), on every kernel.
+pub fn kernel_lane_targets() -> u64 {
+    cfg_const(KERNEL_LANES, None, "MAX_TARGETS").unwrap_or(4)
+}
+
+/// The lanes `target`'s kernel holds across every target where its lane
+/// table is compiled in (`STATIC_LANES`: wasm); `None` where the table is
+/// sized at boot from what the targets declare — allocated on Linux, carved
+/// on aarch64, carved from the per-graph static pool on RP
+/// (`kernel::mem::table`), where the compiled figure goes unused.
+pub fn kernel_static_lanes(target: &str) -> Option<u64> {
+    match kernel_profile(target) {
+        "profile_wasm" => cfg_const(
+            KERNEL_LANES,
+            Some("not(any(feature = \"host-linux\", feature = \"aarch64-metal\"))"),
+            "STATIC_LANES",
+        ),
+        _ => None,
+    }
+}
+
 /// The Linux host-process backend, embedded for its sandbox and PTY-session
 /// index ranges.
 const KERNEL_HOST_BACKEND: &str = include_str!("../../src/platform/linux/host_backend.rs");
@@ -633,7 +661,7 @@ pub fn check_boot_plan(
     declared: &PoolFigures,
 ) -> Result<String, String> {
     let mut summary = Vec::new();
-    for &(pool, _) in POOL_IDS {
+    for (pool, _) in pool_ids() {
         if !kernel_has_pool(target, pool) || is_arena_name(pool) {
             continue;
         }
@@ -690,55 +718,44 @@ pub fn check_boot_plan(
     Ok(format!("Boot plan ({target}): {}", summary.join(", ")))
 }
 
-/// Kernel resource-pool registry mirror: `(yaml name, pool id)` — the
-/// composer-facing names for `crates/fluxor-abi/src/contracts/resource.rs` ids.
-/// Pinned against the contract source by `capacity_pool_ids_match_contract`
-/// in `tools/tests/limit_register.rs`.
-pub const POOL_IDS: &[(&str, u16)] = &[
-    ("state_arena", 0x0001),
-    ("buffer_arena", 0x0002),
-    ("config_arena", 0x0003),
-    ("channels", 0x0004),
-    ("events", 0x0005),
-    ("timers", 0x0006),
-    ("owners", 0x0007),
-    ("module_slots", 0x0008),
-    ("elastic_region", 0x0009),
-    ("store_subs", 0x000A),
-    ("store_reads", 0x000B),
-    ("store_writes", 0x000C),
-    ("store_grants", 0x000D),
-    ("sandboxes", 0x000E),
-    ("tty_sessions", 0x000F),
-    ("handles", 0x0010),
-    ("state_free_list", 0x0011),
-    ("net_policy_tables", 0x0012),
-    ("net_policy_table_bytes", 0x0013),
-    ("owner_store_subs", 0x0014),
-    ("owner_store_reads", 0x0015),
-    ("owner_store_writes", 0x0016),
-    ("net_route_segments", 0x0017),
-    ("net_route_peers", 0x0018),
-    ("net_route_held", 0x0019),
-    ("lends", 0x001A),
-];
+/// Every pool, `(name, id)`: the kernel pools then the module-served ones,
+/// as the ABI registry declares them (`registry::pool`).
+pub fn pool_ids() -> impl Iterator<Item = (&'static str, u16)> {
+    use fluxor_abi::registry::pool;
+    pool::ALL
+        .into_iter()
+        .filter_map(|id| pool::name(id).map(|n| (n, id)))
+}
 
-/// An arena entry with this bit set is in KiB — mirror of
-/// `resource::ENTRY_KIB`, pinned by `capacity_pool_ids_match_contract` in
-/// `tools/tests/limit_register.rs`.
-pub const ENTRY_KIB: u32 = 1 << 31;
+/// The id of the pool `name` spells.
+pub fn pool_id(name: &str) -> Option<u16> {
+    fluxor_abi::registry::pool::of_name(name)
+}
 
-/// Whether pool `id` is an arena — mirror of `resource::is_arena`.
+/// The arena-entry KiB bit (`resource::ENTRY_KIB`).
+pub const ENTRY_KIB: u32 = fluxor_abi::contracts::resource::ENTRY_KIB;
+
+/// Whether pool `id` is an arena (`registry::pool::is_arena`).
 pub fn is_arena(id: u16) -> bool {
-    POOL_IDS
-        .iter()
-        .any(|&(name, i)| i == id && is_arena_name(name))
+    fluxor_abi::registry::pool::is_arena(id)
 }
 
 /// Whether the pool named `name` is an arena (its envelope entry a size in
 /// bytes, never derived).
 pub fn is_arena_name(name: &str) -> bool {
-    matches!(name, "state_arena" | "buffer_arena" | "elastic_region")
+    pool_id(name).is_some_and(is_arena)
+}
+
+/// The contract whose module providers serve the pool named `name` from
+/// their own heap, `None` for a kernel pool: the graph's providers of the
+/// contract carry the pool's declared demand in their `heap_per_demand`
+/// figure. The kernel pulls the pool's in-use figure from those providers
+/// (`resource::POOL_SAMPLE`), and they count their refusals there
+/// (`resource::LEDGER_DENY`).
+pub fn module_pool_contract(name: &str) -> Option<&'static str> {
+    pool_id(name)
+        .and_then(fluxor_abi::registry::pool::served_by)
+        .and_then(fluxor_abi::registry::contract_name)
 }
 
 /// Encode figure `n` (bytes for an arena, slots otherwise) as an envelope
@@ -772,14 +789,3 @@ pub const DECLARED_DEMAND: &[(&str, &str)] = &[
     ("store_subscriptions", "store_subs"),
     ("store_subscribers", "events"),
 ];
-
-/// Pools a module provider can serve from its own heap in place of the
-/// kernel's host table, `(pool, contract)`. When a graph has an unkeyed module
-/// provider of the contract, its consumers call that module, so the composer
-/// leaves the pool's declared demand off the host table (which the Linux and
-/// bcm2712 stores size from `plan_ceiling(POOL_STORE_SUBS)`) and the provider
-/// carries it in its `heap_per_demand` figure — the demand is spent once. The
-/// kernel pulls the pool's in-use figure from that provider
-/// (`resource::POOL_SAMPLE`) and it counts its refusals there
-/// (`resource::LEDGER_DENY`).
-pub const MODULE_PROVIDED_POOLS: &[(&str, &str)] = &[("store_subs", "storage.namespace")];

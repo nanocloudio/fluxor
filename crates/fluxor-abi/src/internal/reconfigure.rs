@@ -123,12 +123,15 @@ pub use super::super::registry::reconfigure::OWNER_RESUME;
 /// teardown: the owner's slot/generation still resolve, the provider module's
 /// state is still live, and syscalls made from the handler behave normally.
 ///
-/// `handle = -1`; `arg` is the SAME 8-byte owner record that
+/// `handle = -1`; `arg` begins with the SAME 8-byte owner record that
 /// `query_key::CALLER_OWNER` hands back, so a provider that stamped its
-/// resources with the caller's owner compares the two without reformatting:
+/// resources with the caller's owner compares the two without reformatting,
+/// followed by the owner's durable uid (`query_key::CALLER_OWNER_UID`'s
+/// answer), so a provider can remove what the owner left on media without
+/// having seen it this boot:
 ///
 /// ```text
-///   [slot: u16 LE][reserved: u16 (0)][generation: u32 LE]
+///   [slot: u16 LE][reserved: u16 (0)][generation: u32 LE][uid: 16]
 /// ```
 ///
 /// Return value is ignored. The handler MUST be bounded: it runs inline on
@@ -137,7 +140,7 @@ pub use super::super::registry::reconfigure::OWNER_RESUME;
 pub use super::super::registry::reconfigure::OWNER_RELEASED;
 
 /// Byte length of the `OWNER_RELEASED` argument record.
-pub const OWNER_RELEASED_ARG_LEN: usize = 8;
+pub const OWNER_RELEASED_ARG_LEN: usize = 24;
 
 // ── OTA RAM staging (Pi 5 / hosted Linux) ────────────────────────────────────
 // The RAM-staged counterpart of the RP flash graph-slot pair: a module

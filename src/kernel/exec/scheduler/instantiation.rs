@@ -503,6 +503,27 @@ pub fn params_node_tag(params: &[u8]) -> Option<u8> {
     None
 }
 
+/// The one-byte value a params TLV carries under `tag`, walked as
+/// [`params_node_tag`] walks it.
+pub fn params_u8(params: &[u8], tag: u8) -> Option<u8> {
+    if params.len() < 4 {
+        return None;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let t = params[pos];
+        let len = params[pos + 1] as usize;
+        if t == 0xFF {
+            break;
+        }
+        if t == tag && len == 1 {
+            return params.get(pos + 2).copied();
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
 /// Whether a params TLV carries an entry under `tag`, walked as
 /// [`params_node_tag`] walks it.
 pub fn params_carry_tag(params: &[u8], tag: u8) -> bool {

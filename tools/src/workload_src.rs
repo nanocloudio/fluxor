@@ -3,7 +3,7 @@
 //! A thin TOML source manifest — non-derivable fields only — from which
 //! `fluxor build <workload.toml>` emits the package format the agent
 //! consumes (`workload.json` + `resources.json` + `graph.yaml`), plus the
-//! per-target node image (`node.img`) the run path consumes. Emitting a
+//! per-target node image (`node.img`) of this project's own build. Emitting a
 //! package calls the same `build_one` a plain `fluxor build <graph>` calls,
 //! so a package's blobs are byte-for-byte what building the graph directly
 //! produces.
@@ -246,6 +246,20 @@ fn sha256_ref(bytes: &[u8]) -> String {
 // Emission
 // ============================================================================
 
+/// What an emission is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emit {
+    /// Use on this node: a graph without params is built into the package's
+    /// `node.img`, as `fluxor build <graph>` builds it. A launch composes
+    /// its own image against the runtime it runs, and never runs this one.
+    Run,
+    /// A publish: the package's documents and modules are what ships, and
+    /// the node that runs it composes its own image. Every graph is built as
+    /// a check ([`crate::config::compose_as_check`]) and no `node.img` is
+    /// kept.
+    Publish,
+}
+
 /// An emitted package: its root (`target/fluxor/<name>/`) and the bytes of
 /// every module artefact its `workload.json` pins.
 pub struct EmittedPackage {
@@ -263,6 +277,7 @@ pub struct EmittedPackage {
 pub fn emit_package(
     manifest_path: &Path,
     module_root: Option<&Path>,
+    purpose: Emit,
     verbose: bool,
 ) -> Result<EmittedPackage> {
     let text = std::fs::read_to_string(manifest_path)
@@ -385,7 +400,7 @@ pub fn emit_package(
             serde_json::to_vec_pretty(&resources).map_err(|e| Error::Config(e.to_string()))?;
         std::fs::write(target_dir.join("resources.json"), &resources_bytes)?;
 
-        // Per-target blobs: the run path's artifacts, built by the same
+        // Per-target blobs: this project's build of the graph, by the same
         // `build_one` a plain `fluxor build <graph>` calls, so a package's
         // blobs are identical to building the graph on its own.
         //
@@ -393,14 +408,30 @@ pub fn emit_package(
         // depends on the values a run supplies. It is still built here,
         // rendered with its defaults and examples, so a template the
         // builder refuses never becomes a package, and any blobs an earlier
-        // emit left behind are removed so nothing can launch them.
-        if params.is_empty() {
-            crate::build_one_from(
-                &graph_path,
-                Some(&target_dir.join("node.img")),
-                module_root,
-                verbose,
-            )?;
+        // emit left behind are removed so nothing can launch them. A
+        // publish builds every graph that way: what it ships is the
+        // documents and the modules. A build whose image is kept nowhere is
+        // a check, which binds no host runtime.
+        let is_applet = src.workload.role == fluxor_tools::packaging::Kind::Applet.role();
+        // An applet's graph is composed as one: the rules that hold only for
+        // an applet's graph key on it.
+        let as_applet = |build: &dyn Fn() -> Result<()>| {
+            if is_applet {
+                fluxor_tools::packaging::with_applet(&src.workload.name, build)
+            } else {
+                build()
+            }
+        };
+        if params.is_empty() && purpose == Emit::Run {
+            as_applet(&|| {
+                crate::build_one_from(
+                    &graph_path,
+                    Some(&target_dir.join("node.img")),
+                    module_root,
+                    verbose,
+                )
+                .map(|_| ())
+            })?;
         } else {
             let _ = std::fs::remove_file(target_dir.join("node.img"));
             let check_dir = project_root.join("target/fluxor/run").join(format!(
@@ -408,25 +439,40 @@ pub fn emit_package(
                 src.workload.name,
                 std::process::id()
             ));
-            let values = params::check_values(&params, fluxor_tools::stack::graph_dir(&graph_path))
-                .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
-            let rendered = params::render_graph_text(&template, &values)
-                .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
             std::fs::create_dir_all(&check_dir)?;
-            let check_graph = check_dir.join("graph.yaml");
-            std::fs::write(&check_graph, rendered)?;
-            let built = crate::build_one_from(
-                &check_graph,
-                Some(&check_dir.join("node.img")),
-                module_root,
-                verbose,
-            );
+            let check_graph = if params.is_empty() {
+                graph_path.clone()
+            } else {
+                let values =
+                    params::check_values(&params, fluxor_tools::stack::graph_dir(&graph_path))
+                        .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
+                let rendered = params::render_graph_text(&template, &values)
+                    .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
+                let at = check_dir.join("graph.yaml");
+                std::fs::write(&at, rendered)?;
+                at
+            };
+            let built = crate::config::compose_as_check(|| {
+                as_applet(&|| {
+                    crate::build_one_from(
+                        &check_graph,
+                        Some(&check_dir.join("node.img")),
+                        module_root,
+                        verbose,
+                    )
+                    .map(|_| ())
+                })
+            });
             let _ = std::fs::remove_dir_all(&check_dir);
             built.map_err(|e| {
-                Error::Config(format!(
-                    "{} rendered with its defaults and examples does not build: {e}",
-                    graph_path.display()
-                ))
+                if params.is_empty() {
+                    e
+                } else {
+                    Error::Config(format!(
+                        "{} rendered with its defaults and examples does not build: {e}",
+                        graph_path.display()
+                    ))
+                }
             })?;
         }
 
@@ -527,7 +573,6 @@ pub fn emit_package(
         },
         implementations,
         params,
-        store_dir: src.workload.store_dir.clone(),
     };
 
     // The emitted manifest must pass the same validation the agent applies
@@ -838,6 +883,77 @@ fn write_identity_image(
     Ok(())
 }
 
+/// The param schema of each module packed in a node image's module table
+/// (`fmod::table`), by type-name hash.
+fn image_schemas(table: &[u8]) -> std::collections::HashMap<u32, crate::schema::ParamSchema> {
+    use fluxor_abi::wire::fmod::{header, table as t};
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+    };
+    let mut out = std::collections::HashMap::new();
+    let Some(count) = table
+        .get(t::MODULE_COUNT..t::MODULE_COUNT + 2)
+        .map(|v| u16::from_le_bytes([v[0], v[1]]) as usize)
+    else {
+        return out;
+    };
+    for i in 0..count {
+        let e = t::HEADER_SIZE + i * t::ENTRY_SIZE;
+        let (Some(hash), Some(off), Some(size)) = (
+            u32_at(table, e + t::ENTRY_NAME_HASH),
+            u32_at(table, e + t::ENTRY_OFFSET),
+            u32_at(table, e + t::ENTRY_SIZE_AT),
+        ) else {
+            break;
+        };
+        let Some(fmod) = table.get(off as usize..off as usize + size as usize) else {
+            continue;
+        };
+        let Some(h) = header::Header::read(fmod) else {
+            continue;
+        };
+        let at = header::SIZE
+            + h.code_size as usize
+            + h.data_size as usize
+            + h.export_count as usize * 8;
+        let schema = fmod.get(at..at + h.schema_size as usize).unwrap_or(&[]);
+        if let Some(ps) = crate::schema::ParamSchema::from_bytes(schema) {
+            out.insert(hash, ps);
+        }
+    }
+    out
+}
+
+/// The node image `image` with applet `name`'s data directory given where
+/// its graph names `${applet:data_dir}`, re-signed with `seed`; `None` when
+/// the graph names none, and then no directory is made.
+fn data_dir_image(image: &Path, name: &str, seed: Option<&[u8; 32]>) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let img = std::fs::read(image)?;
+    let what = image.display().to_string();
+    let header = crate::node_image::read(&img, &what)?;
+    let config = header.config(&img);
+    let at =
+        |e: String| Error::Config(format!("{}: {e}", fluxor_tools::packaging::APPLET_DATA_DIR));
+    if !crate::trust_anchors::names_applet_data_dir(config).map_err(at)? {
+        return Ok(None);
+    }
+    let dir = fluxor_tools::packaging::ensure_applet_data_dir(name, |k| std::env::var_os(k))
+        .map_err(Error::Config)?;
+    let schemas = image_schemas(header.modules(&img));
+    let bound = |hash: u32, tag: u8| {
+        let p = schemas.get(&hash)?.params.iter().find(|p| p.tag == tag)?;
+        Some((p.min, p.max))
+    };
+    let (given, _) =
+        crate::trust_anchors::give_applet_data_dir(config, dir.as_os_str().as_bytes(), &bound)
+            .map_err(at)?;
+    Ok(Some(crate::node_image::with_config(
+        &img, &given, seed, &what,
+    )?))
+}
+
 /// A package's `workload.json`, parsed and held to the same validation the
 /// agent applies at commit.
 fn load_manifest(text: &str) -> Result<WorkloadManifest> {
@@ -853,65 +969,43 @@ fn load_manifest(text: &str) -> Result<WorkloadManifest> {
     Ok(manifest)
 }
 
-/// The files one launch writes, in a directory only its owner can enter,
-/// removed when the launch ends by any path.
-struct Scratch {
+/// What one launch writes — its rendered graph, the image composed from
+/// it, the copies given the applet's data directory, the operator's trust
+/// anchors or the operator's key — in a directory only its owner can enter,
+/// outside every project tree: under `$XDG_RUNTIME_DIR` (per user, in
+/// memory, cleared at logout) when that is set, else under a per-user
+/// directory in the system temporary directory. A project tree is backed
+/// up, synced and committed, and a package's tree is its producer's: a
+/// launch writes into neither. The directory is removed when the launch
+/// ends by any path.
+struct LaunchScratch {
     dir: PathBuf,
 }
 
-impl Scratch {
-    fn create(project_root: &Path, name: &str) -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-        let parent = project_root.join("target/fluxor/run");
-        std::fs::create_dir_all(&parent)?;
-        let dir = parent.join(format!("{name}-{}", std::process::id()));
-        // A directory a crashed launch with this pid left behind.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        Ok(Scratch { dir })
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Where a launch keeps what carries the operator's private key: a
-/// directory only its owner can enter, outside the project tree — under
-/// `$XDG_RUNTIME_DIR` (per user, in memory, cleared at logout) when that is
-/// set, else under a per-user directory in the system temporary directory.
-/// A project tree is backed up, synced and committed; a key written there
-/// by a launch killed before its cleanup would stay with it.
-struct SecretScratch {
-    dir: PathBuf,
-}
-
-impl SecretScratch {
+impl LaunchScratch {
     fn create(name: &str) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let root = secret_root()?;
+        let root = launch_root()?;
         sweep_dead_launches(&root);
         let dir = root.join(format!("{name}-{}", std::process::id()));
         // A directory a crashed launch with this pid left behind.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        Ok(SecretScratch { dir })
+        Ok(LaunchScratch { dir })
     }
 }
 
-impl Drop for SecretScratch {
+impl Drop for LaunchScratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// The per-user root [`SecretScratch`] directories live under, created
+/// The per-user root [`LaunchScratch`] directories live under, created
 /// `0700` and refused unless it is a real directory this user owns that no
 /// one else can enter: in a shared temporary directory another user could
 /// have made the name first.
-fn secret_root() -> Result<PathBuf> {
+fn launch_root() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     // SAFETY: `geteuid` takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };
@@ -927,7 +1021,7 @@ fn secret_root() -> Result<PathBuf> {
     let meta = std::fs::symlink_metadata(&root)?;
     if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err(Error::Config(format!(
-            "{}: not a private directory of this user; refusing to write an identity there",
+            "{}: not a private directory of this user; refusing to launch from it",
             root.display()
         )));
     }
@@ -979,13 +1073,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// the program's alone — and files them under the applet's name instead, so
 /// a CLI package's output is only what the program itself wrote.
 ///
-/// A package with built blobs and no parameters runs them as they are. A
-/// package that declares parameters, or that carries no blobs (a pinned
-/// package materialised by sync), is built for this run: its template is
-/// rendered with the run's checked values and built against the package's
-/// own pinned modules — `modules/` when the package carries them, else the
-/// emitting project's built modules — each verified against the digest
-/// `workload.json` pins.
+/// Every launch composes the image it runs ([`compose_for_launch`]): the
+/// package's template is rendered with the run's checked values and
+/// composed against the package's own pinned modules — `modules/` when the
+/// package carries them, else the emitting project's built modules — each
+/// verified against the digest `workload.json` pins, and against the
+/// runtime this launch runs. A `node.img` the package's producer built is
+/// never what a launch runs.
 fn launch_package(
     path: &Path,
     app_args: &[String],
@@ -1003,7 +1097,7 @@ fn launch_package(
     let dir = if path.extension().is_some_and(|e| e == "toml") {
         let (name, schema) = source_params(path)?;
         params.resolve(&name, &schema)?;
-        emit_package(path, params.module_root.as_deref(), verbose)?.root
+        emit_package(path, params.module_root.as_deref(), Emit::Run, verbose)?.root
     } else {
         path.to_path_buf()
     };
@@ -1052,107 +1146,6 @@ fn launch_package(
     }
 
     let project_root = crate::project::root_for_config(&dir);
-    let prebuilt = manifest.params.is_empty() && target_dir.join("node.img").is_file();
-    // Scratch holds what this launch writes: a rendered graph and its blobs,
-    // a widened config. Parameter values reach all of them, so the directory
-    // is private and goes away on every exit path. A config carrying the
-    // operator's key goes to a `SecretScratch` instead, outside the tree.
-    let scratch = if !prebuilt || ca.is_some() {
-        Some(Scratch::create(&project_root, &manifest.name)?)
-    } else {
-        None
-    };
-    let mut image = match (prebuilt, &scratch) {
-        (true, _) | (_, None) => target_dir.join("node.img"),
-        (false, Some(scratch)) => {
-            let run_dir = &scratch.dir;
-            let module_root = if target_dir.join("modules").is_dir() {
-                target_dir.join("modules")
-            } else {
-                linux_module_dir(&project_root, params.module_root.as_deref())?
-            };
-            for m in &imp.modules {
-                let fmod = module_root.join(format!("{}.fmod", m.name));
-                let bytes = std::fs::read(&fmod).map_err(|e| {
-                    Error::Config(format!(
-                        "package module '{}': {} ({e})",
-                        m.name,
-                        fmod.display()
-                    ))
-                })?;
-                let actual = sha256_ref(&bytes);
-                if actual != m.digest {
-                    return Err(Error::Config(format!(
-                        "package module '{}': {} is {actual} but the package pins {} — \
-                         re-emit the package or re-sync it",
-                        m.name,
-                        fmod.display(),
-                        m.digest
-                    )));
-                }
-            }
-            let template = std::fs::read_to_string(target_dir.join("graph.yaml"))?;
-            let rendered = params::render_graph_text(&template, &values).map_err(Error::Config)?;
-            // Only the pinned modules are verified above, so the rendered
-            // graph may load nothing else: a value substituted into a module
-            // name would otherwise pull in an unverified artefact.
-            let facts = graph_facts(&rendered)?;
-            let graph = run_dir.join("graph.yaml");
-            let r = crate::module_resolver::ModuleResolver::for_graph(
-                &serde_json::to_value(params::parse_graph(&rendered).map_err(Error::Config)?.doc)
-                    .map_err(|e| Error::Config(e.to_string()))?,
-                &graph,
-                Some(&crate::target::load_target("linux", &project_root)?),
-                Some(&module_root),
-            )?;
-            for entry in &facts.entries {
-                let (name, ty, variant) = crate::module_resolver::entry_identity(entry)
-                    .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
-                let a = r.require(name, ty, variant)?;
-                if !a.is_native() && !imp.modules.iter().any(|m| m.name == a.artifact) {
-                    return Err(Error::Config(format!(
-                        "the rendered graph loads module '{}', which package '{}' does not pin",
-                        a.artifact, manifest.name
-                    )));
-                }
-            }
-            std::fs::write(&graph, rendered)?;
-            crate::build_one_from(
-                &graph,
-                Some(&run_dir.join("node.img")),
-                Some(&module_root),
-                verbose,
-            )?;
-            run_dir.join("node.img")
-        }
-    };
-    if !image.is_file() {
-        return Err(Error::Config(format!(
-            "{} missing — rebuild the package (`fluxor build <workload.toml>`)",
-            image.display()
-        )));
-    }
-    // A changed config is re-signed with this workspace's key, as the build
-    // signed it.
-    let seed = crate::signing::seed(None, &project_root)?;
-    // `--ca` widens a copy for this run only; the cached package is the
-    // publisher's and stays byte-identical.
-    if let (Some(pem), Some(scratch)) = (ca, &scratch) {
-        let widened = scratch.dir.join("graph.operator.img");
-        write_widened_image(&image, &widened, pem, seed.as_ref())?;
-        image = widened;
-    }
-    // The operator's identity is given the same way: to this run's copy,
-    // held where a key may be written.
-    let secret = match identity {
-        Some(_) => Some(SecretScratch::create(&manifest.name)?),
-        None => None,
-    };
-    if let (Some((cert, key)), Some(secret)) = (identity, &secret) {
-        let given = secret.dir.join("graph.identity.img");
-        write_identity_image(&image, &given, cert, key, seed.as_ref(), verbose)?;
-        image = given;
-    }
     // A recorded runtime is the one this package's modules were packed
     // against. If it has gone, say so and name it: running the package
     // against whatever binary the current directory resolves to would
@@ -1175,6 +1168,109 @@ fn launch_package(
             "Linux binary not found at {}. Run 'make build' first.",
             linux_bin.display()
         )));
+    }
+
+    // Every launch composes the image it runs, against the runtime it runs:
+    // the image pins the providers beside that binary, so an image composed
+    // for another runtime, or before this one was rebuilt, is never run.
+    // Parameter values, the operator's trust anchors and key reach what the
+    // launch writes, so its directory is private and goes away on every exit
+    // path.
+    let scratch = LaunchScratch::create(&manifest.name)?;
+    let module_root = if target_dir.join("modules").is_dir() {
+        target_dir.join("modules")
+    } else {
+        linux_module_dir(&project_root, params.module_root.as_deref())?
+    };
+    for m in &imp.modules {
+        let fmod = module_root.join(format!("{}.fmod", m.name));
+        let bytes = std::fs::read(&fmod).map_err(|e| {
+            Error::Config(format!(
+                "package module '{}': {} ({e})",
+                m.name,
+                fmod.display()
+            ))
+        })?;
+        let actual = sha256_ref(&bytes);
+        if actual != m.digest {
+            return Err(Error::Config(format!(
+                "package module '{}': {} is {actual} but the package pins {} — \
+                 re-emit the package or re-sync it",
+                m.name,
+                fmod.display(),
+                m.digest
+            )));
+        }
+    }
+    let template = std::fs::read_to_string(target_dir.join("graph.yaml"))?;
+    let rendered = params::render_graph_text(&template, &values).map_err(Error::Config)?;
+    // Only the pinned modules are verified above, so the rendered graph may
+    // load nothing else: a value substituted into a module name would
+    // otherwise pull in an unverified artefact.
+    let facts = graph_facts(&rendered)?;
+    let graph = scratch.dir.join("graph.yaml");
+    let r = crate::module_resolver::ModuleResolver::for_graph(
+        &serde_json::to_value(params::parse_graph(&rendered).map_err(Error::Config)?.doc)
+            .map_err(|e| Error::Config(e.to_string()))?,
+        &graph,
+        Some(&crate::target::load_target("linux", &project_root)?),
+        Some(&module_root),
+    )?;
+    for entry in &facts.entries {
+        let (name, ty, variant) = crate::module_resolver::entry_identity(entry)
+            .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
+        let a = r.require(name, ty, variant)?;
+        if !a.is_native() && !imp.modules.iter().any(|m| m.name == a.artifact) {
+            return Err(Error::Config(format!(
+                "the rendered graph loads module '{}', which package '{}' does not pin",
+                a.artifact, manifest.name
+            )));
+        }
+    }
+    std::fs::write(&graph, rendered)?;
+    let mut image = scratch.dir.join("node.img");
+    let is_applet = manifest.role == fluxor_tools::packaging::Kind::Applet.role();
+    compose_for_launch(
+        &LaunchComposition {
+            graph: &graph,
+            output: &image,
+            module_root: &module_root,
+            runtime: &linux_bin,
+            applet: is_applet.then_some(manifest.name.as_str()),
+            project_root: &project_root,
+            log: &scratch.dir.join("compose.log"),
+        },
+        if applet.is_none() {
+            ComposeReport::Shown
+        } else if verbose {
+            ComposeReport::OnStderr
+        } else {
+            ComposeReport::OnFailure
+        },
+        verbose,
+    )?;
+    // A changed config is re-signed with this workspace's key, as the build
+    // signed it.
+    let seed = crate::signing::seed(None, &project_root)?;
+    // The applet's data directory is given to this run's copy, as the
+    // operator's identity is below: resolved for the operator running it,
+    // and made on first use.
+    if let Some(given) = data_dir_image(&image, applet.unwrap_or(&manifest.name), seed.as_ref())? {
+        let out = scratch.dir.join("graph.data_dir.img");
+        std::fs::write(&out, given)?;
+        image = out;
+    }
+    // `--ca` widens this run's copy only; the package stays byte-identical.
+    if let Some(pem) = ca {
+        let widened = scratch.dir.join("graph.operator.img");
+        write_widened_image(&image, &widened, pem, seed.as_ref())?;
+        image = widened;
+    }
+    // The operator's identity is given the same way, to this run's copy.
+    if let Some((cert, key)) = identity {
+        let given = scratch.dir.join("graph.identity.img");
+        write_identity_image(&image, &given, cert, key, seed.as_ref(), verbose)?;
+        image = given;
     }
 
     // A dev run says what it runs; an applet run is the program's, and says
@@ -1203,40 +1299,122 @@ fn launch_package(
             cmd.env("FLUXOR_EXEC_LOG_STDERR", "1");
         }
     }
-    // A workload that declares where its store lives gets that store,
-    // whatever the caller exported, so the same applet run from two shells
-    // reaches the same state. Relative paths resolve against the package, so
-    // a package carries its own state with it.
-    if let Some(store_dir) = manifest.store_dir.as_deref() {
-        let resolved = {
-            let p = Path::new(store_dir);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                dir.join(p)
-            }
-        };
-        if verbose {
-            eprintln!(
-                "[exec] store dir from workload.json: {}",
-                resolved.display()
-            );
-        }
-        cmd.env("FLUXOR_STORE_DIR", &resolved);
-    }
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
     // must not orphan a runtime that never exits on its own. A stop signal
     // is passed on so the runtime drains first (see `run_tied`).
     let status = crate::run_tied(&mut cmd);
     // `exit` below skips destructors.
     drop(scratch);
-    drop(secret);
     let status = status?;
     crate::exit_if_signalled(&status);
     // A CLI package's exit code IS the deliverable: propagate it verbatim
     // rather than wrapping a non-zero status in a tool error, so a shell
     // sees what the program returned.
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The image one launch composes: the rendered graph, where the image goes,
+/// the verified modules, the runtime the launch runs, the applet whose
+/// graph it is, the project whose signing key and target definition it
+/// takes, and where the composer's report is kept.
+struct LaunchComposition<'a> {
+    graph: &'a Path,
+    output: &'a Path,
+    module_root: &'a Path,
+    runtime: &'a Path,
+    applet: Option<&'a str>,
+    project_root: &'a Path,
+    log: &'a Path,
+}
+
+/// Where a launch's composer report goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposeReport {
+    /// A dev run: on this process's stdout and stderr, as `fluxor build`
+    /// reports.
+    Shown,
+    /// An applet run with `-v`: on stderr, so stdout stays the program's.
+    OnStderr,
+    /// An applet run: kept in the launch's log, and printed on stderr only
+    /// when the composition fails. Both of an applet's streams are the
+    /// program's.
+    OnFailure,
+}
+
+/// Compose a launch's image in a child of this CLI (`compose-launch`), so
+/// every line the composer writes, and every process a build step starts,
+/// goes where `report` says and nowhere else. The child runs in the
+/// launch's directory with the project root named, since the rendered
+/// graph lies outside every project tree.
+fn compose_for_launch(
+    c: &LaunchComposition<'_>,
+    report: ComposeReport,
+    verbose: bool,
+) -> Result<()> {
+    let mut cmd = crate::ci::self_invoke();
+    cmd.arg("compose-launch")
+        .arg(c.graph)
+        .arg("--output")
+        .arg(c.output)
+        .arg("--module-root")
+        .arg(c.module_root)
+        .arg("--runtime")
+        .arg(c.runtime);
+    if let Some(name) = c.applet {
+        cmd.arg("--applet").arg(name);
+    }
+    if verbose {
+        cmd.arg("--verbose");
+    }
+    cmd.env(crate::project::ENV_PROJECT_ROOT, c.project_root)
+        .current_dir(c.graph.parent().unwrap_or(Path::new(".")))
+        .stdin(std::process::Stdio::null());
+    match report {
+        ComposeReport::Shown => {}
+        ComposeReport::OnStderr => {
+            cmd.stdout(std::io::stderr());
+        }
+        ComposeReport::OnFailure => {
+            let log = std::fs::File::create(c.log)?;
+            cmd.stdout(log.try_clone()?).stderr(log);
+        }
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| Error::Config(format!("compose the launch's image: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    if report == ComposeReport::OnFailure {
+        if let Ok(text) = std::fs::read_to_string(c.log) {
+            eprint!("{text}");
+        }
+    }
+    Err(Error::Config(format!(
+        "composing the image this launch runs failed ({status})"
+    )))
+}
+
+/// `fluxor compose-launch`: compose the image a launch runs
+/// ([`compose_for_launch`]), pinning the providers beside `runtime`, as an
+/// applet's graph when `applet` names one.
+pub fn compose_launch_image(
+    graph: &Path,
+    output: &Path,
+    module_root: &Path,
+    runtime: &Path,
+    applet: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    let compose = || {
+        crate::config::compose_on_runtime(runtime, || {
+            crate::build_one_from(graph, Some(output), Some(module_root), verbose).map(|_| ())
+        })
+    };
+    match applet {
+        Some(name) => fluxor_tools::packaging::with_applet(name, compose),
+        None => compose(),
+    }
 }
 
 // ============================================================================
@@ -1332,7 +1510,7 @@ pub fn install_applet(
     verbose: bool,
 ) -> Result<()> {
     let dir = if package.extension().is_some_and(|e| e == "toml") {
-        emit_package(package, None, verbose)?.root
+        emit_package(package, None, Emit::Run, verbose)?.root
     } else if !package.exists() {
         // Not a path: a name. The project's own package is emitted from its
         // packaging/; a sibling's CLI is consumed as the published artifact
@@ -1340,7 +1518,7 @@ pub fn install_applet(
         // applet cache.
         let name = package.to_string_lossy();
         match fluxor_tools::packaging::package_path(&crate::project::root(), &name) {
-            Some(own) => emit_package(&own, None, verbose)?.root,
+            Some(own) => emit_package(&own, None, Emit::Run, verbose)?.root,
             None => materialize_pinned_package(&name, verbose)?,
         }
     } else {
@@ -1410,8 +1588,9 @@ pub fn install_applet(
 /// `fluxor exec <name> [-- args…]`. Resolution order, first match wins:
 /// an exact name in the applet registry, then a package built in this
 /// project (`target/fluxor/<name>/`), else an error listing the applets
-/// that ARE known. No compilation on the hot path: the cached package
-/// execs as-is.
+/// that ARE known. Nothing is compiled: each launch composes the package's
+/// image from its pinned modules, against the runtime it runs, and says
+/// nothing of that composition unless it fails or `-v` asks.
 pub fn exec_applet(
     name: &str,
     args: &[String],
@@ -1527,9 +1706,8 @@ pub fn applet_logs(name: &str, tail: usize, all: bool) -> Result<()> {
 /// Materialise the package this project pins under `name` as a runnable
 /// package dir under the applet cache (`$XDG_DATA_HOME/fluxor/applets/<name>/`):
 /// the same digest-verified flat layout `fluxor sync` writes (documents +
-/// the package's own `modules/`), plus the node image (`node.img`) built
-/// once from those pinned modules, so `exec` runs
-/// without compiling anything.
+/// the package's own `modules/`). Each `exec` composes its image from them
+/// against the runtime it runs.
 fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
     use fluxor_tools::oci_store::{self, OciStore};
     let project_root = crate::project::root();
@@ -1566,12 +1744,6 @@ fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
             manifest.name, manifest.name
         )));
     }
-    crate::build_one_from(
-        &cache_root.join("graph.yaml"),
-        Some(&cache_root.join("node.img")),
-        Some(&cache_root.join("modules")),
-        verbose,
-    )?;
     if verbose {
         println!(
             "materialised pinned package {} ({}) -> {}",

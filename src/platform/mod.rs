@@ -43,12 +43,6 @@ pub mod multicore;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/net.rs"]
 pub mod nic_ring;
-/// Owner-rooted storage on bare metal (bcm2712): a workload's `fs` calls,
-/// served beneath `/owners/<uid hex>/files/` on the node's own volume, with
-/// the owner's storage quota, and the root removed when the owner is.
-#[cfg(feature = "chip-bcm2712")]
-#[path = "bcm2712/owner_root.rs"]
-pub mod owner_root;
 /// PCIe1 root-complex bring-up, enumeration and device access (bcm2712).
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/pcie.rs"]
@@ -57,12 +51,6 @@ pub mod pcie;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/pcie_aliases.rs"]
 pub mod pcie_aliases;
-/// Versioned watchable key store — `storage.object` + `storage.namespace` on
-/// bare metal (bcm2712). Without it no store-backed graph can run on the board
-/// at all.
-#[cfg(feature = "chip-bcm2712")]
-#[path = "bcm2712/store.rs"]
-pub mod store;
 
 /// Chip backend — the per-target chip services (clocks, arenas, boot glue),
 /// selected by `#[cfg]`. Every target has exactly one.

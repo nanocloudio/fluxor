@@ -7,12 +7,9 @@
 //! moves only when the output can take it whole: nothing is consumed that
 //! cannot be written in the same step, and nothing is held between steps.
 //!
-//! What a unit is comes from the `frame_kind` param (see `../tee/fan.rs`):
-//! a stream moves one transfer a step, and an input a transfer was cut
-//! short on is drained to empty before another is read, so a unit the cut
-//! split is finished before another producer's bytes follow it; a framed
-//! kind moves whole frames, up to `frames_per_step` a step; a record kind
-//! moves one mailbox record per transfer.
+//! A unit is one record — one write of a producer, whatever it holds —
+//! moved whole, up to `frames_per_step` a step (see `../tee/fan.rs`), so no
+//! producer's record is ever split by another's.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 
@@ -35,72 +32,13 @@ fn next_lane(s: &mut FanState) -> usize {
     k as usize
 }
 
-/// One stream transfer from the owed input, else the first in the round
-/// robin with bytes waiting.
-unsafe fn merge_stream(s: &mut FanState) -> Result<(), i32> {
-    if s.owed >= 0 && !polls(s, s.lanes[s.owed as usize], POLL_IN) {
-        s.owed = -1;
-    }
-    for _ in 0..s.lanes_len {
-        let k = if s.owed >= 0 {
-            s.owed as usize
-        } else {
-            next_lane(s)
-        };
-        let chan = s.lanes[k];
-        if !polls(s, chan, POLL_IN) {
-            continue;
-        }
-        let amount = (s.scratch_len as usize).min(writable(s, s.one));
-        if amount == 0 {
-            if s.owed >= 0 {
-                // The owed input waits for room; nothing else may go first.
-                return Ok(());
-            }
-            continue;
-        }
-        let read = ((*s.syscalls).channel_read)(chan, s.scratch, amount);
-        if read <= 0 {
-            continue;
-        }
-        put(s, s.one, read as usize)?;
-        // Cut short when the transfer filled `amount` and bytes remain.
-        s.owed = if read as usize == amount && polls(s, chan, POLL_IN) {
-            k as i8
-        } else {
-            -1
-        };
-        return Ok(());
-    }
-    Ok(())
-}
-
-/// One round-robin pass, moving the first whole frame that fits the output:
-/// `Ok(false)` when the pass moved nothing.
-unsafe fn merge_frame(s: &mut FanState) -> Result<bool, i32> {
-    for _ in 0..s.lanes_len {
-        let chan = s.lanes[next_lane(s)];
-        let room = |total: usize| writable(s, s.one) >= total;
-        if let Some(total) = take_frame(s, chan, room)? {
-            put(s, s.one, total)?;
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// One round-robin pass, moving the first record waiting once the output is
-/// free: `Ok(false)` when the pass moved nothing.
+/// One round-robin pass, moving the first record waiting that the output
+/// takes: `Ok(false)` when the pass moved nothing.
 unsafe fn merge_record(s: &mut FanState) -> Result<bool, i32> {
-    if !polls(s, s.one, POLL_OUT) {
-        return Ok(false);
-    }
     for _ in 0..s.lanes_len {
         let chan = s.lanes[next_lane(s)];
-        if !polls(s, chan, POLL_IN) {
-            continue;
-        }
-        if let Some(len) = take_record(s, chan)? {
+        let room = |len: usize| takes(s, s.one, len);
+        if let Some(len) = take(s, chan, room)? {
             put(s, s.one, len)?;
             return Ok(true);
         }
@@ -145,14 +83,7 @@ pub unsafe extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut FanState);
-    match s.frame_kind {
-        KIND_STREAM => match merge_stream(s) {
-            Ok(()) => StepReturn::Continue,
-            Err(e) => StepReturn::error(e),
-        },
-        KIND_RECORD => burst(s, |s| merge_record(s)),
-        _ => burst(s, |s| merge_frame(s)),
-    }
+    burst(s, |s| merge_record(s))
 }
 
 fluxor_rt::wasm_entry!();

@@ -2,8 +2,8 @@
 //! groups, rings and order.
 
 use fluxor_contracts::graph::plan::{
-    self, compose, fan_pass, order, plan, record_mailboxes, Fan, FanDir, FrameKind, PlanError,
-    PlanModule, PlanPort, RingNode, RingPlatform, RingRole, DIR_CTRL, DIR_IN, DIR_OUT,
+    self, compose, fan_pass, order, plan, record_mailboxes, Fan, FanDir, PlanError, PlanModule,
+    PlanPort, RingNode, RingPlatform, RingRole, DIR_CTRL, DIR_IN, DIR_OUT,
 };
 use fluxor_contracts::graph::{EdgeClass, EdgeRecord, Endpoint};
 use fluxor_contracts::ring_size::{
@@ -16,18 +16,18 @@ const HOST: RingPlatform = RingPlatform {
     domain_cores: [0, 0, 0, 0],
 };
 
-fn port(direction: u8, index: u8, buffer_size: u32, frame: FrameKind) -> PlanPort {
+fn port(direction: u8, index: u8, buffer_size: u32, mailbox: bool) -> PlanPort {
     PlanPort {
         direction,
         index,
         buffer_size,
         max_record: 0,
-        frame,
+        mailbox,
     }
 }
 
 fn out(index: u8, buffer_size: u32) -> PlanPort {
-    port(DIR_OUT, index, buffer_size, FrameKind::Stream)
+    port(DIR_OUT, index, buffer_size, false)
 }
 
 fn module(ports: &[PlanPort]) -> PlanModule<'_> {
@@ -67,25 +67,24 @@ fn rings_round_up_to_a_power_of_two_and_refuse_past_the_ceiling() {
 }
 
 #[test]
-fn a_port_s_frame_kind_follows_its_content_type() {
+fn a_port_carries_mailbox_records_by_its_framing_alone() {
     let ct = |name: &str| {
         fluxor_contracts::CONTENT_TYPES
             .iter()
             .position(|t| *t == name)
             .unwrap() as u8
     };
-    assert_eq!(plan::port_frame(ct("OctetStream"), 0), FrameKind::Stream);
-    assert_eq!(
-        plan::port_frame(ct("OctetStream"), plan::PORT_FLAG_FRAMED),
-        FrameKind::Record
-    );
-    assert_eq!(plan::port_frame(ct("EthernetFrame"), 0), FrameKind::Eth);
-    assert_eq!(plan::port_frame(ct("NetProto"), 0), FrameKind::Net);
-    assert_eq!(plan::port_frame(ct("Telemetry"), 0), FrameKind::Telemetry);
-    assert_eq!(
-        plan::port_frame(ct("ExchangeRequest"), 0),
-        FrameKind::Record
-    );
+    assert!(!plan::port_mailbox(ct("OctetStream"), 0));
+    assert!(plan::port_mailbox(
+        ct("OctetStream"),
+        plan::PORT_FLAG_FRAMED
+    ));
+    // A content type is never a frame format to the composer: Ethernet, net
+    // and telemetry records ride rings, one record per write.
+    assert!(!plan::port_mailbox(ct("EthernetFrame"), 0));
+    assert!(!plan::port_mailbox(ct("NetProto"), 0));
+    assert!(!plan::port_mailbox(ct("Telemetry"), 0));
+    assert!(plan::port_mailbox(ct("ExchangeRequest"), 0));
 }
 
 #[test]
@@ -104,9 +103,9 @@ fn a_fan_out_gets_a_tee_and_its_joining_edge_takes_the_producer_s_size() {
         c.fans,
         [Fan {
             dir: FanDir::Out,
-            of: 0,
+            of: Endpoint::New(0),
             port: 0,
-            kind: FrameKind::Stream,
+            mailbox: false,
             domain: 0
         }]
     );
@@ -117,12 +116,24 @@ fn a_fan_out_gets_a_tee_and_its_joining_edge_takes_the_producer_s_size() {
     assert_eq!((c.edges[0].from_port, c.edges[1].from_port), (0, 1));
     assert_eq!(c.edges[2], edge(0, 0, 3, 0));
     assert_eq!(c.order, [0, 3, 1, 2]);
+    // The fan pass alone: tee→1 unsized, tee→2 sized by the graph,
+    // producer→tee by the port.
+    let mut fanned = [edges[0], edges[1], EdgeRecord::default()];
+    let mut fans = [c.fans[0]];
+    fan_pass(&modules, &mut fanned, 2, &mut fans, 256).unwrap();
+    let mut alone = Vec::new();
+    plan::rings(&modules, &fans, &fanned, 2, HOST, |r| alone.push(r.ring)).unwrap();
+    assert_eq!(alone, vec![8192, 1024, 32_768]);
+    // Composed, every edge the tee writes asks for what reaches it: the
+    // producer's port, since the producer declares no record.
     let p = c.rings(&modules, HOST).unwrap();
     let rings: Vec<u32> = p.rings.iter().map(|r| r.ring).collect();
-    // tee→1 unsized, tee→2 sized by the graph, producer→tee by the port.
-    assert_eq!(rings, vec![8192, 1024, 32_768]);
-    assert_eq!(p.total(), 8192 + 1024 + 32_768);
-    let tee = RingNode::Tee { of: 0, port: 0 };
+    assert_eq!(rings, vec![32_768, 32_768, 32_768]);
+    assert_eq!(p.total(), 3 * 32_768);
+    let tee = RingNode::Tee {
+        of: Endpoint::New(0),
+        port: 0,
+    };
     assert_eq!(p.largest_adjacent(tee), 32_768);
     assert_eq!(p.rings[2].ends.role, RingRole::Fan);
     assert_eq!(p.rings[1].ends.role, RingRole::Edge(1));
@@ -265,7 +276,7 @@ fn an_aliased_edge_that_crosses_domains_still_gets_its_consumer_ring() {
 
 #[test]
 fn record_fans_draw_groups_above_the_config_s_until_none_is_left() {
-    let record = [port(DIR_OUT, 0, 0, FrameKind::Record)];
+    let record = [port(DIR_OUT, 0, 0, true)];
     let modules = [module(&record), module(&[]), module(&[])];
     let edges = [edge(0, 0, 1, 0), edge(0, 0, 2, 0)];
     // Three edges around the tee, a group each.
@@ -273,7 +284,7 @@ fn record_fans_draw_groups_above_the_config_s_until_none_is_left() {
     let c = compose(&modules, &edges, room, false).unwrap();
     let groups: Vec<u8> = c.edges.iter().map(|e| e.buffer_group).collect();
     assert_eq!(groups, [32, 33, 34]);
-    assert_eq!(c.fans[0].kind, FrameKind::Record);
+    assert!(c.fans[0].mailbox);
     assert_eq!(
         compose(&modules, &edges, room - 1, false).unwrap_err(),
         PlanError::GroupsExhausted
@@ -298,36 +309,99 @@ fn a_stream_fan_clears_the_groups_of_its_edges() {
 }
 
 #[test]
-fn a_fan_s_kind_is_the_kind_its_peers_agree_on() {
+fn a_fan_s_buffer_is_the_one_its_peers_agree_on() {
     let sink = module(&[]);
-    let net = [out(0, 0)].map(|p| PlanPort {
-        frame: FrameKind::Net,
-        ..p
-    });
-    let stream = [out(0, 0)];
-    let record = [out(0, 0)].map(|p| PlanPort {
-        frame: FrameKind::Record,
-        ..p
-    });
-    let kind = |a: &[PlanPort], b: &[PlanPort]| {
+    let ring = [out(0, 0)];
+    let record = [out(0, 0)].map(|p| PlanPort { mailbox: true, ..p });
+    let mailbox = |a: &[PlanPort], b: &[PlanPort]| {
         let modules = [module(a), module(b), sink];
         compose(&modules, &[edge(0, 0, 2, 0), edge(1, 0, 2, 0)], 256, false)
             .unwrap()
             .fans[0]
-            .kind
+            .mailbox
     };
     // The fanned input declares nothing: its producers say it.
-    assert_eq!(kind(&net, &net), FrameKind::Net);
+    assert!(mailbox(&record, &record));
     // A producer that declares nothing says nothing.
-    assert_eq!(kind(&net, &[]), FrameKind::Net);
-    // A declared stream is a declaration: disagreement makes a byte fan.
-    assert_eq!(kind(&net, &stream), FrameKind::Stream);
-    assert_eq!(kind(&record, &net), FrameKind::Stream);
-    // The fanned port's own non-stream declaration wins over its peers'.
-    let typed_sink = [port(DIR_IN, 0, 0, FrameKind::Eth)];
-    let modules = [module(&net), module(&stream), module(&typed_sink)];
+    assert!(mailbox(&record, &[]));
+    // A declared ring is a declaration: disagreement makes a ring fan.
+    assert!(!mailbox(&record, &ring));
+    assert!(!mailbox(&ring, &ring));
+    // The fanned port's own record declaration wins over its peers'.
+    let typed_sink = [port(DIR_IN, 0, 0, true)];
+    let modules = [module(&ring), module(&ring), module(&typed_sink)];
     let c = compose(&modules, &[edge(0, 0, 2, 0), edge(1, 0, 2, 0)], 256, false).unwrap();
-    assert_eq!(c.fans[0].kind, FrameKind::Eth);
+    assert!(c.fans[0].mailbox);
+}
+
+/// A fan copies records whole, so its own writes carry the largest record
+/// its producers declare: a ring out of a fan that cannot hold it is
+/// refused, and the fan's scratch is that record where every producer
+/// declares one, else the largest ring beside it.
+#[test]
+fn a_fan_writes_the_largest_record_its_producers_declare() {
+    let big = [PlanPort {
+        max_record: 3000,
+        ..out(0, 8192)
+    }];
+    let small = [PlanPort {
+        max_record: 500,
+        ..out(0, 8192)
+    }];
+    // A tee of 3000-byte records, one output asked to hold 1000 bytes.
+    let modules = [module(&big), module(&[]), module(&[])];
+    let edges = [
+        edge(0, 0, 1, 0),
+        EdgeRecord {
+            buffer_bytes: 1000,
+            ..edge(0, 0, 2, 0)
+        },
+    ];
+    // The fan pass alone leaves that output at its 1000 bytes, and the ring
+    // plan refuses it.
+    let mut fanned = [edges[0], edges[1], EdgeRecord::default()];
+    let mut fans = [Fan {
+        dir: FanDir::Out,
+        of: Endpoint::New(0),
+        port: 0,
+        mailbox: false,
+        domain: 0,
+    }];
+    fan_pass(&modules, &mut fanned, 2, &mut fans, 256).unwrap();
+    assert!(matches!(
+        plan::rings(&modules, &fans, &fanned, 2, HOST, |_| {}),
+        Err(PlanError::RecordOverRing {
+            max_record: 3000,
+            ..
+        })
+    ));
+    // Composed, every edge the fan writes holds the record.
+    let c = compose(&modules, &edges, 256, false).unwrap();
+    let rings = c.rings(&modules, HOST).unwrap();
+    assert!(rings
+        .rings
+        .iter()
+        .all(|r| u64::from(r.ring) >= fluxor_contracts::ring_size::record_bytes(3000)));
+    // Room for it everywhere: the scratch is the record, not the ring.
+    let c = compose(&modules, &[edge(0, 0, 1, 0), edge(0, 0, 2, 0)], 256, false).unwrap();
+    let rings = c.rings(&modules, HOST).unwrap();
+    assert_eq!(rings.largest_adjacent(c.fans[0].ring_node()), 8192);
+    assert_eq!(c.fan_scratch(0, &modules, &rings), 3000);
+    // A merge: the largest of its producers'; one undeclared falls back to
+    // the largest ring beside it.
+    let sink = module(&[]);
+    let modules = [module(&big), module(&small), sink];
+    let merge = [edge(0, 0, 2, 0), edge(1, 0, 2, 0)];
+    let c = compose(&modules, &merge, 256, false).unwrap();
+    let rings = c.rings(&modules, HOST).unwrap();
+    assert_eq!(c.fan_scratch(0, &modules, &rings), 3000);
+    let modules = [module(&big), module(&[]), sink];
+    let c = compose(&modules, &merge, 256, false).unwrap();
+    let rings = c.rings(&modules, HOST).unwrap();
+    assert_eq!(
+        c.fan_scratch(0, &modules, &rings),
+        rings.largest_adjacent(c.fans[0].ring_node())
+    );
 }
 
 #[test]
@@ -399,7 +473,7 @@ fn order_is_breadth_first_in_edge_order() {
     assert_eq!(out, [0, 2, 1]);
     // An edge to the outside the graph orders nothing.
     let edges = [EdgeRecord {
-        to: Endpoint::Net(0),
+        to: Endpoint::Lane { key: 0, target: 7 },
         ..edge(1, 0, 0, 0)
     }];
     order(3, &edges, false, &mut out, &mut indeg).unwrap();
@@ -429,9 +503,9 @@ fn the_fan_pass_works_in_the_caller_s_buffers() {
     let mut edges = [edge(0, 0, 1, 0), edge(0, 0, 2, 0), EdgeRecord::default()];
     let mut fans = [Fan {
         dir: FanDir::Out,
-        of: 0,
+        of: Endpoint::New(0),
         port: 0,
-        kind: FrameKind::Stream,
+        mailbox: false,
         domain: 0,
     }; 1];
     let counts = fan_pass(&modules, &mut edges, 2, &mut fans, 256).unwrap();
@@ -462,7 +536,7 @@ fn a_fan_is_at_most_sixteen_wide() {
         compose(&modules, &tee(17), 256, false).unwrap_err(),
         PlanError::FanWidth {
             dir: FanDir::Out,
-            of: 0,
+            of: Endpoint::New(0),
             port: 0,
             edges: 17
         }
@@ -472,7 +546,7 @@ fn a_fan_is_at_most_sixteen_wide() {
         compose(&modules, &merge, 256, false).unwrap_err(),
         PlanError::FanWidth {
             dir: FanDir::In,
-            of: 0,
+            of: Endpoint::New(0),
             port: 0,
             edges: 17
         }
@@ -481,8 +555,8 @@ fn a_fan_is_at_most_sixteen_wide() {
 
 #[test]
 fn a_point_to_point_record_edge_gets_a_mailbox_of_its_own() {
-    let record = [port(DIR_OUT, 0, 0, FrameKind::Record)];
-    let record_in = [port(DIR_CTRL, 1, 0, FrameKind::Record)];
+    let record = [port(DIR_OUT, 0, 0, true)];
+    let record_in = [port(DIR_CTRL, 1, 0, true)];
     let modules = [module(&record), module(&record_in), module(&[])];
     let mut edges = [
         // Records out of 0.
@@ -496,7 +570,7 @@ fn a_point_to_point_record_edge_gets_a_mailbox_of_its_own() {
         edge(2, 0, 2, 0),
         // A net lane carries its own framing.
         EdgeRecord {
-            to: Endpoint::Net(1),
+            to: Endpoint::Lane { key: 1, target: 7 },
             ..edge(0, 0, 0, 0)
         },
         // A group the graph gave is kept.
@@ -519,12 +593,12 @@ fn a_point_to_point_record_edge_gets_a_mailbox_of_its_own() {
 fn a_fan_record_carries_its_params() {
     let fan = Fan {
         dir: FanDir::In,
-        of: 3,
+        of: Endpoint::New(3),
         port: 0,
-        kind: FrameKind::Telemetry,
+        mailbox: false,
         domain: 2,
     };
-    let params = plan::fan_params(fan.kind, 32, 8192);
+    let params = plan::fan_params(32, 8192);
     let r = fan.record(&params);
     assert_eq!(r.name_hash, fluxor_contracts::graph::MERGE_NAME_HASH);
     assert_eq!(r.domain, 2);
@@ -533,12 +607,153 @@ fn a_fan_record_carries_its_params() {
     assert_eq!(
         seen,
         [
-            (plan::fan_param::FRAME_KIND, vec![3]),
             (plan::fan_param::FRAMES_PER_STEP, vec![32, 0]),
             (
                 plan::fan_param::SCRATCH_BYTES,
                 8192u32.to_le_bytes().to_vec()
             ),
         ]
+    );
+}
+
+/// A lane end is a port of its own: edges into one lane share a merge whose
+/// one edge carries the lane's commands, and edges out of it a tee fed by
+/// the lane's one events edge, so the kernel's lane rule (one edge each
+/// way) holds of the composed graph.
+#[test]
+fn a_lane_end_fans_as_a_port() {
+    let lane = Endpoint::Lane { key: 0, target: 7 };
+    let modules = [module(&[]), module(&[]), module(&[])];
+    let into = |from: u16| EdgeRecord {
+        to: lane,
+        ..edge(from, 0, 0, 0)
+    };
+    let out_to = |to: u16| EdgeRecord {
+        from: lane,
+        ..edge(0, 0, to, 0)
+    };
+    // The shape a shared lane takes: two producers into it, its events to
+    // a third module and back to one producer.
+    let edges = [into(0), into(1), out_to(2), out_to(0)];
+    let c = compose(&modules, &edges, 256, true).unwrap();
+    assert_eq!(c.fans.len(), 2);
+    let tee = c.fans.iter().position(|f| f.dir == FanDir::Out).unwrap();
+    let merge = c.fans.iter().position(|f| f.dir == FanDir::In).unwrap();
+    assert_eq!(c.fans[tee].of, lane);
+    assert_eq!(c.fans[merge].of, lane);
+    let tee_node = Endpoint::New((modules.len() + tee) as u16);
+    let merge_node = Endpoint::New((modules.len() + merge) as u16);
+    assert_eq!(c.edges.iter().filter(|e| e.to == lane).count(), 1);
+    assert_eq!(c.edges.iter().filter(|e| e.from == lane).count(), 1);
+    assert!(c.edges.iter().any(|e| e.from == merge_node && e.to == lane));
+    assert!(c.edges.iter().any(|e| e.from == lane && e.to == tee_node));
+    // Each producer reaches the merge on a port of its own; each consumer
+    // leaves the tee on one.
+    let mut into_merge: Vec<u8> = c
+        .edges
+        .iter()
+        .filter(|e| e.to == merge_node)
+        .map(|e| e.to_port)
+        .collect();
+    into_merge.sort_unstable();
+    assert_eq!(into_merge, [0, 1]);
+    let mut out_of_tee: Vec<u8> = c
+        .edges
+        .iter()
+        .filter(|e| e.from == tee_node)
+        .map(|e| e.from_port)
+        .collect();
+    out_of_tee.sort_unstable();
+    assert_eq!(out_of_tee, [0, 1]);
+}
+
+/// Two lanes are two ports: one edge each way on each is left alone.
+#[test]
+fn a_lane_with_one_edge_each_way_is_not_fanned() {
+    let modules = [module(&[]), module(&[])];
+    let lane = |key| Endpoint::Lane { key, target: 7 };
+    let edges = [
+        EdgeRecord {
+            to: lane(0),
+            ..edge(0, 0, 0, 0)
+        },
+        EdgeRecord {
+            from: lane(0),
+            ..edge(0, 0, 0, 0)
+        },
+        EdgeRecord {
+            to: lane(1),
+            ..edge(1, 0, 0, 0)
+        },
+        EdgeRecord {
+            from: lane(1),
+            ..edge(0, 0, 1, 0)
+        },
+    ];
+    let c = compose(&modules, &edges, 256, true).unwrap();
+    assert!(c.fans.is_empty());
+    assert_eq!(c.edges, edges);
+}
+
+/// A lane steps nowhere in the graph: its fan steps in the domain of the
+/// first peer across it.
+#[test]
+fn a_lane_fan_steps_with_its_first_peer() {
+    let lane = Endpoint::Lane { key: 3, target: 7 };
+    let modules = [
+        PlanModule {
+            domain: 2,
+            ..module(&[])
+        },
+        PlanModule {
+            domain: 1,
+            ..module(&[])
+        },
+    ];
+    let edges = [
+        EdgeRecord {
+            to: lane,
+            ..edge(0, 0, 0, 0)
+        },
+        EdgeRecord {
+            to: lane,
+            ..edge(1, 0, 0, 0)
+        },
+    ];
+    let c = compose(&modules, &edges, 256, true).unwrap();
+    assert_eq!(c.fans.len(), 1);
+    assert_eq!(
+        (c.fans[0].dir, c.fans[0].of, c.fans[0].domain),
+        (FanDir::In, lane, 2)
+    );
+}
+
+/// A lane fan is as wide as any other: seventeen producers into one lane
+/// are refused naming the lane.
+#[test]
+fn a_lane_fan_is_at_most_sixteen_wide() {
+    let lane = Endpoint::Lane { key: 0, target: 7 };
+    let modules: Vec<PlanModule<'_>> = (0..17).map(|_| module(&[])).collect();
+    let into: Vec<EdgeRecord> = (0..17)
+        .map(|p| EdgeRecord {
+            to: lane,
+            ..edge(p, 0, 0, 0)
+        })
+        .collect();
+    assert_eq!(
+        compose(&modules, &into, 256, true).unwrap_err(),
+        PlanError::FanWidth {
+            dir: FanDir::In,
+            of: lane,
+            port: 0,
+            edges: 17
+        }
+    );
+    assert_eq!(
+        compose(&modules, &into[..16], 256, true)
+            .unwrap()
+            .fans
+            .len(),
+        1
     );
 }

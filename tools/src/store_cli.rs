@@ -229,7 +229,12 @@ pub fn stage_package(
     let (dir, emitted) = if crate::workload_src::is_source_manifest(package) {
         let project_root = crate::project::root_for_config(package);
         fluxor_tools::packaging::check_package(package, &project_root).map_err(Error::Config)?;
-        let e = crate::workload_src::emit_package(package, None, verbose)?;
+        let e = crate::workload_src::emit_package(
+            package,
+            None,
+            crate::workload_src::Emit::Publish,
+            verbose,
+        )?;
         // A consumer pins a package's modules from where they are
         // published: each of the project's own the package ships must be a
         // published artefact carrying these bytes — staged by this publish,
@@ -650,6 +655,7 @@ pub fn cmd_workload_image_publish(
         });
     }
     let env = workload_image_env(&doc)?;
+    let endpoints = workload_image_endpoints(&doc)?;
     let ref_name = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("{name}:latest"));
@@ -665,6 +671,7 @@ pub fn cmd_workload_image_publish(
             graph: &graph,
             modules: &modules,
             env: &env,
+            endpoints: &endpoints,
             provenance: PROVENANCE_LOCAL,
             source_rev: source_rev.as_deref(),
             ref_name: &ref_name,
@@ -673,6 +680,46 @@ pub fn cmd_workload_image_publish(
     .map_err(|e| Error::Config(e.to_string()))?;
     println!("{ref_name} -> {}", desc.digest);
     Ok(())
+}
+
+/// `workload-image.json`'s `endpoints`: each `protocol` (`tcp`/`udp`) and
+/// nonzero `port` the image listens on, each once. None listed is an image
+/// that listens nowhere.
+fn workload_image_endpoints(doc: &serde_json::Value) -> Result<Vec<oci_store::WorkloadEndpoint>> {
+    let Some(listed) = doc.get("endpoints") else {
+        return Ok(Vec::new());
+    };
+    let Some(listed) = listed.as_array() else {
+        return Err(Error::Config(
+            "workload-image.json: `endpoints` is not a list".into(),
+        ));
+    };
+    let mut out: Vec<oci_store::WorkloadEndpoint> = Vec::with_capacity(listed.len());
+    for e in listed {
+        let protocol = e.get("protocol").and_then(|v| v.as_str());
+        let port = e
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p != 0);
+        let (Some(protocol @ ("tcp" | "udp")), Some(port)) = (protocol, port) else {
+            return Err(Error::Config(format!(
+                "workload-image.json: an endpoint is a protocol tcp or udp and a port \
+                 1..=65535: {e}"
+            )));
+        };
+        let ep = oci_store::WorkloadEndpoint {
+            protocol: protocol.into(),
+            port,
+        };
+        if out.contains(&ep) {
+            return Err(Error::Config(format!(
+                "workload-image.json: endpoint {protocol}/{port} is listed twice"
+            )));
+        }
+        out.push(ep);
+    }
+    Ok(out)
 }
 
 /// `workload-image.json`'s `env`: every param the image binds to the

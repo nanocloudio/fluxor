@@ -601,15 +601,6 @@ unsafe fn rp_protected_call(
 }
 
 static RP_HAL_OPS: HalOps = HalOps {
-    // No durable home for a sealed blob on this platform yet, and saying so
-    // is the point: the vault keeps its in-RAM entry and behaves exactly as
-    // before. A platform gains cold-restart persistence by implementing
-    // these two and loses nothing by not.
-    seal_blob_write: |_, _| false,
-    seal_blob_store: || false,
-    seal_blob_delete: |_| true,
-    seal_blob_read: |_, _| None,
-    seal_blob_ready: || true,
     disable_interrupts: rp_disable_interrupts,
     restore_interrupts: rp_restore_interrupts,
     wake_scheduler: rp_wake_scheduler,
@@ -623,13 +614,12 @@ static RP_HAL_OPS: HalOps = HalOps {
     // no wall clock and says it cannot tell.
     now_unix_millis: rp_now_unix_millis,
     clock_sync_status: rp_clock_sync_status,
-    // Sealing under the RP2350's OTP seal key (`rp_otp_seal`), when the page
-    // holds one: read once, then soft-locked for the rest of the boot. An
-    // RP2040 has no OTP and seals nothing. Unproven on hardware.
+    // The RP2350's OTP seal key (`rp_otp_seal`), when the page holds one:
+    // read once, then soft-locked for the rest of the boot. An RP2040 has
+    // no OTP and no key.
     seal_provenance: rp_seal_provenance,
+    seal_key: rp_seal_key,
     signing_root: fluxor::kernel::security::root::image_root,
-    seal: rp_seal,
-    unseal: rp_unseal,
     now_micros: rp_now_micros,
     tick_count: rp_tick_count,
     flash_base: rp_flash_base,
@@ -722,7 +712,7 @@ fn rp_clock_sync_status() -> Option<(bool, u64)> {
     None
 }
 
-/// The vault's sealing key: the RP2350's OTP seal key, or none.
+/// The platform's sealing key: the RP2350's OTP seal key, or none.
 fn rp_seal_key() -> Option<[u8; 32]> {
     #[cfg(not(feature = "chip-rp2040"))]
     return fluxor::platform::rp_otp_seal::key();
@@ -735,53 +725,6 @@ fn rp_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
     return fluxor::platform::rp_otp_seal::provenance();
     #[cfg(feature = "chip-rp2040")]
     fluxor::kernel::sys::hal::SealProvenance::None
-}
-
-/// `HalOps::seal`: ChaCha20-Poly1305 under the OTP seal key, a TRNG nonce;
-/// `[nonce:12][ciphertext][tag:16]`. `None` without a key.
-fn rp_seal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
-    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt;
-    let mut key = rp_seal_key()?;
-    let n = input.len();
-    if out.len() < 12 + n + 16 {
-        key.fill(0);
-        return None;
-    }
-    let mut nonce = [0u8; 12];
-    if rp_csprng_fill(&mut nonce) != 0 {
-        key.fill(0);
-        return None;
-    }
-    out[..12].copy_from_slice(&nonce);
-    out[12..12 + n].copy_from_slice(input);
-    let tag = chacha20_poly1305_encrypt(&key, &nonce, aad, &mut out[12..12 + n]);
-    out[12 + n..12 + n + 16].copy_from_slice(&tag);
-    key.fill(0);
-    Some(12 + n + 16)
-}
-
-/// `HalOps::unseal`: the inverse; nothing of a failed open left in `out`.
-fn rp_unseal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
-    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt;
-    let mut key = rp_seal_key()?;
-    if input.len() < 28 || out.len() < input.len() - 28 {
-        key.fill(0);
-        return None;
-    }
-    let n = input.len() - 28;
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&input[..12]);
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&input[12 + n..]);
-    out[..n].copy_from_slice(&input[12..12 + n]);
-    let ok = chacha20_poly1305_decrypt(&key, &nonce, aad, &mut out[..n], &tag);
-    key.fill(0);
-    if ok {
-        Some(n)
-    } else {
-        out[..n].fill(0);
-        None
-    }
 }
 
 /// Fill a buffer with conditioned entropy.

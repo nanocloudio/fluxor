@@ -10,12 +10,13 @@
 //!
 //! A held address is installed into the address table as a node-owned
 //! secondary, armed or fenced as the writer asks, with the token this module
-//! minted for it kept here: no coordinator holds it, because on a workload
-//! node the kernel is `addr_ctl`'s only writer. Fencing closes the emission
-//! gate as an `ADDR_FENCE` does, and the evidence — the install generation,
-//! the frame count at the cutoff, and whether that cutoff is the wire (the
-//! driver answered that everything handed over has left the NIC) or only the
-//! ring hand-off — goes back with the entry's state through `REPORT`.
+//! minted for it kept here: the table's writer asks for arming and fencing
+//! by replacing the table, and never holds a token. Fencing closes the
+//! emission gate as an `ADDR_FENCE` does, and the evidence — the install
+//! generation, the frame count at the cutoff, and whether that cutoff is the
+//! wire (the driver answered that everything handed over has left the NIC)
+//! or only the ring hand-off — is stated with the entry, where `READ` finds
+//! it.
 
 use super::*;
 use abi::contracts::net::route as nr;
@@ -175,7 +176,7 @@ unsafe fn settle(s: &mut IpState, slot: usize) -> bool {
     true
 }
 
-/// Settle open fences, and report when one settles.
+/// Settle open fences, and state the entries when one settles.
 pub(crate) unsafe fn step(s: &mut IpState) {
     if s.rt_nheld == 0 {
         return;
@@ -203,7 +204,7 @@ pub(crate) unsafe fn step(s: &mut IpState) {
     }
 }
 
-/// Held entry `i`'s state and evidence, for `REPORT`.
+/// Held entry `i`'s state and evidence.
 pub(crate) unsafe fn entry_state(s: &IpState, i: usize) -> nr::EntryState {
     let mut e = nr::EntryState {
         kind: nr::entry::KIND_HELD,

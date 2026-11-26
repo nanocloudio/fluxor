@@ -481,13 +481,41 @@ pub struct GraphEdge {
     /// what it sends until the provider reports it acknowledged. Set by the
     /// composer; read back through `channel::FACTS`.
     pub retains_send: bool,
+    /// One end is a lane, not a module of the graph: that end's id is 0 and
+    /// names nothing. A lane is never split across cores nor bridged.
+    pub lane: Option<GraphLane>,
+}
+
+/// A node-graph edge's lane end (`Endpoint::Lane`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLane {
+    /// The lane is the edge's consumer end (its commands), else its
+    /// producer end (its events).
+    pub to: bool,
+    pub key: u8,
+    /// The name hash the lane's target declares its lanes under.
+    pub target: u32,
 }
 
 impl GraphEdge {
     /// The node graph's edge `e`, whose ends `splice::check_boot` has
-    /// checked are the graph's own modules.
+    /// checked are the graph's own modules and lanes.
     fn of(e: &graph::EdgeRecord) -> Self {
+        let lane = match (e.from, e.to) {
+            (graph::Endpoint::Lane { key, target }, _) => Some(GraphLane {
+                to: false,
+                key,
+                target,
+            }),
+            (_, graph::Endpoint::Lane { key, target }) => Some(GraphLane {
+                to: true,
+                key,
+                target,
+            }),
+            _ => None,
+        };
         Self {
+            lane,
             from_id: e.from.new_index().unwrap_or(0) as ModuleId,
             to_id: e.to.new_index().unwrap_or(0) as ModuleId,
             to_port: u8::from(e.to_ctrl),

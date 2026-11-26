@@ -1,10 +1,26 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
-# An instance's state in the kernel's arena, in 64-byte units: the pointer
-# to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
-# the kernel's vtable and the build's state-arena charge both read.
-state_bytes_64 = 1
+
+# The node's network on a Linux host: the stream and datagram surfaces over
+# the host's TCP and UDP, the `net_route` and `net_policy` contracts, and
+# address control. A host provider serves it, out of the runtime's process:
+# the build makes an instance a `host_lane` running `fluxor-provider-net`,
+# its one static pair address control (`addr_ctl`/`addr_evt`), and every
+# socket consumer one of its lanes.
+[host_provider]
+runtime = "fluxor-provider-net"
+serves = ["net_route", "net_policy"]
+
+# Lanes: every socket consumer — a module of the node's graph under the node
+# owner, a workload's under its own — reaches it over a lane, never a port.
+# The `net_in`/`net_out` ports below describe each lane's commands and
+# events: the composer wires every edge to them as a lane (one per edge into
+# `net_in`, one shared by the edges marked `edge_class: merge`), and adds the
+# node graph's lanes to `lanes`; the provider drains lanes in attach order,
+# the node graph's first.
+[lanes]
+capacity_param = "lanes"
 
 # Connection table size: listeners + clients, and the ceiling on the
 # `u16` conn id net_proto carries. Idle slots hold no buffer.
@@ -16,12 +32,11 @@ default = 128
 range = [2, 65535]
 
 # Per-connection unsent-byte backlog cap, KiB. Grown as a send backs up
-# and released with the slot. Commands stop being read (back-pressure on
-# the shared upstream channel) only while some backlog is FULL — one more
-# command frame would not fit — so a peer slow to read is buffered up to
-# this cap without holding up every other connection. A server whose
-# answers are large (an API serving 1 MiB objects) sets it to hold a
-# few of them.
+# and released with the slot. Commands stop being acted on (back-pressure
+# on the lanes) only while some backlog is FULL — one more command frame
+# would not fit — so a peer slow to read is buffered up to this cap without
+# holding up every other connection. A server whose answers are large (an
+# API serving 1 MiB objects) sets it to hold a few of them.
 [[params]]
 name = "write_buf_kib"
 tag = 11
@@ -37,9 +52,18 @@ type = "u32"
 default = 128
 range = [1, 65535]
 
-# Records are bounded per port, header included; the native module states the
-# same figures in providers.rs (`LINUX_NET_OUT_MAX_RECORD`,
-# `LINUX_NET_IN_ACCEPTS_RECORD`). A MSG_DATA carries at most 1460 bytes and a
+# Workload lanes served at once, beside the node graph's, which the build
+# adds; 0 serves none.
+[[params]]
+name = "lanes"
+tag = 13
+type = "u8"
+default = 32
+range = [0, 255]
+
+# Records are bounded per port, header included; the provider states the
+# same figures (`fluxor_provider_net::sockets::OUT_MAX_RECORD`,
+# `IN_ACCEPTS_RECORD`). A MSG_DATA carries at most 1460 bytes and a
 # datagram is delivered only while its MSG_DG_RX_FROM fits 1483 (1472 bytes
 # of IPv4 payload); a larger host datagram is dropped and counted.
 [[ports]]
@@ -55,6 +79,21 @@ direction = "input"
 content_type = "NetProto"
 accepts_record = 49155
 
+# Address control from the node's workload creator (`net::identity`):
+# `ADDR_ADD`/`ADDR_DEL`/… records in.
+[[ports]]
+name = "addr_ctl"
+direction = "input"
+content_type = "NetProto"
+accepts_record = 265
+
+# Address-control events back to the writer (`MSG_ADDR_*`).
+[[ports]]
+name = "addr_evt"
+direction = "output"
+content_type = "NetProto"
+max_record = 265
+
 # Module-scope observability — exempt.
 [observability]
-exempt = "Linux-host TCP/IP adapter — dev/test substitute for the silicon ip stack; host-side throughput is observed via the host OS (ss/netstat) and at the instrumented stream modules above it"
+exempt = "Linux-host network provider — host-side throughput is observed via the host OS (ss/netstat) and at the instrumented stream modules above it"

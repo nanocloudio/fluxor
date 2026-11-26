@@ -12,17 +12,22 @@
 //! ETH frames → [out_chan] ──────► [in_chan] → ARP/IPv4 parse
 //!                                            ├── ICMP echo → reply ──► [out_chan] → driver
 //!                                            ├── DHCP reply → config
-//!                                            ├── TCP data ────────────► [net_out] MSG_DATA
-//!                                            └── UDP datagram ────────► [net_out] MSG_DATA
-//! [net_in] CMD_SEND ──────────► TCP/UDP build ──► [out_chan] → driver
+//!                                            ├── TCP data ────────────► [lane events] MSG_DATA
+//!                                            └── UDP datagram ────────► [lane events] MSG_DATA
+//! [lane commands] CMD_SEND ───► TCP/UDP build ──► [out_chan] → driver
 //! ```
 //!
 //! # Channels
 //!
 //! - `in_chan` (in[0]): Raw ethernet frames from driver module
 //! - `out_chan` (out[0]): Raw ethernet frames to driver module
-//! - `net_in_chan` (in[1]): Net protocol commands from consumer (CMD_BIND, CMD_SEND, etc.)
-//! - `net_out_chan` (out[1]): Net protocol messages to consumer (MSG_DATA, MSG_ACCEPTED, etc.)
+//! - **Lanes**: every consumer — a module of the node's graph under the
+//!   node owner, a workload's under its own — reaches the stack over a lane
+//!   of its own, its commands (CMD_BIND, CMD_SEND, …) in and its events
+//!   (MSG_DATA, MSG_ACCEPTED, …) out, taken from the kernel with
+//!   `LANE_TAKE`. The manifest's `net_in`/`net_out` describe each lane's two
+//!   channels; the composer wires every edge to them as a lane, never a
+//!   port.
 //!
 //! # Stack profile
 //!
@@ -70,9 +75,9 @@
 //! sends one A query per name from an ephemeral port it holds for its
 //! lifetime, to `resolver` when set and otherwise to the DHCP lease's DNS
 //! server; a reply is demuxed by that port ahead of the datagram endpoints.
-//! Answers are cached by TTL, per owner — the node and each workload lane
-//! keep their own `dns_cache` entries and `dns_pending` queries, so no owner
-//! joins or reads another's — and a repeated dial pays no round trip. Names
+//! Answers are cached by TTL, per lane — each keeps its own `dns_cache`
+//! entries and `dns_pending` queries, so no lane joins or reads another's —
+//! and a repeated dial pays no round trip. Names
 //! are held whole up to the protocol's 253 bytes. A query unanswered after 3 s is sent once more with a fresh id,
 //! then the dial fails `ENOENT` on its requester tag, as does a negative
 //! answer or a dial with no resolver known. `CMD_DG_SEND_TO` takes the same
@@ -156,9 +161,11 @@ mod ipv4;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod ipv6;
-/// Packet policy enforced from `net.policy` tables.
+/// The `net.policy` store, and the tables this instance enforces.
 mod policy;
-/// The `net.route` tables read with TAKE: segments, peer routes, held.
+/// `net.route` and `net.policy` served to the node's other modules.
+pub mod provider;
+/// The `net.route` tables: segments, peer routes, held addresses.
 mod route;
 /// The send buffers of connections whose consumer keeps no copy.
 mod send_pool;
@@ -379,8 +386,8 @@ const LANES_DEFAULT: u8 = 16;
 const LANES_DEFAULT: u8 = 0;
 /// Datagram endpoints one lane holds when the graph declares no quota.
 const LANE_ENDPOINTS_DEFAULT: u8 = 16;
-/// Resolver cache entries and pending queries per owner (the node and each
-/// lane) when the graph declares none: room for a search list's expansion.
+/// Resolver cache entries and pending queries per lane when the graph
+/// declares none: room for a search list's expansion.
 #[cfg(target_arch = "aarch64")]
 const DNS_CACHE_DEFAULT: u8 = 8;
 #[cfg(not(target_arch = "aarch64"))]
@@ -394,12 +401,29 @@ const DNS_PENDING_DEFAULT: u8 = 2;
 /// (`module_facts!`'s `arena:`). On aarch64 the heap is elastic — it commits what
 /// the tables touch, so the cap is room to declare more, not memory spent;
 /// on an MCU-class target it is committed whole, so it is what the defaults
-/// need.
+/// need beside the lanes — the tables every instance holds, and the
+/// allocation headers of every table, the lanes' among them — and each lane
+/// is charged on top (`LANE_HEAP_BYTES`, the manifest's `heap_per_param`).
 #[cfg(target_arch = "aarch64")]
 const HEAP_DEFAULT_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(not(target_arch = "aarch64"))]
-const HEAP_DEFAULT_BYTES: u32 =
-    5 * 1024 + send_pool::POOL_BLOCKS as u32 * send_pool::BLOCK_OVERHEAD;
+const HEAP_DEFAULT_BYTES: u32 = 1944 + send_pool::POOL_BLOCKS as u32 * send_pool::BLOCK_OVERHEAD;
+
+/// Heap bytes one lane takes at the declared defaults: its state and stash,
+/// its entry in the lane table and the owner contexts, its event queue
+/// (`lane_events`) and its resolver partition (`dns_cache`, `dns_pending`).
+/// The manifest's `heap_per_param` term for `lanes` charges this per lane, so
+/// a graph pays for the lanes it wires. On aarch64 the heap is elastic and
+/// the term is 0.
+#[cfg(not(target_arch = "aarch64"))]
+const LANE_HEAP_BYTES: usize = core::mem::size_of::<LaneState>()
+    + core::mem::size_of::<NetLane>()
+    + core::mem::size_of::<OwnerRctx>()
+    + LANE_EVENTS_DEFAULT as usize * core::mem::size_of::<EvSlot>()
+    + DNS_CACHE_DEFAULT as usize * core::mem::size_of::<DnsCacheEntry>()
+    + DNS_PENDING_DEFAULT as usize * core::mem::size_of::<DnsPending>();
+#[cfg(not(target_arch = "aarch64"))]
+const _: () = assert!(LANE_HEAP_BYTES == 3548);
 
 /// Heap bytes one decision-seam hold takes: the held frame and its owed-record
 /// reference. The manifest's `heap_per_param` term for `packet_holds` charges
@@ -409,14 +433,17 @@ const _: () = assert!(HOLD_BYTES == 1628);
 /// The most holds a `pkt_id` can name.
 const PACKET_HOLDS_MAX: usize = 1 << abi::contracts::net::packet::PKT_SLOT_BITS;
 
-/// Workload network lanes this provider holds: a staged workload's own
-/// command/event channel pair, attached by the kernel. The provider states
-/// its capacity (`lanes`) when it claims the role (`NET_PROVIDE`), and the
-/// kernel admits no more, so a lane it attaches is one this module has room
-/// for. A lane id is a `u8`: at most 255.
-use abi::contracts::workload::{net_lane, NET_LANE_ADMIT, NET_LANE_TAKE, NET_PROVIDE};
+/// The lanes this provider holds: each consumer's own command/event channel
+/// pair, under the owner of the module writing its commands (the node, or
+/// the workload the owner plan or an add gives it), attached by the kernel and taken here with `LANE_TAKE`.
+/// The kernel reads the capacity from the `lanes` param the manifest's
+/// `[lanes]` names as this module is instantiated, and attaches no more, so
+/// a lane it attaches is one this module has room for. A lane id is a
+/// `u8`: at most 255.
+use abi::kernel_abi::lane as net_lane;
+use abi::kernel_abi::{LANE_TAKE, OWNER_GRANTS};
 
-/// One workload lane. Its index (1-based) is the `lane` stamped on every
+/// One lane. Its index (1-based) is the `lane` stamped on every
 /// endpoint it opens and every dial it parks; everything keyed by it is
 /// cleared when the lane detaches (`lane_close`), so a lane that later takes
 /// the same index inherits nothing.
@@ -434,14 +461,42 @@ struct NetLane {
     /// The owner's own IPv4 address slot (`LOCAL_SLOT_ANY` when it has
     /// none), cached under the address-table epoch it was looked up in.
     src_slot: u16,
-    /// The owner's name-service context (`workload::NET_RESOLVER`), and
-    /// whether it was read: 0 not yet, 1 held, 2 none (the node's own
-    /// upstream serves the owner).
+    /// The owner's name-service context (`OWNER_RESOLVER` on `addr_ctl`),
+    /// and whether there is one: 1 held, 0 none (the node's own upstream
+    /// serves the owner).
     rctx_len: u16,
     src_epoch: u32,
     rctx_state: u8,
-    _rctx_pad: [u8; 3],
-    rctx: [u8; abi::contracts::workload::resolver::MAX],
+    /// 1 once the kernel said the owner is draining (`OP_DRAIN`): the lane
+    /// binds nothing new.
+    draining: u8,
+    /// 1 when every consumer of its events retains what it sends
+    /// (`lane_retains`, asked at attach): its connections are granted
+    /// `RETX`.
+    retx: u8,
+    _rctx_pad: u8,
+    rctx: [u8; netid::owner_resolver::CONTEXT_MAX],
+}
+
+/// An owner's name-service context as `OWNER_RESOLVER` delivered it, kept
+/// for the owner's lanes, which may attach after it arrives. `len` 0: a free
+/// entry.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct OwnerRctx {
+    owner_slot: u16,
+    len: u16,
+    owner_gen: u32,
+    ctx: [u8; netid::owner_resolver::CONTEXT_MAX],
+}
+
+impl OwnerRctx {
+    const EMPTY: OwnerRctx = OwnerRctx {
+        owner_slot: 0,
+        len: 0,
+        owner_gen: 0,
+        ctx: [0; netid::owner_resolver::CONTEXT_MAX],
+    };
 }
 
 impl NetLane {
@@ -456,16 +511,18 @@ impl NetLane {
         rctx_len: 0,
         src_epoch: 0,
         rctx_state: 0,
-        _rctx_pad: [0; 3],
-        rctx: [0; abi::contracts::workload::resolver::MAX],
+        draining: 0,
+        retx: 0,
+        _rctx_pad: 0,
+        rctx: [0; netid::owner_resolver::CONTEXT_MAX],
     };
 }
 
-/// One lane's own state (lane 0 is the node's): its command stash — a
-/// CMD_SEND tail that could not be drained in one step, and a CLOSE
-/// deferred behind it — its event queue, and its fast-path count. Each lane
-/// has its own, so a workload whose peer stops reading holds up its own
-/// commands and events and nobody else's.
+/// One lane's own state: its command stash — a CMD_SEND tail that could
+/// not be drained in one step, and a CLOSE deferred behind it — its event
+/// queue, and its fast-path count. Each lane has its own, so a consumer
+/// whose peer stops reading holds up its own commands and events and nobody
+/// else's.
 /// `LaneState::close_valid` for a deferred abortive close (1: an orderly
 /// one).
 const CLOSE_STASH_ABORT: u8 = 2;
@@ -489,7 +546,15 @@ struct LaneState {
     ev_head: u16,
     ev_count: u16,
     ev_cap: u16,
-    _pad: u16,
+    /// Receivers on the lane whose window was updated in the current
+    /// sharing epoch, hashed by connection index (`conn_idx & 255`; a
+    /// collision undercounts, which only offers a larger share), and the
+    /// previous epoch's count: a connection's receive window is a share of
+    /// its lane's events ring, and this is how many it is shared between
+    /// (`update_rcv_wnd`).
+    rx_prev: u16,
+    rx_epoch_ms: u32,
+    rx_seen: [u64; 4],
     buf: [u8; PENDING_CMD_BUF_SIZE],
 }
 
@@ -624,7 +689,11 @@ pub struct LocalAddr {
     /// the driver is still being asked whether the wire is quiet.
     pub fence_cutoff: u64,
     pub fence_kind: u8,
-    pub _fence_pad: [u8; 3],
+    pub _fence_pad: u8,
+    /// The `net.route` segment the address joined (`ADDR_ADD`'s trailer;
+    /// 0: none). A segment an address joined is not removed or re-shaped
+    /// under it (`EBUSY` on the SEGMENTS replace).
+    pub segment: u16,
     pub fence_deadline_ms: u32,
 }
 
@@ -642,7 +711,8 @@ impl LocalAddr {
             flags: 0,
             fence_cutoff: 0,
             fence_kind: 0,
-            _fence_pad: [0; 3],
+            _fence_pad: 0,
+            segment: 0,
             fence_deadline_ms: 0,
         }
     }
@@ -672,14 +742,15 @@ impl LocalAddr {
 
 /// `addr_ctl` port opcodes — the shared `net::identity` control contract
 /// (`crates/fluxor-abi/src/contracts/net/identity.rs`). This module is one *provider* of
-/// that contract; the workload backend is its writer. Both sides reference these
-/// same constants, so the opcodes and payload layout have a single source of
-/// truth rather than one copy per side to keep in step by hand.
-///   ADDR_ADD payload: [addr:16][prefix_len:1][owner_tag:2 LE]
+/// that contract; the workload creator (or an address coordinator) is its
+/// writer. Both sides reference these same constants, so the opcodes and
+/// payload layout have a single source of truth.
+///   ADDR_ADD payload: [addr:16][prefix_len:1][owner_tag:2 LE][flags:1]?[segment:2 LE]?
 ///   ADDR_DEL payload: [addr:16]
 use abi::contracts::net::identity as netid;
 const IP_ADDR_ADD: u8 = netid::ADDR_ADD;
 const IP_ADDR_DEL: u8 = netid::ADDR_DEL;
+const IP_OWNER_RESOLVER: u8 = netid::OWNER_RESOLVER;
 const IP_ADDR_ARM: u8 = netid::ADDR_ARM;
 const IP_ADDR_FENCE: u8 = netid::ADDR_FENCE;
 /// Emission events to the address-control writer (out[5]).
@@ -688,9 +759,7 @@ const ADDR_EVT_PORT: u8 = 5;
 const AUTH_RSP_PORT: u8 = 5;
 const AUTH_REQ_PORT: u8 = 7;
 /// THIS module's input-port indices (module-local facts, matching
-/// `manifest.toml`); `addr_ctl`'s is declared to the kernel at init via the
-/// `NET_IDENT_PROVIDER` self-registration.
-const NET_IN_PORT: u8 = 1;
+/// `manifest.toml`).
 const ADDR_CTL_PORT: u8 = 2;
 /// Pre-transport decision-seam ports of the packet contract
 /// (`crates/fluxor-abi/src/contracts/net/packet.rs`):
@@ -722,11 +791,6 @@ struct EvSlot {
     frame: [u8; NET_OUT_FRAME_MAX],
 }
 
-/// The node's event queue when the graph declares none (`node_events`).
-#[cfg(target_arch = "aarch64")]
-const NODE_EVENTS_DEFAULT: u8 = 32;
-#[cfg(not(target_arch = "aarch64"))]
-const NODE_EVENTS_DEFAULT: u8 = 16;
 /// Each lane's event queue, its reserved floor, when the graph declares none
 /// (`lane_events`). An accept is announced only with two slots free (its
 /// `MSG_ACCEPTED` and peer report), and a command's answer takes two at most.
@@ -734,9 +798,9 @@ const LANE_EVENTS_DEFAULT: u8 = 8;
 /// Fast-path halves one lane holds at once when the graph declares none
 /// (`lane_pairs`).
 const LANE_PAIRS_DEFAULT: u8 = 16;
-/// Free slots in a workload lane's event queue below which its command
-/// intake pauses: a command's answer is at most two frames
-/// (`MSG_CONNECTED` and its peer report).
+/// Free slots in a lane's event queue below which its command intake
+/// pauses: a command's answer is at most two frames (`MSG_CONNECTED` and
+/// its peer report).
 const LANE_EVENT_HEADROOM: usize = 2;
 
 /// `TcpConn::pending_close_notify` codes — non-zero values identify
@@ -958,8 +1022,7 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
     // A send or close the lane held back for this connection is this
     // connection's alone: the next connection in the slot — another
     // workload's, possibly — must not receive it.
-    {
-        let st = lane_state(s, (*s.tcp_conns.ptr(idx)).lane);
+    if let Some(st) = lane_state(s, (*s.tcp_conns.ptr(idx)).lane) {
         if st.valid != 0 && st.conn as usize == idx {
             st.valid = 0;
             st.off = 0;
@@ -1238,24 +1301,11 @@ unsafe fn find_listener_indexed(s: &IpState, local_port: u16, local_slot: u16) -
 }
 
 /// Whether the lane being served must stop reading commands: its own event
-/// queue has too little room for the answers. The node pauses at
-/// `NET_OUT_QUEUE_HEADROOM`, a workload lane at `LANE_EVENT_HEADROOM`.
+/// queue has too little room for the answers (`LANE_EVENT_HEADROOM`). The
+/// pause propagates backpressure to that lane's producer alone.
 unsafe fn lane_intake_paused(s: &IpState) -> bool {
-    let room = ev_room(s, s.cur_lane);
-    if s.cur_lane == 0 {
-        room <= NET_OUT_QUEUE_HEADROOM
-    } else {
-        room < LANE_EVENT_HEADROOM
-    }
+    ev_room(s, s.cur_lane) < LANE_EVENT_HEADROOM
 }
-
-/// Inbound RX / command processing pauses when the outbound control
-/// queue has fewer than this many free slots. Each accepted segment
-/// or command typically synthesises one outbound control event, so
-/// pulling more in while the queue is near-full would just risk
-/// overflow. The pause propagates backpressure to the upstream
-/// producer.
-const NET_OUT_QUEUE_HEADROOM: usize = 4;
 
 // ============================================================================
 // Module State
@@ -1632,9 +1682,9 @@ struct IpState {
     ip_id: u16,
     _id_pad: [u8; 2],
 
-    // Net protocol channels (consumer ↔ IP)
+    /// The commands channel of the lane being served (`cur_lane`); -1
+    /// between lanes.
     net_in_chan: i32,
-    net_out_chan: i32,
     /// Address-control input port (in[2]); -1 when unwired. Single writer =
     /// the platform workload backend. A graph without it wired runs with the
     /// single primary address.
@@ -1766,9 +1816,9 @@ struct IpState {
     _aw_pad: [u8; 3],
     arp_wait_overflow: u32,
 
-    /// Per-lane command stashes (`LaneState`), `lane_cap + 1` of them in
-    /// the module heap, lane 0 the node's: a CMD_SEND tail that couldn't be
-    /// drained in one tick (peer window closed mid-frame, or NIC out_chan
+    /// Per-lane command stashes (`LaneState`), `lane_cap` of them in the
+    /// module heap, lane `k` at index `k - 1`: a CMD_SEND tail that couldn't
+    /// be drained in one tick (peer window closed mid-frame, or NIC out_chan
     /// rejected a segment), and a CMD_CLOSE deferred behind it (RFC 793 §3.5
     /// — CLOSE transmits all queued SENDs first). The lane's channel is not
     /// read while its stash is occupied, so backpressure propagates back to
@@ -1776,8 +1826,8 @@ struct IpState {
     /// else's.
     lane_states: *mut LaneState,
 
-    /// The event queues' slots, in the module heap: the node's queue
-    /// (`node_events`) then each lane's (`lane_events`); see `LaneState`.
+    /// The event queues' slots, in the module heap: each lane's
+    /// (`lane_events`); see `LaneState`.
     /// Event-channel writes are atomic-FIFO and reject when full; queueing
     /// lets a momentarily-full consumer apply backpressure without losing
     /// the control event. Drained at the top of each `module_step`.
@@ -1786,15 +1836,16 @@ struct IpState {
     ev_total: u32,
     /// Control frames refused because their lane's queue was full.
     ev_refused: u32,
-    /// `node_events` / `lane_events` / `lane_pairs` (params).
-    node_events: u8,
+    /// `lane_events` / `lane_pairs` (params).
     lane_events: u8,
     lane_pairs: u8,
-    _ev_pad: u8,
-    /// Workload network lanes (see `NetLane`), the lane whose commands are
-    /// being served (1-based; 0 = `net_in_chan`), and the provider claim:
-    /// 0 not asked, 1 held, 2 refused (another provider, or no kernel support).
+    _ev_pad: [u8; 2],
+    /// The lanes (see `NetLane`), the lane whose commands are being served
+    /// (1-based; 0 between lanes), and the provider claim: 0 not asked, 1
+    /// held, 2 refused (another provider, or no kernel support).
     lanes: *mut NetLane,
+    /// Owners' name-service contexts (`OWNER_RESOLVER`), `lanes` entries.
+    owner_rctx: *mut OwnerRctx,
     cur_lane: u8,
     lane_provider: u8,
     /// `lanes`: the lanes this provider holds, stated to the kernel.
@@ -1849,14 +1900,6 @@ struct IpState {
     tlm: TlmCounters,
     /// One-line scratch for the tlm emit, sized at `TLM_LINE_BUF_SIZE`.
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
-    /// Receivers whose window was updated in the current sharing epoch,
-    /// hashed by connection index (`conn_idx & 255`; a collision undercounts,
-    /// which only offers a larger share), and the previous epoch's count. The
-    /// receive window is a share of the consumer ring, and this is how many
-    /// it is shared between (`update_rcv_wnd`).
-    rx_seen: [u64; 4],
-    rx_active_prev: u16,
-    rx_epoch_ms: u32,
     /// Which line of the periodic report the next step writes; 0 when none.
     report_line: u8,
 
@@ -1975,29 +2018,29 @@ struct IpState {
     /// by; 0 until the first lookup allocates it. Held for the module's
     /// lifetime and reserved against `next_port`.
     resolver_port: u16,
-    // ── net.route tables (`route.rs`) ─────────────────────────────────
+    // ── net.route tables (`route.rs`, served by `provider.rs`) ────────
     /// `max_segments` (param).
     max_segments: u8,
+    /// Entries realized, as of the last realization (`route::step`).
     rt_nsegs: u8,
-    /// Whether a TAKE has been adopted, and whether the provider is absent.
-    rt_have: bool,
-    rt_absent: bool,
+    _rt_pad: u8,
     rt_nroutes: u16,
     rt_nheld: u16,
-    rt_buf: *mut u8,
-    rt_buf_len: u32,
-    rt_polled_ms: u32,
+    /// The tables as stored (`net_tables::RouteTables`), with a spare of
+    /// each where a replace is checked before it is kept, and each entry's
+    /// state.
     rt_segs: *mut abi::contracts::net::route::Segment,
     rt_routes: *mut abi::contracts::net::route::Route,
     rt_held: *mut abi::contracts::net::route::Held,
+    rt_spare_segs: *mut abi::contracts::net::route::Segment,
+    rt_spare_routes: *mut abi::contracts::net::route::Route,
+    rt_spare_held: *mut abi::contracts::net::route::Held,
+    rt_seg_state: *mut abi::contracts::net::route::EntryState,
+    rt_route_state: *mut abi::contracts::net::route::EntryState,
+    rt_held_state: *mut abi::contracts::net::route::EntryState,
+    rt_meta: fluxor_sdk::cores::net_tables::RouteMeta,
+    /// The table generation last realized.
     rt_gen: u64,
-    /// Entries the node's tables hold, as the last TAKE's header stated:
-    /// those past what this module holds are reported `table_full`.
-    rt_tsegs: u8,
-    rt_troutes: u16,
-    rt_theld: u16,
-    /// TAKEs whose records did not fit the declared sizes.
-    rt_overflow: u32,
     /// The primary address the held addresses were last realized against.
     rt_realized_ip: u32,
     /// The primary's netmask the peer routes were last checked against.
@@ -2008,7 +2051,6 @@ struct IpState {
     /// Moves on every address install and removal: lanes' cached source
     /// slots are looked up again.
     addr_epoch: u32,
-    rt_report: [u8; route::REPORT_BYTES],
 
     // ── Datagram flows (`flows.rs`) ───────────────────────────────────
     max_dg_flows: u16,
@@ -2035,16 +2077,21 @@ struct IpState {
     pol_names: [u8; 255],
     pol_names_len: u8,
     pol_n: u8,
-    pol_attached: bool,
-    pol_absent: bool,
-    /// `policy_bytes` (param): bytes held per table.
+    /// `policy_store` (param): tables the store holds.
+    pol_store_n: u8,
+    _pol_pad: u8,
+    /// `policy_bytes` (param): rule bytes per table.
     policy_bytes: u16,
-    _pol_pad: u16,
+    /// The tables this instance enforces (`policy_tables`).
     pol: *mut policy::PolTable,
-    pol_buf: *mut u8,
+    /// The store (`net_tables::PolicyStore`): tables, enforcer bindings
+    /// and `pol_store_n * policy_bytes` rule bytes.
+    pol_tables: *mut fluxor_sdk::cores::net_tables::PolicyTable,
+    pol_bindings: *mut fluxor_sdk::cores::net_tables::PolicyBinding,
+    pol_rules: *mut u8,
+    pol_meta: fluxor_sdk::cores::net_tables::PolicyMeta,
+    /// The store generation last applied.
     pol_store_gen: u64,
-    pol_polled_ms: u32,
-    pol_oversized: u32,
     /// Moves when a table holding filter records changes: what a datagram
     /// flow's verdict is stamped with.
     filter_epoch: u32,
@@ -2073,12 +2120,6 @@ struct IpState {
     /// `tcp_send_pool`: bytes of the whole pool.
     tcp_send_pool: u32,
     send_pool: send_pool::SendPool,
-    /// The owner the kernel attests for the node's own `net_in`, and
-    /// whether every consumer of its `net_out` retains what it sends
-    /// (`node_facts`, asked once).
-    node_owner: u16,
-    node_retx: bool,
-    node_facts_known: bool,
     dial_vport: u16,
     /// The name being dialled ended in a dot (absolute: no search list).
     dial_absolute: bool,
@@ -2182,8 +2223,9 @@ mod params_def {
         // construction. A graph that declares more than the defaults gives
         // the instance the heap for it (`heap.arena_bytes`).
         //
-        // Workload lanes held (1..=255, a lane id is a u8; 0 = serve no
-        // workloads), stated to the kernel when the role is claimed.
+        // Lanes held (1..=255, a lane id is a u8; 0 serves no one): the
+        // node graph's, which the composer adds, and its workloads'. Stated
+        // to the kernel as the module is instantiated.
         12, lanes, u8, LANES_DEFAULT
             => |s, d, len| { s.lane_cap = p_u8(d, len, 0, LANES_DEFAULT); };
         // Datagram endpoints one lane may hold at once; a bind past it is
@@ -2209,7 +2251,7 @@ mod params_def {
         // each lane's reserved floor of them, and how long an idle flow
         // nobody has answered lives (an answered one lives at least the
         // flow model's DATAGRAM_REPLIED_S). Construction requires
-        // max_dg_flows >= (lanes + 1) x floor.
+        // max_dg_flows >= lanes x floor.
         15, max_dg_flows, u16, flows::FLOWS_DEFAULT
             => |s, d, len| { s.max_dg_flows = p_u16(d, len, 0, flows::FLOWS_DEFAULT); };
         16, dg_flow_floor, u8, flows::FLOOR_DEFAULT
@@ -2235,6 +2277,11 @@ mod params_def {
             };
         26, policy_bytes, u16, policy::BYTES_DEFAULT
             => |s, d, len| { s.policy_bytes = p_u16(d, len, 0, policy::BYTES_DEFAULT); };
+        // net.policy tables this instance stores for the node (each of
+        // `policy_bytes`): one per controller. 0 stores none: every REPLACE
+        // is refused ENOSPC.
+        35, policy_store, u8, policy::STORE_DEFAULT
+            => |s, d, len| { s.pol_store_n = p_u8(d, len, 0, policy::STORE_DEFAULT); };
         // Decision seam: MIRROR copies per second (a token bucket that
         // deep). 0, the default, makes every mirror a reported loss.
         27, packet_mirror_budget, u16, 0
@@ -2281,13 +2328,10 @@ mod params_def {
         // Fast-path halves (same-node streams) one lane holds at once.
         17, lane_pairs, u8, LANE_PAIRS_DEFAULT
             => |s, d, len| { s.lane_pairs = p_u8(d, len, 0, LANE_PAIRS_DEFAULT); };
-        // Event-queue slots reserved for each lane (at least 4), and the
-        // node's own (at least 8): a lane's queue fills only with its own
-        // events.
+        // Event-queue slots reserved for each lane (at least 4): a lane's
+        // queue fills only with its own events.
         18, lane_events, u8, LANE_EVENTS_DEFAULT
             => |s, d, len| { s.lane_events = p_u8(d, len, 0, LANE_EVENTS_DEFAULT).max(4); };
-        19, node_events, u8, NODE_EVENTS_DEFAULT
-            => |s, d, len| { s.node_events = p_u8(d, len, 0, NODE_EVENTS_DEFAULT).max(8); };
     }
 }
 
@@ -2337,16 +2381,39 @@ unsafe fn lane_at<'a>(s: &IpState, lane: u8) -> Option<&'a mut NetLane> {
     Some(&mut *s.lanes.add(lane as usize - 1))
 }
 
-/// Lane `lane`'s command stash (0 = the node's). A lane past the table
-/// falls back to the node's, which never happens: `cur_lane` only names a
-/// lane the table holds.
+/// Lane `lane`'s own state (1-based): `None` for lane 0, which names no
+/// lane (a connection whose lane has gone), or one past the table.
 ///
 /// # Safety
-/// As [`arp_tab`]; `module_new` always allocates the node's stash.
+/// As [`arp_tab`]; `module_new` allocates a state per lane.
 #[inline(always)]
-unsafe fn lane_state<'a>(s: &IpState, lane: u8) -> &'a mut LaneState {
-    let i = if lane > s.lane_cap { 0 } else { lane as usize };
-    &mut *s.lane_states.add(i)
+unsafe fn lane_state<'a>(s: &IpState, lane: u8) -> Option<&'a mut LaneState> {
+    if lane == 0 || lane > s.lane_cap || s.lane_states.is_null() {
+        return None;
+    }
+    Some(&mut *s.lane_states.add(lane as usize - 1))
+}
+
+/// Whether lane `lane` is the node owner's: a module of the node's graph
+/// commands on it. Its traffic is the node's own — it binds and leaves from
+/// the node's addresses, and packet policy is the workloads'.
+///
+/// # Safety
+/// As [`arp_tab`].
+#[inline(always)]
+unsafe fn lane_is_node(s: &IpState, lane: u8) -> bool {
+    lane_at(s, lane).is_some_and(|l| l.active != 0 && l.owner_slot == 0)
+}
+
+/// Whether lane `lane` is a workload's: packet policy judges what it sends
+/// and what reaches its endpoints. Neither the node's lane nor no lane (a
+/// connection whose lane has gone) is.
+///
+/// # Safety
+/// As [`arp_tab`].
+#[inline(always)]
+unsafe fn lane_is_workload(s: &IpState, lane: u8) -> bool {
+    lane_at(s, lane).is_some_and(|l| l.active != 0 && l.owner_slot != 0)
 }
 
 /// The lane connection `idx` belongs to (0 for a slot past the table).
@@ -2362,32 +2429,37 @@ unsafe fn conn_lane(s: &IpState, idx: usize) -> u8 {
     }
 }
 
-/// The resolver cache partition of `lane`: its first entry and length.
+/// The resolver cache partition of `lane`: its first entry and length;
+/// empty for a lane the table does not hold.
 #[inline(always)]
 fn dns_cache_part(s: &IpState, lane: u8) -> (usize, usize) {
     let per = s.dns_cache_per as usize;
-    let lane = if lane > s.lane_cap { 0 } else { lane as usize };
-    (lane * per, per)
+    if lane == 0 || lane > s.lane_cap {
+        return (0, 0);
+    }
+    ((lane as usize - 1) * per, per)
 }
 
-/// The pending-query partition of `lane`.
+/// The pending-query partition of `lane`, as [`dns_cache_part`].
 #[inline(always)]
 fn dns_pending_part(s: &IpState, lane: u8) -> (usize, usize) {
     let per = s.dns_pending_per as usize;
-    let lane = if lane > s.lane_cap { 0 } else { lane as usize };
-    (lane * per, per)
+    if lane == 0 || lane > s.lane_cap {
+        return (0, 0);
+    }
+    ((lane as usize - 1) * per, per)
 }
 
 /// Pending-query entries across every partition.
 #[inline(always)]
 fn dns_pending_total(s: &IpState) -> usize {
-    (s.lane_cap as usize + 1) * s.dns_pending_per as usize
+    s.lane_cap as usize * s.dns_pending_per as usize
 }
 
-/// Cache entry `i` (an index inside some owner's partition).
+/// Cache entry `i` (an index inside some lane's partition).
 ///
 /// # Safety
-/// `i < (lane_cap + 1) * dns_cache_per`.
+/// `i < lane_cap * dns_cache_per`.
 #[inline(always)]
 unsafe fn dns_cache_at<'a>(s: &IpState, i: usize) -> &'a mut DnsCacheEntry {
     &mut *s.dns_cache.add(i)
@@ -2491,48 +2563,41 @@ unsafe fn size_declared_tables(s: &mut IpState) -> bool {
         return false;
     }
     s.arp_len = arp_n as u16;
-    let owners = s.lane_cap as usize + 1;
-    s.lane_states = heap_lane_states(s, owners);
-    if s.lane_states.is_null() {
-        refuse_capacity(s, b"the lane stashes (lanes)");
-        return false;
-    }
-    let ev_n = s.node_events as usize + s.lane_cap as usize * s.lane_events as usize;
-    s.ev_slots = heap_table(
-        s,
-        ev_n,
-        EvSlot {
-            len: 0,
-            frame: [0; NET_OUT_FRAME_MAX],
-        },
-    );
-    if s.ev_slots.is_null() {
-        refuse_capacity(s, b"the event queues (node_events, lane_events)");
-        return false;
+    // Every consumer is a lane: its state, its event queue and its entry in
+    // the lane table, `lanes` of each.
+    let owners = s.lane_cap as usize;
+    if owners > 0 {
+        s.lane_states = heap_lane_states(s, owners);
+        s.ev_slots = heap_table(
+            s,
+            owners * s.lane_events as usize,
+            EvSlot {
+                len: 0,
+                frame: [0; NET_OUT_FRAME_MAX],
+            },
+        );
+        s.lanes = heap_table(s, owners, NetLane::EMPTY);
+        s.owner_rctx = heap_table(s, owners, OwnerRctx::EMPTY);
+        if s.lane_states.is_null()
+            || s.ev_slots.is_null()
+            || s.lanes.is_null()
+            || s.owner_rctx.is_null()
+        {
+            refuse_capacity(s, b"the lanes (lanes, lane_events)");
+            return false;
+        }
     }
     let mut lane = 0usize;
     let mut base = 0u32;
     while lane < owners {
         let st = &mut *s.lane_states.add(lane);
-        let cap = if lane == 0 {
-            s.node_events
-        } else {
-            s.lane_events
-        };
         st.ev_base = base;
-        st.ev_cap = u16::from(cap);
-        base += u32::from(cap);
+        st.ev_cap = u16::from(s.lane_events);
+        base += u32::from(s.lane_events);
         lane += 1;
     }
-    if s.lane_cap > 0 {
-        s.lanes = heap_table(s, s.lane_cap as usize, NetLane::EMPTY);
-        if s.lanes.is_null() {
-            refuse_capacity(s, b"the lane table (lanes)");
-            return false;
-        }
-    }
     s.dns_cache = heap_table(s, owners * s.dns_cache_per as usize, DnsCacheEntry::EMPTY);
-    if s.dns_cache_per > 0 && s.dns_cache.is_null() {
+    if owners > 0 && s.dns_cache_per > 0 && s.dns_cache.is_null() {
         refuse_capacity(s, b"the resolver cache (dns_cache)");
         return false;
     }
@@ -2556,7 +2621,7 @@ unsafe fn size_declared_tables(s: &mut IpState) -> bool {
             dial_flags: 0,
         },
     );
-    if s.dns_pending_per > 0 && s.dns_pending.is_null() {
+    if owners > 0 && s.dns_pending_per > 0 && s.dns_pending.is_null() {
         refuse_capacity(s, b"the resolver queries (dns_pending)");
         return false;
     }
@@ -2606,7 +2671,9 @@ unsafe fn heap_lane_states(s: &IpState, n: usize) -> *mut LaneState {
         e.ev_head = 0;
         e.ev_count = 0;
         e.ev_cap = 0;
-        e._pad = 0;
+        e.rx_prev = 0;
+        e.rx_epoch_ms = 0;
+        e.rx_seen = [0; 4];
         i += 1;
     }
     p
@@ -3282,26 +3349,23 @@ unsafe fn ip_net_write_frame(
 /// `delivered_bytes` advancement and the outbound ACK on the return:
 /// ACKing data the consumer never received makes the peer think it
 /// landed and stop retransmitting, permanently losing payload.
-/// The event channel of lane `lane` (0 = `net_out_chan`), -1 for a lane
-/// that is gone.
+/// The event channel of lane `lane`, -1 for no lane or one that is gone.
 #[inline(always)]
 unsafe fn lane_evt(s: &IpState, lane: u8) -> i32 {
-    if lane == 0 {
-        return s.net_out_chan;
-    }
     match lane_at(s, lane) {
         Some(l) if l.active != 0 => l.evt,
         _ => -1,
     }
 }
 
-/// The lane endpoint `idx`'s events go to.
+/// The lane endpoint `idx`'s events go to: its own, or — for a slot of no
+/// lane (free, or released by the command being answered) — the lane whose
+/// command this is.
 #[inline(always)]
 unsafe fn out_lane_conn(s: &IpState, idx: usize) -> u8 {
-    if idx < s.tcp_conns.len() {
-        (*s.tcp_conns.ptr(idx)).lane
-    } else {
-        s.cur_lane
+    match conn_lane(s, idx) {
+        0 => s.cur_lane,
+        lane => lane,
     }
 }
 
@@ -3348,9 +3412,9 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
     if ch < 0 || data_len == 0 {
         return true;
     }
-    if lane_state(s, lane).ev_count != 0 {
+    if ev_queued(s, lane) != 0 {
         ev_drain_lane(s, lane);
-        if lane_state(s, lane).ev_count != 0 {
+        if ev_queued(s, lane) != 0 {
             return false;
         }
     }
@@ -3384,11 +3448,11 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
 // A control frame (`MSG_BOUND`, `MSG_ACCEPTED` and its peer report,
 // `MSG_CLOSED`, `MSG_CONNECTED`, `MSG_ERROR`, …) that a full event channel
 // refuses is queued rather than lost. Every lane has a queue of its own in
-// the module heap — the node's `node_events` slots, each workload lane's
-// `lane_events` — so a lane's count is its queue's, kept on push and drain,
-// and nothing scans one shared queue per send. A workload that stops reading
-// fills its own queue and no one else's; the receive path pauses only on the
-// node's queue, so stalled lanes never pause receive for everyone.
+// the module heap, `lane_events` slots, so a lane's count is its queue's,
+// kept on push and drain, and nothing scans one shared queue per send. A
+// consumer that stops reading fills its own queue and no one else's: its
+// events are refused (an accept, data held unacknowledged) and receive
+// never pauses for it.
 
 /// Event slot `i` of the heap array every lane's queue is a run of.
 ///
@@ -3399,16 +3463,26 @@ unsafe fn ev_slot<'a>(s: &IpState, i: usize) -> &'a mut EvSlot {
     &mut *s.ev_slots.add(i)
 }
 
-/// Free slots in `lane`'s event queue.
+/// Free slots in `lane`'s event queue; none for no lane.
 #[inline(always)]
 unsafe fn ev_room(s: &IpState, lane: u8) -> usize {
-    let l = lane_state(s, lane);
-    (l.ev_cap as usize).saturating_sub(l.ev_count as usize)
+    lane_state(s, lane).map_or(0, |l| {
+        (l.ev_cap as usize).saturating_sub(l.ev_count as usize)
+    })
 }
 
-/// Queue `frame` for `lane`. `false` when its queue is full.
+/// Frames `lane`'s event queue holds.
+#[inline(always)]
+unsafe fn ev_queued(s: &IpState, lane: u8) -> u16 {
+    lane_state(s, lane).map_or(0, |l| l.ev_count)
+}
+
+/// Queue `frame` for `lane`. `false` when its queue is full, or there is no
+/// such lane.
 unsafe fn ev_push(s: &mut IpState, lane: u8, frame: &[u8]) -> bool {
-    let l = lane_state(s, lane);
+    let Some(l) = lane_state(s, lane) else {
+        return false;
+    };
     if l.ev_count >= l.ev_cap || frame.is_empty() || frame.len() > NET_OUT_FRAME_MAX {
         return false;
     }
@@ -3435,7 +3509,9 @@ unsafe fn ev_push(s: &mut IpState, lane: u8, frame: &[u8]) -> bool {
 /// refuses one; the rest keep their order. A lane that has gone drops what
 /// it had queued.
 unsafe fn ev_drain_lane(s: &mut IpState, lane: u8) {
-    let l = lane_state(s, lane);
+    let Some(l) = lane_state(s, lane) else {
+        return;
+    };
     if l.ev_count == 0 {
         return;
     }
@@ -3461,7 +3537,9 @@ unsafe fn ev_drain_lane(s: &mut IpState, lane: u8) {
 
 /// Drop everything `lane` has queued (its channel has gone).
 unsafe fn ev_discard_lane(s: &mut IpState, lane: u8) {
-    let l = lane_state(s, lane);
+    let Some(l) = lane_state(s, lane) else {
+        return;
+    };
     s.ev_total = s.ev_total.saturating_sub(u32::from(l.ev_count));
     l.ev_count = 0;
     l.ev_head = 0;
@@ -3482,7 +3560,7 @@ unsafe fn net_send_or_queue_lane(s: &mut IpState, lane: u8, frame: &[u8]) -> boo
         return false;
     }
     ev_drain_lane(s, lane);
-    if lane_state(s, lane).ev_count == 0 {
+    if ev_queued(s, lane) == 0 {
         let sys = &*s.syscalls;
         let n = (sys.channel_write)(ch, frame.as_ptr(), frame.len());
         if n == frame.len() as i32 {
@@ -3491,9 +3569,6 @@ unsafe fn net_send_or_queue_lane(s: &mut IpState, lane: u8, frame: &[u8]) -> boo
     }
     if ev_push(s, lane, frame) {
         return true;
-    }
-    if lane == 0 {
-        log_info(s, b"[ip] net out queue full");
     }
     s.ev_refused = s.ev_refused.wrapping_add(1);
     false
@@ -3510,12 +3585,12 @@ unsafe fn drain_pending_net_out(s: &mut IpState) {
     if s.ev_total == 0 {
         return;
     }
-    let mut lane = 0u8;
-    loop {
-        if lane_state(s, lane).ev_count != 0 {
+    let mut lane = 1u8;
+    while lane <= s.lane_cap {
+        if ev_queued(s, lane) != 0 {
             ev_drain_lane(s, lane);
         }
-        if lane >= s.lane_cap {
+        if lane == u8::MAX {
             break;
         }
         lane += 1;
@@ -3904,7 +3979,7 @@ unsafe fn net_send_ack(
     if ch < 0 {
         return true;
     }
-    if lane_state(s, lane).ev_count != 0 {
+    if ev_queued(s, lane) != 0 {
         return false;
     }
     let sys = &*s.syscalls;
@@ -4077,8 +4152,25 @@ unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
     net_send_or_queue_lane(s, lane, &frame);
 }
 
-/// Length of a receive-window sharing epoch (`rx_seen`).
+/// Length of a receive-window sharing epoch (`LaneState::rx_seen`).
 const RX_EPOCH_MS: u32 = 50;
+
+/// The most receivers any lane shared its ring between last epoch: what the
+/// report states as `sharers`.
+unsafe fn rx_sharers_peak(s: &IpState) -> u32 {
+    let mut peak = 0u32;
+    let mut lane = 1u8;
+    while lane <= s.lane_cap {
+        if let Some(st) = lane_state(s, lane) {
+            peak = peak.max(u32::from(st.rx_prev));
+        }
+        if lane == u8::MAX {
+            break;
+        }
+        lane += 1;
+    }
+    peak
+}
 /// Smallest window worth opening (RFC 9293 §3.8.6.2.2 receiver-side silly
 /// window avoidance): below one default-MSS segment, advertise zero and
 /// let the sweep reopen it once the ring has drained.
@@ -4102,23 +4194,23 @@ const MIN_OPEN_WND: u32 = 536;
 /// too (`rcv_wnd_exposed`).
 unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     let sys = &*s.syscalls;
-    // Epoch bookkeeping: which receivers are active.
+    // Epoch bookkeeping: which receivers on the connection's lane are
+    // active, since they share its events ring.
     let now_ms = dev_millis(sys) as u32;
-    if now_ms.wrapping_sub(s.rx_epoch_ms) >= RX_EPOCH_MS {
-        let seen: u32 = s.rx_seen.iter().map(|w| w.count_ones()).sum();
-        s.rx_active_prev = seen as u16;
-        s.rx_seen = [0; 4];
-        s.rx_epoch_ms = now_ms;
-    }
-    let bit = conn_idx & 255;
-    s.rx_seen[bit >> 6] |= 1u64 << (bit & 63);
-    let seen_now: u32 = s.rx_seen.iter().map(|w| w.count_ones()).sum();
-    // A lane's event channel is the endpoint's own ring, not one shared.
-    let on_lane = (*s.tcp_conns.ptr(conn_idx)).lane != 0;
-    let sharers = if on_lane {
-        1
-    } else {
-        seen_now.max(s.rx_active_prev as u32).max(1)
+    let sharers = match lane_state(s, conn_lane(s, conn_idx)) {
+        Some(st) => {
+            if now_ms.wrapping_sub(st.rx_epoch_ms) >= RX_EPOCH_MS {
+                let seen: u32 = st.rx_seen.iter().map(|w| w.count_ones()).sum();
+                st.rx_prev = seen as u16;
+                st.rx_seen = [0; 4];
+                st.rx_epoch_ms = now_ms;
+            }
+            let bit = conn_idx & 255;
+            st.rx_seen[bit >> 6] |= 1u64 << (bit & 63);
+            let seen_now: u32 = st.rx_seen.iter().map(|w| w.count_ones()).sum();
+            seen_now.max(u32::from(st.rx_prev)).max(1)
+        }
+        None => 1,
     };
     let out_ch = out_chan_conn(s, conn_idx);
 
@@ -4183,35 +4275,20 @@ const EPHEMERAL_SCAN_MAX: usize = tcp::MAX_TCP_CONNS * 2;
 ///
 /// # Safety
 /// `s.tcp_conns` must be initialised.
-/// The owner the channel being served commands as, as the kernel attests
-/// it: a workload lane's owner from `NET_LANE_TAKE`, the node's own channel
-/// the producer owner `channel::FACTS` reported for it (`node_facts`). A
-/// command never names its owner.
+/// The owner the lane being served commands as, as the kernel attests it
+/// (`LANE_TAKE`): the node owner (0) for a module of the node's graph, a
+/// workload's own otherwise. A command never names its owner.
 unsafe fn cmd_owner(s: &IpState) -> u16 {
-    match lane_at(s, s.cur_lane) {
-        Some(l) => l.owner_slot,
-        None => s.node_owner,
-    }
+    lane_at(s, s.cur_lane).map_or(0, |l| l.owner_slot)
 }
 
-/// Ask the kernel, once, about the node's own pair of channels: who writes
-/// `net_in` (the owner its binds and endpoints are made as), and whether
-/// every consumer of `net_out` keeps its own copy of what it sends
-/// (`RETAINS_SEND`: its connections are granted `RETX` and this module
-/// retains nothing for them). A kernel that cannot say leaves the host
-/// owner and no `RETX`.
-unsafe fn node_facts(s: &mut IpState) {
-    if s.node_facts_known {
-        return;
-    }
-    s.node_facts_known = true;
-    let sys = &*s.syscalls;
-    if let Some((owner, _)) = channel_facts(sys, s.net_in_chan) {
-        s.node_owner = owner;
-    }
-    if let Some((_, flags)) = channel_facts(sys, s.net_out_chan) {
-        s.node_retx = flags & abi::kernel_abi::channel::facts::RETAINS_SEND != 0;
-    }
+/// Whether every consumer of a lane's events keeps its own copy of what it
+/// sends (`channel::FACTS` on the events channel, `RETAINS_SEND`): its
+/// connections are granted `RETX` and this module retains nothing for
+/// them. A kernel that cannot say grants no `RETX`.
+unsafe fn lane_retains(sys: &SyscallTable, evt: i32) -> bool {
+    channel_facts(sys, evt)
+        .is_some_and(|(_, flags)| flags & abi::kernel_abi::channel::facts::RETAINS_SEND != 0)
 }
 
 /// `channel::FACTS` for channel `ch`: `(producer owner, edge flags)`.
@@ -4231,13 +4308,13 @@ unsafe fn channel_facts(sys: &SyscallTable, ch: i32) -> Option<(u16, u8)> {
     ))
 }
 
-/// The sidebands this module grants of those `requested` on the channel
-/// being served: `TRACE` when asked; `RETX` on the node's own channel when
-/// every consumer of it retains what it sends. `CURSORS` is a record
-/// layer's to serve, never this transport's.
+/// The sidebands this module grants of those `requested` on the lane being
+/// served: `TRACE` when asked; `RETX` when every consumer of the lane's
+/// events retains what it sends. `CURSORS` is a record layer's to serve,
+/// never this transport's.
 unsafe fn grant_flags(s: &IpState, requested: u8) -> u8 {
     let mut g = requested & net_flag::TRACE;
-    if s.cur_lane == 0 && s.node_retx {
+    if lane_at(s, s.cur_lane).is_some_and(|l| l.retx != 0) {
         g |= net_flag::RETX;
     }
     g
@@ -4679,8 +4756,9 @@ fluxor_rt::module_facts! {
         out 1 NET_OUT_MAX_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         // A command up to the stash (`PENDING_CMD_BUF_SIZE`).
         in 1 NET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + PENDING_CMD_BUF_SIZE,
-        // An address-control command, its authority token included.
-        in 2 ADDR_CTL_ACCEPTS_RECORD = NET_FRAME_HDR + 32 + 2 + netid::ARM_AUTH_MAX,
+        // An address-control command: an owner's name-service context, the
+        // longest (an arm with its authority token is shorter).
+        in 2 ADDR_CTL_ACCEPTS_RECORD = NET_FRAME_HDR + netid::owner_resolver::PAYLOAD_MAX,
         // A disposition.
         in 3 PACKET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + 24,
         // A decision record, the IPv6 one the longest.
@@ -4859,14 +4937,10 @@ pub unsafe extern "C" fn module_new(
         s.gw_pin_pending = false;
         s.gw_pin_ip = 0;
         s.dial_flags = 0;
-        s.node_owner = 0;
-        s.node_retx = false;
-        s.node_facts_known = false;
 
-        // Discover net protocol channels
+        // Every consumer is a lane, taken from the kernel as it attaches.
         let sys = &*s.syscalls;
-        s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
-        s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
+        s.net_in_chan = -1;
         s.addr_evt_chan = dev_channel_port(sys, 1, ADDR_EVT_PORT); // out[5]: emission events (optional)
         s.auth_rsp_chan = dev_channel_port(sys, 0, AUTH_RSP_PORT); // in[5]: authority verdicts (optional)
         s.auth_req_chan = dev_channel_port(sys, 1, AUTH_REQ_PORT); // out[7]: token checks (optional)
@@ -4911,23 +4985,8 @@ pub unsafe extern "C" fn module_new(
         // The holds are sized (and emptied, `HeldPacket::EMPTY`) with the
         // declared tables below.
 
-        // Self-register as the node's net-identity provider (the kernel-side
-        // workload backend resolves addr_ctl through this — no name
-        // convention). Declares OUR port index; best-effort: on a
-        // kernel without a workload backend this is ENOSYS, in a bare harness a stub — the
-        // single-address path is byte-identical either way.
-        let mut reg = [ADDR_CTL_PORT];
-        let _ = (sys.provider_call)(
-            -1,
-            abi::kernel_abi::NET_IDENT_PROVIDER,
-            reg.as_mut_ptr(),
-            reg.len(),
-            core::ptr::null_mut(),
-            0,
-        );
-        // in[2]: addr control (optional). Read after registering: on a node
-        // that creates workloads the kernel gives the unwired port its
-        // channel when it takes the registration.
+        // in[2]: addr control (optional): an ordinary wired edge from its one
+        // writer — on a node that creates workloads, the workload creator.
         s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT);
 
         // Address table starts empty; slot 0 is the primary and is kept in
@@ -4948,12 +5007,12 @@ pub unsafe extern "C" fn module_new(
         s.dns_pending_per = DNS_PENDING_DEFAULT;
         s.lane_pairs = LANE_PAIRS_DEFAULT;
         s.lane_events = LANE_EVENTS_DEFAULT;
-        s.node_events = NODE_EVENTS_DEFAULT;
         s.max_dg_flows = flows::FLOWS_DEFAULT;
         s.dg_flow_floor = flows::FLOOR_DEFAULT;
         s.dg_flow_idle_s = flows::IDLE_DEFAULT_S;
         s.max_segments = route::SEGMENTS_DEFAULT;
         s.policy_bytes = policy::BYTES_DEFAULT;
+        s.pol_store_n = policy::STORE_DEFAULT;
         s.pkt_holds = 0;
         s.tcp_send_buf = send_pool::BLOCK_DEFAULT;
         s.tcp_send_pool = send_pool::POOL_DEFAULT;
@@ -4992,27 +5051,10 @@ pub unsafe extern "C" fn module_new(
                 k += 1;
             }
         }
-        // Claim the lane-provider role while the graph is instantiated, so
-        // the kernel sizes its lane tables now rather than on a step. A
-        // kernel that cannot answer yet is asked again on the first step.
-        if s.lane_cap > 0 {
-            let mut cap = [s.lane_cap];
-            let rc = (sys.provider_call)(
-                -1,
-                NET_PROVIDE,
-                cap.as_mut_ptr(),
-                cap.len(),
-                core::ptr::null_mut(),
-                0,
-            );
-            s.lane_provider = match rc {
-                0 => 1,
-                -16 | -22 | -28 => 2, // EBUSY, EINVAL, ENOSPC
-                _ => 0,
-            };
-        } else {
-            s.lane_provider = 2;
-        }
+        // The lanes this module serves are the kernel's to queue: it read
+        // the capacity from `lanes` (the manifest's `[lanes]`) as it
+        // instantiated the module. A module serving none takes none.
+        s.lane_provider = if s.lane_cap > 0 { 1 } else { 2 };
 
         // The decision seam is either wholly present or wholly absent. A
         // director wired to a module that will never ask it, or a module
@@ -5103,8 +5145,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
     }
 
-    // 0b. Flush any control frames left queued by a congested
-    // `net_out_chan` before producing new events; FIFO order matters.
+    // 0b. Flush any control frames left queued by a congested lane before
+    // producing new events; FIFO order matters.
     drain_pending_net_out(s);
 
     // 0c. Settle the director's dispositions before taking new frames, so
@@ -5453,7 +5495,7 @@ unsafe fn emit_report_line(s: &mut IpState) {
             emit(b" wupd=", &mut pos);
             num(s.drops.tcp_window_update, &mut pos);
             emit(b" sharers=", &mut pos);
-            num(s.rx_active_prev as u32, &mut pos);
+            num(rx_sharers_peak(s), &mut pos);
             // Connection-table growth: elastic chunks granted and refused,
             // and the slots now backed (`conn_arena.rs`).
             emit(b" cgrow=", &mut pos);
@@ -5551,16 +5593,9 @@ unsafe fn process_rx_frames(s: &mut IpState) {
     // the segmentation path supplied with credit.
     let mut count = 0;
     while count < 32 {
-        // Each iteration may synthesise a control event (SYN →
-        // MSG_ACCEPTED, FIN → MSG_CLOSED), so re-check headroom
-        // every loop rather than once up-front. The peer's TCP
-        // retransmit covers segments dropped while we're paused.
-        // Only the node's own queue pauses receive: a workload lane whose
-        // queue is full refuses its own events (an accept is refused, data
-        // is held unacknowledged) and holds up no one else.
-        if ev_room(s, 0) <= NET_OUT_QUEUE_HEADROOM {
-            break;
-        }
+        // No lane's queue pauses receive: a lane whose queue is full
+        // refuses its own events (an accept is refused, data is held
+        // unacknowledged) and holds up no one else.
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
@@ -7438,7 +7473,7 @@ unsafe fn udp_demux(s: &mut IpState, a: &DgAddr, payload: *const u8, payload_len
                 let f = *flows::get(s, fi);
                 from_ip = f.dst_ip;
                 from_port = f.dst_port;
-            } else if lane != 0 && a.wire && !dg_inbound_admitted(s, i, a) {
+            } else if lane_is_workload(s, lane) && a.wire && !dg_inbound_admitted(s, i, a) {
                 return;
             }
             dg_send_rx_from_v4(s, i as u8, from_ip, from_port, payload, payload_len);
@@ -8883,7 +8918,8 @@ unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Re
         dst_port,
     };
     let svc = service::lookup(s, POLICY_PROTO_UDP, dst_ip, dst_port);
-    if lane == 0 && svc.is_none() {
+    let workload = lane_is_workload(s, lane);
+    if !workload && svc.is_none() {
         return Ok(to);
     }
     // The flow this datagram is on, by where it is sent: made, judged and
@@ -8906,13 +8942,13 @@ unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Re
                 && !local
                 && owned
                 && !route::in_cluster(s, local_ip_for_slot(s, slot), peer_ip);
-            if lane != 0 {
+            if workload {
                 let src = local_ip_for_slot(s, slot);
-                let dst_lane = match local_delivery_slot(s, peer_ip) {
-                    Some(ds) => dg_lane_for(s, ds, peer_port),
-                    None => 1, // off the node: forwarded, so judged
+                let judged = match local_delivery_slot(s, peer_ip) {
+                    Some(ds) => dg_to_workload(s, ds, peer_port),
+                    None => true, // off the node: forwarded, so judged
                 };
-                if dst_lane != 0 && !policy_allows(s, src, peer_ip, POLICY_PROTO_UDP, peer_port) {
+                if judged && !policy_allows(s, src, peer_ip, POLICY_PROTO_UDP, peer_port) {
                     // Dropped, as the host's filter drops it: the sender is
                     // not told, and the next datagram is judged afresh.
                     return Err(0);
@@ -9720,12 +9756,12 @@ fn local_delivery_slot(s: &IpState, ip: u32) -> Option<u16> {
     }
 }
 
-/// The IPv4 address slot lane `lane`'s owner holds (`LOCAL_SLOT_ANY` for the
-/// node's lane, or an owner with no IPv4 address), cached on the lane under
+/// The IPv4 address slot lane `lane`'s owner holds (`LOCAL_SLOT_ANY` for a
+/// node lane, or an owner with no IPv4 address), cached on the lane under
 /// the address-table epoch and looked up again when an address is installed
 /// or removed.
 unsafe fn lane_owner_slot(s: &IpState, lane: u8) -> u16 {
-    let Some(l) = lane_at(s, lane) else {
+    let Some(l) = lane_at(s, lane).filter(|l| l.owner_slot != 0) else {
         return LOCAL_SLOT_ANY;
     };
     if l.src_epoch != s.addr_epoch || l.src_epoch == 0 {
@@ -9741,13 +9777,15 @@ unsafe fn lane_owner_slot(s: &IpState, lane: u8) -> u16 {
 /// A workload that holds addresses of its own uses only those: its IPv4
 /// address for IPv4, its IPv6 address for IPv6, and a family it holds no
 /// address of is unreachable to it (`ENETUNREACH`) — never sourced from the
-/// node's or another owner's address. The node's own lane, and a workload
-/// holding no address (which shares the node's, as its wildcard binds do),
-/// leave from the node's: the primary for IPv4 (`LOCAL_SLOT_ANY`), the node's
-/// own first armed IPv6 address for IPv6.
+/// node's or another owner's address. A node lane, and a workload holding
+/// no address (which shares the node's, as its wildcard binds do), leave
+/// from the node's: the primary for IPv4 (`LOCAL_SLOT_ANY`), the node's own
+/// first armed IPv6 address for IPv6.
 unsafe fn lane_source(s: &IpState, lane: u8, v6: bool) -> Result<u16, i8> {
     let v4_slot = lane_owner_slot(s, lane);
-    let v6_slot = lane_at(s, lane).and_then(|l| v6t::owner_slot(s, l.owner_slot));
+    let v6_slot = lane_at(s, lane)
+        .filter(|l| l.owner_slot != 0)
+        .and_then(|l| v6t::owner_slot(s, l.owner_slot));
     if v4_slot == LOCAL_SLOT_ANY && v6_slot.is_none() {
         return if v6 {
             v6t::node_slot(s, 0).ok_or(E_NETUNREACH)
@@ -9810,7 +9848,7 @@ unsafe fn endpoint_source(s: &IpState, ep: usize, v6: bool, via: u16) -> Result<
     }
     let slot = if v6 {
         v6t::owner_slot(s, owner)
-    } else if lane != 0 {
+    } else if lane_is_workload(s, lane) {
         Some(lane_owner_slot(s, lane)).filter(|&k| k != LOCAL_SLOT_ANY)
     } else {
         owner_slot_v4(s, owner)
@@ -9828,8 +9866,8 @@ const POLICY_PROTO_UDP: u8 = 17;
 /// (sent by lane `src_lane`) reach `dst` (lane `dst_lane`) on `dport`.
 ///
 /// Judged as the host's forward hook judges traffic between two of its
-/// workloads; anything the node itself sends (lane 0), or that reaches the
-/// node's own endpoints, is not forwarded and is exempt.
+/// workloads; anything the node itself sends (a node lane), or that reaches
+/// the node's own endpoints, is not forwarded and is exempt.
 unsafe fn policy_admits_local(
     s: &mut IpState,
     src: u32,
@@ -9839,7 +9877,7 @@ unsafe fn policy_admits_local(
     src_lane: u8,
     dst_lane: u8,
 ) -> bool {
-    if src_lane == 0 || dst_lane == 0 {
+    if !lane_is_workload(s, src_lane) || !lane_is_workload(s, dst_lane) {
         return true;
     }
     policy_allows(s, src, dst, proto, dport)
@@ -9860,9 +9898,9 @@ unsafe fn policy_allows(s: &mut IpState, src: u32, dst: u32, proto: u8, dport: u
     policy::allows(s, &p)
 }
 
-/// The lane of the datagram endpoint a same-node datagram to
-/// `(dst_slot, port)` would reach (0 when none, or the node's).
-unsafe fn dg_lane_for(s: &IpState, dst_slot: u16, port: u16) -> u8 {
+/// Whether a same-node datagram to `(dst_slot, port)` would reach a
+/// workload's endpoint: one packet policy judges.
+unsafe fn dg_to_workload(s: &IpState, dst_slot: u16, port: u16) -> bool {
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
         let c = &*s.tcp_conns.ptr(i);
@@ -9871,11 +9909,11 @@ unsafe fn dg_lane_for(s: &IpState, dst_slot: u16, port: u16) -> u8 {
             && c.local_port == port
             && bind_serves(s, c.local_slot, c.owner_tag, dst_slot)
         {
-            return c.lane;
+            return lane_is_workload(s, c.lane);
         }
         i += 1;
     }
-    0
+    false
 }
 
 /// Serve a CMD_CONNECT_TO addressed to this host (see `loopback_peer`):
@@ -9924,7 +9962,8 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
         return;
     }
     let cap = s.lane_pairs as u16;
-    if lane_state(s, dialler_lane).pairs >= cap || lane_state(s, listener_lane).pairs >= cap {
+    let full = |lane: u8| lane_state(s, lane).is_none_or(|st| st.pairs >= cap);
+    if full(dialler_lane) || full(listener_lane) {
         let _ = net_send_reply_error(s, -105, requester_tag); // ENOBUFS
         return;
     }
@@ -9996,8 +10035,11 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
     conn_index_insert(s, si);
     *s.loopback_peer.as_mut_ptr().add(ci) = si as i32;
     *s.loopback_peer.as_mut_ptr().add(si) = ci as i32;
-    lane_state(s, dialler_lane).pairs += 1;
-    lane_state(s, listener_lane).pairs += 1;
+    for lane in [dialler_lane, listener_lane] {
+        if let Some(st) = lane_state(s, lane) {
+            st.pairs += 1;
+        }
+    }
 
     // Listener first (it filters MSG_ACCEPTED by `local_port`), then
     // the connector, each with its peer report. If either lane cannot take
@@ -10018,15 +10060,15 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
 unsafe fn loopback_unpair(s: &mut IpState, idx: usize) {
     let p = *s.loopback_peer.as_ptr().add(idx);
     *s.loopback_peer.as_mut_ptr().add(idx) = -1;
-    let l = conn_lane(s, idx);
-    let st = lane_state(s, l);
-    st.pairs = st.pairs.saturating_sub(1);
+    if let Some(st) = lane_state(s, conn_lane(s, idx)) {
+        st.pairs = st.pairs.saturating_sub(1);
+    }
     if p >= 0 && (p as usize) < s.tcp_conns.len() {
         let pi = p as usize;
         *s.loopback_peer.as_mut_ptr().add(pi) = -1;
-        let pl = conn_lane(s, pi);
-        let pst = lane_state(s, pl);
-        pst.pairs = pst.pairs.saturating_sub(1);
+        if let Some(pst) = lane_state(s, conn_lane(s, pi)) {
+            pst.pairs = pst.pairs.saturating_sub(1);
+        }
     }
 }
 
@@ -10484,23 +10526,73 @@ unsafe fn resend_cmd_payload(
     }
 }
 
+/// An `IP_ADDR_ADD` of an address already installed at `slot` refreshes its
+/// prefix and segment, keeping its token, generation and emission state.
+/// The same owner's re-add (a writer re-issuing after its own restart) is
+/// answered `MSG_ADDR_ADDED` with the token and generation it already has.
+/// An address moves to another owner only when one of the two is the node
+/// (owner tag 0) — a workload's address is never moved to another workload
+/// (`refusal::OWNER`) — and a moved address inherits nothing the old owner
+/// had latched to it.
+unsafe fn addr_ctl_readd(
+    s: &mut IpState,
+    slot: u16,
+    a16: &[u8; 16],
+    prefix_len: u8,
+    owner_tag: u16,
+    segment: u16,
+) {
+    let held = s.local_addrs[slot as usize].owner_tag;
+    if held != owner_tag && held != 0 && owner_tag != 0 {
+        addr_evt_refused(s, a16, IP_ADDR_ADD, netid::refusal::OWNER);
+        return;
+    }
+    let a = &mut s.local_addrs[slot as usize];
+    a.prefix_len = prefix_len;
+    a.segment = segment;
+    a.owner_tag = owner_tag;
+    let (token, generation) = (a.token, a.generation);
+    if held != owner_tag {
+        s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
+        release_slot_bindings(s, slot);
+        return;
+    }
+    let mut p = [0u8; 36];
+    p[..16].copy_from_slice(a16);
+    p[16..32].copy_from_slice(&token);
+    p[32..36].copy_from_slice(&generation.to_le_bytes());
+    addr_evt(s, netid::MSG_ADDR_ADDED, &p);
+}
+
 /// Add a secondary local address (`IP_ADDR_ADD`). No-op if the IPv4 word is
-/// zero, if the address is already configured (primary or secondary — only
-/// owner/prefix are refreshed then), or if the table is full. Sends a single
-/// same-subnet gratuitous ARP on first insertion. owner_tag stamps the
-/// slot's owner and is enforced on bind and source selection (see
-/// `slot_for_owner` / `bind_serves`).
+/// zero; an address already configured is re-added ([`addr_ctl_readd`]; the
+/// primary is off-limits); a segment the install names must hold it; a full
+/// table refuses. Sends a single same-subnet gratuitous ARP on first
+/// insertion. owner_tag stamps the slot's owner and is enforced on bind and
+/// source selection (see `slot_for_owner` / `bind_serves`).
 unsafe fn addr_ctl_add(
     s: &mut IpState,
     addr16: *const u8,
     prefix_len: u8,
     owner_tag: u16,
     flags: u8,
+    segment: u16,
 ) {
     let mut a16 = [0u8; 16];
     core::ptr::copy_nonoverlapping(addr16, a16.as_mut_ptr(), 16);
+    if segment != 0 {
+        let family = if flags & netid::install::FAMILY6 != 0 {
+            abi::contracts::net::route::FAM_IPV6
+        } else {
+            abi::contracts::net::route::FAM_IPV4
+        };
+        if !provider::segment_admits(s, segment, family, &a16) {
+            addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::SEGMENT);
+            return;
+        }
+    }
     if flags & netid::install::FAMILY6 != 0 {
-        addr_ctl_add6(s, &a16, prefix_len, owner_tag, flags);
+        addr_ctl_add6(s, &a16, prefix_len, owner_tag, flags, segment);
         return;
     }
     let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
@@ -10508,19 +10600,8 @@ unsafe fn addr_ctl_add(
         return;
     }
     if let Some(slot) = local_slot_for_dst(s, ipv4) {
-        // Already present. Slot 0 (primary) is off-limits to addr_ctl; a
-        // secondary just refreshes owner/prefix without re-announcing and
-        // keeps its token, generation and emission state. A new owner
-        // inherits nothing the old one had latched to it.
         if slot != 0 {
-            let a = &mut s.local_addrs[slot as usize];
-            a.prefix_len = prefix_len;
-            let moved = a.owner_tag != owner_tag;
-            a.owner_tag = owner_tag;
-            if moved {
-                s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
-                release_slot_bindings(s, slot);
-            }
+            addr_ctl_readd(s, slot, &a16, prefix_len, owner_tag, segment);
         }
         return;
     }
@@ -10544,6 +10625,7 @@ unsafe fn addr_ctl_add(
             a.generation = generation;
             a.prefix_len = prefix_len;
             a.owner_tag = owner_tag;
+            a.segment = segment;
             a.flags = if armed { ADDR_FLAG_ARMED } else { 0 };
             let _ = index::insert(&mut s.addr_index, index::mix32(ipv4 ^ s.index_seed), i);
             log_info(s, b"[ip] addr_ctl add");
@@ -10579,6 +10661,7 @@ unsafe fn addr_ctl_add6(
     prefix_len: u8,
     owner_tag: u16,
     flags: u8,
+    segment: u16,
 ) {
     if !v6t::V6T
         || ipv6::is_multicast(a16)
@@ -10590,14 +10673,7 @@ unsafe fn addr_ctl_add6(
         return;
     }
     if let Some(slot) = v6t::slot_of_v6(s, a16) {
-        let a = &mut s.local_addrs[slot as usize];
-        a.prefix_len = prefix_len;
-        let moved = a.owner_tag != owner_tag;
-        a.owner_tag = owner_tag;
-        if moved {
-            s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
-            release_slot_bindings(s, slot);
-        }
+        addr_ctl_readd(s, slot, a16, prefix_len, owner_tag, segment);
         return;
     }
     let Some(token) = mint_token(s) else {
@@ -10622,6 +10698,7 @@ unsafe fn addr_ctl_add6(
     let a = &mut s.local_addrs[slot as usize];
     a.token = token;
     a.generation = generation;
+    a.segment = segment;
     log_info(s, b"[ip] addr_ctl add (ipv6)");
     let mut p = [0u8; 36];
     p[..16].copy_from_slice(a16);
@@ -10759,9 +10836,9 @@ unsafe fn addr_ctl_del(s: &mut IpState, addr16: &[u8; 16]) {
     }
 }
 
-/// Drain the address-control port (in[2]) and apply IP_ADDR_ADD / IP_ADDR_DEL.
-/// Single writer = the platform workload backend. No-op — and byte-identical —
-/// when the port is unwired.
+/// Drain the address-control port (in[2]) and apply what its single writer
+/// sends: installs, removals, arming and fencing, and owners' name-service
+/// contexts. No-op — and byte-identical — when the port is unwired.
 unsafe fn service_addr_ctl(s: &mut IpState) {
     if s.addr_ctl_chan < 0 {
         return;
@@ -10779,7 +10856,7 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
         }
         let buf = &frame[NET_FRAME_HDR..];
         match msg_type {
-            // [addr:16][prefix_len:1][owner_tag:2 LE][flags:1]?
+            // [addr:16][prefix_len:1][owner_tag:2 LE][flags:1]?[segment:2 LE]?
             IP_ADDR_ADD if plen >= netid::ADDR_ADD_PAYLOAD_LEN => {
                 let prefix_len = *buf.as_ptr().add(netid::ADD_PREFIX_LEN_OFF);
                 let owner_tag = u16::from_le_bytes([
@@ -10791,7 +10868,19 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
                 } else {
                     0
                 };
-                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag, flags);
+                let segment = if plen >= netid::ADD_SEGMENT_OFF + 2 {
+                    u16::from_le_bytes([
+                        *buf.as_ptr().add(netid::ADD_SEGMENT_OFF),
+                        *buf.as_ptr().add(netid::ADD_SEGMENT_OFF + 1),
+                    ])
+                } else {
+                    0
+                };
+                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag, flags, segment);
+            }
+            IP_OWNER_RESOLVER if plen >= netid::owner_resolver::OWNER => {
+                let p = buf.get(..plen).unwrap_or(&[]);
+                addr_ctl_owner_resolver(s, p);
             }
             // [addr:16][token:16]
             IP_ADDR_ARM | IP_ADDR_FENCE if plen >= netid::ADDR_TOKEN_PAYLOAD_LEN => {
@@ -10826,16 +10915,12 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
     }
 }
 
-/// Serve the node's own command channel, then every workload lane's: the
-/// lane changes the kernel queued are taken first, before any lane I/O, so a
-/// channel it freed and reused within this tick is never touched by the lane
-/// that held it.
+/// Serve every lane's commands in lane order: the node graph's lanes, which
+/// attach first, then each workload's. The lane changes the kernel queued
+/// are taken first, before any lane I/O, so a channel it freed and reused
+/// within this tick is never touched by the lane that held it.
 unsafe fn service_net_channels(s: &mut IpState) {
     lanes_take(s);
-    s.cur_lane = 0;
-    node_facts(s);
-    service_net_channel(s);
-    let shared_in = s.net_in_chan;
     let mut lane = 1u8;
     while lane <= s.lane_cap {
         if let Some(l) = lane_at(s, lane) {
@@ -10850,12 +10935,13 @@ unsafe fn service_net_channels(s: &mut IpState) {
         }
         lane += 1;
     }
-    s.net_in_chan = shared_in;
+    s.net_in_chan = -1;
     s.cur_lane = 0;
 }
 
-/// True when the command (if it names an endpoint) names one opened from
-/// the lane being served.
+/// False when the command names an endpoint another lane opened. One naming
+/// an endpoint of the lane being served, or a slot of no lane (free, or
+/// whose lane has gone), goes on to be answered as any stale handle is.
 unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize) -> bool {
     let idx = match msg_type {
         NET_CMD_SEND | NET_CMD_CLOSE | NET_CMD_RETX_RESEND if plen >= 2 => {
@@ -10864,7 +10950,11 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
         DG_CMD_SEND_TO | DG_CMD_CLOSE if plen >= 1 => *p as usize,
         _ => return true,
     };
-    idx >= s.tcp_conns.len() || (*s.tcp_conns.ptr(idx)).lane == s.cur_lane
+    if idx >= s.tcp_conns.len() {
+        return true;
+    }
+    let lane = (*s.tcp_conns.ptr(idx)).lane;
+    lane == 0 || lane == s.cur_lane
 }
 
 /// Where a lane's bind lands, and as whom: `(owner_tag, local slot)`, or the
@@ -10872,37 +10962,61 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 ///
 /// A lane's bind is stamped with the lane's own owner, never with an owner
 /// tag its payload names: a workload cannot bind as another — the same owner
-/// `cmd_owner` presents for its later commands. It is anchored at the
-/// owner's own address when the owner holds one, and serves every address it
-/// holds of either family (`bind_serves`); it lands on the wildcard (the
-/// node's shared addresses) when the owner holds none. The kernel then admits it as
-/// it admits a bind for a native provider (`NET_LANE_ADMIT`): refused while
-/// the owner drains or is gone, and refused for a port the committed plan
-/// does not lease to it.
+/// `cmd_owner` presents for its later commands. The node owner's lane binds
+/// on the wildcard (the node's shared addresses), any port. A workload's
+/// listening bind (a nonzero port) must be one its owner is granted
+/// (`OWNER_GRANTS`, kind `net.endpoint`): an owner granted nothing listens
+/// nowhere. Granted, it is anchored at its owner's own address when the
+/// owner holds one, and serves every address it holds of either family
+/// (`bind_serves`); the grant is what lets an owner holding none listen on
+/// the wildcard. Port 0 (an ephemeral source) is never a claim. An owner
+/// the kernel said is draining binds nothing new.
 unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16, u16), i8> {
     let Some(l) = lane_at(s, s.cur_lane).map(|l| *l) else {
         return Err(-13); // EACCES: no such lane
     };
-    let mut req = [0u8; net_lane::ADMIT_LEN];
-    req[0..2].copy_from_slice(&l.owner_slot.to_le_bytes());
-    req[4..8].copy_from_slice(&l.owner_gen.to_le_bytes());
-    req[8] = protocol;
-    req[10..12].copy_from_slice(&port.to_le_bytes());
-    let rc = ((*s.syscalls).provider_call)(
-        -1,
-        NET_LANE_ADMIT,
-        req.as_mut_ptr(),
-        req.len(),
-        core::ptr::null_mut(),
-        0,
-    );
-    if rc < 0 {
-        return Err(rc as i8);
+    if l.draining != 0 {
+        return Err(-1); // EPERM: a draining owner binds nothing new
+    }
+    if l.owner_slot == 0 {
+        return Ok((0, LOCAL_SLOT_ANY));
+    }
+    if port != 0 && !owner_granted(s, l.owner_slot, l.owner_gen, protocol, port) {
+        return Err(-13);
     }
     Ok((
         l.owner_slot,
         slot_for_owner(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY),
     ))
+}
+
+/// Bytes of an owner's grants a bind reads at once.
+const GRANTS_BUF: usize = 512;
+
+/// Whether owner `(slot, gen)` is granted `(protocol, port)`. Grants past
+/// [`GRANTS_BUF`] are not read, and a bind they would grant is refused.
+unsafe fn owner_granted(s: &IpState, slot: u16, gen: u32, protocol: u8, port: u16) -> bool {
+    let mut arg = [0u8; 8];
+    arg[0..2].copy_from_slice(&slot.to_le_bytes());
+    arg[4..8].copy_from_slice(&gen.to_le_bytes());
+    let mut grants = [0u8; GRANTS_BUF];
+    let rc = ((*s.syscalls).provider_call)(
+        -1,
+        OWNER_GRANTS,
+        arg.as_mut_ptr(),
+        arg.len(),
+        grants.as_mut_ptr(),
+        grants.len(),
+    );
+    if rc < 0 {
+        return false;
+    }
+    let n = (rc as usize).min(GRANTS_BUF);
+    abi::contracts::net::net_proto::grant::grants_endpoint(
+        grants.get(..n).unwrap_or(&[]),
+        protocol,
+        port,
+    )
 }
 
 /// Lanes attached now.
@@ -10922,43 +11036,29 @@ unsafe fn lanes_active(s: &IpState) -> u32 {
 }
 
 /// A lane has just attached at index `lane`: it starts with nothing of the
-/// last workload that held the index.
+/// last owner that held the index.
 unsafe fn lane_opened(s: &mut IpState, lane: u8) {
-    let st = lane_state(s, lane);
-    st.valid = 0;
-    st.close_valid = 0;
+    if let Some(st) = lane_state(s, lane) {
+        st.valid = 0;
+        st.close_valid = 0;
+    }
 }
 
-/// Take the lane changes the kernel queued (`net_attach`): claim the
-/// provider role once, then attach and detach as recorded.
+/// Take the lane changes the kernel queued (`LANE_TAKE`): attach, detach
+/// and drain as recorded.
 unsafe fn lanes_take(s: &mut IpState) {
     let sys = &*s.syscalls;
-    if s.lane_provider == 0 {
-        let mut cap = [s.lane_cap];
-        let rc = (sys.provider_call)(
-            -1,
-            NET_PROVIDE,
-            cap.as_mut_ptr(),
-            cap.len(),
-            core::ptr::null_mut(),
-            0,
-        );
-        s.lane_provider = if rc == 0 { 1 } else { 2 };
-        if rc == 0 {
-            log_info(s, b"[ip] net lanes: provider");
-        }
-    }
     if s.lane_provider != 1 {
         return;
     }
-    // Every change the kernel can have queued: an attach and a detach per
-    // lane at most.
+    // Every change the kernel can have queued: an attach, a drain and a
+    // detach per lane at most.
     let mut n = 0;
-    while n < 2 * s.lane_cap as usize {
+    while n < 3 * s.lane_cap as usize {
         let mut r = [0u8; net_lane::RECORD_LEN];
         let rc = (sys.provider_call)(
             -1,
-            NET_LANE_TAKE,
+            LANE_TAKE,
             r.as_mut_ptr(),
             net_lane::RECORD_LEN,
             core::ptr::null_mut(),
@@ -10990,9 +11090,11 @@ unsafe fn lanes_take(s: &mut IpState) {
                         owner_gen,
                         cmd,
                         evt,
+                        retx: u8::from(lane_retains(sys, evt)),
                         ..NetLane::EMPTY
                     };
                     lane_opened(s, j);
+                    lane_take_rctx(s, j);
                     s.lane_attached = s.lane_attached.wrapping_add(1);
                     log_info(s, b"[ip] net lane attached");
                 } else {
@@ -11019,10 +11121,99 @@ unsafe fn lanes_take(s: &mut IpState) {
                     }
                     j += 1;
                 }
+                owner_rctx_forget(s, owner_slot, owner_gen);
+            }
+            net_lane::OP_DRAIN => {
+                let mut j = 1u8;
+                while j <= s.lane_cap {
+                    if let Some(l) = lane_at(s, j).filter(|l| {
+                        l.active != 0 && l.owner_slot == owner_slot && l.owner_gen == owner_gen
+                    }) {
+                        l.draining = 1;
+                    }
+                    if j == u8::MAX {
+                        break;
+                    }
+                    j += 1;
+                }
             }
             _ => {}
         }
         n += 1;
+    }
+}
+
+/// The owner contexts `OWNER_RESOLVER` delivered, one per lane at most.
+unsafe fn owner_rctxs<'a>(s: &IpState) -> &'a mut [OwnerRctx] {
+    if s.owner_rctx.is_null() {
+        return &mut [];
+    }
+    core::slice::from_raw_parts_mut(s.owner_rctx, s.lane_cap as usize)
+}
+
+/// Lane `lane` just attached: it takes its owner's context, if one came.
+unsafe fn lane_take_rctx(s: &mut IpState, lane: u8) {
+    let Some(l) = lane_at(s, lane) else { return };
+    let (slot, gen) = (l.owner_slot, l.owner_gen);
+    if let Some(e) = owner_rctxs(s)
+        .iter()
+        .find(|e| e.len != 0 && e.owner_slot == slot && e.owner_gen == gen)
+    {
+        let n = (e.len as usize).min(l.rctx.len());
+        l.rctx[..n].copy_from_slice(&e.ctx[..n]);
+        l.rctx_len = n as u16;
+        l.rctx_state = 1;
+    }
+}
+
+/// The owner's lanes detached: its context goes with them.
+unsafe fn owner_rctx_forget(s: &mut IpState, slot: u16, gen: u32) {
+    for e in owner_rctxs(s).iter_mut() {
+        if e.len != 0 && e.owner_slot == slot && e.owner_gen == gen {
+            *e = OwnerRctx::EMPTY;
+        }
+    }
+}
+
+/// `OWNER_RESOLVER`: `[owner_slot u16][owner_gen u32]` then the context
+/// (`[family u8][server 16][n][(len, name) × n]`; family 0 clears it). Kept
+/// for the owner's lanes, attached now or later.
+unsafe fn addr_ctl_owner_resolver(s: &mut IpState, p: &[u8]) {
+    use netid::owner_resolver as orr;
+    let (Some(&s0), Some(&s1), Some(g)) = (p.first(), p.get(1), p.get(2..orr::OWNER)) else {
+        return;
+    };
+    let slot = u16::from_le_bytes([s0, s1]);
+    let gen = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+    let ctx = p.get(orr::OWNER..).unwrap_or(&[]);
+    let clear = ctx.first().is_none_or(|f| *f == 0) || ctx.len() < orr::HEAD;
+    owner_rctx_forget(s, slot, gen);
+    if !clear {
+        let n = ctx.len().min(orr::CONTEXT_MAX);
+        match owner_rctxs(s).iter_mut().find(|e| e.len == 0) {
+            Some(e) => {
+                e.owner_slot = slot;
+                e.owner_gen = gen;
+                e.ctx[..n].copy_from_slice(&ctx[..n]);
+                e.len = n as u16;
+            }
+            None => log_error(s, b"[ip] owner resolver: no room for another owner"),
+        }
+    }
+    // The owner's lanes attached already take it (or lose it) now.
+    let mut j = 1u8;
+    while j <= s.lane_cap {
+        if let Some(l) = lane_at(s, j) {
+            if l.active != 0 && l.owner_slot == slot && l.owner_gen == gen {
+                l.rctx_state = 0;
+                l.rctx_len = 0;
+                lane_take_rctx(s, j);
+            }
+        }
+        if j == u8::MAX {
+            break;
+        }
+        j += 1;
     }
 }
 
@@ -11051,9 +11242,10 @@ unsafe fn lane_close(s: &mut IpState, lane: u8) {
         *dns_cache_at(s, c) = DnsCacheEntry::EMPTY;
         c += 1;
     }
-    let st = lane_state(s, lane);
-    st.valid = 0;
-    st.close_valid = 0;
+    if let Some(st) = lane_state(s, lane) {
+        st.valid = 0;
+        st.close_valid = 0;
+    }
     let mut idx = 0;
     while idx < s.tcp_conns.len() {
         let (mine, live, dg) = {
@@ -11101,12 +11293,15 @@ unsafe fn lane_close(s: &mut IpState, lane: u8) {
     }
 }
 
-/// Read and dispatch net protocol commands from the channel being served
-/// (`net_in_chan`: the node's own, or a lane's while `cur_lane` names it).
+/// Read and dispatch net protocol commands from the lane being served
+/// (`cur_lane`, its commands on `net_in_chan`).
 unsafe fn service_net_channel(s: &mut IpState) {
     if s.net_in_chan < 0 {
         return;
     }
+    let Some(st) = lane_state(s, s.cur_lane) else {
+        return;
+    };
     let sys = &*s.syscalls;
 
     // Pause command intake when outbound headroom is low: each
@@ -11123,7 +11318,6 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // Holding off on the read propagates backpressure to the consumer
     // (its `channel_write` into `net_in_chan` stalls when the ring
     // fills).
-    let st = lane_state(s, s.cur_lane);
     if st.valid != 0 {
         let conn_id = st.conn as usize;
         let total_len = st.len as usize;
@@ -11179,8 +11373,8 @@ unsafe fn service_net_channel(s: &mut IpState) {
         }
         let buf = &frame[NET_FRAME_HDR..];
 
-        // A command naming an endpoint acts only on one its own lane opened
-        // (the shared `net_in` is lane 0, and owns lane 0's).
+        // A command naming an endpoint acts only on one its own lane
+        // opened.
         if !lane_may_command(s, msg_type, buf.as_ptr(), plen) {
             s.lane_refused = s.lane_refused.wrapping_add(1);
             count += 1;
@@ -11205,44 +11399,19 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         count += 1;
                         continue;
                     }
-                    // A lane binds as its own owner (`lane_bind_target`).
-                    let lane_target = if s.cur_lane != 0 {
-                        match lane_bind_target(s, abi::contracts::workload::NET_PROTO_TCP, port) {
-                            Ok(t) => Some(t),
-                            Err(errno) => {
-                                log_info(s, b"[ip] net bind: lane bind refused");
-                                net_send_reply_error(s, errno, 0);
-                                count += 1;
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let owner_tag = lane_target.map_or(cmd_owner(s), |t| t.0);
-                    // Resolve the target local-address slot for this bind.
-                    // owner 0 → wildcard (host). A nonzero owner must own a
-                    // configured address here; if it does not, the bind is
-                    // refused — the metal analogue of the Linux lease-owner
-                    // gate.
-                    let target_slot = if let Some((_, slot)) = lane_target {
-                        slot
-                    } else if owner_tag == 0 {
-                        LOCAL_SLOT_ANY
-                    } else {
-                        match slot_for_owner(s, owner_tag) {
-                            Some(si) => si,
-                            None => {
-                                log_info(s, b"[ip] net bind: refused (owner has no addr)");
-                                // EACCES — cross-owner / no-lease bind refusal.
-                                // Signalled via the module's MSG_ERROR frame
-                                // ([conn_id=0][errno][tag]), the ip module's
-                                // established bind-failure channel (matches the
-                                // no-free-conn ENOMEM path below).
-                                net_send_reply_error(s, -13, 0);
-                                count += 1;
-                                continue;
-                            }
+                    // A lane binds as its own owner (`lane_bind_target`), at
+                    // the address slot that names.
+                    let (owner_tag, target_slot) = match lane_bind_target(
+                        s,
+                        abi::contracts::net::net_proto::grant::PROTO_TCP,
+                        port,
+                    ) {
+                        Ok(t) => t,
+                        Err(errno) => {
+                            log_info(s, b"[ip] net bind: lane bind refused");
+                            net_send_reply_error(s, errno, 0);
+                            count += 1;
+                            continue;
                         }
                     };
                     // Idempotent bind: if a TCP listener for this
@@ -11413,7 +11582,6 @@ unsafe fn service_net_channel(s: &mut IpState) {
                                 // the same offsets, and stop reading
                                 // — backpressure must propagate to
                                 // the consumer.
-                                let st = lane_state(s, s.cur_lane);
                                 core::ptr::copy_nonoverlapping(
                                     buf.as_ptr(),
                                     st.buf.as_mut_ptr(),
@@ -11458,12 +11626,13 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 {
                     let conn_id = conn_id as usize;
                     if conn_id < s.tcp_conns.len()
-                        && (lane_state(s, s.cur_lane).valid != 0
+                        && (lane_state(s, s.cur_lane).is_some_and(|st| st.valid != 0)
                             || !process_cmd_close(s, conn_id, abort))
                     {
-                        let st = lane_state(s, s.cur_lane);
-                        st.close_valid = if abort { CLOSE_STASH_ABORT } else { 1 };
-                        st.close_conn = conn_id as u16;
+                        if let Some(st) = lane_state(s, s.cur_lane) {
+                            st.close_valid = if abort { CLOSE_STASH_ABORT } else { 1 };
+                            st.close_conn = conn_id as u16;
+                        }
                         return;
                     }
                 }
@@ -11477,29 +11646,28 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 if let Some((req_port, _flags)) =
                     abi::contracts::net::datagram::bind_parts(&buf[..plen])
                 {
-                    // A lane binds as its own owner (`lane_bind_target`); an
-                    // ephemeral request (port 0) claims no endpoint and is
-                    // admitted as such.
-                    let lane_target = if s.cur_lane != 0 {
-                        match lane_bind_target(s, abi::contracts::workload::NET_PROTO_UDP, req_port)
-                        {
-                            Ok(t) => Some(t),
-                            Err(errno) => {
-                                log_info(s, b"[ip] dg bind: lane bind refused");
-                                dg_send_error(s, 0, errno);
-                                count += 1;
-                                continue;
-                            }
+                    // A lane binds as its own owner (`lane_bind_target`), at
+                    // the address slot that names, before a port is drawn: a
+                    // bind that is going to be refused must not consume an
+                    // ephemeral allocation. An ephemeral request (port 0)
+                    // claims no endpoint and is admitted as such.
+                    let (owner_tag, target_slot) = match lane_bind_target(
+                        s,
+                        abi::contracts::net::net_proto::grant::PROTO_UDP,
+                        req_port,
+                    ) {
+                        Ok(t) => t,
+                        Err(errno) => {
+                            log_info(s, b"[ip] dg bind: lane bind refused");
+                            dg_send_error(s, 0, errno);
+                            count += 1;
+                            continue;
                         }
-                    } else {
-                        None
                     };
-                    let owner_tag = lane_target.map_or(cmd_owner(s), |t| t.0);
                     // A lane holds at most its quota of endpoints: the
                     // endpoint id is a u8 every lane draws from, so one
-                    // workload cannot take the ids the others need.
-                    if s.cur_lane != 0
-                        && lane_endpoint_count(s, s.cur_lane) >= s.lane_endpoints as usize
+                    // consumer cannot take the ids the others need.
+                    if lane_endpoint_count(s, s.cur_lane) >= s.lane_endpoints as usize
                         && dg_bind_existing(s, req_port, s.cur_lane).is_none()
                     {
                         s.lane_ep_refused = s.lane_ep_refused.wrapping_add(1);
@@ -11507,25 +11675,6 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         count += 1;
                         continue;
                     }
-                    // Resolve the owner's address slot before drawing a port:
-                    // a bind that is going to be refused must not consume an
-                    // ephemeral allocation.
-                    let target_slot = if let Some((_, slot)) = lane_target {
-                        Some(slot)
-                    } else if owner_tag == 0 {
-                        Some(LOCAL_SLOT_ANY)
-                    } else {
-                        slot_for_owner(s, owner_tag)
-                    };
-                    let target_slot = match target_slot {
-                        Some(si) => si,
-                        None => {
-                            log_info(s, b"[ip] dg bind: refused (owner has no addr)");
-                            dg_send_error(s, 0, -13); // EACCES — cross-owner refusal
-                            count += 1;
-                            continue;
-                        }
-                    };
                     let port = if req_port == 0 {
                         // Collision-aware: `next_port` probes the live table
                         // for every candidate, so an ephemeral bind cannot
@@ -11821,7 +11970,7 @@ unsafe fn connect_v4_to(s: &mut IpState, ip: u32, port: u16, requester_tag: Requ
     // A workload's stream is judged at its connect, from the workload's own
     // address (what the host's forward hook would see before any source
     // translation). Refused as a locally dropped packet is: EPERM.
-    if s.cur_lane != 0 {
+    if lane_is_workload(s, s.cur_lane) {
         let src = match lane_owner_slot(s, s.cur_lane) {
             LOCAL_SLOT_ANY => s.local_ip,
             slot => local_ip_for_slot(s, slot),
@@ -11874,44 +12023,16 @@ fn resolver_server(s: &IpState) -> u32 {
     }
 }
 
-/// Lane `lane`'s name service: the server its owner's CREATE named and its
-/// search list (`[n][(len, name) × n]`), read from the kernel the first
-/// time it is needed; the node's own upstream and no search list for the
-/// node's lane, or an owner that named none.
+/// Lane `lane`'s name service: the server its owner's context named and its
+/// search list (`[n][(len, name) × n]`), as `OWNER_RESOLVER` delivered it;
+/// the node's own upstream and no search list for a node lane, or an
+/// owner that has none.
 unsafe fn lane_resolver<'a>(s: &IpState, lane: u8) -> (u32, &'a [u8]) {
     let node = (resolver_server(s), &[][..]);
     let Some(st) = lane_at(s, lane) else {
         return node;
     };
-    let (owner_slot, owner_gen) = (st.owner_slot, st.owner_gen);
-    if st.rctx_state != 1 {
-        // Not read yet, or none was there when it was: the CREATE that made
-        // the owner may still have been completing.
-        let mut buf = [0u8; 8 + abi::contracts::workload::resolver::MAX];
-        buf[0..2].copy_from_slice(&owner_slot.to_le_bytes());
-        buf[4..8].copy_from_slice(&owner_gen.to_le_bytes());
-        let rc = ((*s.syscalls).provider_call)(
-            -1,
-            abi::contracts::workload::NET_RESOLVER,
-            buf.as_mut_ptr(),
-            buf.len(),
-            core::ptr::null_mut(),
-            0,
-        );
-        if rc > 0 {
-            let n = (rc as usize).min(st.rctx.len());
-            let mut i = 0;
-            while i < n {
-                st.rctx[i] = buf[i];
-                i += 1;
-            }
-            st.rctx_len = n as u16;
-            st.rctx_state = 1;
-        } else {
-            st.rctx_state = 2;
-        }
-    }
-    if st.rctx_state != 1 || (st.rctx_len as usize) < abi::contracts::workload::resolver::HEAD {
+    if st.rctx_state != 1 || (st.rctx_len as usize) < netid::owner_resolver::HEAD {
         return node;
     }
     let server = u32::from_be_bytes([st.rctx[1], st.rctx[2], st.rctx[3], st.rctx[4]]);
@@ -12289,7 +12410,7 @@ unsafe fn resolver_start(
             };
         let src_slot = source_for(s, lane, srv_ip)?;
         // A workload's query is egress like any datagram of its: judged.
-        if lane != 0 {
+        if lane_is_workload(s, lane) {
             let src = match lane_owner_slot(s, lane) {
                 LOCAL_SLOT_ANY => s.local_ip,
                 slot => local_ip_for_slot(s, slot),

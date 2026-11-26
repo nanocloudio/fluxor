@@ -1,0 +1,193 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: the pointer
+# to its host instance.
+state_bytes_64 = 1
+
+# A host provider behind ports or contracts: a process of its own
+# (`hosts/linux/<provider>/`, published as a runtime beside `fluxor-linux`),
+# reached through a host lane (`hosts/linux/lane/`) — one sealed shared ring
+# per channel direction and a control socket. The provider is started when
+# the instance is built and stopped before the graph is torn down; a
+# provider that exits closes the lane.
+#
+# A port channel pairs input `chN` → provider with provider → output
+# `chN_rx`, as `remote_channel` carries a channel; the records cross whole,
+# framed as `channels` declares. A served contract (`serves`) makes this
+# instance its provider: every call crosses with the calling module's
+# identity and answers by the key vault's resumable rule — a call not
+# answered within a short wait answers `EAGAIN`, its identical repeat
+# collects the answer, and a different call from a caller with one out
+# answers `EBUSY`.
+#
+# The provider's `HELLO` states the ABI surface digest it was built
+# against, the contracts it serves and its channel table; any difference
+# from this instance's refuses the instance, as does a provider binary
+# that is not beside the runtime or is not the one `runtime_digest` pins.
+
+# Tag 10 — the provider's runtime name (`fluxor-provider-hsm`), found
+# beside `fluxor-linux` where `fluxor sync` puts a project's runtimes.
+[[params]]
+name = "runtime"
+tag = 10
+type = "str"
+default = ""
+
+# Tag 11 — the port channels, `content_type:framing:max_record;…`, channel
+# index = port pair, at most 8: `remote_channel`'s table vocabulary
+# (`fluxor_contracts::channel_table`). Empty for a lane that only serves.
+[[params]]
+name = "channels"
+tag = 11
+type = "str"
+default = ""
+
+# Tag 12 — the provider's own parameter string, opaque to the runtime and
+# handed to the provider as its one argument. Never a secret: params land
+# in the node image. A provider reads secrets from its environment, which
+# the runtime passes through by a per-provider allowlist.
+[[params]]
+name = "args"
+tag = 12
+type = "str"
+default = ""
+
+# Tag 13 — what a port channel does with a record the provider's ring has
+# no room for, and with records once the lane has closed: `block` holds it
+# on the edge (backpressure to the producer); `drop_oldest` keeps the newest
+# and drops the one waiting; `drop_newest` keeps the one waiting and drops
+# what arrives behind it. Dropped records are counted.
+[[params]]
+name = "overload"
+tag = 13
+type = "enum"
+values = ["block", "drop_oldest", "drop_newest"]
+default = "drop_oldest"
+
+# Tag 14 — contracts this instance serves through the provider,
+# comma-separated registry names (`key_custody`). Each must be one the
+# provider states in its `HELLO`.
+[[params]]
+name = "serves"
+tag = 14
+type = "str"
+default = ""
+
+# Tag 15 — the name workload graphs reach this instance's dynamic lanes by
+# (a workload's lane endpoint names its target's type, as the node's
+# network is named `linux_net`). Empty with `lanes = 0`.
+[[params]]
+name = "lane_target"
+tag = 15
+type = "str"
+default = ""
+
+# Tag 16 — dynamic lanes: how many workload lanes the instance carries at
+# once, each a ring pair of the provider's, added and removed with its
+# workload. 0 carries none.
+[[params]]
+name = "lanes"
+tag = 16
+type = "u8"
+default = 0
+
+# Tag 17 — the SHA-256 of the provider binary, hex: the node image pins the
+# one binary it was built with, and the instance refuses any other beside the
+# runtime. The composer writes it from the binary it builds against.
+[[params]]
+name = "runtime_digest"
+tag = 17
+type = "str"
+default = ""
+max = 64
+
+[[ports]]
+name = "ch0"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch1"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch2"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch3"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch4"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch5"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch6"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch7"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch0_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch1_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch2_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch3_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch4_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch5_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch6_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch7_rx"
+direction = "output"
+content_type = "OctetStream"
+
+# `[event:u8]` records: 1 = the lane opened, 2 = the lane closed (the
+# provider exited or broke the protocol). Nothing crosses after a close.
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "a transport between the graph and a host process: what crosses it is the records and calls of the ports and contracts it stands behind, observed where they are produced and consumed; the lane's own facts are its events port"

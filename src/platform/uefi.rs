@@ -1180,7 +1180,6 @@ static PLATFORM: domains::Platform = domains::Platform {
     set_tick: fluxor::arch::aarch64::smp::set_tick,
     has_core: |domain_id| smp::online(domains::domain_core(domain_id)),
     after_pass,
-    after_step,
 };
 
 /// After each pass: every domain's heartbeat and domain 0's pending rebuild;
@@ -1211,8 +1210,6 @@ fn after_pass(
         report_interrupts();
     }
 }
-
-fn after_step(_domain_id: usize) {}
 
 /// Release the graph to the other cores and run domain 0 on this one. The
 /// summary keeps repeating, because a cloud console joins late.

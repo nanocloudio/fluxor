@@ -591,7 +591,6 @@ pub static PLATFORM: domains::Platform = domains::Platform {
     set_tick,
     has_core: |domain_id| domains::domain_core(domain_id) == 1 && launched(),
     after_pass,
-    after_step: |_| {},
 };
 
 /// # Safety

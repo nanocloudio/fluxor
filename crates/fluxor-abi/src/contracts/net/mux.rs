@@ -151,11 +151,6 @@ pub const STATUS_RESET: u8 = 6;
 
 // ─── Upstream: consumer → provider ─────────────────────────────────
 
-/// Open a new transport-level session.
-/// Payload: [af: u8 = 4 or 6] [addr: 4 or 16 BE] [port: u16 LE] [flags: u8]
-/// (`flags` reserved). Provider responds with MSG_MUX_SESSION_OPENED.
-pub use super::super::super::registry::msg::mux::CMD_MUX_SESSION_OPEN;
-
 /// Close a transport-level session and all streams in it.
 /// Payload: [session_id: u32 LE] [reason: u8].
 ///
@@ -226,23 +221,6 @@ pub use super::super::super::registry::msg::mux::CMD_MUX_STREAM_RESET;
 /// locally as MSG_MUX_STREAM_RESET. `app_error` is opaque.
 pub use super::super::super::registry::msg::mux::CMD_MUX_STREAM_STOP_SENDING;
 
-/// Open a stream AND queue its first bytes atomically.
-/// Payload: [session_id: u32 LE] [flags: u8] [data: ...].
-///
-/// Equivalent to CMD_MUX_STREAM_OPEN immediately followed by
-/// CMD_MUX_STREAM_SEND on the resulting handle, but without the
-/// round trip through MSG_MUX_STREAM_OPENED — which matters only for a
-/// protocol whose connection preamble opens several streams and writes a
-/// short prefix on each before anything else may flow. The provider
-/// still answers with MSG_MUX_STREAM_OPENED; on STATUS_NO_CAPACITY the
-/// data is discarded with the failed open, so nothing is half-applied.
-///
-/// RESERVED: the opcode is allocated and the semantics fixed, but no
-/// provider implements it. A consumer MUST implement the plain
-/// open/send path regardless and treat this purely as a latency
-/// optimisation.
-pub use super::super::super::registry::msg::mux::CMD_MUX_STREAM_OPEN_WITH;
-
 // ─── Downstream: provider → consumer ───────────────────────────────
 
 /// Session established and ready to carry streams.
@@ -271,8 +249,7 @@ pub use super::super::super::registry::msg::mux::MSG_MUX_SESSION_OPENED;
 /// per session that was announced with MSG_MUX_SESSION_OPENED.
 pub use super::super::super::registry::msg::mux::MSG_MUX_SESSION_CLOSED;
 
-/// Stream opened locally (response to CMD_MUX_STREAM_OPEN or
-/// CMD_MUX_STREAM_OPEN_WITH).
+/// Stream opened locally (response to CMD_MUX_STREAM_OPEN).
 /// Payload:
 /// `[session_id: u32 LE] [stream_id: u32 LE] [status: u8] [flags: u8]
 ///  [quic_stream_id: u64 LE]`

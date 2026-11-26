@@ -13,7 +13,8 @@
 //!    permutation, known kinds and bits, lengths);
 //! 3. header flags admitted for the authority;
 //! 4. every module's domain below the node's domain count;
-//! 5. every edge end resolves and every port is below `MAX_PORTS`;
+//! 5. every edge end resolves (a node graph's lane ends resolve as their
+//!    targets declare, in [`finish`]) and every port is below `MAX_PORTS`;
 //! 6. pre-pass modules per domain within [`graph::MAX_PRE_PASS_PER_DOMAIN`];
 //! 7. step budgets admitted ([`admit_step_budget`]);
 //! 8. no node tag in a workload's params, and no env bind in any;
@@ -36,15 +37,17 @@
 use super::live::{admit_step_budget, caller, StepBudget};
 use super::native::{NativeInit, NativeModule};
 use super::{
-    module_slots, native, Edge, InstantiateResult, ModuleId, ModuleSlot, SchedulerState,
-    BUFFER_GROUPS, MAX_DOMAINS, MAX_PORTS, SCHED,
+    module_slots, native, Edge, InstantiateResult, LaneEnd, ModuleId, ModuleSlot, SchedulerState,
+    BUFFER_GROUPS, LANE_PENDING, MAX_DOMAINS, MAX_PORTS, SCHED,
 };
+use crate::abi::contracts::resource::{OWNER_LINE_BUFFER, OWNER_LINE_STATE, OWNER_LINE_STORAGE};
 use crate::kernel::boot::config::ModuleEntry;
 use crate::kernel::exec::step_guard::{FaultPolicy, ModuleFaultInfo};
 use crate::kernel::module::loader::{DynamicModulePending, ModuleLoader, Signing};
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_NODE};
 use fluxor_contracts::boot_config::ExecMode;
 use fluxor_contracts::graph::{self, ComposedGraph, EdgeRecord, Endpoint, ModuleRecord};
+use fluxor_contracts::isolation::Level;
 
 /// Largest graph one live add admits, in modules (fans included).
 pub const MAX_ADD_MODULES: usize = 64;
@@ -151,7 +154,7 @@ pub enum AddError {
     /// A workload module's params carry a node tag (`is_node_param_tag`).
     NodeParamRefused,
     /// A workload's edge names a module of the node's graph as an
-    /// `Existing` end: the node's modules are reached by `Net`, `Caller` or
+    /// `Existing` end: the node's modules are reached by `Lane`, `Caller` or
     /// `Tap` ends only, never by an edge that rebuilds their ports.
     NodeModuleRefused,
     /// A module's params still carry an env bind record.
@@ -179,14 +182,24 @@ pub enum AddError {
     /// The rings the add opens would exceed the owner's admitted
     /// `buffer_cap`.
     BufferCapExceeded,
-    /// The node's net provider refused a lane.
-    NetAttachFailed,
+    /// A lane's target is absent or refused the lane (no room, a key it
+    /// already holds for the owner).
+    LaneAttachFailed,
     /// An owner already carries the graph's identity.
     OwnerExists,
     /// The node's plan seats no workload owner.
     NoCapacity,
     /// Every stage is held by an add in progress.
     WorkspaceBusy,
+    /// A workload's module would run unprivileged and this node has no
+    /// protection backend to run it so.
+    GateUnavailable,
+    /// A workload brings a module that would run privileged without the
+    /// node vouching for it: a provider (or a native module) that is not a
+    /// `workload_instantiable` type of the node's own image.
+    GateRefused,
+    /// Every isolation slot is held: a gated module would have none.
+    IsolationSlotsExhausted,
 }
 
 impl AddError {
@@ -210,18 +223,21 @@ impl AddError {
             | AddError::StateCapExceeded
             | AddError::BufferCapExceeded
             | AddError::GroupsExhausted
-            | AddError::NoCapacity => errno::ENOSPC,
+            | AddError::NoCapacity
+            | AddError::IsolationSlotsExhausted => errno::ENOSPC,
             AddError::ChannelOpenFailed => errno::ENOMEM,
             AddError::Instantiate => errno::ENOEXEC,
             AddError::UnknownModule => errno::ENOENT,
             AddError::InterruptDomain => errno::ENOTSUP,
             AddError::WouldBlock => errno::EAGAIN,
-            AddError::NetAttachFailed | AddError::WorkspaceBusy => errno::EBUSY,
+            AddError::LaneAttachFailed | AddError::WorkspaceBusy => errno::EBUSY,
             AddError::OwnerExists => errno::EEXIST,
             AddError::BudgetRefused => errno::ERANGE,
+            AddError::GateUnavailable => errno::ENOSYS,
             AddError::NodeParamRefused
             | AddError::AuthorityRefused
-            | AddError::NodeModuleRefused => errno::EACCES,
+            | AddError::NodeModuleRefused
+            | AddError::GateRefused => errno::EACCES,
         }
     }
 
@@ -252,10 +268,13 @@ impl AddError {
             AddError::WouldBlock => "load would block",
             AddError::StateCapExceeded => "state cap exceeded",
             AddError::BufferCapExceeded => "buffer cap exceeded",
-            AddError::NetAttachFailed => "net lane refused",
+            AddError::LaneAttachFailed => "lane refused",
             AddError::OwnerExists => "owner exists",
             AddError::NoCapacity => "no staging capacity",
             AddError::WorkspaceBusy => "staging busy",
+            AddError::GateUnavailable => "no protection backend for a workload module",
+            AddError::GateRefused => "workload module would run privileged unvouched",
+            AddError::IsolationSlotsExhausted => "isolation slots exhausted",
         }
     }
 }
@@ -349,52 +368,73 @@ fn live_slot(g: usize) -> bool {
     g < module_slots() && !matches!(sched().modules[g], ModuleSlot::Empty)
 }
 
-/// Each net key names exactly one edge from a new module into the network
-/// and one from the network to a new module; each caller key at most one
-/// edge of each direction, between the caller and a new module.
+/// Each lane `(target, key)` names exactly one edge from a new module into
+/// the target and one from the target to a new module; each caller key at
+/// most one edge of each direction, between the caller and a new module.
 fn keys_valid(graph: &ComposedGraph<'_>) -> bool {
     for e in graph.edges() {
-        let (net, key) = match (e.from, e.to) {
-            (Endpoint::New(_), Endpoint::Net(k)) | (Endpoint::Net(k), Endpoint::New(_)) => {
-                (true, k)
-            }
-            (Endpoint::New(_), Endpoint::Caller(k)) | (Endpoint::Caller(k), Endpoint::New(_)) => {
-                (false, k)
-            }
-            (Endpoint::Net(_) | Endpoint::Caller(_), _)
-            | (_, Endpoint::Net(_) | Endpoint::Caller(_)) => return false,
+        let (lane, key) = match (e.from, e.to) {
+            (Endpoint::New(_), l @ Endpoint::Lane { .. })
+            | (l @ Endpoint::Lane { .. }, Endpoint::New(_)) => (true, l),
+            (Endpoint::New(_), c @ Endpoint::Caller(_))
+            | (c @ Endpoint::Caller(_), Endpoint::New(_)) => (false, c),
+            (Endpoint::Lane { .. } | Endpoint::Caller(_), _)
+            | (_, Endpoint::Lane { .. } | Endpoint::Caller(_)) => return false,
             _ => continue,
         };
-        let is = |end: Endpoint| match end {
-            Endpoint::Net(k) => net && k == key,
-            Endpoint::Caller(k) => !net && k == key,
-            _ => false,
-        };
+        let is = |end: Endpoint| end == key;
         let into = graph.edges().filter(|x| is(x.to)).count();
         let out = graph.edges().filter(|x| is(x.from)).count();
-        if (net && (into != 1 || out != 1)) || (!net && (into > 1 || out > 1)) {
+        if (lane && (into != 1 || out != 1)) || (!lane && (into > 1 || out > 1)) {
             return false;
         }
     }
     true
 }
 
-/// Step 5. The node's own graph names its own modules only. A workload's
-/// edge has a module of its own at one end at least, and names a running
-/// module as `Existing` only when that module is not the node's: an
-/// `Existing` end rebuilds the module's port table, and the node's modules
-/// take a workload's traffic over `Net` and `Caller` lanes alone. A graph
-/// acting with the node's authority may name the node's modules.
+/// Whether no input port of a module takes two edges: one (module, port,
+/// control) end each. A second edge into a port would be moved to another
+/// port index when the channels are collected, so it could take a port the
+/// graph meant for another producer (a `Caller` lane among them).
+fn inputs_unique(graph: &ComposedGraph<'_>) -> bool {
+    for (i, e) in graph.edges().enumerate() {
+        if !matches!(e.to, Endpoint::New(_) | Endpoint::Existing(_)) {
+            continue;
+        }
+        if graph
+            .edges()
+            .skip(i + 1)
+            .any(|x| x.to == e.to && x.to_port == e.to_port && x.to_ctrl == e.to_ctrl)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Step 5. The node's own graph names its own modules and lanes to its own
+/// lane targets: a lane end is held to the lane rule ([`keys_valid`]) here
+/// and resolved in [`finish`], once its target has declared its lanes, so a
+/// lane naming no module of the graph refuses the graph there. A
+/// workload's edge has a module of its own at one end at least, and names
+/// a running module as `Existing` only when that module is not the node's:
+/// an `Existing` end rebuilds the module's port table, and the node's
+/// modules take a workload's traffic over `Lane` and `Caller` lanes alone.
+/// A graph acting with the node's authority may name the node's modules.
 fn check_endpoints(graph: &ComposedGraph<'_>, authority: AddAuthority) -> Result<(), AddError> {
     if authority == AddAuthority::Node {
+        let own = |end: Endpoint| matches!(end, Endpoint::New(_) | Endpoint::Lane { .. });
+        if !keys_valid(graph) {
+            return Err(AddError::BadEndpoint);
+        }
         for e in graph.edges() {
-            if e.from.new_index().is_none() || e.to.new_index().is_none() || !ports_in_range(&e) {
+            if !own(e.from) || !own(e.to) || !ports_in_range(&e) {
                 return Err(AddError::BadEndpoint);
             }
         }
         return Ok(());
     }
-    if !keys_valid(graph) {
+    if !keys_valid(graph) || !inputs_unique(graph) {
         return Err(AddError::BadEndpoint);
     }
     for e in graph.edges() {
@@ -423,7 +463,9 @@ fn check_endpoints(graph: &ComposedGraph<'_>, authority: AddAuthority) -> Result
                     Err(AddError::BadEndpoint)
                 }
             }
-            Endpoint::Net(_) if crate::kernel::workload::net_attach::provider_slot().is_some() => {
+            Endpoint::Lane { target, .. }
+                if crate::kernel::workload::lanes::resolve(target).is_some() =>
+            {
                 Ok(())
             }
             Endpoint::Caller(_) if caller().is_some_and(live_slot) => Ok(()),
@@ -441,7 +483,7 @@ fn check_module(
     m: &ModuleRecord<'_>,
     loader: &ModuleLoader,
     authority: AddAuthority,
-) -> Result<Option<crate::kernel::module::loader::LoadedModule>, AddError> {
+) -> Result<(Option<crate::kernel::module::loader::LoadedModule>, Level), AddError> {
     let system = authority == AddAuthority::Node;
     let budget = record_budget(m);
     // The node's graph chooses any policy; a workload only one confined to
@@ -475,15 +517,27 @@ fn check_module(
             return Err(AddError::NodeParamRefused);
         }
     }
-    if super::params_carry_tag(m.params, crate::abi::contracts::workload::env::BIND_TAG) {
+    if super::params_carry_tag(m.params, fluxor_contracts::graph::env_bind::BIND_TAG) {
         return Err(AddError::UnboundEnv);
     }
-    let loaded = resolving_loader(m.name_hash, loader).find_by_name_hash(m.name_hash);
+    let resolver = resolving_loader(m.name_hash, loader);
+    let loaded = resolver.find_by_name_hash(m.name_hash);
     let native = native::lookup(m.name_hash);
     if loaded.is_err() && native.is_none() {
         log::warn!("[splice] module {:#010x} resolves nowhere", m.name_hash);
         return Err(AddError::UnknownModule);
     }
+    // The level: the node's graph names its own (params tag 0xF5); a
+    // workload's is the kernel's to set, never its params'.
+    let level = if system {
+        super::params_level(m.params)
+    } else {
+        workload_level(
+            m.name_hash,
+            loaded.as_ref().ok(),
+            core::ptr::eq(resolver, loader),
+        )?
+    };
     let mode = super::domain_exec_mode(usize::from(m.domain));
     if mode.is_interrupt() {
         if !system {
@@ -507,7 +561,178 @@ fn check_module(
             }
         }
     }
-    Ok(loaded.ok())
+    Ok((loaded.ok(), level))
+}
+
+/// How this node runs a workload's modules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkloadGate {
+    /// In the runtime's own process (the Linux runtime): not metal, and its
+    /// CAPS says the isolation is the process.
+    Host,
+    /// Unprivileged at this level: the strongest the node implements for
+    /// the module.
+    Backend(Level),
+    /// Not at all: a metal node with no protection backend.
+    Unavailable,
+}
+
+impl WorkloadGate {
+    /// The workload posture (`contracts::workload::POSTURE_*`) a node with
+    /// this gate realizes for a graph workload, `None` for none: the Linux
+    /// runtime `SHARED` (the isolation is its process, said as it is), a
+    /// metal node with a backend `ISOLATED`, one without nothing.
+    pub fn posture(self) -> Option<u8> {
+        use crate::abi::contracts::workload as wl;
+        match self {
+            WorkloadGate::Host => Some(wl::POSTURE_SHARED),
+            WorkloadGate::Backend(_) => Some(wl::POSTURE_ISOLATED),
+            WorkloadGate::Unavailable => None,
+        }
+    }
+}
+
+/// This node's gate for a workload, before any module is known.
+pub fn node_workload_gate() -> WorkloadGate {
+    node_gate(None)
+}
+
+/// What admission reads of one workload module: where its type resolved and
+/// what its signed manifest says.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkloadModuleFacts {
+    /// A native module (kernel code): it cannot be gated.
+    pub native: bool,
+    /// The node's own loader resolved the type, never a code pack (which may
+    /// shadow an image type by name).
+    pub node_resolved: bool,
+    /// The manifest's `workload_instantiable` fact.
+    pub workload_instantiable: bool,
+    /// The manifest's grant words: every bit the module may hold, its
+    /// conditional grants among them (their block only narrows admission).
+    pub grants: [u64; 2],
+    /// Contracts the module provides.
+    pub provides: usize,
+}
+
+/// The level a workload's module runs at under `gate`. Every module a
+/// workload brings runs gated at the node's level — except a type the node's
+/// own loader resolved whose signed manifest declares it
+/// `workload_instantiable` and which holds no grant (no op-level grant, no
+/// contract that reaches the kernel, conditional or not): the node vouches
+/// for that code as it does for its own modules, and it runs privileged,
+/// its memory charged to the owner. Any other provider is refused (`GateRefused`,
+/// `EACCES`): other modules' calls into it would run its code privileged.
+/// A native module is kernel code and is refused too. A node with no
+/// backend admits no workload module (`GateUnavailable`, `ENOSYS`).
+pub fn workload_module_level(
+    f: &WorkloadModuleFacts,
+    gate: WorkloadGate,
+) -> Result<Level, AddError> {
+    let backend = match gate {
+        WorkloadGate::Host => return Ok(Level::Privileged),
+        WorkloadGate::Unavailable => None,
+        WorkloadGate::Backend(level) => Some(level),
+    };
+    if f.native {
+        return Err(AddError::GateRefused);
+    }
+    let vouched = f.node_resolved
+        && f.workload_instantiable
+        && f.grants[1] == 0
+        && f.grants[0] & crate::abi::registry::CONTRACT_REACH_KERNEL == 0;
+    if vouched {
+        return Ok(Level::Privileged);
+    }
+    if f.provides != 0 {
+        return Err(AddError::GateRefused);
+    }
+    backend.ok_or(AddError::GateUnavailable)
+}
+
+/// Whether a workload's `isolated` modules fit the `free` isolation slots:
+/// refused at admission, never run privileged for want of one.
+pub fn isolated_admission(isolated: usize, free: usize) -> Result<(), AddError> {
+    if isolated > free {
+        Err(AddError::IsolationSlotsExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+/// The level a workload's module runs at on this node ([`workload_module_level`]).
+/// Out of line: the admission walk's frame stays the size it was.
+#[inline(never)]
+fn workload_level(
+    name_hash: u32,
+    loaded: Option<&crate::kernel::module::loader::LoadedModule>,
+    node_resolved: bool,
+) -> Result<Level, AddError> {
+    let facts = match loaded {
+        None => WorkloadModuleFacts {
+            native: true,
+            ..WorkloadModuleFacts::default()
+        },
+        Some(lm) => WorkloadModuleFacts {
+            native: false,
+            node_resolved,
+            workload_instantiable: lm.manifest_workload_instantiable(),
+            grants: lm.manifest_grants(),
+            provides: lm.manifest_provides_count(),
+        },
+    };
+    let r = workload_module_level(&facts, node_gate(loaded));
+    if let Err(e) = r {
+        log::warn!(
+            "[splice] workload module {name_hash:#010x} refused: {}",
+            e.name()
+        );
+    }
+    r
+}
+
+/// This node's [`WorkloadGate`] for `lm`. The Linux runtime is a process,
+/// not metal. A metal node with a protection backend gates at the strongest
+/// level it implements for the module: isolated under an MMU; on an MPU
+/// isolated when the module's code can be drawn as one region, else
+/// contained.
+#[inline(never)]
+fn node_gate(lm: Option<&crate::kernel::module::loader::LoadedModule>) -> WorkloadGate {
+    if cfg!(feature = "host-linux") {
+        return WorkloadGate::Host;
+    }
+    if crate::kernel::sys::hal::protection_gateway_table().is_null() {
+        return WorkloadGate::Unavailable;
+    }
+    #[cfg(feature = "kernel-mpu")]
+    {
+        if let Some(lm) = lm {
+            use fluxor_contracts::isolation::{code_region_len, region_plan, Access, Span};
+            let code = Span {
+                base: lm.code_base() as u64,
+                len: code_region_len(u64::from(lm.header.code_size)),
+                access: Access::ReadExec,
+            };
+            if region_plan(&[code], crate::platform::rp_protection::MODEL).is_err() {
+                return WorkloadGate::Backend(Level::Contained);
+            }
+        }
+    }
+    let _ = lm;
+    WorkloadGate::Backend(Level::Isolated)
+}
+
+/// Isolation slots free on this node: what a workload's isolated modules
+/// may take. `usize::MAX` where isolation keeps no slot pool.
+fn isolation_slots_free() -> usize {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        crate::arch::aarch64::isolation::free_slots()
+    }
+    #[cfg(not(feature = "chip-bcm2712"))]
+    {
+        usize::MAX
+    }
 }
 
 /// What a loader-resolved module's signature establishes, its bytes
@@ -719,13 +944,29 @@ fn check(
     // 7-10. Each module.
     // SAFETY: scheduler-thread graph-mutation context, as every add.
     let loader = unsafe { super::static_loader() };
+    let mut isolated = 0usize;
     for (k, m) in g.modules().enumerate() {
-        let signing = validated(check_module(&m, loader, authority)?)?;
+        let (module, level) = check_module(&m, loader, authority)?;
+        let signing = validated(module)?;
+        if level == Level::Isolated {
+            isolated += 1;
+        }
         // The node's graph sits at its own indices; a workload's slots are
         // assigned after its checks.
         match signings.get_mut(k) {
             Some(s) => *s = signing,
             None => sched().module_signing[k] = signing,
+        }
+    }
+    // A workload's isolated modules each need a slot now: refused here,
+    // before anything is staged, never run privileged for want of one.
+    if authority != AddAuthority::Node {
+        let free = isolation_slots_free();
+        if let Err(e) = isolated_admission(isolated, free) {
+            log::warn!(
+                "[splice] add refused: {isolated} isolated modules, {free} isolation slots free"
+            );
+            return Err(e);
         }
     }
     // 11. Groups.
@@ -813,10 +1054,9 @@ fn reserve_owner(
             handle.slot
         );
     } else {
-        sched().owners.set_storage_grant(
-            handle,
-            crate::kernel::workload::storage::StorageGrant::OwnRoot,
-        );
+        // A workload's add holds an uncapped storage line; a `CREATE`
+        // installs the one its header names over it.
+        sched().owners.set_line(handle, OWNER_LINE_STORAGE, 0);
     }
     Ok(handle)
 }
@@ -880,11 +1120,16 @@ fn append_edges(st: &StagedAdd, map: &[u8; 256]) -> Result<(), AddError> {
         crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
         return Err(AddError::TooManyEdges);
     }
+    // A workload's lane resolves now (step 5 checked it does); a node
+    // graph's target is one of the graph's own modules, which declares its
+    // lanes as it instantiates, so its lane ends resolve in `finish`.
     let resolve = |end: Endpoint| -> usize {
         match end {
             Endpoint::New(l) => st.slot(usize::from(l)),
             Endpoint::Existing(g) | Endpoint::Tap(g) => usize::from(g),
-            Endpoint::Net(_) => crate::kernel::workload::net_attach::provider_slot().unwrap_or(0),
+            Endpoint::Lane { target, .. } => {
+                crate::kernel::workload::lanes::resolve(target).unwrap_or(LANE_PENDING)
+            }
             Endpoint::Caller(_) => caller().unwrap_or(0),
         }
     };
@@ -905,6 +1150,11 @@ fn append_edges(st: &StagedAdd, map: &[u8; 256]) -> Result<(), AddError> {
         );
         edge.tap = tap_source >= 0;
         edge.tap_source = tap_source;
+        edge.lane = match (r.from, r.to) {
+            (Endpoint::Lane { .. }, _) => LaneEnd::From,
+            (_, Endpoint::Lane { .. }) => LaneEnd::To,
+            _ => LaneEnd::None,
+        };
         fill_edge(&mut edge, &r, map);
         sched().edges[edge_base + i] = edge;
     }
@@ -922,9 +1172,24 @@ fn append_edges(st: &StagedAdd, map: &[u8; 256]) -> Result<(), AddError> {
                 &entry_of(&m, slot),
                 slot,
             );
-            let level = super::params_level(m.params);
+            // The level admission checked: the node's from its params, a
+            // workload's set by the kernel (`workload_level`, decided again
+            // here from the same facts rather than carried on the stack).
+            let level = if st.authority == AddAuthority::Node {
+                super::params_level(m.params)
+            } else {
+                let ldr = resolving_loader(m.name_hash, loader);
+                let lm = ldr.find_by_name_hash(m.name_hash).ok();
+                match workload_level(m.name_hash, lm.as_ref(), core::ptr::eq(ldr, loader)) {
+                    Ok(l) => l,
+                    Err(why) => {
+                        clear_edge_range(edge_base, e);
+                        return Err(why);
+                    }
+                }
+            };
+            sched().protection[slot] = level;
             if level.is_gated() {
-                sched().protection[slot] = level;
                 crate::kernel::sys::hal::protection_set_enabled(true);
             }
         }
@@ -996,7 +1261,9 @@ fn charge_rings(st: &StagedAdd, base: usize, count: usize) -> Result<(), ()> {
         );
     }
     let total = u32::try_from(total).map_err(|_| ())?;
-    s.owners.charge_buffer(owner, total)?;
+    s.owners
+        .charge(owner, OWNER_LINE_BUFFER, u64::from(total), false)
+        .map_err(|_| ())?;
     for (i, r) in (base..base + count).zip(st.graph.edges()) {
         let ch = s.edges[i].channel;
         if ch < 0 || s.edges[base..i].iter().any(|x| x.channel == ch) {
@@ -1025,7 +1292,7 @@ pub(super) fn release_ring(edge: &Edge) {
     );
     sched()
         .owners
-        .uncharge_buffer(super::module_owner(end), bytes as u32);
+        .release(super::module_owner(end), OWNER_LINE_BUFFER, bytes as u64);
 }
 
 /// No zero-copy edge of `edges[base..base+count]` touches a gated module: a
@@ -1270,9 +1537,17 @@ fn settle(st: &mut StagedAdd, k: usize) -> Result<(), AddError> {
     let owner = super::module_owner(slot);
     if !owner.is_node() {
         let footprint = super::module_state_footprint(slot);
-        if sched().owners.charge_state(owner, footprint).is_err() {
-            let (charged, cap) = sched().owners.charged_state(owner);
-            let (_, buffers) = sched().owners.charged_bytes(owner);
+        if sched()
+            .owners
+            .charge(owner, OWNER_LINE_STATE, u64::from(footprint), false)
+            .is_err()
+        {
+            let state = sched().owners.line(owner, OWNER_LINE_STATE);
+            let (charged, cap) = state.map_or((0, 0), |l| (l.used, l.cap));
+            let buffers = sched()
+                .owners
+                .line(owner, OWNER_LINE_BUFFER)
+                .map_or(0, |l| l.used);
             log::warn!(
                 "[splice] owner slot {} refused: module state {} + {} exceeds its admitted \
                  state_cap {} (buffers {})",
@@ -1299,12 +1574,16 @@ fn settle(st: &mut StagedAdd, k: usize) -> Result<(), AddError> {
 
 // ── Publication ─────────────────────────────────────────────────────────────
 
-/// Publish an add whose every module has instantiated: hand its net lanes
-/// to the provider, gate its modules on each other and on the contract
+/// Publish an add whose every module has instantiated: hand its lanes to
+/// their targets, gate its modules on each other and on the contract
 /// providers they wait for, splice its order into each domain's order with
 /// every peer core parked, hand its interrupt-mode modules to their
-/// dispatchers and activate the owner. A refused lane rolls the whole add
-/// back.
+/// dispatchers and activate the owner. Each lane resolves here by the name
+/// its target declared ([`lanes::resolve`]), a node graph's included, and
+/// its edges take the target as their end. A lane that resolves nowhere or
+/// that the target cannot take rolls the whole add back.
+///
+/// [`lanes::resolve`]: crate::kernel::workload::lanes::resolve
 pub fn finish(mut st: StagedAdd) -> Result<OwnerHandle, AddError> {
     debug_assert!(st.complete());
     let handle = st.handle;
@@ -1312,28 +1591,39 @@ pub fn finish(mut st: StagedAdd) -> Result<OwnerHandle, AddError> {
     let n = st.n();
     let e = st.e();
     for (i, r) in st.graph.edges().enumerate() {
-        let Endpoint::Net(key) = r.to else {
+        let Endpoint::Lane { key, target } = r.to else {
             continue;
         };
+        let events_edge = st.graph.edges().position(|x| x.from == r.to);
         let commands = sched().edges[edge_base + i].channel;
-        let events = st
-            .graph
-            .edges()
-            .position(|x| matches!(x.from, Endpoint::Net(k) if k == key))
-            .map_or(-1, |j| sched().edges[edge_base + j].channel);
-        // SAFETY: scheduler thread; both channels were opened for this
-        // owner's edges.
-        let rc =
-            unsafe { crate::kernel::workload::net_attach::attach(handle, key, commands, events) };
+        let events = events_edge.map_or(-1, |j| sched().edges[edge_base + j].channel);
+        let reader = events_edge
+            .and_then(|j| st.graph.edges().nth(j))
+            .map(|x| x.to);
+        let owner = lane_owner(&st, r.from, reader);
+        let rc = match (owner, crate::kernel::workload::lanes::resolve(target)) {
+            (None, _) => crate::kernel::sys::errno::EACCES,
+            (Some(owner), Some(slot)) => {
+                let s = sched();
+                s.edges[edge_base + i].to_module = slot;
+                if let Some(j) = events_edge {
+                    s.edges[edge_base + j].from_module = slot;
+                }
+                // SAFETY: scheduler thread; both channels were opened for
+                // this owner's edges.
+                unsafe {
+                    crate::kernel::workload::lanes::attach(owner, key, slot, commands, events)
+                }
+            }
+            (Some(_), None) => crate::kernel::sys::errno::ENODEV,
+        };
         if rc != 0 {
             log::warn!(
-                "[splice] owner slot {} net lane {key} refused: {rc} (the provider holds {} \
-                 lanes for every workload)",
+                "[splice] owner slot {} lane {key} to {target:#010x} refused: {rc}",
                 handle.slot,
-                crate::kernel::workload::net_attach::provider_lanes()
             );
             rollback(&mut st, n);
-            return Err(AddError::NetAttachFailed);
+            return Err(AddError::LaneAttachFailed);
         }
     }
     // The ready gate between the new modules: a module waits on each module
@@ -1455,6 +1745,28 @@ fn register_isr_modules(st: &StagedAdd) {
     }
 }
 
+/// The owner a lane of this add is attached for: a workload's add's own;
+/// in the node's graph, the owner stamped on the module writing the lane's
+/// commands, so a module the owner plan gives a workload reaches the
+/// network as that workload, under its grants and its drain. `None` when
+/// the module reading the lane's events is another workload's: a lane
+/// carries one owner's traffic, which the node may read and no other
+/// workload may.
+fn lane_owner(st: &StagedAdd, writer: Endpoint, reader: Option<Endpoint>) -> Option<OwnerHandle> {
+    if st.authority != AddAuthority::Node {
+        return Some(st.handle);
+    }
+    let owner_of = |e: Endpoint| match e {
+        Endpoint::New(a) => Some(super::module_owner(st.slot(usize::from(a)))),
+        _ => None,
+    };
+    let owner = owner_of(writer).unwrap_or(st.handle);
+    match reader.and_then(owner_of) {
+        Some(r) if r != owner && !r.is_node() => None,
+        _ => Some(owner),
+    }
+}
+
 /// Roll a staged add back.
 pub fn abandon(mut st: StagedAdd) {
     if let Some(pending) = st.pending.take() {
@@ -1475,9 +1787,25 @@ fn rollback(st: &mut StagedAdd, instantiated: usize) {
     let system = st.authority == AddAuthority::Node;
     if !system {
         crate::kernel::module::provider::notify_owner_released(handle);
-        // SAFETY: scheduler thread, before the owner's channels close.
-        unsafe { crate::kernel::workload::net_attach::detach(handle) };
     }
+    // The lanes this add attached: its owner's, and in the node's graph
+    // those of each owner stamped on one of its modules ([`lane_owner`]).
+    // SAFETY: scheduler thread, before the owner's channels close.
+    unsafe { crate::kernel::workload::lanes::detach(handle) };
+    if system {
+        for k in 0..st.n() {
+            let owner = super::module_owner(st.slot(k));
+            if owner != handle {
+                // SAFETY: as above.
+                unsafe { crate::kernel::workload::lanes::detach(owner) };
+            }
+        }
+    }
+    debug_assert_eq!(
+        crate::kernel::workload::lanes::lanes_of(handle),
+        0,
+        "a rolled-back add leaves no lane of its owner"
+    );
     let s = sched();
     for k in 0..instantiated.min(st.n()) {
         let slot = st.slot(k);
@@ -1610,56 +1938,113 @@ pub fn caller_edges(blob: &[u8], out: &mut [CallerEdge]) -> Option<usize> {
     Some(n)
 }
 
-/// A parameter's value from a params TLV, as an `i64`, or `None` when the
-/// instance does not set it.
-fn param_i64(params: &[u8], tag: u8) -> Option<i64> {
-    if params.len() < 4 {
-        return None;
-    }
-    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
-    while pos + 2 <= params.len() {
-        let t = params[pos];
-        let len = params[pos + 1] as usize;
-        pos += 2;
-        if t == 0xFF {
-            return None;
-        }
-        let v = params.get(pos..pos + len)?;
-        if t == tag {
-            if len == 0 || len > 8 {
-                return None;
-            }
-            let mut b = [0u8; 8];
-            b[..len].copy_from_slice(v);
-            // Sign-extend, so a negative value reads as one.
-            let shift = 64 - len * 8;
-            return Some((i64::from_le_bytes(b) << shift) >> shift);
-        }
-        pos += len;
-    }
-    None
+/// Whether `contract` is one only claims grant: a contract a module may
+/// provide, served by a provider rather than across an edge.
+fn claim_granted(contract: u8) -> bool {
+    u16::from(contract) < 64
+        && crate::abi::registry::module_providable(u16::from(contract))
+        && !crate::abi::registry::contract_is_edge(u16::from(contract))
 }
 
-/// The grants one module contributes with the params it will be
-/// instantiated with: its manifest words, less every conditional grant whose
-/// condition this configuration does not meet.
+/// The grants one module holds with the params it will be instantiated
+/// with: its manifest words, each grant its conditions narrow kept only
+/// where they hold, and each contract only claims grant kept only while one
+/// of its claims holds.
 fn effective_module_grants(
     m: &crate::kernel::module::loader::LoadedModule,
     params: &[u8],
 ) -> [u64; 2] {
-    let mut g = m.manifest_grants();
-    let Some(block) = m.manifest_cond_grants() else {
-        return g;
+    use crate::abi::wire::fmod::{
+        claim, cond, for_each_condition, grant_holds, subject_holds, RESOURCE_CLAIM_AT,
+        RESOURCE_RECORD_SIZE,
     };
-    crate::abi::wire::fmod::for_each_cond_grant(block, |c| {
-        if c.needed(block, param_i64(params, c.param_id as u8)) {
-            return;
-        }
-        if let Some(w) = g.get_mut(c.word as usize) {
-            *w &= !(1u64 << c.bit);
+    let mut g = m.manifest_grants();
+    let block = m.manifest_conditions();
+    let mut conditioned = [0u64; 2];
+    for_each_condition(block, |c| {
+        if c.subject <= cond::SUBJECT_OP_GRANT && c.index < 64 {
+            conditioned[c.subject as usize] |= 1u64 << c.index;
         }
     });
+    for word in 0..2u8 {
+        let mut bits = conditioned[word as usize];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
+            if !grant_holds(block, word, bit, params) {
+                g[word as usize] &= !(1u64 << bit);
+            }
+        }
+    }
+    let (mut claimed, mut held) = (0u64, 0u64);
+    for (i, r) in m
+        .manifest_resources()
+        .chunks_exact(RESOURCE_RECORD_SIZE)
+        .enumerate()
+    {
+        if !claim_granted(r[0]) {
+            continue;
+        }
+        claimed |= 1u64 << r[0];
+        if r[RESOURCE_CLAIM_AT] != claim::CONDITIONAL
+            || subject_holds(block, cond::SUBJECT_CLAIM, i as u8, params).unwrap_or(true)
+        {
+            held |= 1u64 << r[0];
+        }
+    }
+    g[0] &= !(claimed & !held);
     g
+}
+
+/// The contracts the modules of a graph require served as configured, a bit
+/// per contract id: each resource record on a contract a module may provide
+/// that [`fmod::claim_required`] says is required for the module's params.
+/// `None` for a blob the codec refuses.
+///
+/// [`fmod::claim_required`]: crate::abi::wire::fmod::claim_required
+pub fn module_required_claims(blob: &[u8]) -> Option<u64> {
+    use crate::abi::wire::fmod::{claim_required, RESOURCE_RECORD_SIZE};
+    let g = graph::decode(blob).ok()?;
+    // SAFETY: scheduler-thread context, as every caller of the add.
+    let loader = unsafe { super::static_loader() };
+    let mut required = 0u64;
+    for m in g.modules() {
+        let Ok(lm) = resolving_loader(m.name_hash, loader).find_by_name_hash(m.name_hash) else {
+            continue;
+        };
+        let block = lm.manifest_conditions();
+        for (i, r) in lm
+            .manifest_resources()
+            .chunks_exact(RESOURCE_RECORD_SIZE)
+            .enumerate()
+        {
+            if claim_granted(r[0]) && claim_required(r, i as u8, block, m.params) {
+                required |= 1u64 << r[0];
+            }
+        }
+    }
+    Some(required)
+}
+
+/// The contracts the modules a graph names provide, a bit per contract id,
+/// each resolved against the loader as [`module_grants`] resolves it. `None`
+/// for a blob the codec refuses.
+pub fn module_provides(blob: &[u8]) -> Option<u64> {
+    let g = graph::decode(blob).ok()?;
+    // SAFETY: scheduler-thread context, as every caller of the add.
+    let loader = unsafe { super::static_loader() };
+    let mut provides = 0u64;
+    for m in g.modules() {
+        if let Ok(lm) = resolving_loader(m.name_hash, loader).find_by_name_hash(m.name_hash) {
+            let (ids, n) = lm.manifest_provides();
+            for &c in &ids[..n] {
+                if c < 64 {
+                    provides |= 1u64 << c;
+                }
+            }
+        }
+    }
+    Some(provides)
 }
 
 /// The union of the grants of the modules a graph names, each resolved

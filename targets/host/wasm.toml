@@ -71,4 +71,4 @@ cycles = "system"
 # otherwise answer ENOSYS at run time. `workload`, where present, is what the
 # platform answers a workload's modules; absent, the same as `platform`.
 [providers]
-platform = ["fs", "image_decode", "net_policy", "storage.namespace", "storage.object"]
+platform = ["fs", "image_decode", "storage.namespace", "storage.object"]

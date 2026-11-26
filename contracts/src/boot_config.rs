@@ -24,7 +24,8 @@
 //!       no caps, no flags
 //! HWRP  the platform's hardware payload, decoded by the platform that
 //!       declares one; the codec carries it as bytes
-//! WKLD  count u16 | (blob_len u32 | flags u8 | composed graph) × count
+//! WKLD  count u16 | (blob_len u32 | flags u8 | endpoint_count u8
+//!       | (protocol u8 | port u16) × endpoint_count | composed graph) × count
 //! ENVL  count u16 | (pool u16 | n u32) × count
 //! DMND  count u16 | (pool u16 | n u32) × count
 //! ```
@@ -76,8 +77,10 @@ pub const GRAPH_HEAD_LEN: usize = 8;
 pub const DOMAIN_LEN: usize = 8;
 /// Bytes of one envelope or demand entry.
 pub const POOL_ENTRY_LEN: usize = 6;
-/// Bytes of a workload record before its composed graph.
-pub const WORKLOAD_HEAD_LEN: usize = 5;
+/// Bytes of a workload record before its endpoints.
+pub const WORKLOAD_HEAD_LEN: usize = 6;
+/// Bytes of one endpoint a workload record grants: `protocol u8 | port u16`.
+pub const WORKLOAD_ENDPOINT_LEN: usize = 3;
 
 /// Domain `adaptive_flags` bit: demand-driven idle.
 pub const ADAPTIVE_IDLE: u8 = 0x01;
@@ -184,10 +187,16 @@ pub struct PoolEntry {
     pub n: u32,
 }
 
-/// One resident workload: its admission flags and its composed graph.
+/// One resident workload: its admission flags, the endpoints its owner is
+/// granted and its composed graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkloadRecord<'a> {
     pub idle_safe: bool,
+    /// The endpoints the workload may listen on, each `protocol u8 | port
+    /// u16` ([`WORKLOAD_ENDPOINT_LEN`] bytes; `protocol` an IP protocol
+    /// number). The graph's author grants them; the kernel answers them as
+    /// the owner's `net.endpoint` grants.
+    pub endpoints: &'a [u8],
     pub blob: &'a [u8],
 }
 
@@ -531,11 +540,15 @@ impl<'a> Workloads<'a> {
             // all the same, so none can panic.
             let len = le32(bytes, 0) as usize;
             let flags = bytes.get(4).copied().unwrap_or(0);
-            let end = (WORKLOAD_HEAD_LEN + len).min(bytes.len());
-            let blob = bytes.get(WORKLOAD_HEAD_LEN..end).unwrap_or(&[]);
+            let eps = usize::from(bytes.get(5).copied().unwrap_or(0)) * WORKLOAD_ENDPOINT_LEN;
+            let at = (WORKLOAD_HEAD_LEN + eps).min(bytes.len());
+            let endpoints = bytes.get(WORKLOAD_HEAD_LEN..at).unwrap_or(&[]);
+            let end = (at + len).min(bytes.len());
+            let blob = bytes.get(at..end).unwrap_or(&[]);
             bytes = bytes.get(end..).unwrap_or(&[]);
             WorkloadRecord {
                 idle_safe: flags & WORKLOAD_FLAG_IDLE_SAFE != 0,
+                endpoints,
                 blob,
             }
         })
@@ -725,10 +738,14 @@ fn decode_workloads(p: &[u8]) -> Result<Workloads<'_>, DecodeError> {
         if p[off + 4] & !WORKLOAD_FLAGS_KNOWN != 0 {
             return Err(bad("unknown workload flag"));
         }
-        if len > p.len() - off - WORKLOAD_HEAD_LEN {
+        let eps = usize::from(p[off + 5]) * WORKLOAD_ENDPOINT_LEN;
+        if eps > p.len() - off - WORKLOAD_HEAD_LEN {
+            return Err(bad("workload endpoints past the section"));
+        }
+        if len > p.len() - off - WORKLOAD_HEAD_LEN - eps {
             return Err(bad("workload blob past the section"));
         }
-        off += WORKLOAD_HEAD_LEN + len;
+        off += WORKLOAD_HEAD_LEN + eps + len;
     }
     if off != p.len() {
         return Err(bad("bytes after the last workload"));
@@ -873,6 +890,14 @@ fn encode_workloads(w: &[WorkloadRecord<'_>]) -> Result<Vec<u8>, EncodeError> {
         } else {
             0
         });
+        if !r.endpoints.len().is_multiple_of(WORKLOAD_ENDPOINT_LEN) {
+            return Err(EncodeError("workload endpoints"));
+        }
+        p.push(
+            u8::try_from(r.endpoints.len() / WORKLOAD_ENDPOINT_LEN)
+                .map_err(|_| EncodeError("workload endpoint count"))?,
+        );
+        p.extend_from_slice(r.endpoints);
         p.extend_from_slice(r.blob);
     }
     Ok(p)

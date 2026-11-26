@@ -209,7 +209,6 @@ macro_rules! bank_stream {
 
         mod params_def {
             use super::BankState;
-            use super::SCHEMA_MAX;
             use super::{p_u16, p_u32, p_u8};
 
             /// Copy a path string into slot `idx` of `s.paths`. Bumps

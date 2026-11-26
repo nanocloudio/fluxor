@@ -12,8 +12,7 @@ pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
 
 /// Size the kernel's tables from the boot plan (`size`), then the host's:
-/// sandboxes, host-process workloads, TTY sessions and the control-plane
-/// store.
+/// sandboxes, host-process workloads and TTY sessions.
 ///
 /// A host-process sandbox is a workload with an owner of its own: the owner
 /// table's workload slots are the sandbox pool's derived part, so every
@@ -45,7 +44,6 @@ pub unsafe fn plan_tables(
             .map_err(|e| ledger::refuse_table(res::POOL_SANDBOXES, e))?;
         crate::platform::linux::host_backend::size_tty_sessions(ttys)
             .map_err(|e| ledger::refuse_table(res::POOL_TTY_SESSIONS, e))?;
-        crate::platform::linux::store::size_from_plan();
     }
     Ok(())
 }

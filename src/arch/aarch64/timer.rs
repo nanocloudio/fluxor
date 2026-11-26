@@ -140,3 +140,47 @@ pub unsafe fn timer_set(ticks: u32) {
         );
     }
 }
+
+/// Arm the deadline timer `ticks` counter ticks from now: the generic timer
+/// the tick does not use (virtual when the tick runs on the physical one,
+/// and the other way round), so a gated entry is stopped at its deadline
+/// whatever the tick's period. Both count the same system counter, so a
+/// relative arm needs no offset between them.
+///
+/// # Safety
+/// Writes the other timer's registers; the caller owns them on this core.
+#[inline(always)]
+pub unsafe fn deadline_arm(ticks: u64) {
+    let ticks = ticks.min(i32::MAX as u64);
+    if virtual_counter() {
+        core::arch::asm!(
+            "msr cntp_tval_el0, {val}",
+            "mov {ctl}, #1",
+            "msr cntp_ctl_el0, {ctl}",
+            val = in(reg) ticks,
+            ctl = out(reg) _,
+        );
+    } else {
+        core::arch::asm!(
+            "msr cntv_tval_el0, {val}",
+            "mov {ctl}, #1",
+            "msr cntv_ctl_el0, {ctl}",
+            val = in(reg) ticks,
+            ctl = out(reg) _,
+        );
+    }
+}
+
+/// Disarm the deadline timer: disabled and masked, so its level-triggered
+/// line drops.
+///
+/// # Safety
+/// As [`deadline_arm`].
+#[inline(always)]
+pub unsafe fn deadline_disarm() {
+    if virtual_counter() {
+        core::arch::asm!("msr cntp_ctl_el0, {ctl}", ctl = in(reg) 2u64);
+    } else {
+        core::arch::asm!("msr cntv_ctl_el0, {ctl}", ctl = in(reg) 2u64);
+    }
+}

@@ -38,8 +38,8 @@ for a graph whose traffic is a few datagrams.
 |---|---|---|---|
 | `frames_rx` | input | `EthernetFrame` | required |
 | `frames_tx` | output | `EthernetFrame` | required |
-| `net_out` | output | `NetProto` |  |
-| `net_in` | input | `NetProto` |  |
+| `net_out` | output | `NetProto` | each lane's events |
+| `net_in` | input | `NetProto` | each lane's commands |
 | `addr_ctl` | input | `NetProto` |  |
 | `addr_evt` | output | `NetProto` |  |
 | `packet_in` | input | `NetProto` |  |
@@ -52,10 +52,15 @@ for a graph whose traffic is a few datagrams.
 
 Builds for: `rp2040`, `rp2350`, `bcm2712`, `linux`, `uefi`. [manifest.toml](manifest.toml) is the declaration.
 
-The optional ports — `net_in` / `net_out`, `addr_ctl` / `addr_evt`, the
-pre-transport decision seam and the continuity pair — and the contracts it
-declares (`workload`, `net_route`, `net_policy`) are described in
-`manifest.toml`.
+Every consumer reaches `ip` over a lane of its own (`[lanes]`), a module of
+the node's graph under the node owner and a workload's under its own:
+`net_in` / `net_out` describe each lane's commands and events, and the
+composer wires every edge to them as a lane, never a port — one per edge
+into `net_in`, one shared by the edges marked `edge_class: merge` — adding
+the node graph's lanes to `lanes`. The optional ports — `addr_ctl` /
+`addr_evt`, the pre-transport decision seam and the continuity pair — and
+the contracts it declares (`workload`, `net_route`, `net_policy`) are
+described in `manifest.toml`.
 
 ## Parameters
 
@@ -97,10 +102,12 @@ a graph declaring more than the default heap holds gives the instance
 `heap.arena_bytes`, and construction otherwise refuses, naming the table.
 Defaults are aarch64's, with the MCU-class figure after the slash:
 
-- `lanes` (16 / 0) — workload lanes, stated to the kernel with
-  `NET_PROVIDE`; `lane_endpoints` (16) — datagram endpoints per lane;
-  `lane_pairs` (16) — same-node stream halves per lane; `lane_events` (8)
-  and `node_events` (32 / 16) — each lane's own event queue and the node's.
+- `lanes` (16 / 0) — workload lanes, to which the composer adds the node
+  graph's, read by the kernel as the module is instantiated; on an
+  MCU-class target each takes `LANE_HEAP_BYTES` (3548 B) of heap;
+  `lane_endpoints` (16) — datagram endpoints per lane; `lane_pairs` (16) —
+  same-node stream halves per lane; `lane_events` (8) — each lane's own
+  event queue.
 - `max_peers` (0) — peer nodes (ARP table and peer routes); `max_segments`
   (4 / 0), `max_held` (0) — the `net.route` tables realized. Entries the
   node's tables hold past these are reported `refused(table_full)`.

@@ -1,7 +1,8 @@
 //! Public Fluxor contracts and shared vocabulary.
 //!
 //! Fluxor owns the wire-byte content-type table used by every module
-//! manifest, its rate classes and framing, the isolation planner, the
+//! manifest, its rate classes and framing, the channel table a carrier
+//! declares, the isolation planner, the
 //! boot memory map, the boot configuration and owner plan codecs, the
 //! channel ring sizing rule, the state arena's carve rule, the params TLV and
 //! the owner-log ring format. Downstream
@@ -20,6 +21,7 @@ extern crate alloc;
 
 pub mod boot;
 pub mod boot_config;
+pub mod channel_table;
 pub mod core_map;
 pub mod graph;
 pub mod isolation;

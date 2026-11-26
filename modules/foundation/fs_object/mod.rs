@@ -299,7 +299,7 @@ mod params_def {
     use super::*;
     fluxor_rt::define_params! {
         State;
-        1, root, str, 0 => |s, d, len| {
+        1, root, str, 0, max ROOT_MAX => |s, d, len| {
             if len > ROOT_MAX {
                 s.root_len = ROOT_MAX + 1;
             } else {

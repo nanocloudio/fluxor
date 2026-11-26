@@ -15,7 +15,9 @@
 [registry]
 semantic_epoch = 1
 max_contracts = 64
-chain_next = 0x10000
+# Module-declared pools take ids from here up, densely; kernel pools are
+# `1..` below it, densely.
+module_pool_base = 0x0100
 # The handle word: `0 | contract | generation | index`, high to low.
 handle_contract_bits = 7
 handle_generation_bits = 9
@@ -55,25 +57,13 @@ doc = "Replace or clear the node's network policy (`REPLACE`, `CLEAR`)."
 name = "net_route.table"
 bit = 5
 reach = "kernel"
-doc = "Read and write the node's route table and segments (`SEGMENTS`, `ROUTES`, `HOLD`, `READ`)."
-
-[[grant]]
-name = "net_route.stack"
-bit = 6
-reach = "kernel"
-doc = "Report to and take from the route table as the node's IP stack (`REPORT`, `TAKE`)."
+doc = "Read and write the node's route table and segments (`SEGMENTS`, `ROUTES`, `HOLD`, `READ`), and end a resync (`RESYNC_END`)."
 
 [[grant]]
 name = "workload.create"
 bit = 7
 reach = "kernel"
 doc = "Create, run, signal and inspect workloads."
-
-[[grant]]
-name = "workload.net"
-bit = 8
-reach = "kernel"
-doc = "Serve workloads' network lanes as the node's IP stack (`NET_*`)."
 
 [[grant]]
 name = "host_process.exec"
@@ -121,12 +111,24 @@ doc = "Allocate DMA memory from the kernel's arena and maintain its cache."
 name = "seal_key"
 bit = 16
 reach = "kernel"
-doc = "Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium."
+doc = "Derive this module's own sealing key from the platform's (`SEAL_KEY_DERIVE`): HKDF over the device key, bound to the caller's module type and a context it names. The platform key itself never leaves the kernel."
 
 [[grant]]
 name = "lend.borrow"
 bit = 17
 doc = "Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): the borrower reads or writes the span in place. It reaches only memory its lender opened to it; DMA into the span is `platform_dma`'s privilege, not this one."
+
+[[grant]]
+name = "resource.owner_charge"
+bit = 18
+reach = "kernel"
+doc = "Charge and refund the storage line of the owner a workload-scoped provider is serving (`LEDGER_CHARGE`, `LEDGER_RELEASE`). The owner is the call's caller, never an argument."
+
+[[grant]]
+name = "event.bind_irq"
+bit = 19
+reach = "kernel"
+doc = "Bind a hardware interrupt line to an event this module owns (`BIND_IRQ`). A line is the node's device, so a workload's module never holds it."
 
 [[errno]]
 name = "OK"
@@ -167,6 +169,10 @@ value = -12
 [[errno]]
 name = "ENOSPC"
 value = -28
+
+[[errno]]
+name = "EROFS"
+value = -30
 
 [[errno]]
 name = "E2BIG"
@@ -268,6 +274,90 @@ bit = 0x08
 name = "WROTE"
 bit = 0x20
 
+# Accounted pools: every capacity the resource ledger reports, by id. A
+# kernel pool is declared here, `1..` densely; a pool a module provider
+# serves is declared under its contract (`[[contract.pool]]`), from
+# `module_pool_base` densely. `arena`: its figures are bytes and an
+# envelope entry may be in KiB.
+
+[[pool]]
+name = "state_arena"
+id = 0x0001
+arena = true
+doc = "Per-module state arena (bytes; backs `loader::alloc_state`)."
+
+[[pool]]
+name = "buffer_arena"
+id = 0x0002
+arena = true
+doc = "Shared channel buffer-pool arena (bytes)."
+
+[[pool]]
+name = "config_arena"
+id = 0x0003
+doc = "Boot configuration (bytes): the module params the graph borrows from its config blob in place, against the blob's mapped length. Observed, never allocated from, so it is not sizable by a capacity envelope."
+
+[[pool]]
+name = "channels"
+id = 0x0004
+doc = "Channel slot table (slots)."
+
+[[pool]]
+name = "events"
+id = 0x0005
+doc = "Event slot table (slots)."
+
+[[pool]]
+name = "timers"
+id = 0x0006
+doc = "Timer-fd slot table (slots)."
+
+[[pool]]
+name = "owners"
+id = 0x0007
+doc = "Workload owner table (slots)."
+
+[[pool]]
+name = "module_slots"
+id = 0x0008
+doc = "Scheduler module slot table (slots)."
+
+[[pool]]
+name = "elastic_region"
+id = 0x0009
+arena = true
+doc = "Kernel elastic region (bytes): chunk grants (`ELASTIC_ALLOC`)."
+
+[[pool]]
+name = "sandboxes"
+id = 0x000A
+doc = "Host-process sandboxes held at once, finished ones included (slots)."
+
+[[pool]]
+name = "tty_sessions"
+id = 0x000B
+doc = "Interactive terminal sessions open at once (slots)."
+
+[[pool]]
+name = "handles"
+id = 0x000C
+doc = "Provider handles the kernel tracks for teardown at once (slots)."
+
+[[pool]]
+name = "state_free_list"
+id = 0x000D
+doc = "State-arena free-list entries: the holes freed modules leave below the bump mark (slots)."
+
+[[pool]]
+name = "lends"
+id = 0x000E
+doc = "Lends open at once (slots): spans a module registered for the provider of one of its sessions to use past a call."
+
+[[pool]]
+name = "isolated_slots"
+id = 0x000F
+doc = "Isolation slots (slots): modules a node runs under their own translation regime at once; a gated workload module takes one for its life."
+
 [[contract]]
 name = "kernel"
 grant = "none"
@@ -342,11 +432,6 @@ route = "class"
   gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
-  name = "NET_IDENT_PROVIDER"
-  op = 0x4C
-  gate = { handle = "global", arg = "in", max = 1 }
-
-  [[contract.op]]
   name = "BOOT_INCARNATION"
   op = 0x2F
   gate = { handle = "global", arg = "out", max = 16 }
@@ -382,10 +467,12 @@ route = "class"
   op = 0x46
   gate = { handle = "global", arg = "in", max = 2 }
 
+  # A fact of the board the firmware handed the kernel at boot:
+  # `arg` in = `[fact u8]` (`kernel_abi::board_fact`), out = the fact's bytes.
   [[contract.op]]
-  name = "GET_HW_ETHERNET_MAC"
+  name = "BOARD_FACT"
   op = 0x3D
-  gate = { handle = "global", arg = "out", max = 6 }
+  gate = { handle = "global", arg = "inout", max = 16 }
 
   [[contract.op]]
   name = "QUERY_OP"
@@ -396,10 +483,6 @@ route = "class"
   [[contract.op]]
   name = "QUERY_CLASS"
   op = 0x01
-
-
-
-
 
   [[contract.op]]
   name = "QUERY_HEAP_STATS"
@@ -420,6 +503,15 @@ route = "class"
   [[contract.op]]
   name = "QUERY_MODULE_LIVE"
   op = 0x0b
+  query = 8
+
+  [[contract.op]]
+  name = "QUERY_CALLER_OWNER_UID"
+  op = 0x0c
+
+  [[contract.op]]
+  name = "QUERY_CALLER_AUTHORITY"
+  op = 0x0d
 
   [[contract.op]]
   name = "SIGNAL_CORE"
@@ -452,6 +544,56 @@ route = "class"
   name = "DOORBELL_RING"
   op = 0x55
   gate = { handle = "global", arg = "in", max = 4 }
+
+  # The caller's own sealing key: `arg` = `[ctx_len u8][ctx]` (at most 64
+  # bytes) in, `[provenance u8][key 32]` out. The key is HKDF-SHA256 over
+  # the platform's sealing key, salt `fluxor/seal`, info = the caller's
+  # module type hash (u32 LE) then `ctx`: one key per module type and
+  # context, which only that module type can derive again. `ENOSYS` on a
+  # platform with no sealing key.
+  [[contract.op]]
+  name = "SEAL_KEY_DERIVE"
+  grant = "seal_key"
+  op = 0x56
+  gate = { handle = "global", arg = "inout", max = 65 }
+
+  # The graph's composition record, as the key vault's
+  # `ATTEST_COMPOSITION` signs it: `arg` = `[challenge 32][custody u8]`,
+  # the record out in `data`. Returns its length, or `ERANGE` with the
+  # length needed written as `[len u32]` to `arg` when `data` is short.
+  # Read only: it names hashes of what the node runs and nothing secret.
+  [[contract.op]]
+  name = "COMPOSITION_RECORD"
+  op = 0x57
+  gate = { handle = "global", arg = "inout", max = 33, data = "out", data_max = "any" }
+
+  # The next lane change the kernel queued for the calling module, a node
+  # module that serves lanes: `arg` out = one `lane` record
+  # (`kernel_abi::lane`). Returns the record's length, 0 when none is
+  # queued, `EACCES` to a module that serves no lanes.
+  [[contract.op]]
+  name = "LANE_TAKE"
+  op = 0x58
+  gate = { handle = "global", arg = "out", max = 20 }
+
+  # An owner's grants from the committed owner plan, opaque to the kernel:
+  # `arg` in = `[slot u16][0 u16][generation u32]`, `data` out = its grant
+  # records `[kind u16][len u16][bytes]`. Answered only to a module holding
+  # one of that owner's lanes (`EACCES` otherwise); `ENOENT` when no plan is
+  # committed (nothing is granted or refused); `ERANGE` with the length
+  # needed as `[len u32]` in `arg` when `data` is short.
+  [[contract.op]]
+  name = "OWNER_GRANTS"
+  op = 0x59
+  gate = { handle = "global", arg = "inout", max = 8, data = "out", data_max = "any" }
+
+  # The node image's modules: `[count u16][0 u16]` then `[name_hash u32]
+  # [sha256 32]` per module, into `data`. Returns the length, or `ERANGE`
+  # when `data` cannot hold it.
+  [[contract.op]]
+  name = "MODULE_DIGESTS"
+  op = 0x5A
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
 [[contract]]
 # The channel: a ring (FIFO) or a one-record mailbox between a producer and a
@@ -651,7 +793,7 @@ manifest = true
   name = "BIND_IRQ"
   op = 0x51
   admission = true
-  gate = { handle = "minted", arg = "in", max = 5 }
+  grant = "event.bind_irq"
 
 [[contract]]
 name = "key_vault"
@@ -1178,9 +1320,12 @@ manifest = true
   gate = { handle = "minted", arg = "none", max = 0 }
 
 [[contract]]
+# `workload_served`: the node graph's workload layer (`owner_fs`) serves every
+# workload's `fs`, rooted and charged to the workload's owner.
 name = "fs"
 id = 0x0D
 module_provided = true
+workload_served = true
 manifest = true
 
   [[contract.op]]
@@ -1360,6 +1505,11 @@ manifest = true
   op = 0xFF
   gate = { handle = "scoped", arg = "out", max = 4 }
 
+  [[contract.pool]]
+  name = "store_subs"
+  id = 0x0100
+  doc = "Store subscriptions (slots): one per watched prefix per module, held in the heap of the graph's `storage.namespace` providers, which the composer sizes from what the graph's store consumers declare."
+
 [[contract]]
 name = "storage.object"
 id = 0x0F
@@ -1487,6 +1637,19 @@ route = "class"
   op = 0x24
   gate = { handle = "global", arg = "in", max = 2 }
 
+  # A workload-scoped provider charges the owner it is serving.
+  [[contract.op]]
+  name = "LEDGER_CHARGE"
+  grant = "resource.owner_charge"
+  op = 0x26
+  gate = { handle = "global", arg = "in", max = 11 }
+
+  [[contract.op]]
+  name = "LEDGER_RELEASE"
+  grant = "resource.owner_charge"
+  op = 0x27
+  gate = { handle = "global", arg = "in", max = 10 }
+
 [[contract]]
 name = "runtime_params"
 grant = "none"
@@ -1532,6 +1695,7 @@ manifest = true
 name = "net_policy"
 id = 0x15
 manifest = true
+module_provided = true
 
   [[contract.op]]
   name = "REPLACE"
@@ -1564,6 +1728,7 @@ manifest = true
 name = "net_route"
 id = 0x16
 manifest = true
+module_provided = true
 
   [[contract.op]]
   name = "SEGMENTS"
@@ -1590,16 +1755,10 @@ manifest = true
   gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
-  name = "REPORT"
-  grant = "net_route.stack"
+  name = "RESYNC_END"
+  grant = "net_route.table"
   op = 0x04
-  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
-
-  [[contract.op]]
-  name = "TAKE"
-  grant = "net_route.stack"
-  op = 0x05
-  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "CAPS"
@@ -1642,6 +1801,12 @@ manifest = true
   gate = { handle = "scoped", arg = "in", max = 16 }
 
   [[contract.op]]
+  name = "OWNERS"
+  grant = "workload.create"
+  op = 0x05
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
+
+  [[contract.op]]
   name = "PAUSE"
   grant = "workload.create"
   op = 0x0B
@@ -1660,40 +1825,10 @@ manifest = true
   gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
-  name = "NET_PROVIDE"
-  grant = "workload.net"
-  op = 0x0E
-  gate = { handle = "global", arg = "in", max = 1 }
-
-  [[contract.op]]
-  name = "NET_LANE_TAKE"
-  grant = "workload.net"
-  op = 0x0F
-  gate = { handle = "global", arg = "out", max = 20 }
-
-  [[contract.op]]
-  name = "NET_LANE_ADMIT"
-  grant = "workload.net"
-  op = 0x10
-  gate = { handle = "global", arg = "in", max = 12 }
-
-  [[contract.op]]
-  name = "NET_RESOLVER"
-  grant = "workload.net"
-  op = 0x13
-  gate = { handle = "global", arg = "out", max = 256 }
-
-  [[contract.op]]
   name = "LOOKUP"
   grant = "workload.create"
   op = 0x12
   gate = { handle = "mints", arg = "inout", max = 16 }
-
-  [[contract.op]]
-  name = "MODULE_DIGESTS"
-  grant = "workload.create"
-  op = 0x11
-  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "OPTIONS"
@@ -1708,40 +1843,68 @@ manifest = true
   gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
+# Host processes on a host node: a workload's own output, a command or a
+# terminal session joined to a running workload, and a command the node
+# runs itself. An op on a workload takes the caller's workload handle in
+# the handle slot (`accepts`); a terminal session and a spawned command are
+# handles this contract mints. Served by the host platform alone.
 name = "host_process"
 grant = "host_process.exec"
 reach = "kernel"
 id = 0x18
+accepts = ["workload"]
 
   [[contract.op]]
   name = "READ"
   op = 0x00
-  gate = { handle = "global", arg = "in", max = 16, data = "out", data_max = "any" }
+  gate = { handle = "accepted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "EXEC"
   op = 0x01
-  gate = { handle = "global", arg = "inout", max = 20, data = "inout", data_max = "any" }
+  gate = { handle = "accepted", arg = "inout", max = 4, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_OPEN"
   op = 0x02
-  gate = { handle = "global", arg = "in", max = 20, data = "in", data_max = "any" }
+  gate = { handle = "accepted_mints", arg = "in", max = 4, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_STEP"
   op = 0x03
-  gate = { handle = "global", arg = "inout", max = 13, data = "inout", data_max = "any" }
+  gate = { handle = "minted", arg = "inout", max = 9, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_RESIZE"
   op = 0x04
-  gate = { handle = "global", arg = "in", max = 8 }
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "TTY_CLOSE"
   op = 0x05
-  gate = { handle = "global", arg = "in", max = 4 }
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
+
+  [[contract.op]]
+  name = "PROC_SPAWN"
+  op = 0x06
+  gate = { handle = "mints", arg = "none", max = 0, data = "in", data_max = "any" }
+
+  [[contract.op]]
+  name = "PROC_READ"
+  op = 0x07
+  gate = { handle = "minted", arg = "out", max = 1024 }
+
+  [[contract.op]]
+  name = "PROC_STATUS"
+  op = 0x08
+  gate = { handle = "minted", arg = "out", max = 4 }
+
+  [[contract.op]]
+  name = "PROC_CLOSE"
+  op = 0x09
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "CAPS"
@@ -1798,32 +1961,6 @@ manifest = true
   name = "CAPS"
   op = 0xFF
   gate = { handle = "scoped", arg = "out", max = 4 }
-
-[[contract]]
-name = "proc"
-id = 0x1A
-manifest = true
-
-  [[contract.op]]
-  name = "PROC_SPAWN"
-  op = 0x00
-  gate = { handle = "mints", arg = "none", max = 0, data = "in", data_max = "any" }
-
-  [[contract.op]]
-  name = "PROC_READ"
-  op = 0x01
-  gate = { handle = "minted", arg = "out", max = 1024 }
-
-  [[contract.op]]
-  name = "PROC_STATUS"
-  op = 0x02
-  gate = { handle = "minted", arg = "out", max = 4 }
-
-  [[contract.op]]
-  name = "PROC_CLOSE"
-  op = 0x03
-  gate = { handle = "minted", arg = "none", max = 0 }
-  closes = true
 
 [[contract]]
 name = "usb_host"
@@ -2202,42 +2339,6 @@ route = "class"
   gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
 [[contract]]
-name = "vault_store"
-grant = "seal_key"
-reach = "kernel"
-id = 0x26
-
-  [[contract.op]]
-  name = "ATTACH"
-  op = 0x40
-  gate = { handle = "global", arg = "in", max = 8 }
-
-  [[contract.op]]
-  name = "LOAD"
-  op = 0x41
-  gate = { handle = "global", arg = "in", max = 8, data = "in", data_max = "any" }
-
-  [[contract.op]]
-  name = "DECIDE"
-  op = 0x42
-  gate = { handle = "global", arg = "none", max = 0 }
-
-  [[contract.op]]
-  name = "PENDING"
-  op = 0x43
-  gate = { handle = "global", arg = "out", max = 16 }
-
-  [[contract.op]]
-  name = "READ"
-  op = 0x44
-  gate = { handle = "global", arg = "in", max = 12, data = "out", data_max = "any" }
-
-  [[contract.op]]
-  name = "DONE"
-  op = 0x45
-  gate = { handle = "global", arg = "in", max = 16 }
-
-[[contract]]
 name = "rp_raw"
 reach = "kernel"
 id = 0x27
@@ -2529,8 +2630,6 @@ manifest = true
   op = 0xF7
   gate = { handle = "global", arg = "in", max = 8 }
 
-
-
 [[contract]]
 # Custody of a keyed volume's key: the provider holds the key in its own
 # key_vault namespace (a label no other module type reaches) and answers
@@ -2681,7 +2780,7 @@ manifest = true
 # Cycle and instruction-cache counters (`contracts::counters`): served by the
 # kernel, reached by `grants = ["counters"]`.
 name = "counters"
-id = 0x2D
+id = 0x1A
 route = "class"
 
   [[contract.op]]
@@ -2693,6 +2792,46 @@ route = "class"
   name = "READ"
   op = 0x01
   gate = { handle = "global", arg = "out", max = 16 }
+
+[[contract]]
+# Custody of P-256 keys in a host-side token (`contracts::key_custody`):
+# six ops on flat records, served by a `key_custody` provider process behind
+# `host_lane serves = "key_custody"` and called by the key vault.
+name = "key_custody"
+id = 0x26
+manifest = true
+module_provided = true
+
+  [[contract.op]]
+  name = "GENERATE"
+  op = 0x00
+  gate = { handle = "mints", arg = "inout", max = 73 }
+
+  [[contract.op]]
+  name = "SIGN"
+  op = 0x01
+  gate = { handle = "minted", arg = "inout", max = 65 }
+
+  [[contract.op]]
+  name = "ECDH"
+  op = 0x02
+  gate = { handle = "minted", arg = "inout", max = 66 }
+
+  [[contract.op]]
+  name = "PUBLIC"
+  op = 0x03
+  gate = { handle = "minted", arg = "out", max = 65 }
+
+  [[contract.op]]
+  name = "FIND"
+  op = 0x04
+  gate = { handle = "mints", arg = "inout", max = 70 }
+
+  [[contract.op]]
+  name = "DESTROY"
+  op = 0x05
+  gate = { handle = "minted", arg = "in", max = 1 }
+  closes = true
 
 [[msgset]]
 name = "net_tlv"
@@ -2823,6 +2962,41 @@ members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagra
   first = 0x40
   last = 0x43
 
+  [[msgset.range]]
+  surface = "packet"
+  first = 0x53
+  last = 0x54
+
+  [[msgset.range]]
+  surface = "packet"
+  first = 0x64
+  last = 0x69
+
+  [[msgset.range]]
+  surface = "mux"
+  first = 0xB1
+  last = 0xB8
+
+  [[msgset.range]]
+  surface = "mux"
+  first = 0xC0
+  last = 0xC5
+
+  [[msgset.range]]
+  surface = "mux"
+  first = 0xC7
+  last = 0xC7
+
+  [[msgset.range]]
+  surface = "mux"
+  first = 0xCA
+  last = 0xCB
+
+  [[msgset.range]]
+  surface = "mux"
+  first = 0xCE
+  last = 0xCF
+
   [[msgset.msg]]
   surface = "datagram"
   name = "CMD_DG_BIND"
@@ -2857,41 +3031,6 @@ members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagra
   surface = "datagram"
   name = "MSG_DG_ERROR"
   value = 0x43
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "CMD_PKT_BIND"
-  value = 0x50
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "CMD_PKT_TX"
-  value = 0x51
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "CMD_PKT_CLOSE"
-  value = 0x52
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "MSG_PKT_BOUND"
-  value = 0x60
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "MSG_PKT_RX"
-  value = 0x61
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "MSG_PKT_CLOSED"
-  value = 0x62
-
-  [[msgset.msg]]
-  surface = "packet"
-  name = "MSG_PKT_ERROR"
-  value = 0x63
 
   [[msgset.msg]]
   surface = "packet"
@@ -3150,6 +3289,11 @@ members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagra
 
   [[msgset.msg]]
   surface = "identity"
+  name = "OWNER_RESOLVER"
+  value = 0xA4
+
+  [[msgset.msg]]
+  surface = "identity"
   name = "MSG_ADDR_ADDED"
   value = 0xA8
 
@@ -3182,11 +3326,6 @@ members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagra
   surface = "peer_identity"
   name = "MSG_PEER_IDENTITY"
   value = 0xC8
-
-  [[msgset.msg]]
-  surface = "mux"
-  name = "CMD_MUX_SESSION_OPEN"
-  value = 0xB0
 
   [[msgset.msg]]
   surface = "mux"
@@ -3227,11 +3366,6 @@ members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagra
   surface = "mux"
   name = "CMD_MUX_STREAM_STOP_SENDING"
   value = 0xB8
-
-  [[msgset.msg]]
-  surface = "mux"
-  name = "CMD_MUX_STREAM_OPEN_WITH"
-  value = 0xB9
 
   [[msgset.msg]]
   surface = "mux"

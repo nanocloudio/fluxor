@@ -260,7 +260,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     // Its net lanes go before its channels close, and the provider closes
     // every endpoint they opened.
     // SAFETY: scheduler thread, before the owner's channels close.
-    unsafe { crate::kernel::workload::net_attach::detach(handle) };
+    unsafe { crate::kernel::workload::lanes::detach(handle) };
     // Which module slots belong to this owner, and which domains they occupy —
     // captured up front (pure reads) BEFORE any mutation, because the
     // per-domain unsplice below needs the freed owner's domain set, and

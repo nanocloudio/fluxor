@@ -1,0 +1,53 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# FS state is readiness-driven; no scheduler-step deadline.
+timer_class = "wall_clock"
+
+# The node's workload `fs` layer: every workload's `fs` call is served here,
+# beneath a root of its own under `root` (`<root>/<uid hex>/files/`) on the
+# node's file system, which this module reaches as the node through the layer
+# beneath it (the node's `fat32` or `mount` on metal, the host file system on
+# Linux). What a workload holds is charged to its owner's storage line; a
+# released owner's root is removed in the background. A node-owned module
+# alone may register it, and the node itself never reaches it.
+provides = ["fs"]
+provider_contracts = ["fs"]
+provider_scope = "workloads"
+
+# The owner a call is made for is told to this layer as the call's caller;
+# it charges that owner's storage line and no other.
+grants = ["resource.owner_charge"]
+
+observes_owner_release = true
+
+# Every rooted op goes to the node's file system under this module's own
+# `fs` grant: its dispatch runs as the node, so the node's layer serves it.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+# Volumes lent to workloads, from the node agent (in[0]): one record per
+# change, `[cmd u8][uid 16][dst_len u8][dst][vol_len u8][volume]
+# [path_len u16][path][ro u8]` (`cmd` 1 = ADD, 2 = REMOVE, which carries the
+# uid and dst alone). A workload's paths at or under `dst` reach the
+# volume (a keyed `fs` provider by name, or `platform`, beneath `path`),
+# uncharged. Drained before every call and every step, so a record written
+# before a workload is created is in force at its first call.
+[[ports]]
+name = "ctl"
+direction = "input"
+content_type = "OctetStream"
+required = false
+
+[capacities]
+# Every table from the heap, one allocation each (the base covers the
+# allocator's per-allocation rounding): a root is 336 bytes, an open handle
+# 64, a lent volume 216.
+heap_per_param = { base = 256, params = [
+    { tag = 2, default = 80, bytes_each = 336 },
+    { tag = 3, default = 128, bytes_each = 64 },
+    { tag = 5, default = 16, bytes_each = 216 },
+] }
+
+[observability]
+exempt = "a rooting layer: its '[owner_fs]' lines (a root not made, not removed, a tombstoned root queued) are the observable; the bytes it serves are the workload's"

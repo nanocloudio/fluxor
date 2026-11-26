@@ -836,7 +836,10 @@ unsafe fn creds_install(
                 0,
             );
         }
-        if !deposited {
+        if deposited.is_err() {
+            // Read at runtime, the key is deposited once: a vault that is
+            // not reachable yet refuses it like any other.
+            identity_key_wipe(s);
             // Validated above against the vault's presence; a vault that
             // then refuses the key leaves no identity to serve.
             s.creds.ready = false;

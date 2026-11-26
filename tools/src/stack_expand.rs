@@ -371,6 +371,7 @@ pub fn expand_platform_stacks(
         Some(p) => p.clone(),
         None => {
             fluxor_tools::stack::strip_stack_member_marks(config);
+            crate::config::order_for_construction(config, r)?;
             return Ok(auto_added);
         }
     };
@@ -475,7 +476,9 @@ pub fn expand_platform_stacks(
     // wrong names. Computed over the EXPANDED module list (indices =
     // instantiation order) from the project's own `modules/` tree — the same
     // default the `fluxor id-table` exporter uses. An explicit user
-    // `table_digest` wins.
+    // `table_digest` wins. The list is put in construction order first: it
+    // is the order the kernel instantiates, and so stamps.
+    crate::config::order_for_construction(config, r)?;
     inject_id_table_digest(config, r)?;
 
     Ok(auto_added)

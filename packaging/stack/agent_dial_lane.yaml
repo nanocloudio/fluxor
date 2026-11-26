@@ -9,9 +9,10 @@
 # the record came from; outbound, the peer it goes to, all zero for every
 # session. `[len:u32][record]` is the channel's `len32` record.
 #
-# Everything but the two ends is `agent_dial`'s, parameters included. A graph may
-# include this once per target, each under its own `as:`, and needs
-# `accept_cycles`, the network provider and `tls` being a feedback pair:
+# Everything but the two ends is `agent_dial`'s, parameters included. Its `linux_net`
+# is the graph's network provider, and a graph has one, so a graph includes
+# this once and runs no `linux_net` of its own. It needs `accept_cycles`, the
+# network provider and `tls` being a feedback pair:
 #
 #   target: linux
 #   tick_us: 1000
@@ -94,6 +95,11 @@ modules:
     channels: "OctetStream:len32:8196"
     require_peer: 1
     peer_tag: 1
+
+  # The key vault: every key its callers hold lives in its heap and none
+  # outlives the instance (no block source), so it seals nothing.
+  - name: key_vault
+    seal: none
 
 wiring:
   - from: net.net_out

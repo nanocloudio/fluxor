@@ -765,14 +765,44 @@ fn v6_ends(s: &IpState, c: &tcp::TcpConn) -> Option<([u8; 16], [u8; 16])> {
     ))
 }
 
-/// Whether connection `idx` is the node's own: on the node's lane, from an
+/// Whether connection `idx` is the node's own: on a node lane, from an
 /// address no workload owns. Only those are migratable.
 ///
 /// # Safety
 /// `idx` is a connection slot.
 unsafe fn node_conn(s: &IpState, idx: usize) -> bool {
     let c = &*s.tcp_conns.ptr(idx);
-    c.lane == 0 && c.owner_tag == 0
+    lane_is_node(s, c.lane) && c.owner_tag == 0
+}
+
+/// The node lane a restored connection belongs to: the lane whose listener
+/// serves its port at its address, as an accepted connection takes its
+/// listener's; with no such listener, the node's one lane. `None` when
+/// neither names one — no listener, and no lane or several — since then no
+/// consumer here is the connection's.
+///
+/// # Safety
+/// `s` was constructed.
+unsafe fn restore_lane(s: &IpState, port: u16, slot: u16) -> Option<u8> {
+    if let Some(li) = find_listener_indexed(s, port, slot) {
+        let lane = (*s.tcp_conns.ptr(li)).lane;
+        return lane_is_node(s, lane).then_some(lane);
+    }
+    let mut only = None;
+    let mut lane = 1u8;
+    while lane <= s.lane_cap {
+        if lane_is_node(s, lane) {
+            if only.is_some() {
+                return None;
+            }
+            only = Some(lane);
+        }
+        if lane == u8::MAX {
+            break;
+        }
+        lane += 1;
+    }
+    only
 }
 
 /// Whether an IPv4 flow names a local address a workload owns. An IPv6
@@ -1127,12 +1157,15 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
     if owner_tag_for_slot(s, slot) != 0 {
         return Err(sc::STATUS_UNSUPPORTED);
     }
+    // Its events go to the node lane its consumer reads.
+    let lane = restore_lane(s, lport, slot).ok_or(sc::STATUS_NOT_READY)?;
     *conn = tcp::TcpConn::new();
     conn.state = state;
     conn.local_port = lport;
     conn.remote_port = rport;
     conn.remote_ip = remote;
     conn.local_slot = slot;
+    conn.lane = lane;
     conn.iss = rd_u32(rec, p);
     p += 4;
     conn.snd_una = rd_u32(rec, p);
@@ -1235,7 +1268,11 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
     p += 4;
     // Kept bytes sit between SND.UNA and SND.NXT, whole, and only where
     // this side's consumer does not keep them itself.
-    conn.flags = if s.node_retx { net_flag::RETX } else { 0 };
+    conn.flags = if lane_at(s, lane).is_some_and(|l| l.retx != 0) {
+        net_flag::RETX
+    } else {
+        0
+    };
     let flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
     if send_len > REC_SEND_MAX
         || send_len > flight
@@ -1808,8 +1845,10 @@ unsafe fn mirror_drained(s: &IpState, mi: usize) -> bool {
     let m = &s.cont.mirrors[mi];
     let idx = m.conn_idx as usize;
     let st = lane_state(s, conn_lane(s, idx));
-    let stashed = st.valid != 0 && st.conn as usize == idx;
-    let closing = st.close_valid != 0 && st.close_conn as usize == idx;
+    let stashed = st
+        .as_ref()
+        .is_some_and(|st| st.valid != 0 && st.conn as usize == idx);
+    let closing = st.is_some_and(|st| st.close_valid != 0 && st.close_conn as usize == idx);
     !stashed && !closing && s.pending_tx_len == 0 && m.gate_kind == GATE_NONE && m.recv_pending == 0
 }
 
@@ -2802,11 +2841,9 @@ unsafe fn quiesce_reply(s: &mut IpState, mi: usize) {
     let idx = s.cont.mirrors[mi].conn_idx as usize;
     let c = &*s.tcp_conns.ptr(idx);
     let pending_out = c.snd_nxt.wrapping_sub(c.snd_una);
-    let st = lane_state(s, conn_lane(s, idx));
-    let pending_in = if st.valid != 0 && st.conn as usize == idx {
-        u32::from(st.len)
-    } else {
-        0
+    let pending_in = match lane_state(s, conn_lane(s, idx)) {
+        Some(st) if st.valid != 0 && st.conn as usize == idx => u32::from(st.len),
+        _ => 0,
     };
     let mut body = [0u8; 9];
     body[0] = drained as u8;
@@ -3150,12 +3187,13 @@ unsafe fn cmd_retire(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
     let idx = s.cont.mirrors[mi].conn_idx as usize;
     // The connection leaves silently: no FIN, no RST, no consumer event —
     // the peer is talking to the new anchor now.
-    let st = lane_state(s, conn_lane(s, idx));
-    if st.valid != 0 && st.conn as usize == idx {
-        st.valid = 0;
-    }
-    if st.close_valid != 0 && st.close_conn as usize == idx {
-        st.close_valid = 0;
+    if let Some(st) = lane_state(s, conn_lane(s, idx)) {
+        if st.valid != 0 && st.conn as usize == idx {
+            st.valid = 0;
+        }
+        if st.close_valid != 0 && st.close_conn as usize == idx {
+            st.close_valid = 0;
+        }
     }
     if idx < s.tcp_conns.len() {
         let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;

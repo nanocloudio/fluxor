@@ -17,6 +17,10 @@ use portable_atomic::{AtomicU32, Ordering};
 pub(crate) enum FaultKind {
     /// The step ran past its deadline.
     Timeout,
+    /// The step was forced out at its deadline: a gated entry stopped
+    /// mid-run. Reported as a timeout, but never late work a policy may
+    /// tolerate.
+    ForcedOut,
     /// The step (or a step hook) returned an error.
     Error(i32),
     /// A protection fault: an EL0 abort, or a broken stack fence.
@@ -51,7 +55,7 @@ impl FaultSite {
 impl FaultKind {
     fn wire(self) -> u8 {
         match self {
-            FaultKind::Timeout => fault_type::TIMEOUT,
+            FaultKind::Timeout | FaultKind::ForcedOut => fault_type::TIMEOUT,
             FaultKind::Error(_) => fault_type::STEP_ERROR,
             FaultKind::Protection => fault_type::MPU_FAULT,
         }
@@ -60,7 +64,7 @@ impl FaultKind {
     /// The code the module is finalized with when it does not restart.
     fn rc(self) -> i32 {
         match self {
-            FaultKind::Timeout => -110,
+            FaultKind::Timeout | FaultKind::ForcedOut => -110,
             FaultKind::Error(rc) => rc,
             FaultKind::Protection => -14,
         }
@@ -143,6 +147,7 @@ pub(crate) fn apply_posted(sched: &mut SchedulerState, modules: &mut [ModuleSlot
         let fault = |kind, site| Some((kind, site));
         let as_fault = match what {
             PostedFault::Timeout => fault(FaultKind::Timeout, FaultSite::Step),
+            PostedFault::ForcedOut => fault(FaultKind::ForcedOut, FaultSite::Step),
             PostedFault::Protection => fault(FaultKind::Protection, FaultSite::Step),
             PostedFault::Error => fault(FaultKind::Error(rc), FaultSite::Step),
             PostedFault::ErrorInBurst => fault(FaultKind::Error(rc), FaultSite::Burst),
@@ -229,9 +234,16 @@ pub(crate) fn fault(
     active_count: &mut usize,
     site: FaultSite,
 ) {
+    // Taken on the core the step ran on, where the backend recorded it.
+    let kind = if kind == FaultKind::Timeout && step_guard::take_forced_out() {
+        FaultKind::ForcedOut
+    } else {
+        kind
+    };
     if posts_to_primary(sched.domain_id[module_idx] as usize) {
         let (what, rc) = match (kind, site) {
             (FaultKind::Timeout, _) => (PostedFault::Timeout, 0),
+            (FaultKind::ForcedOut, _) => (PostedFault::ForcedOut, 0),
             (FaultKind::Protection, _) => (PostedFault::Protection, 0),
             (FaultKind::Error(rc), FaultSite::Step) => (PostedFault::Error, rc),
             (FaultKind::Error(rc), FaultSite::Burst) => (PostedFault::ErrorInBurst, rc),
@@ -270,6 +282,10 @@ fn fault_now(
             "[guard] module {module_idx} ({name}) step timeout (fault #{})",
             fi.fault_count
         ),
+        FaultKind::ForcedOut => log::warn!(
+            "[guard] module {module_idx} ({name}) step timeout, forced out (fault #{})",
+            fi.fault_count
+        ),
         FaultKind::Protection => log::warn!(
             "[mpu] module {module_idx} ({name}) protection fault (fault #{})",
             fi.fault_count
@@ -289,6 +305,8 @@ fn fault_now(
         restart_count: fi.restart_count,
     });
 
+    // `Tolerate` is for late work: a step stopped mid-run at its deadline
+    // (`ForcedOut`) did not finish and would burn its deadline every pass.
     if kind == FaultKind::Timeout && fi.policy == FaultPolicy::Tolerate {
         return;
     }
@@ -298,7 +316,7 @@ fn fault_now(
     } else {
         fi.state = FaultState::Terminated;
         let suffix = match kind {
-            FaultKind::Timeout => " (timeout terminated)",
+            FaultKind::Timeout | FaultKind::ForcedOut => " (timeout terminated)",
             FaultKind::Protection => " (mpu terminated)",
             FaultKind::Error(_) => site.suffix(),
         };

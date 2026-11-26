@@ -1,5 +1,5 @@
 version = "1.0.0"
-# A hosted node, because the cut is a host command: the `proc` executor
+# A hosted node, because the cut is a host command: the command runner
 # that runs it belongs to a host platform. `bcm2712` is here because that
 # is the silicon a hosted aarch64 node's PIC modules are compiled for, not
 # a claim that the agent has anything to drive on a bare-metal board.
@@ -13,7 +13,7 @@ timer_class = "wall_clock"
 # address-control surface (`crates/fluxor-abi/src/contracts/net/identity.rs` §Two
 # providers, one surface) on `addr_ctl_in` / `addr_evt_out` — the same
 # verbs the ip module answers — and its cut is a host command run through
-# the `proc` executor.
+# the node's command runner.
 #
 #   ADDR_ADD    take custody of the host owning the address; mints a token
 #   ADDR_FENCE  run `fence_cmd`; then, `quiet_after_ms` after that command
@@ -64,6 +64,9 @@ timer_class = "wall_clock"
 #   [fence_agent] refused <ip> op=<op> reason=<r>
 
 capabilities = ["fence.enforceable"]
+# The node's command runner (`host_process::PROC_SPAWN`) runs the actuator
+# command.
+grants = ["host_process.exec"]
 
 [capability_facts."fence.enforceable"]
 cutoff = "wire"
@@ -87,11 +90,6 @@ required = true
 buffer_size = 512
 max_record = 39
 rate_class_default = "control"
-
-# The host process executor that runs the actuator command.
-[[resources]]
-requires_contract = "proc"
-access = "read"
 
 # Module-scope observability — exempt.
 [observability]

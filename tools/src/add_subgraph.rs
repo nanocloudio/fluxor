@@ -38,7 +38,7 @@
 //! the kernel would refuse at admission).
 
 use fluxor_contracts::graph::plan::{
-    self, Fan, FanDir, PlanError, PlanModule, PlanPort, RingNode, RingPlatform,
+    self, Fan, FanDir, PlanError, PlanModule, PlanPort, RingPlatform,
 };
 use fluxor_contracts::graph::{self, EdgeRecord, Endpoint, GraphSpec, ModuleRecord};
 
@@ -138,7 +138,7 @@ pub fn plan_ports(manifest: &Manifest) -> Vec<PlanPort> {
             index: p.index,
             buffer_size: p.buffer_size,
             max_record: p.max_record,
-            frame: plan::port_frame(p.content_type, p.flags),
+            mailbox: plan::port_mailbox(p.content_type, p.flags),
         })
         .collect()
 }
@@ -161,9 +161,6 @@ pub struct GraphModule {
     pub ports: Vec<PlanPort>,
     /// It may consume from an aliased mailbox.
     pub mailbox_safe: bool,
-    /// The node keeps one channel per edge on its inputs and outputs rather
-    /// than a fan (the Linux network provider).
-    pub multi_channel: bool,
 }
 
 impl GraphModule {
@@ -171,8 +168,8 @@ impl GraphModule {
         PlanModule {
             ports: &self.ports,
             mailbox_safe: self.mailbox_safe,
-            multi_inbound: self.multi_channel,
-            multi_outbound: self.multi_channel,
+            multi_inbound: false,
+            multi_outbound: false,
             domain: self.domain,
         }
     }
@@ -275,15 +272,16 @@ pub type FanParams<'a> = dyn Fn(&Fan, u32) -> Result<Vec<u8>, String> + 'a;
 pub struct Composer<'a> {
     /// A refusal of the plan, said in the graph's own names.
     pub describe: &'a dyn Fn(PlanError) -> String,
-    /// A fan's params TLV for `scratch` bytes of scratch: the frame kind,
-    /// frames per step and scratch (`plan::fan_params`), with the heap the
-    /// fan's module type derives for that scratch.
+    /// A fan's params TLV for `scratch` bytes of scratch: records per step
+    /// and scratch (`plan::fan_params`), with the heap the fan's module type
+    /// derives for that scratch.
     pub fan_params: &'a FanParams<'a>,
 }
 
 /// Compose `edges` between `modules`: refuse a domain whose pre-pass is over
 /// capacity, insert the fans, give record edges their mailboxes, order the
-/// nodes, and size each fan's scratch to the largest ring beside it.
+/// nodes, and size each fan's scratch to the largest record it can be
+/// handed ([`plan::Composed::fan_scratch`]).
 pub fn compose(
     modules: &[GraphModule],
     edges: &[EdgeRecord],
@@ -314,18 +312,9 @@ pub fn compose(
             params: m.params.clone(),
         })
         .collect();
-    for fan in &composed.fans {
-        let node = match fan.dir {
-            FanDir::Out => RingNode::Tee {
-                of: fan.of,
-                port: fan.port,
-            },
-            FanDir::In => RingNode::Merge {
-                of: fan.of,
-                port: fan.port,
-            },
-        };
-        let params = (composer.fan_params)(fan, rings.largest_adjacent(node))?;
+    for (k, fan) in composed.fans.iter().enumerate() {
+        let scratch = composed.fan_scratch(k, &plan_modules, &rings);
+        let params = (composer.fan_params)(fan, scratch)?;
         let r = fan.record(&params);
         out.push(ComposedModule {
             name_hash: r.name_hash,
@@ -412,9 +401,13 @@ fn node_name(modules: &[GraphModule], fans: &[Fan], node: usize) -> String {
     }
     match fans.get(node - modules.len()) {
         Some(f) => {
-            let of = modules
-                .get(usize::from(f.of))
-                .map_or("?", |m| m.name.as_str());
+            let of = match f.of {
+                Endpoint::Lane { key, .. } => format!("lane {key}"),
+                end => end
+                    .new_index()
+                    .and_then(|i| modules.get(i))
+                    .map_or_else(|| "?".to_string(), |m| m.name.clone()),
+            };
             match f.dir {
                 FanDir::Out => format!("tee({of}.out{})", f.port),
                 FanDir::In if f.port & plan::PORT_KEY_CTRL != 0 => {
@@ -427,29 +420,30 @@ fn node_name(modules: &[GraphModule], fans: &[Fan], node: usize) -> String {
     }
 }
 
-/// The kernel's lane rule (`net_keys_paired`): every net key names exactly
-/// one edge into the network (from a workload module) and one out of it (to
-/// a workload module); a lane joined to another lane is refused.
+/// The kernel's lane rule (`keys_valid`): every lane `(target, key)` names
+/// exactly one edge into the target (from a workload module) and one out of
+/// it (to a workload module); a lane joined to another lane is refused.
 pub fn check_net_lanes(edges: &[EdgeRecord]) -> Result<(), String> {
     for e in edges {
-        let key = match (e.from, e.to) {
-            (Endpoint::Net(_), Endpoint::Net(_)) => {
+        let lane = match (e.from, e.to) {
+            (Endpoint::Lane { .. }, Endpoint::Lane { .. }) => {
                 return Err(
-                    "a net lane connects to a module of the workload, not to another lane".into(),
+                    "a lane connects to a module of the workload, not to another lane".into(),
                 )
             }
-            (Endpoint::Net(k), _) | (_, Endpoint::Net(k)) => k,
+            (l @ Endpoint::Lane { .. }, _) | (_, l @ Endpoint::Lane { .. }) => l,
             _ => continue,
         };
-        let into = edges.iter().filter(|x| x.to == Endpoint::Net(key)).count();
-        let out = edges
-            .iter()
-            .filter(|x| x.from == Endpoint::Net(key))
-            .count();
+        let into = edges.iter().filter(|x| x.to == lane).count();
+        let out = edges.iter().filter(|x| x.from == lane).count();
         if into != 1 || out != 1 {
+            let (key, target) = (
+                lane.lane_key().unwrap_or(0),
+                lane.lane_target().unwrap_or(0),
+            );
             return Err(format!(
-                "net lane {key} has {into} edge(s) into it and {out} out of it; a lane is exactly one of each \
-                 (a module's commands in, its events out)"
+                "lane {key} to {target:#010x} has {into} edge(s) into it and {out} out of it; a \
+                 lane is exactly one of each (a module's commands in, its events out)"
             ));
         }
     }
@@ -473,6 +467,11 @@ pub struct Workload {
     /// of them attest; an UNATTESTED workload is fail-closed — never parked, only
     /// relaxed to a liveness step every `tick_max`.
     pub idle_safe: bool,
+    /// The endpoints the workload may listen on, each `[protocol u8][port
+    /// u16 LE]` (graph YAML `endpoints:` on the workload): its owner's
+    /// `net.endpoint` grants, carried in its boot record. A workload with
+    /// none listens nowhere.
+    pub endpoints: Vec<[u8; 3]>,
 }
 
 /// Encode one workload as the composed graph the kernel admits: owned by the
@@ -507,7 +506,7 @@ pub fn encode_workload(workload: &Workload) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxor_contracts::graph::plan::{fan_params, FrameKind, FRAMES_PER_STEP_DEFAULT};
+    use fluxor_contracts::graph::plan::{fan_params, FRAMES_PER_STEP_DEFAULT};
     use fluxor_contracts::graph::{MERGE_NAME_HASH, TEE_NAME_HASH};
 
     const PLATFORM: RingPlatform = RingPlatform {
@@ -533,8 +532,8 @@ mod tests {
         }
     }
 
-    fn fan_tlv(f: &Fan, scratch: u32) -> Result<Vec<u8>, String> {
-        Ok(fan_params(f.kind, FRAMES_PER_STEP_DEFAULT, scratch).to_vec())
+    fn fan_tlv(_: &Fan, scratch: u32) -> Result<Vec<u8>, String> {
+        Ok(fan_params(FRAMES_PER_STEP_DEFAULT, scratch).to_vec())
     }
 
     fn describe(e: PlanError) -> String {
@@ -568,6 +567,7 @@ mod tests {
             buffer_cap: 8192,
             graph: composed(&modules, &edges, true).expect("composes"),
             idle_safe: false,
+            endpoints: Vec::new(),
         }
     }
 
@@ -597,20 +597,24 @@ mod tests {
     }
 
     #[test]
-    fn net_lane_edges_encode_as_net_endpoints() {
+    fn lane_edges_encode_as_lane_endpoints() {
+        let lane = Endpoint::Lane {
+            key: 2,
+            target: fluxor_abi::wire::fnv1a32(b"ip"),
+        };
         let edges = vec![
-            edge(Endpoint::Net(2), 0, Endpoint::New(0), 0),
+            edge(lane, 0, Endpoint::New(0), 0),
             EdgeRecord {
                 buffer_bytes: 4096,
-                ..edge(Endpoint::New(0), 0, Endpoint::Net(2), 0)
+                ..edge(Endpoint::New(0), 0, lane, 0)
             },
         ];
         assert!(check_net_lanes(&edges).is_ok());
         let b = encode_workload(&workload(vec![module("a", 1)], edges)).unwrap();
         let g = graph::decode(&b).unwrap();
         let e: Vec<_> = g.edges().collect();
-        assert_eq!((e[0].from, e[0].to), (Endpoint::Net(2), Endpoint::New(0)));
-        assert_eq!((e[1].from, e[1].to), (Endpoint::New(0), Endpoint::Net(2)));
+        assert_eq!((e[0].from, e[0].to), (lane, Endpoint::New(0)));
+        assert_eq!((e[1].from, e[1].to), (Endpoint::New(0), lane));
         assert_eq!(e[1].buffer_bytes, 4096);
     }
 
@@ -630,10 +634,7 @@ mod tests {
         assert_eq!(c.fan_types(), ["tee"]);
         let tee = &c.modules[3];
         assert_eq!(tee.name_hash, TEE_NAME_HASH);
-        assert_eq!(
-            tee.params,
-            fan_params(FrameKind::Stream, FRAMES_PER_STEP_DEFAULT, 32 * 1024)
-        );
+        assert_eq!(tee.params, fan_params(FRAMES_PER_STEP_DEFAULT, 32 * 1024));
         assert_eq!(c.edges.len(), 3);
         assert_eq!(c.edges[2].from, Endpoint::New(0));
         assert_eq!(c.edges[2].to, Endpoint::New(3));
@@ -748,12 +749,11 @@ mod tests {
     #[test]
     fn net_lanes_are_refused_unless_paired() {
         let e = |from, to| edge(from, 0, to, 0);
-        let (l, n) = (Endpoint::New, Endpoint::Net);
+        let l = Endpoint::New;
+        let n = |key| Endpoint::Lane { key, target: 7 };
         // Commands in, no events out.
         let one_way = [e(l(0), n(1))];
-        assert!(check_net_lanes(&one_way)
-            .unwrap_err()
-            .contains("net lane 1"));
+        assert!(check_net_lanes(&one_way).unwrap_err().contains("lane 1 to"));
         // Two command edges into one lane.
         let doubled = [e(l(0), n(1)), e(l(1), n(1)), e(n(1), l(0))];
         assert!(check_net_lanes(&doubled).is_err());

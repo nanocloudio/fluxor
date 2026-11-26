@@ -34,8 +34,8 @@ carries, none past graph slot B) leaves it as it is. `picotool erase` does not.
   cache, so `FUA` and `FLUSH` cost nothing.
 - `EXEC` answers `ENOSYS`: an erase takes as long as the flash takes.
 
-`vault_store` keeps the key vault's two image slots here: 8 KiB each on an
-RP2350, 4 KiB on an RP2040.
+A `key_vault` keeps its record image's two A/B slots here (`image` bytes
+each, two of them within the 16 KiB).
 
 ## Parameters
 

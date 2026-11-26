@@ -1,7 +1,7 @@
 //! fence_agent — the reference out-of-band `fence.enforceable` provider:
 //! answers the net-identity address-control verbs for the host it holds in
-//! custody, and cuts that host by running a command through the `proc`
-//! executor, confirming the fence only once the command has succeeded and
+//! custody, and cuts that host by running a command through the node's
+//! command runner (`host_process::PROC_SPAWN`), confirming the fence only once the command has succeeded and
 //! the host's hold-up time has passed.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]

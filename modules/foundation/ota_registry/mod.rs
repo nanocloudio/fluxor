@@ -268,7 +268,7 @@ mod params_def {
                 }
             };
 
-        10, authority, str, 0
+        10, authority, str, 0, max MAX_AUTHORITY_LEN
             => |s, d, len| {
                 // A value that does not fit is dropped rather than clipped:
                 // the first 128 bytes of a longer authority name a different

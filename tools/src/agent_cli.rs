@@ -625,7 +625,7 @@ fn logs(a: LogsArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
     let store = GenStore::new(storage);
 
-    // The ring directory sits beside owner_status.json, under `logs/`. If
+    // The ring directory sits beside the published plan, under `logs/`. If
     // nothing has been published yet there is nothing to show; follow mode
     // keeps polling for the publish to appear (a node whose first commit is
     // still in flight).
@@ -823,7 +823,7 @@ fn commit(c: CommitArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?
         .ok_or_else(|| Error::Config("no committed generation after commit".into()))?;
     // Remember the publish location so `agent status` can find the runtime's
-    // owner_status.json beside it. Best-effort: status still works without
+    // owner facts beside it. Best-effort: status still works without
     // it, just without live state.
     let _ = record_publish_path(&mut store, &c.publish);
 

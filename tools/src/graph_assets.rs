@@ -1027,8 +1027,12 @@ fn build_one_asset(
             graph.display()
         ),
     )?;
-    let built = crate::build_one_from(&step_path, Some(&dir.join("node.img")), None, verbose)
-        .map_err(|e| Error::Config(format!("{what}: building its build-step graph: {e}")))?;
+    // The step's image runs here, so it pins this node's providers even
+    // inside a check.
+    let built = crate::config::compose_to_run(|| {
+        crate::build_one_from(&step_path, Some(&dir.join("node.img")), None, verbose)
+    })
+    .map_err(|e| Error::Config(format!("{what}: building its build-step graph: {e}")))?;
 
     let runtime = crate::project::linux_runtime(project_root);
     if !runtime.is_file() {

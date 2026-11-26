@@ -124,32 +124,20 @@ mod profile_linux {
     ///
     /// The derived pools' reserves are live-add headroom: module slots and
     /// channels for the workload subgraphs a node admits after boot (a
-    /// message broker is ~17 modules and ~50 edges), owners for the
-    /// workloads themselves, store subscriptions for the store consumers
-    /// those workloads bring.
+    /// message broker is ~17 modules and ~50 edges), and owners for the
+    /// workloads themselves.
     pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
         (res::POOL_MODULE_SLOTS, 256),
         (res::POOL_CHANNELS, 512),
         (res::POOL_OWNERS, 63),
-        (res::POOL_STORE_SUBS, 64),
         (res::POOL_STATE_FREE_LIST, 32),
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
-        (res::POOL_STORE_READS, 32),
-        (res::POOL_STORE_WRITES, 32),
-        (res::POOL_STORE_GRANTS, 64),
         (res::POOL_SANDBOXES, 64),
         (res::POOL_TTY_SESSIONS, 8),
         (res::POOL_HANDLES, 128),
-        (res::POOL_NET_POLICY_TABLES, 8),
-        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
-        (res::POOL_OWNER_STORE_SUBS, 16),
-        (res::POOL_OWNER_STORE_READS, 8),
-        (res::POOL_OWNER_STORE_WRITES, 4),
-        (res::POOL_NET_ROUTE_SEGMENTS, 16),
-        (res::POOL_NET_ROUTE_PEERS, 256),
-        (res::POOL_NET_ROUTE_HELD, 256),
         (res::POOL_LENDS, LENDS),
+        (res::POOL_ISOLATED_SLOTS, 0),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -228,18 +216,14 @@ mod profile_bcm2712 {
         (res::POOL_MODULE_SLOTS, 256),
         (res::POOL_CHANNELS, 512),
         (res::POOL_OWNERS, 63),
-        (res::POOL_STORE_SUBS, 64),
         (res::POOL_STATE_FREE_LIST, 32),
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
-        (res::POOL_STORE_READS, 32),
         (res::POOL_HANDLES, 128),
-        (res::POOL_NET_POLICY_TABLES, 8),
-        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
-        (res::POOL_NET_ROUTE_SEGMENTS, 16),
-        (res::POOL_NET_ROUTE_PEERS, 256),
-        (res::POOL_NET_ROUTE_HELD, 256),
         (res::POOL_LENDS, LENDS),
+        // Isolation slots: each holds a module's EL0 tables (84 KiB, carved
+        // from DRAM at boot); a gated workload module takes one for its life.
+        (res::POOL_ISOLATED_SLOTS, 32),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -256,8 +240,7 @@ mod profile_bcm2712 {
 // (`kernel::mem::carve`, `platform/uefi.rs`); the module state arena takes
 // what the carves leave of it. The image, its `.bss` (the fixed arenas) and
 // its boot stack lie in the span `targets/host/uefi.toml` reserves
-// (`[memory]`). The control-plane store is bcm2712's and Linux's, so its pools
-// have no row here.
+// (`[memory]`).
 
 #[cfg(feature = "host-uefi")]
 mod profile_uefi {
@@ -306,12 +289,8 @@ mod profile_uefi {
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
         (res::POOL_HANDLES, 128),
-        (res::POOL_NET_POLICY_TABLES, 8),
-        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
-        (res::POOL_NET_ROUTE_SEGMENTS, 16),
-        (res::POOL_NET_ROUTE_PEERS, 256),
-        (res::POOL_NET_ROUTE_HELD, 256),
         (res::POOL_LENDS, LENDS),
+        (res::POOL_ISOLATED_SLOTS, 0),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -399,12 +378,8 @@ mod profile_wasm {
         (res::POOL_TIMERS, 16),
         (res::POOL_HANDLES, 128),
         (res::POOL_STATE_FREE_LIST, 32),
-        (res::POOL_NET_POLICY_TABLES, 2),
-        (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
-        (res::POOL_NET_ROUTE_SEGMENTS, 0),
-        (res::POOL_NET_ROUTE_PEERS, 0),
-        (res::POOL_NET_ROUTE_HELD, 0),
         (res::POOL_LENDS, LENDS),
+        (res::POOL_ISOLATED_SLOTS, 0),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -507,12 +482,8 @@ mod profile_rp {
         // the handles module providers mint. The rig's pico graphs hold at
         // most 3 (a cyw43 PIO command handle on `pio_rp`, `ip`'s binding).
         (res::POOL_HANDLES, 16),
-        (res::POOL_NET_POLICY_TABLES, 0),
-        (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
-        (res::POOL_NET_ROUTE_SEGMENTS, 0),
-        (res::POOL_NET_ROUTE_PEERS, 0),
-        (res::POOL_NET_ROUTE_HELD, 0),
         (res::POOL_LENDS, LENDS),
+        (res::POOL_ISOLATED_SLOTS, 0),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),

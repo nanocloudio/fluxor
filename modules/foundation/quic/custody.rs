@@ -69,19 +69,14 @@ unsafe fn cont_vault_open_or_generate(
     let Some(n) = kv::open::encode(&mut arg, &req) else {
         return -1;
     };
-    let rc = (sys.provider_call)(
+    (sys.provider_call)(
         -1,
         kv::OPEN_OR_GENERATE,
         arg.as_mut_ptr(),
         n,
         pub_out.as_mut_ptr(),
         pub_out.len(),
-    );
-    if rc < 0 {
-        -1
-    } else {
-        rc
-    }
+    )
 }
 
 /// Free a vault handle.
@@ -98,7 +93,9 @@ unsafe fn cont_vault_destroy(sys: &SyscallTable, handle: i32) {
     }
 }
 
-/// The continuity master's handle, opening (or generating) it on first use.
+/// The continuity master's handle, opening (or generating) it on first use;
+/// the vault's negative errno when it cannot answer (`E_AGAIN` while a
+/// master it just made is not yet durable).
 unsafe fn cont_master(s: &mut QuicState) -> i32 {
     if s.continuity.master >= 0 {
         return s.continuity.master;
@@ -119,7 +116,7 @@ unsafe fn cont_master(s: &mut QuicState) -> i32 {
 unsafe fn cont_derive_key(s: &mut QuicState, flow: &[u8; CONT_FLOW_ID_BYTES], epoch: u32) -> i32 {
     let master = cont_master(s);
     if master < 0 {
-        return -1;
+        return master;
     }
     let mut ctx = [0u8; CONT_FLOW_ID_BYTES + 4];
     ctx[..CONT_FLOW_ID_BYTES].copy_from_slice(flow);
@@ -240,7 +237,7 @@ unsafe fn cont_flow_key(s: &mut QuicState, flow: &[u8; CONT_FLOW_ID_BYTES], epoc
     };
     let h = cont_derive_key(s, flow, epoch);
     if h < 0 {
-        return -1;
+        return if h == E_AGAIN { h } else { -1 };
     }
     cont_key_put(s, i, KEY_DERIVED, flow, epoch, h);
     h
@@ -326,12 +323,49 @@ unsafe fn handle_custody(s: &mut QuicState, p: &[u8]) {
         cu::UNWRAP => custody_unwrap(s, &flow, epoch, body),
         _ => Err((sc::STATUS_UNSUPPORTED, 0)),
     };
+    let r = match r {
+        Err(VAULT_PENDING) if hold_for_vault(s, sc::CMD_SC_CUSTODY, p) => return,
+        Err(VAULT_PENDING) => Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT)),
+        r => r,
+    };
     if let Err((status, reason)) = r {
         custody_reply(s, &flow, epoch, op, status, reason, &[]);
     }
 }
 
 type CustodyResult = Result<(), (u8, u8)>;
+
+/// A custody op waiting on the vault (`hold_for_vault`); never answered.
+const VAULT_PENDING: (u8, u8) = (sc::STATUS_NOT_READY, sc::custody::why::VAULT);
+
+/// Milliseconds a command may wait for the vault to make the continuity
+/// master durable before it is refused (`ContinuityState::vault_held`):
+/// the medium's write, not a computation, so only a store that has stopped
+/// answering is given up on.
+const CONT_VAULT_MS: u64 = 5_000;
+
+/// The largest command held for the vault: a custody WRAP (flow header,
+/// op, challenge, evidence).
+pub const VAULT_HELD_MAX: usize = sc::FLOW_HEADER_LEN + 1 + 32 + sc::custody::EVIDENCE_MAX;
+
+/// A command whose flow key the vault cannot answer yet (`E_AGAIN`) is
+/// held whole and handled again at the next step, the commands behind it
+/// unread. False once it has waited `CONT_VAULT_MS`: it is answered as
+/// refused.
+unsafe fn hold_for_vault(s: &mut QuicState, msg_type: u8, p: &[u8]) -> bool {
+    let now = dev_millis(&*s.syscalls).max(1);
+    let c = &mut s.continuity;
+    if c.vault_held_since == 0 {
+        c.vault_held_since = now;
+    }
+    if p.len() > VAULT_HELD_MAX || now.wrapping_sub(c.vault_held_since) > CONT_VAULT_MS {
+        return false;
+    }
+    c.vault_held[..p.len()].copy_from_slice(p);
+    c.vault_held_len = p.len() as u16;
+    c.vault_held_type = msg_type;
+    true
+}
 
 /// A custody ATTEST whose record the custody identity is signing
 /// (`ContinuityState::attest`). The vault signs as a job of several calls,
@@ -594,6 +628,9 @@ unsafe fn custody_wrap(
         return Err((sc::STATUS_STALE_EPOCH, cu::why::NO_FLOW));
     }
     let key = cont_flow_key(s, flow, epoch);
+    if key == E_AGAIN {
+        return Err(VAULT_PENDING);
+    }
     if key < 0 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }

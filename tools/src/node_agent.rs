@@ -145,10 +145,10 @@ pub fn publish_committed_plan<S: Storage>(
 /// Key under which the node's desired workload set persists in the store.
 const DESIRED_KEY: &str = "desired.workloads";
 /// Key recording where the committed plan was last published (the
-/// `FLUXOR_PLAN` file). The node runtime writes its live owner-status file
-/// (`owner_status.json`) NEXT TO the plan it consumes, so this is how a later
-/// `agent status` invocation — which only receives `--store` — locates the
-/// runtime's status surface.
+/// `FLUXOR_PLAN` file). The node runtime writes its owner facts file
+/// (`abi::platform::linux::owner_facts`) NEXT TO the plan it consumes, so
+/// this is how a later `agent status` invocation — which only receives
+/// `--store` — locates them.
 const PUBLISH_PATH_KEY: &str = "publish.path";
 /// Key holding the per-slot high-water owner generation. Slot generations must
 /// survive a slot going empty — reusing a slot must always issue a STRICTLY
@@ -296,7 +296,7 @@ fn snapshot_from_committed<S: Storage>(
 }
 
 /// Remember where the committed plan was published so `agent status` can
-/// find the runtime's `owner_status.json` beside it. Stored canonicalized —
+/// find the runtime's owner facts beside it. Stored canonicalized —
 /// status may run from a different working directory.
 pub fn record_publish_path<S: Storage>(
     store: &mut GenStore<S>,
@@ -309,8 +309,8 @@ pub fn record_publish_path<S: Storage>(
         .map_err(|_| StoreError::WriteFailed)
 }
 
-/// Directory the runtime writes its sidecars into — `owner_status.json` and the
-/// per-owner `logs/` ring directory (one ring file per owner UID, named
+/// Directory the runtime writes its sidecars into — the owner facts file, the
+/// network provider's bound-endpoint report and the per-owner `logs/` ring directory (one ring file per owner UID, named
 /// `<owner_uid>.<slot>.<owner_generation>.ring`) — which is the parent of the
 /// recorded publish path. `None` when nothing has been
 /// published yet. Shared by `agent status` and `agent logs` so both resolve the
@@ -322,13 +322,13 @@ pub fn published_sidecar_dir<S: Storage>(store: &GenStore<S>) -> Option<std::pat
 
 // ── Live runtime status (the closed workload-status vocabulary) ──────────────────
 //
-// These types mirror what the node runtime writes into `owner_status.json`.
-// The reason/phase enums ARE the closed vocabulary — the complete, fixed set of
-// phase, terminated-reason and waiting-reason strings a workload status may carry,
-// and nothing outside it is a valid value: deserialization
-// rejects anything outside the set, so a runtime emitting an unknown reason
-// can never leak it into the orchestrator-facing JSON (nanocloud matches on
-// these strings and rejects others).
+// `agent status` renders these from the kernel's owner facts
+// (`workload::OWNERS`, which the runtime writes verbatim beside the plan):
+// the phase, reasons, restart count and drain detail below are this agent's
+// reading of those facts ([`render_runtime`]). The reason/phase enums ARE the
+// closed vocabulary — the complete, fixed set of phase, terminated-reason and
+// waiting-reason strings a workload status may carry, and nothing outside it
+// is a valid value.
 
 /// Aggregate workload phase as observed by the live runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -368,7 +368,10 @@ pub struct TerminatedState {
     /// Present when an external-process signal determined the termination.
     #[serde(default)]
     pub signal: Option<u8>,
-    pub finished_at: String,
+    /// When it ended (RFC 3339), present when the facts carry a wall-clock
+    /// time for it: a drain the runtime ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 /// One workload's LIVE runtime status, in the closed status vocabulary above. Joined
@@ -380,20 +383,18 @@ pub struct WorkloadRuntimeStatus {
     pub ready: bool,
     /// Aggregate startup complete.
     pub started: bool,
-    /// Activation time (RFC 3339); present once Running.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<String>,
-    /// AGGREGATE owner re-activations only — an internal module retry is
+    /// AGGREGATE owner re-activations only — each time the runtime
+    /// instantiated the owner's modules again; an internal module retry is
     /// module telemetry, never an owner restart.
     pub restart_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminated: Option<TerminatedState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
-    /// Owner lifecycle state; `Some("Draining")` during a graceful drain, absent
-    /// when running normally. A free-form string, not an enum, so an owner
-    /// lifecycle state this reader does not know never trips the strict parse
-    /// that guards the closed phase/reason vocabulary.
+    /// Owner lifecycle state; `Some("Draining")` during a graceful drain,
+    /// `Some("Paused")` while paused, absent when running normally. A
+    /// free-form string, not an enum, so a consumer that does not know a
+    /// lifecycle state never trips over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_state: Option<String>,
     /// Wall-clock second the drain forfeits its grace (present while draining).
@@ -406,19 +407,43 @@ pub struct WorkloadRuntimeStatus {
     /// terminal records).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainDetail>,
-    /// The runtime's RAW bound-endpoint report — which (protocol, port) pairs
-    /// are actually listening for this owner. The runtime reports ONLY what it
-    /// observed binding; matching those against the workload's declared exports is
-    /// the agent's job, never the runtime's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound_endpoints: Option<Vec<BoundEndpoint>>,
 }
 
-/// One bound (protocol, port) pair from the runtime's report.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Terminal drain detail: how a completed drain window closed. Independent
+/// bool fields rather than an enum, so a drain outcome this reader does not
+/// know about arrives as an unset field instead of failing the strict parse.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DrainDetail {
+    /// The grace deadline lapsed before the owner reached quiescence.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// The drain did not run to its end in this runtime: a rebuild dropped
+    /// the owner mid-drain, or the runtime started after it was revoked. The
+    /// grace is simply lost.
+    #[serde(default)]
+    pub forfeited: bool,
+}
+
+/// One bound (protocol, port) pair from the network provider's report.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundEndpoint {
     pub protocol: String,
     pub port: u16,
+}
+
+impl BoundEndpoint {
+    /// The report's record, with its IP protocol number named.
+    fn of(rec: &fluxor_abi::platform::linux::bound_endpoints::Record) -> BoundEndpoint {
+        use fluxor_abi::contracts::net::net_proto::grant;
+        BoundEndpoint {
+            protocol: match rec.protocol {
+                grant::PROTO_TCP => "tcp".to_string(),
+                grant::PROTO_UDP => "udp".to_string(),
+                n => n.to_string(),
+            },
+            port: rec.port,
+        }
+    }
 }
 
 /// The agent's declared⇄bound join for one endpoint: one entry per declared
@@ -433,7 +458,7 @@ pub struct EndpointStatus {
     pub declared: bool,
 }
 
-/// Join a workload's declared exports with the runtime's bound report. Pure —
+/// Join a workload's declared exports with the bound report. Pure —
 /// unit-tested without a store or runtime. Matching is case-insensitive on
 /// protocol + numeric port equality.
 pub fn join_endpoints(
@@ -467,52 +492,175 @@ pub fn join_endpoints(
     out
 }
 
-/// Terminal drain detail: how a completed drain window closed. Independent
-/// bool fields rather than an enum, so a drain outcome this reader does not
-/// know about arrives as an unset field instead of failing the strict parse.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DrainDetail {
-    /// The grace deadline lapsed before the owner reached quiescence.
-    #[serde(default)]
-    pub timed_out: bool,
-    /// A runtime restart forfeited the remainder of the window: a drain does
-    /// not resume across a restart, the grace is simply lost.
-    #[serde(default)]
-    pub by_restart: bool,
-}
-
-/// On-disk shape of the runtime's `owner_status.json`.
-#[derive(Debug, serde::Deserialize)]
-struct RuntimeStatusFile {
-    #[allow(dead_code, reason = "self-describing on-disk field")]
-    version: u32,
+/// The runtime's owner facts file, read: the process that wrote it and the
+/// kernel's `OWNERS` answer.
+struct OwnerFactsFile {
     /// Writer's process id — liveness gate for the whole file.
     pid: u32,
     /// Writer's process start time (clock ticks since boot, field 22 of
     /// `/proc/<pid>/stat`). Together with `pid` this identifies THE writer
     /// process — a recycled PID has a different start time.
     pid_start_ticks: u64,
-    /// Plan generation the live state was derived under. The join is scoped
-    /// to it: after a new commit/publish, live state from the previous
-    /// generation must not be attached to the new durable workload records.
+    /// Plan generation the facts were read under. The join is scoped to it:
+    /// after a new commit/publish, facts from the previous generation must
+    /// not be attached to the new durable workload records.
     plan_generation: u64,
-    /// Digest of the plan the writer applied: the sha256 over its body, verified
-    /// when the runtime decoded it. Absent from a writer that does not report it.
-    #[serde(default)]
-    plan_digest: Option<String>,
-    workloads: Vec<RuntimeStatusWorkload>,
+    /// Digest of the plan the kernel applied, as it verified it.
+    plan_digest: [u8; 32],
+    records: Vec<fluxor_abi::contracts::workload::owners::Record>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct RuntimeStatusWorkload {
-    /// The runtime speaks owner-space: the UID it reports is the owner's,
-    /// which the commit sets to the owner uid.
-    owner_uid_hex: String,
-    /// Owner slot + generation — with the owner uid, the full join key. ALL
-    /// three must match the committed assignment for the join to attach.
-    slot: u16,
-    owner_generation: u32,
-    runtime: WorkloadRuntimeStatus,
+/// Parse an owner facts file: its head, then the `OWNERS` answer. `None`
+/// for a wrong magic, a short head or a malformed answer.
+fn parse_owner_facts(bytes: &[u8]) -> Option<OwnerFactsFile> {
+    use fluxor_abi::contracts::workload::owners;
+    use fluxor_abi::platform::linux::owner_facts as file;
+    let head = bytes.get(..file::HEAD_LEN)?;
+    if head[..4] != file::MAGIC {
+        return None;
+    }
+    let pid = u32::from_le_bytes(head[file::PID..file::PID + 4].try_into().ok()?);
+    let pid_start_ticks = u64::from_le_bytes(
+        head[file::PID_START_TICKS..file::PID_START_TICKS + 8]
+            .try_into()
+            .ok()?,
+    );
+    let answer = &bytes[file::HEAD_LEN..];
+    let (count, len, plan_generation, plan_digest) = owners::read_head(answer)?;
+    let records = (0..count)
+        .map(|i| owners::Record::read(&answer[owners::HEADER_LEN + i * len..]))
+        .collect::<Option<Vec<_>>>()?;
+    Some(OwnerFactsFile {
+        pid,
+        pid_start_ticks,
+        plan_generation,
+        plan_digest,
+        records,
+    })
+}
+
+/// This agent's reading of one owner record, at wall-clock `now_unix`.
+///
+/// - A drained owner (`STATE_GONE`) is Terminated: `Completed` when it
+///   quiesced, else `GraphNodeFault` with the drain-timeout fault code, and
+///   its drain detail.
+/// - A live owner with a terminated module is Terminated with the reason for
+///   that fault kind (`LivenessFailure` for a step deadline, else
+///   `GraphNodeFault`) and the kind as its exit code; one whose every module
+///   ended cleanly is `Completed`, exit 0.
+/// - Otherwise it is Running once every module it stamps is instantiated
+///   (ready while none is being retried and it is not draining), and
+///   Activating before — waiting in `ActivationBackOff` when it stamps
+///   modules of which some failed to instantiate.
+///
+/// The restart count is its activations past the first.
+pub fn render_runtime(
+    rec: &fluxor_abi::contracts::workload::owners::Record,
+    now_unix: u64,
+) -> WorkloadRuntimeStatus {
+    use fluxor_abi::contracts::workload::owners;
+    let drain_timeout = i32::from(owners::FAULT_DRAIN_TIMEOUT);
+    let step_timeout = owners::FAULT_TIMEOUT;
+    let mut rt = WorkloadRuntimeStatus {
+        phase: RuntimePhase::Activating,
+        ready: false,
+        started: false,
+        restart_count: rec.activations.saturating_sub(1),
+        terminated: None,
+        waiting_reason: None,
+        owner_state: None,
+        drain_deadline_unix: None,
+        drain_remaining_secs: None,
+        drain: None,
+    };
+    if rec.state == owners::STATE_GONE {
+        let quiesced = rec.drain == owners::DRAIN_QUIESCED;
+        rt.phase = RuntimePhase::Terminated;
+        rt.terminated = Some(TerminatedState {
+            reason: if quiesced {
+                TerminatedReason::Completed
+            } else {
+                TerminatedReason::GraphNodeFault
+            },
+            exit_code: if quiesced { 0 } else { drain_timeout },
+            signal: None,
+            finished_at: (rec.drained_at > 0).then(|| rfc3339_utc(rec.drained_at)),
+        });
+        rt.drain = Some(DrainDetail {
+            timed_out: !quiesced,
+            forfeited: rec.drain == owners::DRAIN_FORFEITED,
+        });
+        return rt;
+    }
+    let fully_loaded = rec.modules > 0 && rec.loaded >= rec.modules;
+    if rec.terminated > 0 {
+        rt.phase = RuntimePhase::Terminated;
+        rt.terminated = Some(TerminatedState {
+            reason: if rec.fault_kind == step_timeout {
+                TerminatedReason::LivenessFailure
+            } else {
+                TerminatedReason::GraphNodeFault
+            },
+            exit_code: if rec.fault_kind == 0 {
+                1
+            } else {
+                i32::from(rec.fault_kind)
+            },
+            signal: None,
+            finished_at: None,
+        });
+    } else if fully_loaded && rec.finished == rec.modules {
+        rt.phase = RuntimePhase::Terminated;
+        rt.terminated = Some(TerminatedState {
+            reason: TerminatedReason::Completed,
+            exit_code: 0,
+            signal: None,
+            finished_at: None,
+        });
+    } else if fully_loaded {
+        rt.phase = RuntimePhase::Running;
+        rt.started = true;
+        rt.ready = rec.recovering == 0 && rec.state != owners::STATE_DRAINING;
+    } else if rec.modules > 0 {
+        rt.waiting_reason = Some(WaitingReason::ActivationBackOff);
+    }
+    match rec.state {
+        owners::STATE_DRAINING => {
+            rt.owner_state = Some("Draining".to_string());
+            if rec.drain_deadline > 0 {
+                rt.drain_deadline_unix = Some(rec.drain_deadline);
+                rt.drain_remaining_secs = Some(
+                    u32::try_from(rec.drain_deadline.saturating_sub(now_unix)).unwrap_or(u32::MAX),
+                );
+            }
+        }
+        owners::STATE_PAUSED => rt.owner_state = Some("Paused".to_string()),
+        _ => {}
+    }
+    rt
+}
+
+/// RFC 3339 UTC timestamp from unix seconds (Howard Hinnant's
+/// civil-from-days).
+pub fn rfc3339_utc(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let rem = unix_secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
 }
 
 /// One workload's surfaced status: the owner-tagged join of the persisted desired
@@ -539,14 +687,15 @@ pub struct WorkloadStatus {
     pub state_cap: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_cap: Option<u32>,
-    /// LIVE per-workload runtime status (in the closed status vocabulary), joined
-    /// from the runtime's `owner_status.json` by owner uid. Absent when the runtime isn't up —
-    /// additive: existing consumers of the durable fields are unaffected.
+    /// LIVE per-workload runtime status (in the closed status vocabulary),
+    /// rendered from the runtime's owner facts joined by owner uid. Absent
+    /// when the runtime isn't up — additive: existing consumers of the
+    /// durable fields are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<WorkloadRuntimeStatus>,
-    /// Declared⇄bound endpoint join: present only
-    /// when live runtime state is attached — an absent runtime means "unknown",
-    /// never a claimed `bound:false`.
+    /// Declared⇄bound endpoint join ([`join_endpoints`]): present only while
+    /// a live network provider reports its bound endpoints — no report means
+    /// "unknown", never a claimed `bound: false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<EndpointStatus>,
 }
@@ -661,94 +810,136 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
 }
 
 /// `node_status` plus the LIVE per-workload runtime join: read the runtime's
-/// `owner_status.json` (located beside the plan file recorded by
-/// [`record_publish_path`]) and attach each workload's `runtime` object by the full
-/// join key — owner uid + owner slot + owner generation,
-/// scoped to the committed plan generation. Best-effort and fail-absent: a
-/// missing/garbled/out-of-vocabulary file, a writer process that is no
-/// longer alive (or is a recycled PID), a file from a different plan
-/// generation, or a slot/generation mismatch yields the plain durable
-/// status with no `runtime` objects — never an error and never stale live
-/// state presented as current.
+/// owner facts (located beside the plan file recorded by
+/// [`record_publish_path`]) and attach each workload's rendered `runtime`
+/// object ([`render_runtime`]) by the full join key — owner uid, owner slot
+/// and owner generation, scoped to the committed plan generation. Best-effort
+/// and fail-absent: a missing or malformed file, a writer process that is no
+/// longer alive (or is a recycled PID), facts from a different plan
+/// generation, or a slot/generation mismatch yields the plain durable status
+/// with no `runtime` objects — never an error and never stale live state
+/// presented as current.
 pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreError> {
     let mut st = node_status(store)?;
-    if let Some(file) = read_runtime_status(store) {
-        // Live state derived under a different plan generation (the runtime
-        // hasn't rebuilt onto the new commit yet, or is behind a rollback)
-        // must not be joined to the new durable records.
-        if Some(file.plan_generation) == st.generation {
-            st.runtime_plan_digest.clone_from(&file.plan_digest);
-            // Declared exports per workload, for the declared⇄bound endpoint join
-            // (the agent owns this join; the runtime reported only the raw
-            // binds it observed, with no notion of what was declared).
-            let desired = load_desired(store)?;
-            for workload in &mut st.workloads {
-                if let Some(entry) = file.workloads.iter().find(|p| {
-                    p.owner_uid_hex == workload.owner_uid_hex
-                        && Some(p.slot) == workload.slot
-                        && Some(p.owner_generation) == workload.owner_generation
-                }) {
-                    let declared = desired
-                        .iter()
-                        .find(|d| crate::hash::hex(&d.owner_uid) == workload.owner_uid_hex)
-                        .map(|d| d.exports.as_slice())
-                        .unwrap_or(&[]);
-                    let bound = entry.runtime.bound_endpoints.as_deref().unwrap_or(&[]);
-                    workload.endpoints = join_endpoints(declared, bound);
-                    workload.runtime = Some(entry.runtime.clone());
-                }
-            }
-            // Runtime entries with no durable row left — a departed owner
-            // whose revocation already aged out of the plan but whose
-            // terminal record is still inside the runtime's retention
-            // window. Surface them as runtime-only rows rather than
-            // dropping the terminal state.
-            for entry in &file.workloads {
-                if st
-                    .workloads
-                    .iter()
-                    .any(|p| p.owner_uid_hex == entry.owner_uid_hex)
-                {
-                    continue;
-                }
-                st.workloads.push(WorkloadStatus {
-                    owner_uid_hex: entry.owner_uid_hex.clone(),
-                    namespace: String::new(),
-                    name: String::new(),
-                    desired_phase: DesiredPhase::Stopped,
-                    committed: false,
-                    slot: Some(entry.slot),
-                    owner_generation: Some(entry.owner_generation),
-                    modules: None,
-                    edges: None,
-                    state_cap: None,
-                    buffer_cap: None,
-                    runtime: Some(entry.runtime.clone()),
-                    endpoints: Vec::new(),
-                });
-            }
-            st.workloads
-                .sort_by(|a, b| a.owner_uid_hex.cmp(&b.owner_uid_hex));
-        }
+    if let Some(bound) = read_bound_endpoints(store) {
+        join_bound_endpoints(&mut st, &load_desired(store)?, &bound);
     }
+    let Some(file) = read_owner_facts(store) else {
+        return Ok(st);
+    };
+    // Live state read under a different plan generation (the runtime hasn't
+    // rebuilt onto the new commit yet, or is behind a rollback) must not be
+    // joined to the new durable records.
+    if Some(file.plan_generation) != st.generation {
+        return Ok(st);
+    }
+    st.runtime_plan_digest = Some(crate::hash::hex(&file.plan_digest));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for rec in &file.records {
+        let uid_hex = crate::hash::hex(&rec.uid);
+        let rt = render_runtime(rec, now);
+        if let Some(workload) = st.workloads.iter_mut().find(|p| p.owner_uid_hex == uid_hex) {
+            if Some(rec.slot) == workload.slot && Some(rec.generation) == workload.owner_generation
+            {
+                workload.runtime = Some(rt);
+            }
+            continue;
+        }
+        // An owner with no durable row left — a departed owner whose
+        // revocation aged out of this agent's plan while the runtime still
+        // lists it: a runtime-only row rather than a dropped terminal state.
+        st.workloads.push(WorkloadStatus {
+            owner_uid_hex: uid_hex,
+            namespace: String::new(),
+            name: String::new(),
+            desired_phase: DesiredPhase::Stopped,
+            committed: false,
+            slot: Some(rec.slot),
+            owner_generation: Some(rec.generation),
+            modules: None,
+            edges: None,
+            state_cap: None,
+            buffer_cap: None,
+            runtime: Some(rt),
+            endpoints: Vec::new(),
+        });
+    }
+    st.workloads
+        .sort_by(|a, b| a.owner_uid_hex.cmp(&b.owner_uid_hex));
     Ok(st)
 }
 
-/// Load + vocabulary-validate + liveness-gate the runtime status file.
-/// `None` on any failure (the pull-based contract: absent = runtime not up).
-fn read_runtime_status<S: Storage>(store: &GenStore<S>) -> Option<RuntimeStatusFile> {
-    let publish = String::from_utf8(store.storage.read(PUBLISH_PATH_KEY).ok()??).ok()?;
-    let path = std::path::Path::new(&publish)
-        .parent()?
-        .join("owner_status.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    // Strict parse: an unknown phase/reason string fails the enum and drops
-    // the whole file — out-of-vocabulary values must not reach consumers.
-    let file: RuntimeStatusFile = serde_json::from_str(&text).ok()?;
+/// Load + parse + liveness-gate the runtime's owner facts. `None` on any
+/// failure (the pull-based contract: absent = runtime not up).
+fn read_owner_facts<S: Storage>(store: &GenStore<S>) -> Option<OwnerFactsFile> {
+    let path =
+        published_sidecar_dir(store)?.join(fluxor_abi::platform::linux::owner_facts::FILE_NAME);
+    let file = parse_owner_facts(&std::fs::read(path).ok()?)?;
     if !writer_alive(file.pid, file.pid_start_ticks) {
         return None;
     }
     Some(file)
+}
+
+/// Attach the declared⇄bound endpoint join to every workload the committed
+/// plan places: a record is the workload's when its owner slot and owner
+/// generation are the plan's for it (a slot reused by a later owner carries
+/// a higher generation, so it never matches). The declared side is the
+/// admitted exports. Records of no placed workload — the node's own — are
+/// not shown.
+fn join_bound_endpoints(
+    st: &mut NodeStatus,
+    desired: &[WorkloadDesired],
+    bound: &[fluxor_abi::platform::linux::bound_endpoints::Record],
+) {
+    for workload in &mut st.workloads {
+        let (Some(slot), Some(generation)) = (workload.slot, workload.owner_generation) else {
+            continue;
+        };
+        let held: Vec<BoundEndpoint> = bound
+            .iter()
+            .filter(|r| r.owner_slot == slot && r.owner_generation == generation)
+            .map(BoundEndpoint::of)
+            .collect();
+        let declared = desired
+            .iter()
+            .find(|d| crate::hash::hex(&d.owner_uid) == workload.owner_uid_hex)
+            .map(|d| d.exports.as_slice())
+            .unwrap_or(&[]);
+        workload.endpoints = join_endpoints(declared, &held);
+    }
+}
+
+/// Parse a bound-endpoint report: `(pid, pid_start_ticks, records)`. `None`
+/// for a wrong magic, a short head or records past the end.
+fn parse_bound_endpoints(
+    bytes: &[u8],
+) -> Option<(
+    u32,
+    u64,
+    Vec<fluxor_abi::platform::linux::bound_endpoints::Record>,
+)> {
+    use fluxor_abi::platform::linux::bound_endpoints as file;
+    let (pid, ticks, count, len) = file::read_head(bytes)?;
+    let records = (0..count)
+        .map(|i| file::Record::read(&bytes[file::HEAD_LEN + i * len..]))
+        .collect::<Option<Vec<_>>>()?;
+    Some((pid, ticks, records))
+}
+
+/// Load + parse + liveness-gate the network provider's bound-endpoint
+/// report, beside the owner facts. `None` on any failure (absent = no
+/// provider reporting).
+fn read_bound_endpoints<S: Storage>(
+    store: &GenStore<S>,
+) -> Option<Vec<fluxor_abi::platform::linux::bound_endpoints::Record>> {
+    let path =
+        published_sidecar_dir(store)?.join(fluxor_abi::platform::linux::bound_endpoints::FILE_NAME);
+    let (pid, ticks, records) = parse_bound_endpoints(&std::fs::read(path).ok()?)?;
+    writer_alive(pid, ticks).then_some(records)
 }
 
 /// Is the status writer's process still alive AND the same process that
@@ -1344,34 +1535,62 @@ mod tests {
         assert_eq!(store.committed().unwrap().id, 1);
     }
 
-    /// Render a runtime-written `owner_status.json` body for one workload
-    /// (mirrors the linux runtime writer's fixed emission), with every
-    /// join-key field overridable so tests can stage mismatches.
-    fn runtime_status_json_at(
+    /// An owner facts file as the runtime writes it: the head naming
+    /// `pid`/`pid_start_ticks`, then the kernel's `OWNERS` answer holding
+    /// `records` under `plan_generation`.
+    fn owner_facts_at(
         pid: u32,
         pid_start_ticks: u64,
         plan_generation: u64,
-        uid_hex: &str,
-        slot: u16,
-        owner_generation: u32,
-        runtime_body: &str,
-    ) -> String {
-        format!(
-            "{{\"version\":1,\"pid\":{pid},\"pid_start_ticks\":{pid_start_ticks},\
-             \"plan_generation\":{plan_generation},\
-             \"written_at\":\"2026-07-07T00:00:00Z\",\"workloads\":[\
-             {{\"owner_uid_hex\":\"{uid_hex}\",\"slot\":{slot},\
-             \"owner_generation\":{owner_generation},\
-             \"runtime\":{runtime_body}}}]}}"
-        )
+        records: &[fluxor_abi::contracts::workload::owners::Record],
+    ) -> Vec<u8> {
+        use fluxor_abi::contracts::workload::owners;
+        use fluxor_abi::platform::linux::owner_facts as file;
+        let mut b = vec![0u8; file::HEAD_LEN + owners::HEADER_LEN];
+        b[..4].copy_from_slice(&file::MAGIC);
+        b[file::PID..file::PID + 4].copy_from_slice(&pid.to_le_bytes());
+        b[file::PID_START_TICKS..file::PID_START_TICKS + 8]
+            .copy_from_slice(&pid_start_ticks.to_le_bytes());
+        owners::write_head(
+            &mut b[file::HEAD_LEN..],
+            records.len() as u16,
+            plan_generation,
+            &[7; 32],
+        );
+        for r in records {
+            let at = b.len();
+            b.resize(at + owners::RECORD_LEN, 0);
+            assert!(r.write(&mut b[at..]));
+        }
+        b
     }
 
-    /// [`runtime_status_json_at`] with every join-key field matching what
-    /// [`store_with_published_workload`] commits (generation 1, slot 1, owner
-    /// generation 1) and this test process as the live writer.
-    fn runtime_status_json(pid: u32, uid_hex: &str, runtime_body: &str) -> String {
+    /// Workload 1's owner as [`store_with_published_workload`] commits it
+    /// (slot 1, owner generation 1), running its four modules.
+    fn running_owner() -> fluxor_abi::contracts::workload::owners::Record {
+        fluxor_abi::contracts::workload::owners::Record {
+            uid: uid(1),
+            slot: 1,
+            generation: 1,
+            modules: 4,
+            loaded: 4,
+            activations: 1,
+            ..Default::default()
+        }
+    }
+
+    /// [`owner_facts_at`] under the committed plan generation (1), with
+    /// this test process as the live writer.
+    fn owner_facts(
+        pid: u32,
+        records: &[fluxor_abi::contracts::workload::owners::Record],
+    ) -> Vec<u8> {
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
-        runtime_status_json_at(pid, ticks, 1, uid_hex, 1, 1, runtime_body)
+        owner_facts_at(pid, ticks, 1, records)
+    }
+
+    fn facts_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(fluxor_abi::platform::linux::owner_facts::FILE_NAME)
     }
 
     /// FsStorage-backed store in a fresh temp dir with workload 1 committed and
@@ -1379,12 +1598,20 @@ mod tests {
     fn store_with_published_workload(
         tag: &str,
     ) -> (GenStore<crate::genstore::FsStorage>, std::path::PathBuf) {
+        store_with_published(tag, workload(1, 4))
+    }
+
+    /// [`store_with_published_workload`] committing `w`.
+    fn store_with_published(
+        tag: &str,
+        w: WorkloadDesired,
+    ) -> (GenStore<crate::genstore::FsStorage>, std::path::PathBuf) {
         use crate::genstore::FsStorage;
         let dir =
             std::env::temp_dir().join(format!("fluxor-agent-rt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = GenStore::new(FsStorage::open(&dir).unwrap());
-        upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, w, &cap()).unwrap();
         let publish = dir.join("current.plan");
         publish_committed_plan(&store, &publish).unwrap().unwrap();
         record_publish_path(&mut store, &publish).unwrap();
@@ -1393,41 +1620,37 @@ mod tests {
 
     const UID1_HEX: &str = "01000000000000000000000000000000";
 
-    /// The fixture above stands in for the runtime's writer, so it must use
-    /// the keys that writer emits. A reader keyed on anything else parses no
-    /// real status file and reports every runtime as absent.
+    /// The fixture is the runtime's file: what the reader parses back is
+    /// exactly the records the kernel answered, under the writer's head.
     #[test]
-    fn the_runtime_status_fixture_uses_the_writers_keys() {
-        let writer = include_str!("../../src/platform/linux/owner_status.rs");
-        let fixture = runtime_status_json(1, UID1_HEX, "{}");
-        for key in [
-            "owner_uid_hex",
-            "slot",
-            "owner_generation",
-            "plan_generation",
-            "workloads",
-        ] {
-            assert!(
-                writer.contains(&format!("\\\"{key}\\\":")),
-                "the writer emits `{key}`"
-            );
-            assert!(
-                fixture.contains(&format!("\"{key}\":")),
-                "the fixture carries `{key}`"
-            );
-        }
+    fn the_owner_facts_file_reads_back_as_written() {
+        let rec = running_owner();
+        let f = parse_owner_facts(&owner_facts_at(42, 9, 3, &[rec])).expect("parses");
+        assert_eq!((f.pid, f.pid_start_ticks, f.plan_generation), (42, 9, 3));
+        assert_eq!(f.plan_digest, [7; 32]);
+        assert_eq!(f.records, vec![rec]);
+        let mut bad = owner_facts_at(42, 9, 3, &[rec]);
+        bad[0] ^= 1;
+        assert!(parse_owner_facts(&bad).is_none(), "a wrong magic");
+        let short = owner_facts_at(42, 9, 3, &[rec]);
+        assert!(
+            parse_owner_facts(&short[..short.len() - 1]).is_none(),
+            "a record past the end"
+        );
     }
 
     #[test]
     fn status_joins_live_runtime_by_owner_uid() {
         let (store, dir) = store_with_published_workload("join");
-        let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
-                  \"restart_count\":2,\"started_at\":\"2026-07-07T00:00:01Z\",\
-                  \"terminated\":{\"reason\":\"GraphNodeFault\",\"exit_code\":2,\
-                  \"signal\":null,\"finished_at\":\"2026-07-07T00:00:02Z\"}}";
+        let faulted = fluxor_abi::contracts::workload::owners::Record {
+            terminated: 1,
+            fault_kind: fluxor_abi::contracts::workload::owners::FAULT_STEP_ERROR,
+            activations: 3,
+            ..running_owner()
+        };
         std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json(std::process::id(), UID1_HEX, rt),
+            facts_path(&dir),
+            owner_facts(std::process::id(), &[faulted]),
         )
         .unwrap();
 
@@ -1444,6 +1667,7 @@ mod tests {
         assert_eq!(t.reason, TerminatedReason::GraphNodeFault);
         assert_eq!(t.exit_code, 2);
         assert_eq!(t.signal, None);
+        assert_eq!(st.runtime_plan_digest.as_deref(), Some(&*"07".repeat(32)));
 
         // The JSON stays additive: durable fields unchanged, `runtime` is a
         // nested optional object with the exact status-vocabulary field names.
@@ -1456,17 +1680,282 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One rendering per record, from the record alone: a fault in one
+    /// owner terminates that owner only, with the reason its fault kind
+    /// names; an internal retry is unreadiness, not a restart; a draining
+    /// owner withdraws readiness while it keeps running; a clean end is
+    /// Completed.
+    #[test]
+    fn a_record_renders_its_own_phase_and_reason() {
+        use fluxor_abi::contracts::workload::owners::{self, Record};
+        let r = |rec: Record| render_runtime(&rec, 100);
+        let healthy = running_owner();
+        let rt = r(healthy);
+        assert_eq!(rt.phase, RuntimePhase::Running);
+        assert!(rt.ready && rt.started);
+        assert_eq!(rt.restart_count, 0);
+        assert!(rt.owner_state.is_none() && rt.terminated.is_none());
+
+        for (kind, reason) in [
+            (owners::FAULT_TIMEOUT, TerminatedReason::LivenessFailure),
+            (owners::FAULT_STEP_ERROR, TerminatedReason::GraphNodeFault),
+            (owners::FAULT_MPU, TerminatedReason::GraphNodeFault),
+        ] {
+            let rt = r(Record {
+                terminated: 1,
+                fault_kind: kind,
+                ..healthy
+            });
+            assert_eq!(rt.phase, RuntimePhase::Terminated);
+            let t = rt.terminated.unwrap();
+            assert_eq!((t.reason, t.exit_code), (reason, i32::from(kind)));
+        }
+
+        let rt = r(Record {
+            recovering: 1,
+            ..healthy
+        });
+        assert_eq!(rt.phase, RuntimePhase::Running);
+        assert!(!rt.ready, "a module mid-retry is unready");
+        assert_eq!(rt.restart_count, 0, "and not restarted");
+
+        let rt = r(Record {
+            finished: 4,
+            ..healthy
+        });
+        let t = rt.terminated.unwrap();
+        assert_eq!((t.reason, t.exit_code), (TerminatedReason::Completed, 0));
+
+        let rt = r(Record {
+            state: owners::STATE_DRAINING,
+            drain_deadline: 112,
+            ..healthy
+        });
+        assert_eq!(rt.phase, RuntimePhase::Running, "still serving");
+        assert!(!rt.ready);
+        assert_eq!(rt.owner_state.as_deref(), Some("Draining"));
+        assert_eq!(rt.drain_deadline_unix, Some(112));
+        assert_eq!(rt.drain_remaining_secs, Some(12));
+
+        let rt = r(Record {
+            state: owners::STATE_PAUSED,
+            ..healthy
+        });
+        assert_eq!(rt.owner_state.as_deref(), Some("Paused"));
+    }
+
+    /// The restart count is the kernel's re-activations: each time it
+    /// instantiated the owner's modules again.
+    #[test]
+    fn re_activations_are_the_restart_count() {
+        let rt = render_runtime(
+            &fluxor_abi::contracts::workload::owners::Record {
+                activations: 3,
+                ..running_owner()
+            },
+            0,
+        );
+        assert_eq!(rt.restart_count, 2);
+    }
+
+    /// An owner whose modules are not all instantiated is Activating: plainly
+    /// before any is, in `ActivationBackOff` when some failed.
+    #[test]
+    fn an_owner_not_fully_instantiated_is_activating() {
+        use fluxor_abi::contracts::workload::owners::Record;
+        let rt = render_runtime(
+            &Record {
+                modules: 0,
+                loaded: 0,
+                ..running_owner()
+            },
+            0,
+        );
+        assert_eq!(rt.phase, RuntimePhase::Activating);
+        assert!(!rt.started && rt.waiting_reason.is_none());
+        let rt = render_runtime(
+            &Record {
+                loaded: 3,
+                ..running_owner()
+            },
+            0,
+        );
+        assert_eq!(rt.phase, RuntimePhase::Activating);
+        assert!(!rt.ready);
+        assert_eq!(rt.waiting_reason, Some(WaitingReason::ActivationBackOff));
+    }
+
+    /// A drained owner is Terminated: Completed when it quiesced, a
+    /// drain-timeout fault when its deadline passed or its drain was
+    /// forfeited, with the time the runtime freed it when it did.
+    #[test]
+    fn a_drained_owner_renders_how_its_drain_ended() {
+        use fluxor_abi::contracts::workload::owners::{self, Record};
+        let gone = |drain, drained_at| {
+            render_runtime(
+                &Record {
+                    state: owners::STATE_GONE,
+                    drain,
+                    drained_at,
+                    ..running_owner()
+                },
+                0,
+            )
+        };
+        let rt = gone(owners::DRAIN_QUIESCED, 200);
+        let t = rt.terminated.unwrap();
+        assert_eq!((t.reason, t.exit_code), (TerminatedReason::Completed, 0));
+        assert_eq!(t.finished_at.as_deref(), Some("1970-01-01T00:03:20Z"));
+        let d = rt.drain.unwrap();
+        assert!(!d.timed_out && !d.forfeited);
+
+        let rt = gone(owners::DRAIN_DEADLINE_PASSED, 200);
+        let t = rt.terminated.unwrap();
+        assert_eq!(t.reason, TerminatedReason::GraphNodeFault);
+        assert_eq!(t.exit_code, i32::from(owners::FAULT_DRAIN_TIMEOUT));
+        let d = rt.drain.unwrap();
+        assert!(d.timed_out && !d.forfeited);
+
+        let rt = gone(owners::DRAIN_FORFEITED, 0);
+        assert!(rt.terminated.unwrap().finished_at.is_none());
+        let d = rt.drain.unwrap();
+        assert!(d.timed_out && d.forfeited);
+    }
+
+    #[test]
+    fn rfc3339_matches_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_827_696), "2000-02-29T12:34:56Z");
+        assert_eq!(rfc3339_utc(1_783_275_045), "2026-07-05T18:10:45Z");
+    }
+
+    /// A bound-endpoint report as the network provider writes it.
+    fn bound_report(
+        pid: u32,
+        pid_start_ticks: u64,
+        records: &[fluxor_abi::platform::linux::bound_endpoints::Record],
+    ) -> Vec<u8> {
+        use fluxor_abi::platform::linux::bound_endpoints as file;
+        let mut b = vec![0u8; file::HEAD_LEN + records.len() * file::RECORD_LEN];
+        file::write_head(&mut b, pid, pid_start_ticks, records.len() as u16);
+        for (k, r) in records.iter().enumerate() {
+            r.write(&mut b[file::HEAD_LEN + k * file::RECORD_LEN..]);
+        }
+        b
+    }
+
+    fn bound_rec(
+        owner_slot: u16,
+        owner_generation: u32,
+        protocol: u8,
+        port: u16,
+    ) -> fluxor_abi::platform::linux::bound_endpoints::Record {
+        fluxor_abi::platform::linux::bound_endpoints::Record {
+            owner_slot,
+            owner_generation,
+            protocol,
+            port,
+        }
+    }
+
+    #[test]
+    fn the_bound_endpoints_file_reads_back_as_written() {
+        let recs = [bound_rec(1, 1, 17, 5353), bound_rec(0, 0, 6, 80)];
+        let (pid, ticks, back) = parse_bound_endpoints(&bound_report(42, 9, &recs)).unwrap();
+        assert_eq!((pid, ticks), (42, 9));
+        assert_eq!(back, recs.to_vec());
+        let mut bad = bound_report(42, 9, &recs);
+        bad[0] ^= 1;
+        assert!(parse_bound_endpoints(&bad).is_none(), "a wrong magic");
+        let short = bound_report(42, 9, &recs);
+        assert!(
+            parse_bound_endpoints(&short[..short.len() - 1]).is_none(),
+            "a record past the end"
+        );
+    }
+
+    /// The provider's report joins a placed workload by the committed
+    /// plan's owner slot and generation, against what it declared: a
+    /// declared export it holds is bound, one it does not is not, a bind it
+    /// never declared is shown undeclared; the node's own endpoints and an
+    /// earlier owner of the slot are no workload's.
+    #[test]
+    fn status_joins_bound_endpoints_by_the_plans_owner() {
+        use crate::compose::ExportDecl;
+        let mut w = workload(1, 4);
+        w.profile.endpoints = 2;
+        w.exports = vec![
+            ExportDecl {
+                protocol: "udp".into(),
+                port: 15353,
+            },
+            ExportDecl {
+                protocol: "tcp".into(),
+                port: 8080,
+            },
+        ];
+        let (store, dir) = store_with_published("endpoints", w);
+        let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
+        let path = dir.join(fluxor_abi::platform::linux::bound_endpoints::FILE_NAME);
+        std::fs::write(
+            &path,
+            bound_report(
+                std::process::id(),
+                ticks,
+                &[
+                    bound_rec(1, 1, 17, 15353),
+                    bound_rec(1, 1, 6, 9999),
+                    bound_rec(0, 0, 6, 80),
+                    bound_rec(1, 0, 6, 8080),
+                ],
+            ),
+        )
+        .unwrap();
+
+        // No owner facts: the endpoints still join (they are the
+        // provider's, not the runtime's).
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.workloads[0].runtime.is_none());
+        let ep = |protocol: &str, port, bound, declared| EndpointStatus {
+            protocol: protocol.into(),
+            port,
+            bound,
+            declared,
+        };
+        assert_eq!(
+            st.workloads[0].endpoints,
+            vec![
+                ep("udp", 15353, true, true),
+                ep("tcp", 8080, false, true),
+                ep("tcp", 9999, true, false),
+            ]
+        );
+        let v = serde_json::to_value(&st).unwrap();
+        let e = &v["workloads"][0]["endpoints"][0];
+        assert_eq!(e["protocol"], "udp");
+        assert_eq!(e["port"], 15353);
+        assert_eq!(e["bound"], true);
+        assert_eq!(e["declared"], true);
+
+        // A report whose writer is gone says nothing: no `endpoints` key.
+        std::fs::write(
+            &path,
+            bound_report(4_100_000, ticks, &[bound_rec(1, 1, 17, 15353)]),
+        )
+        .unwrap();
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.workloads[0].endpoints.is_empty());
+        let v = serde_json::to_value(&st).unwrap();
+        assert!(v["workloads"][0].get("endpoints").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dead_writer_pid_means_runtime_absent() {
         let (store, dir) = store_with_published_workload("deadpid");
-        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // PID far above pid_max: the writer is gone; its file is history,
         // not live state.
-        std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json(4_100_000, UID1_HEX, rt),
-        )
-        .unwrap();
+        std::fs::write(facts_path(&dir), owner_facts(4_100_000, &[running_owner()])).unwrap();
 
         let st = node_status_with_runtime(&store).unwrap();
         assert!(st.workloads[0].runtime.is_none(), "stale file not surfaced");
@@ -1480,13 +1969,12 @@ mod tests {
     #[test]
     fn recycled_writer_pid_means_runtime_absent() {
         let (store, dir) = store_with_published_workload("recycled");
-        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // The writer's PID is alive (it's ours) but the recorded start time
         // belongs to a different, earlier process: the PID was recycled.
         let wrong_ticks = proc_start_ticks(std::process::id()).unwrap_or(0) + 1;
         std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json_at(std::process::id(), wrong_ticks, 1, UID1_HEX, 1, 1, rt),
+            facts_path(&dir),
+            owner_facts_at(std::process::id(), wrong_ticks, 1, &[running_owner()]),
         )
         .unwrap();
 
@@ -1501,14 +1989,13 @@ mod tests {
     #[test]
     fn stale_plan_generation_drops_the_runtime_join() {
         let (store, dir) = store_with_published_workload("stalegen");
-        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
-        // Live state derived under a different plan generation (runtime not
+        // Live state read under a different plan generation (runtime not
         // yet rebuilt onto the current commit) must not attach to the new
         // durable records — same PID, same owner uid, wrong generation.
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
         std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json_at(std::process::id(), ticks, 999, UID1_HEX, 1, 1, rt),
+            facts_path(&dir),
+            owner_facts_at(std::process::id(), ticks, 999, &[running_owner()]),
         )
         .unwrap();
 
@@ -1522,51 +2009,31 @@ mod tests {
 
     #[test]
     fn slot_or_owner_generation_mismatch_drops_the_runtime_join() {
-        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
+        let at = |slot, generation| {
+            let rec = fluxor_abi::contracts::workload::owners::Record {
+                slot,
+                generation,
+                ..running_owner()
+            };
+            owner_facts_at(std::process::id(), ticks, 1, &[rec])
+        };
 
         // Right owner uid, wrong slot.
         let (store, dir) = store_with_published_workload("wrongslot");
-        std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 9, 1, rt),
-        )
-        .unwrap();
+        std::fs::write(facts_path(&dir), at(9, 1)).unwrap();
         let st = node_status_with_runtime(&store).unwrap();
         assert!(st.workloads[0].runtime.is_none(), "slot mismatch refused");
         let _ = std::fs::remove_dir_all(&dir);
 
         // Right owner uid and slot, wrong owner generation.
         let (store, dir) = store_with_published_workload("wrongogen");
-        std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 1, 9, rt),
-        )
-        .unwrap();
+        std::fs::write(facts_path(&dir), at(1, 9)).unwrap();
         let st = node_status_with_runtime(&store).unwrap();
         assert!(
             st.workloads[0].runtime.is_none(),
             "owner-generation mismatch refused"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn out_of_vocabulary_reason_drops_the_runtime_join() {
-        let (store, dir) = store_with_published_workload("vocab");
-        let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
-                  \"restart_count\":0,\"terminated\":{\"reason\":\"SomethingNew\",\
-                  \"exit_code\":1,\"signal\":null,\"finished_at\":\"2026-07-07T00:00:02Z\"}}";
-        std::fs::write(
-            dir.join("owner_status.json"),
-            runtime_status_json(std::process::id(), UID1_HEX, rt),
-        )
-        .unwrap();
-
-        // Reasons outside the closed set are never emitted — a file
-        // carrying one fails strict parse and the join is dropped.
-        let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.workloads[0].runtime.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1578,7 +2045,7 @@ mod tests {
         let st = node_status_with_runtime(&store).unwrap();
         assert!(st.workloads[0].runtime.is_none());
 
-        // Publish recorded but no owner_status.json written yet.
+        // Publish recorded but no owner facts written yet.
         let (store, dir) = store_with_published_workload("nofile");
         let st = node_status_with_runtime(&store).unwrap();
         assert!(st.workloads[0].runtime.is_none());
@@ -1675,5 +2142,23 @@ mod endpoint_join_tests {
     #[test]
     fn no_declarations_and_no_binds_yield_nothing() {
         assert!(join_endpoints(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn report_protocol_numbers_read_as_names() {
+        use fluxor_abi::platform::linux::bound_endpoints::Record;
+        let of = |protocol| {
+            BoundEndpoint::of(&Record {
+                owner_slot: 1,
+                owner_generation: 1,
+                protocol,
+                port: 53,
+            })
+            .protocol
+        };
+        assert_eq!(
+            (of(6), of(17), of(132)),
+            ("tcp".into(), "udp".into(), "132".into())
+        );
     }
 }

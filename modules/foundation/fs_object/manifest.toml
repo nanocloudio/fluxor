@@ -11,6 +11,9 @@ provides = ["storage.object", "storage.namespace"]
 # No tick-based timekeeping: a pure provider_call surface.
 timer_class = "agnostic"
 provider_contracts = ["storage.object", "storage.namespace"]
+# A metal node runs it privileged inside a workload that composes it from the
+# node's image: it holds no grant and touches no device.
+workload_instantiable = true
 
 # Every op is answered from the filesystem the graph wires underneath.
 [[resources]]

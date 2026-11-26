@@ -13,9 +13,6 @@ use serde_json::Value;
 /// checkable rather than merely intended to agree.
 use fluxor_abi::config::route_handler as handler_id;
 
-/// Schema magic bytes: "SP"
-const SCHEMA_MAGIC: [u8; 2] = [0x53, 0x50];
-
 /// TLV header: magic + version
 const TLV_MAGIC: u8 = 0xFE;
 const TLV_VERSION: u8 = 0x01;
@@ -43,18 +40,8 @@ const TLV_END: u8 = 0xFF;
 // (`params::refuse_environment`): a graph is never read against the build
 // host's environment, and a binding names the workload's, explicitly.
 
-/// The env bind record. Mirrors `abi::contracts::workload::env`.
-pub mod env_bind {
-    pub const BIND_TAG: u8 = 0xED;
-    pub const MAX_NAME: usize = 128;
-    pub const KIND_U8: u8 = 0;
-    pub const KIND_U16: u8 = 1;
-    pub const KIND_U32: u8 = 2;
-    pub const KIND_STR: u8 = 3;
-    pub const KIND_STR_CHUNKED: u8 = 6;
-    pub const FLAG_REQUIRED: u8 = 0x01;
-    pub const FLAG_DEFAULT: u8 = 0x02;
-}
+/// The env bind record.
+pub use fluxor_contracts::graph::env_bind;
 
 /// One env bind a workload's params carry: the module, the param, the name
 /// and whether a CREATE must give it.
@@ -194,7 +181,30 @@ fn pack_env_bind(
     } else {
         0
     };
+    if let Some(d) = &default {
+        let n = if param.ptype.is_integer() {
+            let mut w = [0u8; 4];
+            w[..d.len()].copy_from_slice(d);
+            u64::from(u32::from_le_bytes(w))
+        } else {
+            d.len() as u64
+        };
+        if n < u64::from(param.min) || n > u64::from(param.max) {
+            return Err(format!(
+                "{}: its env binding's default is {}, outside the param's {}",
+                at(),
+                if param.ptype.is_integer() {
+                    n.to_string()
+                } else {
+                    format!("{n} bytes")
+                },
+                param.bounds_text()
+            ));
+        }
+    }
     let mut rec = vec![param.tag, kind, flags, b.name.len() as u8];
+    rec.extend_from_slice(&param.min.to_le_bytes());
+    rec.extend_from_slice(&param.max.to_le_bytes());
     rec.extend_from_slice(b.name.as_bytes());
     rec.extend_from_slice(default.as_deref().unwrap_or_default());
     if rec.len() > MAX_TLV_VALUE_LEN {
@@ -232,6 +242,21 @@ fn pack_env_bind(
     Ok(pos + 2 + rec.len())
 }
 
+/// One param of a schema as a test writes it by hand, bounded by its type's
+/// ceiling, with no enum values; nothing checked, so a test can state a
+/// schema `define_params!` would refuse.
+#[cfg(test)]
+pub(crate) fn raw_param(tag: u8, ptype: u8, default: u32, name: &str) -> Vec<u8> {
+    let mut b = vec![tag, ptype];
+    b.extend_from_slice(&default.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&fluxor_abi::wire::param_schema::type_ceiling(ptype).to_le_bytes());
+    b.push(name.len() as u8);
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    b
+}
+
 /// Parameter types (must match module-side param_macro.rs)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParamType {
@@ -254,16 +279,22 @@ pub enum ParamType {
 
 impl ParamType {
     fn from_u8(v: u8) -> Option<Self> {
+        use fluxor_abi::wire::param_schema::ty;
         match v {
-            0 => Some(Self::U8),
-            1 => Some(Self::U16),
-            2 => Some(Self::U32),
-            3 => Some(Self::Str),
-            4 => Some(Self::U16Array),
-            5 => Some(Self::Blob),
-            6 => Some(Self::StrChunked),
+            ty::U8 => Some(Self::U8),
+            ty::U16 => Some(Self::U16),
+            ty::U32 => Some(Self::U32),
+            ty::STR => Some(Self::Str),
+            ty::U16_ARRAY => Some(Self::U16Array),
+            ty::BLOB => Some(Self::Blob),
+            ty::STR_CHUNKED => Some(Self::StrChunked),
             _ => None,
         }
+    }
+
+    /// Whether the param is an integer, whose bounds are its value's.
+    pub fn is_integer(self) -> bool {
+        matches!(self, Self::U8 | Self::U16 | Self::U32)
     }
 
     #[allow(
@@ -287,8 +318,29 @@ pub struct SchemaParam {
     pub ptype: ParamType,
     pub name: String,
     pub default: u32,
+    /// Inclusive bounds (`fluxor_abi::wire::param_schema`): an integer's
+    /// value, a `str`'s, `blob`'s or `str_chunked`'s bytes, a `u16_array`'s
+    /// elements.
+    pub min: u32,
+    pub max: u32,
     /// Enum mappings: name → value (e.g., "sine" → 5)
     pub enums: HashMap<String, u8>,
+}
+
+impl SchemaParam {
+    /// The param's bounds as an operator reads them.
+    pub fn bounds_text(&self) -> String {
+        let unit = match self.ptype {
+            ParamType::U8 | ParamType::U16 | ParamType::U32 => "",
+            ParamType::U16Array => " elements",
+            _ => " bytes",
+        };
+        if self.min == 0 {
+            format!("at most {}{unit}", self.max)
+        } else {
+            format!("{}..={}{unit}", self.min, self.max)
+        }
+    }
 }
 
 /// Parsed parameter schema for a module.
@@ -320,90 +372,40 @@ impl ParamSchema {
         ParamSchema { params, name_map }
     }
 
-    /// Parse schema from raw bytes (as embedded in .fmod).
+    /// Parse a schema (`fluxor_abi::wire::param_schema`) as a `.fmod`
+    /// embeds it; `None` when it is malformed or names an unknown type.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 {
-            return None;
-        }
-        if data[0] != SCHEMA_MAGIC[0] || data[1] != SCHEMA_MAGIC[1] {
-            return None;
-        }
-        let _version = data[2];
-        let count = data[3] as usize;
-
-        let mut params = Vec::with_capacity(count);
-        let mut pos = 4usize;
-
-        for _ in 0..count {
-            if pos + 6 > data.len() {
-                break;
-            }
-
-            let tag = data[pos];
-            pos += 1;
-            let ptype = ParamType::from_u8(data[pos])?;
-            pos += 1;
-
-            // Default (4 bytes LE)
-            if pos + 4 > data.len() {
-                break;
-            }
-            let default =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-
-            // Name
-            if pos >= data.len() {
-                break;
-            }
-            let name_len = data[pos] as usize;
-            pos += 1;
-            if pos + name_len > data.len() {
-                break;
-            }
-            let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
-            pos += name_len;
-
-            // Enums
-            if pos >= data.len() {
-                break;
-            }
-            let enum_count = data[pos] as usize;
-            pos += 1;
+        use fluxor_abi::wire::param_schema;
+        param_schema::schema_len(data)?;
+        let mut params = Vec::new();
+        let mut bad = false;
+        param_schema::for_each_param(data, |p| {
+            let Some(ptype) = ParamType::from_u8(p.ptype) else {
+                bad = true;
+                return;
+            };
             let mut enums = HashMap::new();
-            for _ in 0..enum_count {
-                if pos >= data.len() {
-                    break;
-                }
-                let val = data[pos];
-                pos += 1;
-                if pos >= data.len() {
-                    break;
-                }
-                let ename_len = data[pos] as usize;
-                pos += 1;
-                if pos + ename_len > data.len() {
-                    break;
-                }
-                let ename = String::from_utf8_lossy(&data[pos..pos + ename_len]).to_string();
-                pos += ename_len;
-                enums.insert(ename, val);
-            }
-
+            p.for_each_enum(|n, v| {
+                enums.insert(String::from_utf8_lossy(n).into_owned(), v);
+            });
             params.push(SchemaParam {
-                tag,
+                tag: p.tag,
                 ptype,
-                name,
-                default,
+                name: String::from_utf8_lossy(p.name).into_owned(),
+                default: p.default,
+                min: p.min,
+                max: p.max,
                 enums,
             });
+        });
+        if bad {
+            return None;
         }
-
-        let mut name_map = HashMap::new();
-        for (i, p) in params.iter().enumerate() {
-            name_map.insert(p.name.clone(), i);
-        }
-
+        let name_map = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), i))
+            .collect();
         Some(ParamSchema { params, name_map })
     }
 
@@ -428,11 +430,15 @@ impl ParamSchema {
             for (name, val) in &mp.enum_values {
                 enums.insert(name.clone(), *val);
             }
+            let ceiling = fluxor_abi::wire::param_schema::type_ceiling(ptype as u8);
+            let (min, max) = mp.range.unwrap_or((0, ceiling));
             params.push(SchemaParam {
                 tag: mp.tag,
                 ptype,
                 name: mp.name.clone(),
                 default: mp.default_num,
+                min,
+                max,
                 enums,
             });
         }
@@ -576,6 +582,22 @@ pub fn param_is_one_of(
         hit |= value == target;
     }
     Some(hit)
+}
+
+/// Whether this module entry sets `param` to a non-empty value (YAML at the
+/// entry or under `params:`); `None` when the schema has no such parameter.
+pub fn param_is_set(module: &Value, schema: &ParamSchema, param: &str) -> Option<bool> {
+    schema.find(param)?;
+    let v = module
+        .get(param)
+        .or_else(|| module.get("params").and_then(|p| p.get(param)));
+    Some(match v {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(_) => true,
+    })
 }
 
 pub fn build_params_from_schema(
@@ -795,6 +817,7 @@ pub fn build_params_from_schema(
 
         if let Some(value) = kv.get(&param.name) {
             check_param_value_len(param, &param.name, value, data_section, module_name)?;
+            check_param_value_width(module_name, &param.name, value, param)?;
             check_param_value_dotted(module_name, &param.name, value, param)?;
             check_param_value_enum(module_name, &param.name, value, param)?;
             pos = pack_param(schema, &param.name, value, entry, pos, data_section);
@@ -857,6 +880,135 @@ pub fn tlv_basic_end(params: &[u8]) -> Option<usize> {
         pos += 2 + params[pos + 1] as usize;
     }
     None
+}
+
+/// Refuse a packed params TLV (`params`) whose values the schema bounds
+/// (`SchemaParam::min`/`max`) do not admit: an integer's value, a `str`'s
+/// bytes, a `str_chunked`'s bytes across its chunks, each `blob`'s length,
+/// a `u16_array`'s elements. Read from the packed bytes, so a value from
+/// anywhere (YAML, a `${file:}` source, a default the composer injects) is
+/// held to the same bounds. A param the instance does not set takes the
+/// module's default and is not checked.
+pub fn check_bounds(schema: &ParamSchema, params: &[u8], module_name: &str) -> Result<(), String> {
+    let Some(end) = tlv_basic_end(params) else {
+        return Ok(());
+    };
+    let mut totals: HashMap<u8, u64> = HashMap::new();
+    // A blob's bytes still to come in its later chunks, per tag.
+    let mut blob_left: HashMap<u8, u64> = HashMap::new();
+    let mut pos = 4usize;
+    while pos + 2 <= end && params[pos] != TLV_END {
+        let (tag, len) = (params[pos], params[pos + 1] as usize);
+        let value = &params[pos + 2..(pos + 2 + len).min(end)];
+        pos += 2 + len;
+        let Some(p) = schema.params.iter().find(|p| p.tag == tag) else {
+            continue;
+        };
+        match p.ptype {
+            ParamType::U8 | ParamType::U16 | ParamType::U32 => {
+                let mut b = [0u8; 8];
+                let w = value.len().min(8);
+                b[..w].copy_from_slice(&value[..w]);
+                refuse_out_of_bounds(p, u64::from_le_bytes(b), module_name)?;
+            }
+            ParamType::Str => refuse_out_of_bounds(p, value.len() as u64, module_name)?,
+            ParamType::Blob => {
+                let left = blob_left.entry(tag).or_default();
+                if *left == 0 && value.len() >= 2 {
+                    // A blob's first chunk opens with its `u16` length.
+                    let n = u64::from(u16::from_le_bytes([value[0], value[1]]));
+                    refuse_out_of_bounds(p, n, module_name)?;
+                    *left = n.saturating_sub((value.len() - 2) as u64);
+                } else {
+                    *left = left.saturating_sub(value.len() as u64);
+                }
+            }
+            ParamType::StrChunked => *totals.entry(tag).or_default() += value.len() as u64,
+            ParamType::U16Array => *totals.entry(tag).or_default() += (value.len() / 2) as u64,
+        }
+    }
+    for (tag, n) in totals {
+        if let Some(p) = schema.params.iter().find(|p| p.tag == tag) {
+            refuse_out_of_bounds(p, n, module_name)?;
+        }
+    }
+    Ok(())
+}
+
+fn refuse_out_of_bounds(p: &SchemaParam, n: u64, module_name: &str) -> Result<(), String> {
+    if n >= u64::from(p.min) && n <= u64::from(p.max) {
+        return Ok(());
+    }
+    let what = match p.ptype {
+        ParamType::U8 | ParamType::U16 | ParamType::U32 => n.to_string(),
+        ParamType::U16Array => format!("{n} elements"),
+        _ => format!("{n} bytes"),
+    };
+    Err(format!(
+        "module '{module_name}': param '{}' is {what}, outside its bound ({}): the module \
+         would refuse it or misread it",
+        p.name,
+        p.bounds_text()
+    ))
+}
+
+/// Refuse an integer value its param's type cannot carry: the packer would
+/// truncate it to the type's width.
+fn check_param_value_width(
+    module_name: &str,
+    key: &str,
+    value: &Value,
+    param: &SchemaParam,
+) -> Result<(), String> {
+    if !param.ptype.is_integer() {
+        return Ok(());
+    }
+    let ceiling = u64::from(fluxor_abi::wire::param_schema::type_ceiling(
+        param.ptype as u8,
+    ));
+    let n: Option<i128> = if let Some(n) = value.as_u64() {
+        Some(i128::from(n))
+    } else if let Some(n) = value.as_i64() {
+        Some(i128::from(n))
+    } else if let Some(t) = value.as_str() {
+        if param.enums.contains_key(t) {
+            return Ok(());
+        }
+        let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            Some(h) => i128::from_str_radix(h, 16).ok(),
+            None => t.parse::<i128>().ok(),
+        };
+        // A `u32` takes a name the packer hashes (an FMP message type) or
+        // an address; a narrower integer has no such reading, and the
+        // packer would put the default in its place.
+        if parsed.is_none() && param.ptype != ParamType::U32 && !t.is_empty() {
+            return Err(format!(
+                "module '{module_name}': parameter '{key}' = \"{t}\" is not a number{}",
+                if param.enums.is_empty() {
+                    String::new()
+                } else {
+                    let mut names: Vec<&str> = param.enums.keys().map(String::as_str).collect();
+                    names.sort_unstable();
+                    format!(" or one of {}", names.join(", "))
+                }
+            ));
+        }
+        parsed
+    } else if value.is_f64() {
+        return Err(format!(
+            "module '{module_name}': parameter '{key}' = {value} is not an integer"
+        ));
+    } else {
+        None
+    };
+    match n {
+        Some(n) if n < 0 || n > i128::from(ceiling) => Err(format!(
+            "module '{module_name}': parameter '{key}' = {n} does not fit its {:?} type \
+             (0..={ceiling})",
+            param.ptype
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Pack a single param value into the TLV buffer.
@@ -1522,7 +1674,7 @@ fn pack_voice_inner(
 /// no module ABI.
 pub fn param_schema(
     a: &crate::module_resolver::ModuleArtifact,
-) -> crate::Result<Option<ParamSchema>> {
+) -> crate::error::Result<Option<ParamSchema>> {
     if a.is_native() {
         return Ok(Some(ParamSchema::from_manifest(&a.manifest)));
     }
@@ -1533,7 +1685,7 @@ pub fn param_schema(
         return Ok(Some(ParamSchema::empty()));
     };
     ParamSchema::from_bytes(data).map(Some).ok_or_else(|| {
-        crate::Error::Config(format!(
+        crate::error::Error::Config(format!(
             "{}: the param schema in its artefact '{}' ({}) is malformed",
             a.label(),
             a.artifact,
@@ -1548,7 +1700,7 @@ pub fn param_schema(
 pub fn entry_schema(
     entry: &serde_json::Value,
     r: &crate::module_resolver::ModuleResolver,
-) -> crate::Result<Option<ParamSchema>> {
+) -> crate::error::Result<Option<ParamSchema>> {
     let Some((_, ty, variant)) = crate::module_resolver::entry_identity(entry) else {
         return Ok(None);
     };
@@ -1812,15 +1964,111 @@ pub(crate) fn expand_routes(
 mod tests {
     use super::*;
 
+    /// A schema written by `define_params!`'s codec reads back whole: each
+    /// param's tag, type, default, bounds, name and enum values.
+    #[test]
+    fn a_schema_round_trips_with_its_bounds() {
+        use fluxor_abi::wire::param_schema::{encode_into, encoded_len, schema_len, ty, Entry};
+        let entries = [
+            Entry {
+                tag: 1,
+                ptype: ty::STR,
+                default: 0,
+                min: 0,
+                max: 96,
+                name: "root",
+                enums: &[],
+            },
+            Entry {
+                tag: 3,
+                ptype: ty::U32,
+                default: 512,
+                min: 1,
+                max: 1 << 30,
+                name: "objects",
+                enums: &[],
+            },
+            Entry {
+                tag: 2,
+                ptype: ty::U8,
+                default: 1,
+                min: 0,
+                max: 1,
+                name: "durable",
+                enums: &[("off", 0), ("on", 1)],
+            },
+        ];
+        let mut b = vec![0u8; encoded_len(&entries)];
+        assert_eq!(encode_into(&entries, &mut b), b.len());
+        assert_eq!(schema_len(&b), Some(b.len()), "exactly its own length");
+        let s = ParamSchema::from_bytes(&b).expect("schema");
+        let got: Vec<(u8, u32, u32, u32, &str)> = s
+            .params
+            .iter()
+            .map(|p| (p.tag, p.default, p.min, p.max, p.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, 0, 0, 96, "root"),
+                (3, 512, 1, 1 << 30, "objects"),
+                (2, 1, 0, 1, "durable")
+            ]
+        );
+        assert_eq!(s.params[2].enums.get("on"), Some(&1));
+        assert_eq!(
+            schema_len(&b[..b.len() - 1]),
+            None,
+            "a cut schema is no schema"
+        );
+    }
+
+    /// A packed value outside its param's bounds is refused at build,
+    /// naming the param: a 97-byte `root` past `max 96`, an integer below
+    /// its `range`, a chunked string past its total.
+    #[test]
+    fn a_value_past_its_bound_is_refused_naming_the_param() {
+        let p = |tag, ptype, name: &str, min, max| SchemaParam {
+            tag,
+            ptype,
+            name: name.to_string(),
+            default: 0,
+            min,
+            max,
+            enums: HashMap::new(),
+        };
+        let schema = ParamSchema::from_params(vec![
+            p(1, ParamType::Str, "root", 0, 96),
+            p(3, ParamType::U32, "objects", 1, u32::MAX),
+            p(4, ParamType::StrChunked, "bounds", 0, 300),
+        ]);
+        let check = |module: Value| {
+            let mut entry = vec![0u8; 4096];
+            let n = build_params_from_schema(&module, &schema, &mut entry, 0, None, "fs_namespace")
+                .expect("pack");
+            check_bounds(&schema, &entry[..n], "ns")
+        };
+        let root = |n: usize| format!("/{}", "r".repeat(n - 1));
+        check(serde_json::json!({ "root": root(96), "objects": 1, "bounds": "a".repeat(300) }))
+            .expect("at the bounds");
+        let e = check(serde_json::json!({ "root": root(97) })).unwrap_err();
+        assert!(
+            e.contains("'root'") && e.contains("97 bytes") && e.contains("at most 96"),
+            "{e}"
+        );
+        let e = check(serde_json::json!({ "objects": 0 })).unwrap_err();
+        assert!(e.contains("'objects'") && e.contains("1..="), "{e}");
+        let e = check(serde_json::json!({ "bounds": "a".repeat(301) })).unwrap_err();
+        assert!(e.contains("'bounds'") && e.contains("301 bytes"), "{e}");
+    }
+
     /// A schema with two params on one tag names both, and the packer
     /// refuses to pack an instance of it.
     #[test]
     fn two_params_on_one_tag_are_refused() {
         let mut bytes = vec![0x53, 0x50, 1, 2];
         for name in ["capacity", "step_budget_us"] {
-            bytes.extend_from_slice(&[54, 2, 0, 0, 0, 0, name.len() as u8]);
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(0);
+            bytes.extend_from_slice(&raw_param(54, 2, 0, name));
         }
         let schema = ParamSchema::from_bytes(&bytes).expect("schema");
         assert_eq!(
@@ -1849,6 +2097,8 @@ mod tests {
             ptype,
             name: name.into(),
             default: 0,
+            min: 0,
+            max: u32::MAX,
             enums: HashMap::new(),
         };
         let params = vec![
@@ -1895,12 +2145,17 @@ mod tests {
         let end = end.expect("env bindings pack in a workload image");
         assert_eq!(entry[end - 2..end], [TLV_END, 0]);
         let entries = tlv_entries(&entry);
+        // Each record carries its param's bounds, here the schema's 0..=u32::MAX.
+        let bounds = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
         let mut port = vec![10, env_bind::KIND_U16, env_bind::FLAG_DEFAULT, 4];
+        port.extend_from_slice(&bounds);
         port.extend_from_slice(b"PORT");
         port.extend_from_slice(&8080u16.to_le_bytes());
         let mut label = vec![11, env_bind::KIND_STR, env_bind::FLAG_REQUIRED, 8];
+        label.extend_from_slice(&bounds);
         label.extend_from_slice(b"POD_NAME");
         let mut body = vec![12, env_bind::KIND_STR_CHUNKED, 0, 4];
+        body.extend_from_slice(&bounds);
         body.extend_from_slice(b"BODY");
         assert_eq!(
             entries,
@@ -1970,6 +2225,8 @@ mod tests {
             ptype: ParamType::Blob,
             name: "image".into(),
             default: 0,
+            min: 0,
+            max: u32::MAX,
             enums: HashMap::new(),
         }];
         let name_map = HashMap::from([("image".to_string(), 0usize)]);
@@ -2314,6 +2571,8 @@ mod resolve_u32_forms {
             ptype: ParamType::U32,
             name: String::from("dst_ip"),
             default: 0,
+            min: 0,
+            max: u32::MAX,
             enums: HashMap::new(),
         }
     }

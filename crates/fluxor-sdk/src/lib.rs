@@ -22,8 +22,10 @@ pub mod crypto {
     pub mod hmac;
     pub mod ml_dsa;
     pub mod p256;
+    pub mod p256_m0;
     pub mod p384;
     pub mod rsa;
+    pub mod seal;
     pub mod sha1;
     pub mod sha256;
     pub mod sha3;
@@ -46,12 +48,16 @@ pub mod accessibility;
 
 pub mod cores {
     //! State machines more than one module runs.
+    pub mod custody_wrap;
     pub mod nat;
+    pub mod net_tables;
     pub mod nonce_reservation;
     pub mod session_handoff;
     pub mod table_consumer;
     pub mod transport_continuity;
     pub mod transport_continuity_record;
+    pub mod vault_image;
+    pub mod vault_record;
 }
 
 pub mod assets {

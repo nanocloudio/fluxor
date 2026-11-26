@@ -94,16 +94,15 @@ impl FaultPolicy {
 
 /// Fault type codes for last_fault_type.
 pub mod fault_type {
+    use crate::abi::contracts::workload::owners;
     /// No fault.
-    pub const NONE: u8 = 0;
+    pub const NONE: u8 = owners::FAULT_NONE;
     /// Step exceeded deadline (timeout).
-    pub const TIMEOUT: u8 = 1;
+    pub const TIMEOUT: u8 = owners::FAULT_TIMEOUT;
     /// Module returned error from step().
-    pub const STEP_ERROR: u8 = 2;
+    pub const STEP_ERROR: u8 = owners::FAULT_STEP_ERROR;
     /// Module caused an MPU/MMU memory protection fault.
-    pub const MPU_FAULT: u8 = 4;
-    /// Module failed to drain within its deadline.
-    pub const DRAIN_TIMEOUT: u8 = 5;
+    pub const MPU_FAULT: u8 = owners::FAULT_MPU;
 }
 
 /// Per-module fault statistics (queryable via `provider_query`).
@@ -169,6 +168,9 @@ pub enum PostedFault {
     /// The module is `Faulted`: its policy is due a look (the quarantine,
     /// then the restart or the termination once its backoff has passed).
     Advance = 9,
+    /// The step was forced out at its deadline (a gated entry stopped
+    /// mid-run).
+    ForcedOut = 10,
 }
 
 /// Per-module fault bookkeeping (stored in SchedulerState).
@@ -363,6 +365,16 @@ static STEP_TIMED_OUT: [AtomicBool; MAX_STEP_GUARD_CORES] = [
     AtomicBool::new(false),
 ];
 
+/// Per-core flag: the step that timed out was forced out by the protection
+/// backend (a gated entry stopped at its deadline), not merely late. A
+/// forced-out step did not finish, so no policy may treat it as late work.
+static STEP_FORCED_OUT: [AtomicBool; MAX_STEP_GUARD_CORES] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
 /// Per-core module index that the guard is armed for (for ISR
 /// context). `NO_MODULE` means no module is currently guarded on that core.
 static GUARDED_MODULE: [AtomicU16; MAX_STEP_GUARD_CORES] = [
@@ -460,8 +472,17 @@ pub fn record_mpu_fault(module_idx: usize) {
 /// alarm caught: the module's timeout policy applies.
 pub fn record_forced_timeout(module_idx: usize) {
     let c = cur_core();
+    STEP_FORCED_OUT[c].store(true, Ordering::Release);
     STEP_TIMED_OUT[c].store(true, Ordering::Release);
     GUARDED_MODULE[c].store(module_idx as ModuleId, Ordering::Release);
+}
+
+/// Whether the current core's last timeout was a forced-out entry (and
+/// clear): the timeout policy reads it so `Tolerate` never lets a step that
+/// was stopped mid-run count as one that ran late.
+#[inline]
+pub fn take_forced_out() -> bool {
+    STEP_FORCED_OUT[cur_core()].swap(false, Ordering::AcqRel)
 }
 
 /// Check if an MPU fault is pending on the current core (and clear).
@@ -541,6 +562,7 @@ pub fn init() {
 /// stepping on another core's guarded module.
 #[inline]
 pub fn arm(deadline_us: u32) {
+    STEP_FORCED_OUT[cur_core()].store(false, Ordering::Release);
     GUARDED_MODULE[cur_core()].store(
         crate::kernel::exec::scheduler::current_module_id(),
         Ordering::Release,

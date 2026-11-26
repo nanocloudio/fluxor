@@ -19,10 +19,10 @@ Source: `crates/fluxor-abi/src/contracts/net/`.
 |------|---------|---------|--------|
 | `net_proto.rs` | stream | `0x01..0x19` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
-| `packet.rs` | packet | `0x50..0x69` | decision seam live: `ip`, `seam_shard`, `fwd_split`, `packet_echo_director` fixture; endpoint verbs (`0x50..0x52`, `0x60..0x63`) an envelope with no provider |
+| `packet.rs` | packet | `0x53..0x54`, `0x64..0x69` | decision seam live: `ip`, `seam_shard`, `fwd_split`, `packet_echo_director` fixture |
 | `identity.rs` | address control | `0xA0..0xA3`, `0xA8..0xAD` | live: net identity self-registration; `ADDR_ADD`/`DEL`/`ARM`/`FENCE` in, `MSG_ADDR_ADDED`/`ARMED`/`FENCED`/`REFUSED` out, the VIP authority's check and verdict |
 | `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures; downstream `http` as a multi-session anchor with `ws_echo_worker` behind it |
-| `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
+| `mux.rs` | multiplexed session | `0xB1..0xCF` | live: `quic`, `mux_echo` fixture |
 | `peer_identity.rs` | peer identity | `0xC8` (also `mux`'s peer-identity record) | live: `tls`, `quic` |
 
 The exchange contract (`crates/fluxor-abi/src/contracts/exchange.rs`, see
@@ -124,26 +124,15 @@ another owner with `EPERM`.
 
 Contract: `crates/fluxor-abi/src/contracts/net/packet.rs`.
 
-Packet-preserving flows with richer metadata: packet classifiers,
-policy modules, NIC fast paths. The endpoint verbs are an envelope no
-module provides; the decision-seam verbs below are `ip`'s.
-
-TX (`CMD_PKT_TX` 0x51) and RX (`MSG_PKT_RX` 0x61) share the shape
-`[ep_id: u8][af: u8][addr: 4|16 BE][port: u16 LE][lane: u8][flags: u8]
-[dscp: u8][ts_us: u64 LE][flow_hint: u32 LE][packet…]` — a 15-byte
-metadata block after the address, prefixes 23 (`V4_META_PREFIX`) or 35
-(`V6_META_PREFIX`) bytes. RX flags: ECN-CE, checksum-ok,
-has-flow-hint, has-timestamp, fast-path. TX flags: ECN-capable,
-no-checksum, urgent. Bind/close/error opcodes mirror the datagram
-surface (`CMD_PKT_BIND` 0x50, `MSG_PKT_BOUND` 0x60, `CMD_PKT_CLOSE`
-0x52, `MSG_PKT_CLOSED` 0x62, `MSG_PKT_ERROR` 0x63).
-
-The surface composes with mailbox and in-place buffer edges where
-available, but it remains a channel contract.
+The pre-transport decision seam: `ip` hands a director each inbound
+packet's headers before any transport state exists for it, and holds the
+buffer until the director settles it. Decision records carry two flags,
+checksum-ok (`RX_FLAG_CSUM_OK`) and has-timestamp
+(`RX_FLAG_HAS_TIMESTAMP`).
 
 #### Pre-transport decision seam
 
-The same contract carries a second family of verbs, consumed by the `ip`
+The contract's verbs are consumed by the `ip`
 module with `packet_decision = pre_transport`: a point between L3
 validation and transport demux where a director settles every inbound
 IPv4 packet before any connection state exists for it. The stack's own

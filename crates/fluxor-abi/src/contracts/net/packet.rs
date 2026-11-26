@@ -4,17 +4,9 @@
 //
 // See docs/architecture/protocol_surfaces.md §Packet Surface.
 //
-// The packet surface is a channel contract for flows that need
-// packet-preserving behaviour and richer ingress metadata than the
-// datagram surface exposes. Intended consumers: QUIC engines, DTLS /
-// SRTP packet processors, packet policy modules, packet classifiers,
-// direct NIC fast paths, market-data and control-plane packet flows.
-//
-// Two verb families share the surface. The endpoint verbs (bind, tx, rx,
-// close) are an envelope no module in this tree provides or consumes. The
-// decision-seam verbs below them are provided by `modules/foundation/ip`: a
-// director settles every inbound packet before transport state exists for
-// it.
+// The packet surface is the pre-transport decision seam, provided by
+// `modules/foundation/ip`: a director settles every inbound packet before
+// transport state exists for it.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto and datagram so the shared SDK helpers
@@ -22,110 +14,23 @@
 // the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
 // message type of every surface sharing this header a distinct value,
 // so misconfigured channels fail loudly.
-//
-// Relationship to datagram: the packet surface subsumes the datagram
-// envelope and adds ingress/egress metadata (timestamp, lane, ECN/DSCP,
-// offload status, flow hint). A module that only cares about payload
-// bytes and src/dst should use datagram instead; the packet surface is
-// for modules that want to see ingress side-information.
-//
-// Address families and byte order match datagram exactly.
-
-/// Frame header size (msg_type + len).
-pub const FRAME_HDR: usize = 3;
 
 /// Address family: IPv4 (4-byte address, big-endian).
 pub const AF_INET: u8 = 4;
 /// Address family: IPv6 (16-byte address, big-endian).
 pub const AF_INET6: u8 = 6;
 
-// ─── RX flags (provider → consumer, MSG_PKT_RX) ────────────────────
+// ─── Decision-record flags (`MSG_PKT_DECIDE`, `MSG_PKT_DECIDE6`) ──────
 
-/// The ingress packet had ECN codepoint CE (congestion experienced).
-pub const RX_FLAG_ECN_CE: u8 = 1 << 0;
 /// Hardware or driver verified the L4 checksum as correct.
 pub const RX_FLAG_CSUM_OK: u8 = 1 << 1;
-/// The `flow_hint` field is meaningful (non-zero is not sufficient by itself
-/// — some providers may supply `flow_hint = 0` legitimately).
-pub const RX_FLAG_HAS_FLOW_HINT: u8 = 1 << 2;
 /// The `ts_us` field is meaningful. If clear, `ts_us` is provider-synthesised
 /// and may be approximate.
 pub const RX_FLAG_HAS_TIMESTAMP: u8 = 1 << 3;
-/// Packet arrived via a fast path (e.g. mailbox edge, zero-copy NIC ring).
-pub const RX_FLAG_FAST_PATH: u8 = 1 << 4;
-
-// ─── TX flags (consumer → provider, CMD_PKT_TX) ────────────────────
-
-/// Request ECN-capable transmit (set ECT(0) or ECT(1) per policy).
-pub const TX_FLAG_ECN_CAPABLE: u8 = 1 << 0;
-/// Skip L4 checksum offload hint (checksum is already in the payload).
-pub const TX_FLAG_NO_CSUM: u8 = 1 << 1;
-/// Urgent: bypass egress pacing queues if supported.
-pub const TX_FLAG_URGENT: u8 = 1 << 2;
-
-// ─── Upstream: consumer → provider ─────────────────────────────────
-
-/// Bind a new packet endpoint to a local port.
-/// Payload: [port: u16 LE] [flags: u8].
-/// Port 0 requests ephemeral allocation. Provider responds with
-/// MSG_PKT_BOUND carrying the allocated ep_id and local_port.
-pub use super::super::super::registry::msg::packet::CMD_PKT_BIND;
-
-/// Send a packet from `ep_id` to the given destination.
-///
-/// IPv4 payload:
-///   [ep_id: u8] [af: u8 = 4] [dst_addr: 4 bytes BE] [dst_port: u16 LE]
-///   [lane_hint: u8] [flags: u8] [dscp: u8]
-///   [ts_us: u64 LE] [flow_hint: u32 LE]
-///   [packet: ...]
-///
-/// IPv6 payload:
-///   [ep_id: u8] [af: u8 = 6] [dst_addr: 16 bytes BE] [dst_port: u16 LE]
-///   [lane_hint: u8] [flags: u8] [dscp: u8]
-///   [ts_us: u64 LE] [flow_hint: u32 LE]
-///   [packet: ...]
-///
-/// On TX, `ts_us` is a caller-supplied desired transmit timestamp (0 = send
-/// now). `lane_hint = 0` means the provider chooses.
-pub use super::super::super::registry::msg::packet::CMD_PKT_TX;
-
-/// Close an endpoint and release its resources.
-/// Payload: [ep_id: u8].
-pub use super::super::super::registry::msg::packet::CMD_PKT_CLOSE;
-
-// ─── Downstream: provider → consumer ───────────────────────────────
-
-/// Bind completed. Payload: [ep_id: u8] [local_port: u16 LE].
-pub use super::super::super::registry::msg::packet::MSG_PKT_BOUND;
-
-/// Received packet with full ingress metadata.
-///
-/// IPv4 payload:
-///   [ep_id: u8] [af: u8 = 4] [src_addr: 4 bytes BE] [src_port: u16 LE]
-///   [lane: u8] [flags: u8] [dscp: u8]
-///   [ts_us: u64 LE] [flow_hint: u32 LE]
-///   [packet: ...]
-///
-/// IPv6 payload:
-///   [ep_id: u8] [af: u8 = 6] [src_addr: 16 bytes BE] [src_port: u16 LE]
-///   [lane: u8] [flags: u8] [dscp: u8]
-///   [ts_us: u64 LE] [flow_hint: u32 LE]
-///   [packet: ...]
-///
-/// `ts_us` is monotonic microseconds at ingress (from `TIMER_MICROS`) when
-/// `RX_FLAG_HAS_TIMESTAMP` is set; approximate otherwise.
-pub use super::super::super::registry::msg::packet::MSG_PKT_RX;
-
-/// Endpoint closed. Payload: [ep_id: u8].
-pub use super::super::super::registry::msg::packet::MSG_PKT_CLOSED;
-
-/// Endpoint error. Payload: [ep_id: u8] [errno: i8].
-pub use super::super::super::registry::msg::packet::MSG_PKT_ERROR;
 
 // ─── Pre-transport decision seam ───────────────────────────────────
 //
-// A second use of this surface, alongside the endpoint verbs above: the
-// `ip` module, with `packet_decision = "pre_transport"`, parses and
+// The `ip` module, with `packet_decision = "pre_transport"`, parses and
 // validates every inbound IPv4 packet (and, with `seam_v6`, every IPv6
 // packet to the addresses it names) ONCE and — before any connection
 // state is created — hands a director the headers and holds the buffer
@@ -336,18 +241,3 @@ pub mod reject {
     /// ICMP destination unreachable, port unreachable.
     pub const ICMP_UNREACHABLE: u8 = 2;
 }
-
-// ─── Payload layout helpers ────────────────────────────────────────
-
-/// Size of the metadata block that follows the address fields in both
-/// CMD_PKT_TX and MSG_PKT_RX: `[lane:1][flags:1][dscp:1][ts_us:8 LE][flow_hint:4 LE]`.
-pub const META_BLOCK: usize = 1 + 1 + 1 + 8 + 4;
-
-/// Byte offset of the first packet byte in a CMD_PKT_TX / MSG_PKT_RX payload
-/// when the address family is IPv4. Layout:
-/// `[ep_id:1][af:1][addr:4][port:2][lane:1][flags:1][dscp:1][ts_us:8][flow_hint:4]`.
-pub const V4_META_PREFIX: usize = 1 + 1 + 4 + 2 + META_BLOCK;
-
-/// Byte offset of the first packet byte in a CMD_PKT_TX / MSG_PKT_RX payload
-/// when the address family is IPv6.
-pub const V6_META_PREFIX: usize = 1 + 1 + 16 + 2 + META_BLOCK;

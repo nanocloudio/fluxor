@@ -88,8 +88,8 @@ unsafe fn size_tables(config: &Config) -> Result<(), crate::kernel::sys::resourc
         .size(owners)
         .map_err(|e| refused(res::POOL_OWNERS, e))?;
     // Every per-owner table is the owner table's size: one log ring, one
-    // code-pack region (and one being staged), one graph-workload slot per
-    // owner slot; the graph-local pacers and the resident-graph index hold
+    // code-pack region (and one being staged), one graph-workload slot and
+    // one entry of admitted endpoints per owner slot; the graph-local pacers and the resident-graph index hold
     // one entry per owner slot and execution domain.
     super::pacer::size_graph_pacers(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     super::multigraph::size_resident_graphs(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
@@ -98,23 +98,35 @@ unsafe fn size_tables(config: &Config) -> Result<(), crate::kernel::sys::resourc
     crate::kernel::workload::code_pack::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     crate::kernel::workload::workload_graph::size(owners)
         .map_err(|e| refused(res::POOL_OWNERS, e))?;
+    crate::kernel::workload::endpoints::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     crate::kernel::module::provider::size_routes(whole(res::POOL_HANDLES))
+        .map_err(|e| refused(res::POOL_HANDLES, e))?;
+    // SAFETY: graph preparation, as the caller's contract.
+    unsafe { crate::kernel::module::gateway::size_handles(whole(res::POOL_HANDLES)) }
         .map_err(|e| refused(res::POOL_HANDLES, e))?;
     crate::kernel::ipc::lend::size(whole(res::POOL_LENDS))
         .map_err(|e| refused(res::POOL_LENDS, e))?;
     crate::kernel::module::loader::size_free_list(whole(res::POOL_STATE_FREE_LIST))
         .map_err(|e| refused(res::POOL_STATE_FREE_LIST, e))?;
-    crate::kernel::net_policy::size(
-        whole(res::POOL_NET_POLICY_TABLES),
-        whole(res::POOL_NET_POLICY_TABLE_BYTES),
-    )
-    .map_err(|e| refused(res::POOL_NET_POLICY_TABLES, e))?;
-    crate::kernel::net_route::size(
-        whole(res::POOL_NET_ROUTE_SEGMENTS),
-        whole(res::POOL_NET_ROUTE_PEERS),
-        whole(res::POOL_NET_ROUTE_HELD),
-    )
-    .map_err(|e| refused(res::POOL_NET_ROUTE_SEGMENTS, e))?;
+    // The isolation slots: the node graph's isolated modules, plus the
+    // reserve workloads' gated modules take theirs from.
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        ledger::set_derived(
+            res::POOL_ISOLATED_SLOTS,
+            isolated_node_modules(config) as u32,
+        );
+        // SAFETY: graph preparation, as the caller's contract.
+        if unsafe { crate::arch::aarch64::isolation::size_slots(whole(res::POOL_ISOLATED_SLOTS)) }
+            .is_err()
+        {
+            ledger::refuse(
+                res::POOL_ISOLATED_SLOTS,
+                "its tables do not fit the carve zone",
+            );
+            return Err(ledger::Refused);
+        }
+    }
     // A ring per edge with an interrupt-mode end; past the profile's rings
     // an edge loses its routing, logged when it is wired.
     // SAFETY: the caller's contract, forwarded.
@@ -127,7 +139,17 @@ unsafe fn size_tables(config: &Config) -> Result<(), crate::kernel::sys::resourc
     Ok(())
 }
 
-/// Edges of the node graph with an end in an interrupt-mode domain.
+/// Modules of the node graph whose params ask for isolation.
+#[cfg(feature = "chip-bcm2712")]
+fn isolated_node_modules(config: &Config) -> usize {
+    (0..usize::from(config.module_count))
+        .filter_map(|i| config.modules.get(i).copied().flatten())
+        .filter(|m| super::params_level(m.params()) == fluxor_contracts::isolation::Level::Isolated)
+        .count()
+}
+
+/// Edges of the node graph with an end in an interrupt-mode domain. A lane
+/// edge is never bridged.
 fn isr_edges(config: &Config) -> usize {
     let isr = |id: ModuleId| {
         config
@@ -148,7 +170,7 @@ fn isr_edges(config: &Config) -> usize {
         .iter()
         .take(config.edge_count as usize)
         .flatten()
-        .filter(|e| isr(e.from_id) || isr(e.to_id))
+        .filter(|e| e.lane.is_none() && (isr(e.from_id) || isr(e.to_id)))
         .count()
 }
 
@@ -185,22 +207,6 @@ pub fn setup() -> bool {
     true
 }
 
-/// Whether the module `name_hash` names declares what the `vault_store`
-/// contract asks of whoever calls it: the graph's store for the vault's
-/// records, by its manifest rather than by its name.
-fn keeps_vault_records(loader: &ModuleLoader, name_hash: u32) -> bool {
-    use crate::abi::registry::{contract_grant, vault_store, OpGrant};
-    let Ok(m) = loader.find_by_name_hash(name_hash) else {
-        return false;
-    };
-    let held = m.manifest_grants();
-    match contract_grant(vault_store::ID) {
-        Some(OpGrant::Contract(c)) => held[0] & (1u64 << c) != 0,
-        Some(OpGrant::Grant(g)) => held[1] & (1u64 << g) != 0,
-        Some(OpGrant::Free) | None => false,
-    }
-}
-
 /// Prepare the node's graph: release the previous graph, reset the kernel's
 /// tables to the plan the installed config derives, and stage the config's
 /// composed graph through the splice under the node owner
@@ -229,17 +235,9 @@ pub fn prepare_graph() -> Result<super::splice::StagedAdd, i32> {
         return Err(crate::kernel::sys::errno::E2BIG);
     }
 
-    // A graph that keeps the vault's records through a store module says so
-    // before any module runs: until that store loads, the vault answers
-    // `EAGAIN` rather than read the platform's store, or none, as its own
-    // and mint a key over one already kept.
-    // SAFETY: graph preparation, the loader's single reader.
-    let loader = unsafe { static_loader() };
-    crate::kernel::security::vault_store::expect(
-        composed
-            .modules()
-            .any(|m| keeps_vault_records(loader, m.name_hash)),
-    );
+    // The loader's table may change under this graph: no blob digest the
+    // composition record cached for the last one stands.
+    super::attest::forget_blob_digests();
 
     log::info!("[graph] modules={module_count} edges={edge_count}");
 
@@ -298,15 +296,14 @@ pub fn prepare_graph() -> Result<super::splice::StagedAdd, i32> {
     // non-BCM2712 platforms.
     crate::kernel::sys::hal::protection_reset();
     crate::kernel::ipc::channel::reset_all();
+    crate::kernel::sys::telemetry_ring::reset();
     crate::kernel::ipc::buffer_pool::reset_all();
     crate::kernel::ipc::buffer_pool::reset_buffer_arena();
     crate::kernel::module::provider::reset_handle_tracking();
     crate::kernel::module::provider::reset_module_layers();
-    // The old graph's slots no longer name net.route writers; the tables stay.
-    crate::kernel::net_route::reset_bindings();
-    // A module net provider and the lanes queued for it belong to the old
-    // graph; a native one registers again as the new graph instantiates.
-    crate::kernel::workload::net_attach::reset_queued();
+    // The lane targets and every lane queued for them belong to the old
+    // graph; the new graph's declare theirs as they instantiate.
+    crate::kernel::workload::lanes::reset();
     // The previous graph's interrupt-mode registrations and bridge slots go
     // before the new graph registers its own.
     crate::kernel::exec::interrupt::reset_all();
@@ -314,7 +311,9 @@ pub fn prepare_graph() -> Result<super::splice::StagedAdd, i32> {
     sched.reset();
     // A resident owner's state is charged again as the new graph
     // instantiates its modules; what the previous graph charged goes.
-    sched.owners.clear_state_charges();
+    sched
+        .owners
+        .clear_charges(crate::abi::contracts::resource::OWNER_LINE_STATE);
     // The pacer statics live outside `SCHED`: a rebuilt graph starts from a
     // clean cadence rather than the prior graph's.
     pacer_reset_all();
@@ -543,7 +542,9 @@ pub(crate) fn wire_isr_bridges(edges: &mut [Edge]) {
     };
     let mut wired: u16 = 0;
     for edge in edges.iter_mut() {
-        if edge.bridge_slot >= 0 {
+        // A lane end is a node module of a cooperative domain, which takes
+        // the lane's channels itself.
+        if edge.bridge_slot >= 0 || edge.lane != LaneEnd::None {
             continue;
         }
         let from_d = sched.domain_id[edge.from_module] as usize;

@@ -378,11 +378,6 @@ pub mod el0 {
     // generated at build time from the silicon's `[isolation]` section.
     include!(concat!(env!("OUT_DIR"), "/isolation_generated.rs"));
 
-    /// Max modules isolated at once: the static L1/L2/L3 + stack slabs.
-    /// The composer admits against `[isolation] isolated_slots`, pinned to
-    /// this; a module that finds no free slot is refused at load, never
-    /// run privileged instead.
-    pub const MAX_ISO: usize = 2;
     /// L3 tables per isolated module. Each maps one 2 MB window at 4 KB
     /// granularity; one per distinct 2 MB-aligned window the module's
     /// regions (code, state, heap, stack, trampoline) and the kernel
@@ -412,6 +407,8 @@ pub mod el0 {
     /// (`map_4k` carves it out of the kernel base), so it needs only page
     /// alignment.
     const STACK_SLAB_BYTES: usize = 4096 + super::ISOLATED_STACK_BYTES; // guard page + stack
+    /// Pages of a stack slab.
+    const STACK_SLAB_PAGES: usize = STACK_SLAB_BYTES / 4096;
 
     // ---- Per-core EL0 control block ------------------------------------
     //
@@ -545,49 +542,151 @@ pub mod el0 {
         [Z; MAX_CORES]
     };
 
-    // ---- Per-isolated-module page tables ------------------------------
+    // ---- Isolation slots ------------------------------------------------
+    //
+    // A slot holds one isolated module's translation tables. The slots are
+    // the `isolated_slots` pool: sized at boot from the plan and carved from
+    // DRAM (`kernel::mem::carve`), never a compiled array. The tables may sit
+    // anywhere the kernel maps — the walker reads them by address — but a
+    // module's EL0 memory must lie in the kernel base its table maps, so its
+    // stack comes from the isolated page pool (`loader::alloc_isolated_pages`)
+    // for as long as it holds the slot.
     #[repr(C, align(4096))]
     struct IsoL2([u64; TABLE_ENTRIES]);
 
-    static mut ISO_L1: [PageTable; MAX_ISO] = {
-        const E: PageTable = PageTable([0; TABLE_ENTRIES]);
-        [E; MAX_ISO]
-    };
-    /// One L2 table per kernel-base GB (`KERNEL_BASE_GB`) per module. The
-    /// module table is a full EL1 identity map of low DRAM (so exception
-    /// vectors / handler code / `EL0_CBS` / kernel channel code+data are
-    /// reachable at EL1 while TTBR0 holds the module table) with the
-    /// module's own regions carved to EL0 access at 4 KB. Indexed by the
-    /// 1 GB (L1) index.
-    static mut ISO_L2: [[IsoL2; KERNEL_BASE_GB_MAX]; MAX_ISO] = {
-        const E: IsoL2 = IsoL2([0; TABLE_ENTRIES]);
-        const M: [IsoL2; KERNEL_BASE_GB_MAX] = [E; KERNEL_BASE_GB_MAX];
-        [M; MAX_ISO]
-    };
-    /// One L2 per module for the gigabyte its device window lies in, and
-    /// that gigabyte's L1 index (`usize::MAX` for none). A window is one
-    /// peripheral block, so it never spans two gigabytes.
-    static mut ISO_DEV_L2: [IsoL2; MAX_ISO] = {
-        const E: IsoL2 = IsoL2([0; TABLE_ENTRIES]);
-        [E; MAX_ISO]
-    };
-    static mut ISO_DEV_GB: [usize; MAX_ISO] = [usize::MAX; MAX_ISO];
-    static mut ISO_L3: [[L3PageTable; MAX_L3]; MAX_ISO] = {
-        const E: L3PageTable = L3PageTable([0; TABLE_ENTRIES]);
-        [[E; MAX_L3]; MAX_ISO]
-    };
-    /// How many L3 tables are committed for each module, and which 2 MB
-    /// window (`l1<<9 | l2` index key) each maps.
-    static mut ISO_L3_USED: [usize; MAX_ISO] = [0; MAX_ISO];
-    static mut ISO_L3_KEY: [[u32; MAX_L3]; MAX_ISO] = [[0; MAX_L3]; MAX_ISO];
-
-    /// EL0 stack slabs, page-aligned. Page 0 = guard (unmapped).
+    /// One slot's tables. The module table is a full EL1 identity map of
+    /// low DRAM (so exception vectors / handler code / `EL0_CBS` / kernel
+    /// channel code+data are reachable at EL1 while TTBR0 holds it) with the
+    /// module's own regions carved to EL0 access at 4 KB.
     #[repr(C, align(4096))]
-    struct StackSlab([u8; STACK_SLAB_BYTES]);
-    static mut ISO_STACKS: [StackSlab; MAX_ISO] = {
-        const Z: StackSlab = StackSlab([0; STACK_SLAB_BYTES]);
-        [Z; MAX_ISO]
-    };
+    struct IsoTables {
+        l1: PageTable,
+        /// One L2 per kernel-base GB (`KERNEL_BASE_GB`), indexed by the
+        /// 1 GB (L1) index.
+        l2: [IsoL2; KERNEL_BASE_GB_MAX],
+        /// The L2 for the gigabyte the module's device window lies in. A
+        /// window is one peripheral block, so it never spans two gigabytes.
+        dev_l2: IsoL2,
+        l3: [L3PageTable; MAX_L3],
+    }
+
+    /// One slot's bookkeeping.
+    struct IsoSlot {
+        /// The module holding the slot, `usize::MAX` when free. Claimed at
+        /// registration, released at teardown.
+        owner: AtomicUsize,
+        /// The table is complete and published: `enter` may use it.
+        built: bool,
+        /// The device gigabyte's L1 index, `usize::MAX` for none.
+        dev_gb: usize,
+        /// L3 tables committed, and the 2 MB window (`l1<<9 | l2`) each maps.
+        l3_used: usize,
+        l3_key: [u32; MAX_L3],
+        /// The EL0 stack slab (guard page + stack) while the slot is held.
+        stack: *mut u8,
+        /// SP_EL0 top (computed in `build_table`).
+        sp_top: u64,
+        /// Clean-call counter for the confirmation log.
+        ok_count: u32,
+    }
+
+    /// The carved slot pool: tables and bookkeeping, `SLOT_COUNT` of each.
+    static mut SLOT_TABLES: *mut IsoTables = core::ptr::null_mut();
+    static mut SLOT_INFO: *mut IsoSlot = core::ptr::null_mut();
+    static SLOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Slots in the pool.
+    fn slot_count() -> usize {
+        SLOT_COUNT.load(Ordering::Acquire)
+    }
+
+    /// Slot `slot`'s tables.
+    ///
+    /// # Safety
+    /// `slot < slot_count()`; the setup path is the only writer, and the
+    /// step path reads a published slot's tables only.
+    unsafe fn tables(slot: usize) -> &'static mut IsoTables {
+        // SAFETY: the caller's contract; the block holds `slot_count()`.
+        unsafe { &mut *SLOT_TABLES.add(slot) }
+    }
+
+    /// Slot `slot`'s bookkeeping.
+    ///
+    /// # Safety
+    /// As [`tables`].
+    unsafe fn info(slot: usize) -> &'static mut IsoSlot {
+        // SAFETY: the caller's contract.
+        unsafe { &mut *SLOT_INFO.add(slot) }
+    }
+
+    /// Size the slot pool to `n` slots: carved from DRAM, zeroed, every slot
+    /// free. A pool already large enough is kept. `Err` when the carve
+    /// cannot hold it.
+    ///
+    /// # Safety
+    /// Graph preparation: no module is isolated and secondary cores are
+    /// parked.
+    pub unsafe fn size_slots(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+        if n <= slot_count() {
+            return Ok(());
+        }
+        let tb = n * core::mem::size_of::<IsoTables>();
+        let ib = n * core::mem::size_of::<IsoSlot>();
+        use crate::kernel::mem::table::TableError;
+        let t = crate::kernel::mem::carve::carve(tb, core::mem::align_of::<IsoTables>())
+            .ok_or(TableError::NoMemory)?;
+        let Some(i) = crate::kernel::mem::carve::carve(ib, core::mem::align_of::<IsoSlot>()) else {
+            // SAFETY: the block just carved, unused.
+            unsafe { crate::kernel::mem::carve::retire(t, tb) };
+            return Err(TableError::NoMemory);
+        };
+        let old = slot_count();
+        // SAFETY: the caller's contract; the old blocks are unused.
+        unsafe {
+            if old > 0 {
+                crate::kernel::mem::carve::retire(
+                    SLOT_TABLES.cast(),
+                    old * core::mem::size_of::<IsoTables>(),
+                );
+                crate::kernel::mem::carve::retire(
+                    SLOT_INFO.cast(),
+                    old * core::mem::size_of::<IsoSlot>(),
+                );
+            }
+            SLOT_TABLES = t.cast();
+            SLOT_INFO = i.cast();
+            for k in 0..n {
+                core::ptr::write(
+                    SLOT_INFO.add(k),
+                    IsoSlot {
+                        owner: AtomicUsize::new(usize::MAX),
+                        built: false,
+                        dev_gb: usize::MAX,
+                        l3_used: 0,
+                        l3_key: [0; MAX_L3],
+                        stack: core::ptr::null_mut(),
+                        sp_top: 0,
+                        ok_count: 0,
+                    },
+                );
+            }
+        }
+        SLOT_COUNT.store(n, Ordering::Release);
+        Ok(())
+    }
+
+    /// Slots held now.
+    pub fn slots_in_use() -> usize {
+        // SAFETY: each index below `slot_count()` is an initialised slot.
+        (0..slot_count())
+            .filter(|&k| unsafe { info(k) }.owner.load(Ordering::Acquire) != usize::MAX)
+            .count()
+    }
+
+    /// Slots free now.
+    pub fn free_slots() -> usize {
+        slot_count() - slots_in_use()
+    }
 
     /// The trampoline page, mapped RO+X at EL0 in every isolated module's
     /// table. Words `2·op, 2·op+1` are op `op`'s veneer, `svc #op; ret`,
@@ -620,23 +719,9 @@ pub mod el0 {
     const GATEWAY_TABLE_OFFSET: usize = 256;
     const _: () = assert!(8 * (RETURN_OP + 1) <= GATEWAY_TABLE_OFFSET);
 
-    /// Owner of each isolated slot, `usize::MAX` when free. A slot is
-    /// claimed at registration and released at teardown.
-    static ISO_SLOT_OWNER: [AtomicUsize; MAX_ISO] =
-        [const { AtomicUsize::new(usize::MAX) }; MAX_ISO];
-
-    /// Maps a scheduler module index → isolated-slot (0..MAX_ISO), or
-    /// `usize::MAX` if not isolated. `ISO_BUILT[slot]` gates `enter`.
+    /// Maps a scheduler module index → isolated slot, or `usize::MAX` if
+    /// not isolated. A slot's `built` gates `enter`.
     static mut MOD_TO_SLOT: [usize; super::MAX_MODULES] = [usize::MAX; super::MAX_MODULES];
-    static mut ISO_BUILT: [bool; MAX_ISO] = [false; MAX_ISO];
-    /// SP_EL0 top for each isolated slot (computed in `build_table`).
-    static mut ISO_SP_TOP: [u64; MAX_ISO] = [0; MAX_ISO];
-    /// Per-slot clean-call counter. The first `EL0_OK_LOG_FIRST` clean EL0
-    /// round trips, then every `EL0_OK_LOG_EVERY`th, log a confirmation
-    /// line (proof of EL0 execution and a clean SVC return). Recurring, not
-    /// one-shot, so the line also reaches a log stream that only starts once
-    /// the module is networking, well after its first call.
-    static mut ISO_OK_COUNT: [u32; MAX_ISO] = [0; MAX_ISO];
     /// Clean calls logged unconditionally from a slot's first.
     const EL0_OK_LOG_FIRST: u32 = 64;
     /// The confirmation period after the first `EL0_OK_LOG_FIRST`. Small
@@ -663,7 +748,7 @@ pub mod el0 {
         // populated and only read on the step path.
         unsafe {
             let slot = MOD_TO_SLOT[module_idx];
-            slot != usize::MAX && slot < MAX_ISO && ISO_BUILT[slot]
+            slot < slot_count() && info(slot).built
         }
     }
 
@@ -678,20 +763,20 @@ pub mod el0 {
             for i in 0..super::MAX_MODULES {
                 (*m)[i] = usize::MAX;
             }
-            let b = core::ptr::addr_of_mut!(ISO_BUILT);
-            let ok = core::ptr::addr_of_mut!(ISO_OK_COUNT);
-            for i in 0..MAX_ISO {
-                (*b)[i] = false;
-                (*ok)[i] = 0;
+            // Every slot free: the isolated page pool is emptied by the same
+            // rebuild (`loader::reset_state_arena`), stacks with it.
+            for k in 0..slot_count() {
+                let slot = info(k);
+                slot.built = false;
+                slot.ok_count = 0;
+                slot.stack = core::ptr::null_mut();
+                slot.owner.store(usize::MAX, Ordering::Relaxed);
             }
             // Clear all per-module region records; instantiation re-sets
             // them for the new graph.
             let ri = core::ptr::addr_of_mut!(MODULE_REGION_INFO);
             for i in 0..super::MAX_MODULES {
                 (*ri)[i] = super::ModuleRegions::empty();
-            }
-            for owner in ISO_SLOT_OWNER.iter() {
-                owner.store(usize::MAX, Ordering::Relaxed);
             }
             // Invalidate every stage-1 EL1&0 translation, inner-shareable,
             // before the graph rebuilds. A module's ASID is its index + 1,
@@ -864,40 +949,36 @@ pub mod el0 {
                 );
                 return false;
             }
-            let Some(slot) = ISO_SLOT_OWNER.iter().position(|o| {
-                o.compare_exchange(usize::MAX, module_idx, Ordering::AcqRel, Ordering::Relaxed)
+            let Some(slot) = (0..slot_count()).find(|&k| {
+                info(k)
+                    .owner
+                    .compare_exchange(usize::MAX, module_idx, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             }) else {
-                log::warn!("[el0] module {module_idx}: no isolated slot free (max {MAX_ISO})");
+                log::warn!(
+                    "[el0] module {module_idx}: no isolated slot free ({} slots)",
+                    slot_count()
+                );
                 return false;
             };
+            // The stack: fresh zeroed pages of the isolated pool, so none of
+            // a previous module's frames survive into it.
+            let Some(slab) = crate::kernel::module::loader::alloc_isolated_pages(STACK_SLAB_PAGES)
+            else {
+                log::warn!("[el0] module {module_idx}: no isolated pages for its stack");
+                info(slot).owner.store(usize::MAX, Ordering::Release);
+                return false;
+            };
+            info(slot).stack = slab;
 
             // Fresh tables for this slot.
-            for e in ISO_L1[slot].0.iter_mut() {
-                *e = 0;
-            }
-            for t in ISO_L2[slot].iter_mut() {
-                for e in t.0.iter_mut() {
-                    *e = 0;
-                }
-            }
-            for t in ISO_L3[slot].iter_mut() {
-                for e in t.0.iter_mut() {
-                    *e = 0;
-                }
-            }
-            ISO_L3_USED[slot] = 0;
-            for e in ISO_DEV_L2[slot].0.iter_mut() {
-                *e = 0;
-            }
-            ISO_DEV_GB[slot] = usize::MAX;
-            // A slot's stack is the module's own memory: none of the
-            // previous occupant's frames survive into it.
             core::ptr::write_bytes(
-                core::ptr::addr_of_mut!(ISO_STACKS[slot]).cast::<u8>(),
+                core::ptr::addr_of_mut!(*tables(slot)).cast::<u8>(),
                 0,
-                STACK_SLAB_BYTES,
+                core::mem::size_of::<IsoTables>(),
             );
+            info(slot).l3_used = 0;
+            info(slot).dev_gb = usize::MAX;
 
             // Seed the kernel EL1-only identity base so the vectors and
             // the trap path are reachable at EL1 while this table is
@@ -908,7 +989,7 @@ pub mod el0 {
             // region must map completely, or the table is not published.
             let mut mapped = true;
             let tramp = core::ptr::addr_of!(FLUXOR_EL0_TRAMP) as u64;
-            let slab = core::ptr::addr_of!(ISO_STACKS[slot]) as u64;
+            let slab = slab as u64;
             let stack_lo = slab + PAGE; // first mapped page (guard = slab..slab+PAGE)
             mapped &= map_region(slot, r.code_base, r.code_size, AP_EL0_RO, false); // RO + X
             mapped &= map_region(slot, r.state_base, r.state_size, AP_EL0_RW, true); // RW + XN
@@ -946,10 +1027,10 @@ pub mod el0 {
             }
             // EL0 stack above an unmapped guard page.
             mapped &= map_region(slot, stack_lo, EL0_STACK_BYTES, AP_EL0_RW, true);
-            ISO_SP_TOP[slot] = stack_lo + EL0_STACK_BYTES; // grows down
-                                                           // The kernel stacks' guard pages stay unmapped under this
-                                                           // table too: the kernel runs on them while serving this
-                                                           // module's traps and interrupts.
+            info(slot).sp_top = stack_lo + EL0_STACK_BYTES; // grows down
+                                                            // The kernel stacks' guard pages stay unmapped under this
+                                                            // table too: the kernel runs on them while serving this
+                                                            // module's traps and interrupts.
             for guard in super::kernel_stack_guards() {
                 mapped &= unmap_4k(slot, guard);
             }
@@ -959,7 +1040,7 @@ pub mod el0 {
                     "[el0] module {module_idx}: page-table build INCOMPLETE (region out of \
                      window or L3 pool exhausted) — refusing to publish (fail closed)"
                 );
-                ISO_SLOT_OWNER[slot].store(usize::MAX, Ordering::Release);
+                release_slot(slot);
                 return false;
             }
 
@@ -967,24 +1048,32 @@ pub mod el0 {
             // then invalidate the EL1&0 regime on every core, so no entry
             // or walk cached under this module's ASID by an earlier holder
             // of the index survives.
+            let asid = module_asid(module_idx);
             core::arch::asm!(
                 "dsb ishst",
-                "tlbi vmalle1is",
+                "tlbi aside1is, {a}",
                 "dsb ish",
                 "isb",
+                a = in(reg) asid << 48,
                 options(nostack, preserves_flags),
             );
             MOD_TO_SLOT[module_idx] = slot;
-            ISO_BUILT[slot] = true;
-            ISO_OK_COUNT[slot] = 0;
-            log::info!(
+            info(slot).built = true;
+            info(slot).ok_count = 0;
+            let level = if crate::kernel::exec::scheduler::module_owner(module_idx).is_node() {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
                 "[el0] module {module_idx} isolated slot={slot} \
                  code=0x{:x}+{} state=0x{:x}+{} sp_top=0x{:x}",
                 r.code_base,
                 r.code_size,
                 r.state_base,
                 r.state_size,
-                ISO_SP_TOP[slot]
+                info(slot).sp_top
             );
             crate::kernel::module::gateway::set_stack(
                 module_idx,
@@ -1006,12 +1095,11 @@ pub mod el0 {
         // SAFETY: teardown runs with the module no longer stepping.
         unsafe {
             let slot = MOD_TO_SLOT[module_idx];
-            if slot >= MAX_ISO {
+            if slot >= slot_count() {
                 return;
             }
             MOD_TO_SLOT[module_idx] = usize::MAX;
-            ISO_BUILT[slot] = false;
-            ISO_SLOT_OWNER[slot].store(usize::MAX, Ordering::Release);
+            release_slot(slot);
             // The module's ASID must not resolve to its old pages.
             let asid = module_asid(module_idx);
             core::arch::asm!(
@@ -1023,6 +1111,26 @@ pub mod el0 {
                 options(nostack, preserves_flags),
             );
         }
+    }
+
+    /// Free slot `slot`: its stack back to the isolated page pool (zeroed),
+    /// then the slot itself.
+    ///
+    /// # Safety
+    /// `slot < slot_count()`, and no core runs under its table.
+    unsafe fn release_slot(slot: usize) {
+        // SAFETY: the caller's contract.
+        let s = unsafe { info(slot) };
+        s.built = false;
+        if !s.stack.is_null() {
+            // SAFETY: the slab `alloc_isolated_pages` gave this slot,
+            // referenced by nothing once the module is out.
+            unsafe {
+                crate::kernel::module::loader::free_isolated_pages(s.stack, STACK_SLAB_PAGES)
+            };
+            s.stack = core::ptr::null_mut();
+        }
+        s.owner.store(usize::MAX, Ordering::Release);
     }
 
     /// Identity-map `[base, base+size)` into slot `slot`'s tables at
@@ -1060,7 +1168,7 @@ pub mod el0 {
             // make_block_desc(phys, attr, ap, xn_el0, xn_el1):
             //   AP_EL1_RW → EL0 no access; xn_el0=true (UXN); xn_el1=false
             //   (PXN=0, EL1 may execute kernel code/vectors).
-            ISO_L1[slot].0[gb] = make_block_desc(phys, ATTR_IDX_NORMAL, AP_EL1_RW, true, false);
+            tables(slot).l1.0[gb] = make_block_desc(phys, ATTR_IDX_NORMAL, AP_EL1_RW, true, false);
         }
         seed_kernel_mmio(slot);
     }
@@ -1080,7 +1188,7 @@ pub mod el0 {
         for &gb in super::kernel_mmio_gb().iter() {
             let phys = (gb as u64) * L1_BLOCK_SIZE;
             // Device-nGnRE, EL1 RW, EL0 no-access, XN at both ELs.
-            ISO_L1[slot].0[gb] = make_block_desc(phys, ATTR_IDX_DEVICE, AP_EL1_RW, true, true);
+            tables(slot).l1.0[gb] = make_block_desc(phys, ATTR_IDX_DEVICE, AP_EL1_RW, true, true);
         }
     }
 
@@ -1108,15 +1216,15 @@ pub mod el0 {
         if l1i >= TABLE_ENTRIES {
             return (0, 0, 0);
         }
-        let l1 = ISO_L1[slot].0[l1i];
+        let l1 = tables(slot).l1.0[l1i];
         if l1 & DESC_TABLE == 0 {
             return (l1, 0, 0); // L1 block — no L2/L3
         }
         let l2i = ((va >> 21) & 0x1FF) as usize;
         let l2 = if l1i < kernel_base_gb() {
-            ISO_L2[slot][l1i].0[l2i]
+            tables(slot).l2[l1i].0[l2i]
         } else {
-            ISO_DEV_L2[slot].0[l2i]
+            tables(slot).dev_l2.0[l2i]
         };
         if l2 & DESC_TABLE == 0 {
             return (l1, l2, 0); // L2 block — no L3: the carve never took effect
@@ -1207,16 +1315,16 @@ pub mod el0 {
         // table, nothing in any other device gigabyte.
         let kernel_mmio = super::kernel_mmio_gb().contains(&l1i);
         let l2: *mut IsoL2 = if l1i < kernel_base_gb() {
-            core::ptr::addr_of_mut!(ISO_L2[slot][l1i])
+            core::ptr::addr_of_mut!(tables(slot).l2[l1i])
         } else if device && l1i < TABLE_ENTRIES {
-            if ISO_DEV_GB[slot] == usize::MAX {
-                ISO_DEV_GB[slot] = l1i;
+            if info(slot).dev_gb == usize::MAX {
+                info(slot).dev_gb = l1i;
             }
-            if ISO_DEV_GB[slot] != l1i {
+            if info(slot).dev_gb != l1i {
                 log::warn!("[el0] slot {slot}: device va 0x{va:x} in a second gigabyte — skipped");
                 return None;
             }
-            core::ptr::addr_of_mut!(ISO_DEV_L2[slot])
+            core::ptr::addr_of_mut!(tables(slot).dev_l2)
         } else {
             log::warn!(
                 "[el0] slot {slot}: va 0x{va:x} above {} GB base — skipped",
@@ -1237,13 +1345,13 @@ pub mod el0 {
         // 1. Ensure L1[l1i] is a table → its L2. If it is still the seeded
         //    1 GB block (or empty), split it: fill the L2 with the 2 MB
         //    blocks covering the whole GB, then point L1 at it.
-        if ISO_L1[slot].0[l1i] & DESC_TABLE == 0 {
+        if tables(slot).l1.0[l1i] & DESC_TABLE == 0 {
             let gb_base = (l1i as u64) * L1_BLOCK_SIZE;
             for (j, e) in (*l2).0.iter_mut().enumerate() {
                 *e = fill_2m(gb_base + (j as u64) * L2_BLOCK_SIZE);
             }
             let l2_base = l2 as u64;
-            ISO_L1[slot].0[l1i] = (l2_base & !0xFFF) | DESC_VALID | DESC_TABLE;
+            tables(slot).l1.0[l1i] = (l2_base & !0xFFF) | DESC_VALID | DESC_TABLE;
         }
 
         // 2. Ensure L2[l2i] is a table → an L3. If it is still a 2 MB
@@ -1251,11 +1359,11 @@ pub mod el0 {
         //    covering the 2 MB, then point L2 at it. The L3 table is
         //    found/allocated from the per-slot pool keyed by (l1i,l2i).
         let key = ((l1i as u32) << 9) | (l2i as u32);
-        let used = ISO_L3_USED[slot];
+        let used = info(slot).l3_used;
         let mut l3slot = usize::MAX;
         let mut k = 0;
         while k < used {
-            if ISO_L3_KEY[slot][k] == key {
+            if info(slot).l3_key[k] == key {
                 l3slot = k;
                 break;
             }
@@ -1267,11 +1375,11 @@ pub mod el0 {
                 return None;
             }
             l3slot = used;
-            ISO_L3_KEY[slot][l3slot] = key;
-            ISO_L3_USED[slot] = used + 1;
+            info(slot).l3_key[l3slot] = key;
+            info(slot).l3_used = used + 1;
             // Back-fill the new L3 with the EL1 pages it replaces.
             let win_base = (l1i as u64) * L1_BLOCK_SIZE + (l2i as u64) * L2_BLOCK_SIZE;
-            for (j, e) in ISO_L3[slot][l3slot].0.iter_mut().enumerate() {
+            for (j, e) in tables(slot).l3[l3slot].0.iter_mut().enumerate() {
                 let phys = win_base + (j as u64) * PAGE;
                 *e = if l1i < kernel_base_gb() {
                     kernel_page_4k(phys)
@@ -1281,10 +1389,10 @@ pub mod el0 {
                     0
                 };
             }
-            let l3_base = core::ptr::addr_of!(ISO_L3[slot][l3slot]) as u64;
+            let l3_base = core::ptr::addr_of!(tables(slot).l3[l3slot]) as u64;
             (*l2).0[l2i] = (l3_base & !0xFFF) | DESC_VALID | DESC_TABLE;
         }
-        Some(&mut ISO_L3[slot][l3slot].0[l3i])
+        Some(&mut tables(slot).l3[l3slot].0[l3i])
     }
 
     /// Call one entry point of isolated module `module_idx` at EL0 under
@@ -1303,14 +1411,14 @@ pub mod el0 {
         deadline_us: u32,
     ) -> i32 {
         let slot = MOD_TO_SLOT[module_idx];
-        if slot == usize::MAX || slot >= MAX_ISO || !ISO_BUILT[slot] {
+        if slot >= slot_count() || !info(slot).built {
             return super::EL0_FAIL_CLOSED;
         }
         let core = cur_core();
         let cb = core::ptr::addr_of_mut!(EL0_CBS[core]);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).module_idx), module_idx as u32);
-        // Module TTBR0: ISO_L1 base | ASID (module_idx+1) in [63:48].
-        let l1 = core::ptr::addr_of!(ISO_L1[slot]) as u64;
+        // Module TTBR0: the slot's L1 base | ASID (module_idx+1) in [63:48].
+        let l1 = core::ptr::addr_of!(tables(slot).l1) as u64;
         let asid = module_asid(module_idx);
         let ttbr0 = (l1 & 0x0000_FFFF_FFFF_FFFF) | (asid << 48);
 
@@ -1320,7 +1428,7 @@ pub mod el0 {
         for (r, a) in regs.iter_mut().zip(args.iter()) {
             *r = *a as u64;
         }
-        let mut sp = ISO_SP_TOP[slot];
+        let mut sp = info(slot).sp_top;
         if !params.is_empty() {
             let len = (params.len() as u64 + 15) & !15;
             if len > EL0_STACK_BYTES / 2 {
@@ -1332,12 +1440,19 @@ pub mod el0 {
         }
         let ret = core::ptr::addr_of!(FLUXOR_EL0_TRAMP) as u64 + 8 * RETURN_OP as u64;
         let freq = timer::timer_freq();
+        let ticks = u64::from(deadline_us) * freq / 1_000_000;
         let deadline = if deadline_us == 0 || freq == 0 {
             0
         } else {
-            timer::read_timer_count_64() + u64::from(deadline_us) * freq / 1_000_000
+            timer::read_timer_count_64() + ticks
         };
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).deadline), deadline);
+        // The deadline has its own timer: the entry is stopped when it is
+        // due, however far apart the (adaptive) tick fires.
+        crate::arch::aarch64::exception::DEADLINE_FIRED[core].store(false, Ordering::Release);
+        if deadline != 0 {
+            timer::deadline_arm(ticks);
+        }
 
         // SAFETY: fluxor_el0_enter saves the kernel context into *cb and
         // returns through fluxor_el0_resume with the outcome.
@@ -1355,17 +1470,24 @@ pub mod el0 {
             // this is a normal C call to the caller.
             clobber_abi("C"),
         );
+        timer::deadline_disarm();
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).deadline), 0);
 
         let fp = core::ptr::read_volatile(core::ptr::addr_of!((*cb).fault_pending));
         if fp == 0 {
-            let n = ISO_OK_COUNT[slot];
-            ISO_OK_COUNT[slot] = n.wrapping_add(1);
+            let n = info(slot).ok_count;
+            info(slot).ok_count = n.wrapping_add(1);
             if n < EL0_OK_LOG_FIRST || n.is_multiple_of(EL0_OK_LOG_EVERY) {
-                log::info!(
-                    "[el0] module {module_idx} el0 step ok outcome={outcome} step={n} \
-                     (lower-EL SVC return confirms EL0 execution)"
-                );
+                // A workload's modules come and go by the thousand: their
+                // confirmations would flood the log a node reports on.
+                if crate::kernel::exec::scheduler::module_owner(module_idx).is_node() {
+                    log::info!(
+                        "[el0] module {module_idx} el0 step ok outcome={outcome} step={n} \
+                         (lower-EL SVC return confirms EL0 execution)"
+                    );
+                } else {
+                    log::debug!("[el0] module {module_idx} el0 step ok outcome={outcome} step={n}");
+                }
             }
             return outcome;
         }
@@ -1385,7 +1507,7 @@ pub mod el0 {
             _ => {
                 let ec = (esr >> 26) & 0x3F;
                 let r = MODULE_REGION_INFO[module_idx];
-                let sp_top = ISO_SP_TOP[slot];
+                let sp_top = info(slot).sp_top;
                 let stack_lo = sp_top.saturating_sub(EL0_STACK_BYTES);
                 let (d1, d2, d3) = walk_descriptors(slot, far);
                 log::error!(
@@ -1451,7 +1573,8 @@ pub mod el0 {
         // SAFETY: this core's control block, read on this core.
         let deadline =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EL0_CBS[core].deadline)) };
-        u32::from(deadline != 0 && timer::read_timer_count_64() >= deadline)
+        let fired = crate::arch::aarch64::exception::DEADLINE_FIRED[core].load(Ordering::Acquire);
+        u32::from(deadline != 0 && (fired || timer::read_timer_count_64() >= deadline))
     }
 
     // ---- Assembly: EL0 entry, longjmp-resume, lower-EL sync dispatch ---
@@ -1955,6 +2078,26 @@ pub fn register_module(
 /// Release an isolated module's slot at teardown.
 pub fn release_module(module_idx: usize) {
     el0::release(module_idx);
+}
+
+/// Size the isolation-slot pool to `n` slots (the `isolated_slots` pool's
+/// ceiling).
+///
+/// # Safety
+/// Graph preparation: no module is isolated and secondary cores are parked.
+pub unsafe fn size_slots(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    // SAFETY: the caller's contract.
+    unsafe { el0::size_slots(n) }
+}
+
+/// Isolation slots held now.
+pub fn slots_in_use() -> usize {
+    el0::slots_in_use()
+}
+
+/// Isolation slots free now.
+pub fn free_slots() -> usize {
+    el0::free_slots()
 }
 
 /// The gateway `SyscallTable` an isolated module is handed.

@@ -241,6 +241,27 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Compose the node image one launch of a package runs: the rendered
+    /// graph, against the runtime that launch runs. A launch runs this as
+    /// its own child, so the composer's report is the launch's to show or
+    /// keep.
+    #[command(hide = true)]
+    ComposeLaunch {
+        /// The rendered graph.
+        graph: PathBuf,
+        /// Where the image is written.
+        #[arg(long)]
+        output: PathBuf,
+        /// The verified modules the graph loads.
+        #[arg(long, value_name = "DIR")]
+        module_root: PathBuf,
+        /// The Linux runtime the launch runs; its providers are pinned.
+        #[arg(long)]
+        runtime: PathBuf,
+        /// The applet whose graph this is, for an applet package.
+        #[arg(long)]
+        applet: Option<String>,
+    },
     /// Register an applet: map a name to a workload package. Accepts
     /// an applet name (the project's own `packaging/applet/<name>/`,
     /// else the package `fluxor.lock` pins under that name), a built
@@ -442,6 +463,14 @@ enum Commands {
     Image {
         #[command(subcommand)]
         action: ImageAction,
+    },
+
+    /// Provision a `key_vault` store image off the device: records sealed
+    /// exactly as the vault seals a key it made, under the key it derives
+    /// from `FLUXOR_SEAL_KEY`.
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
     },
 
     /// Offline GPU program packs: build, inspect, validate.
@@ -942,6 +971,54 @@ enum ImageAction {
     Root {
         #[command(subcommand)]
         action: ImageRootAction,
+    },
+}
+
+/// Where a vault's image sits in its file.
+#[derive(clap::Args)]
+struct VaultImageArgs {
+    /// The image file a graph wires to the vault's `blocks`.
+    #[arg(long)]
+    image: PathBuf,
+    /// The vault's `image` param: bytes per slot.
+    #[arg(long, default_value_t = fluxor_tools::vault::DEFAULT_IMAGE_SIZE)]
+    image_size: usize,
+    /// The vault's `start_sector` param (512-byte sectors).
+    #[arg(long, default_value_t = 0)]
+    start_sector: u64,
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// File a 32-byte symmetric key for a module type under a label: a
+    /// secret another party also holds (a TSIG key, a shared AEAD key).
+    Import {
+        #[command(flatten)]
+        at: VaultImageArgs,
+        /// The module type that opens the key.
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        label: String,
+        /// `hmac-sha256` or `aead-key`.
+        #[arg(long)]
+        suite: String,
+        /// The key, 64 hex digits.
+        #[arg(long = "key-hex")]
+        key_hex: String,
+        /// `yes` adds `WRAP` to an `aead-key`'s uses.
+        #[arg(long, default_value = "no")]
+        wrap: String,
+    },
+    /// Print the P-256 signing identity a module type opens under a label,
+    /// generating and filing it first when it does not exist.
+    Identity {
+        #[command(flatten)]
+        at: VaultImageArgs,
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        label: String,
     },
 }
 

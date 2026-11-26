@@ -290,8 +290,7 @@ pub fn release_owner(owner_slot: u16) {
 }
 
 /// Forget every pack: a rebuild drops every workload, and with it the code
-/// they ran. The node's own image may have changed with it (an OTA swaps the
-/// table), so its digests are computed afresh.
+/// they ran.
 pub fn reset() {
     for id in 0..state().regions.len() {
         free(id);
@@ -299,59 +298,33 @@ pub fn reset() {
     // SAFETY: scheduler-thread state.
     unsafe {
         STAGING = None;
-        DIGESTS_READY = false;
     }
 }
 
-/// Most modules a module table holds: its count is one byte.
-const TABLE_MODULES_MAX: usize = u8::MAX as usize;
-
-/// The node's own modules' digests, computed once (hashing every module of
-/// the image is milliseconds of work, not a per-call cost). Sized by what a
-/// table can hold, not by what one graph instantiates: the image may carry
-/// more modules than its graph runs, and every one of them is pinnable.
-static mut DIGESTS: [(u32, [u8; 32]); TABLE_MODULES_MAX] = [(0, [0; 32]); TABLE_MODULES_MAX];
-static mut DIGEST_COUNT: usize = 0;
-static mut DIGESTS_READY: bool = false;
-
 /// `MODULE_DIGESTS`: `[count:u16][0:u16]` then `[name_hash:u32][sha256:32]`
-/// per module of the node's own image, as many as `out` holds; the count.
+/// per module of the node's own image, hashed straight into `out`; the
+/// length written, or `ERANGE` when `out` cannot hold every record. Every
+/// module the image carries is listed, not only those its graph runs: each
+/// one is pinnable.
 pub fn node_digests(node: &ModuleLoader, out: &mut [u8]) -> i32 {
-    // SAFETY: scheduler-thread state.
-    unsafe {
-        if !DIGESTS_READY {
-            let mut n = 0usize;
-            node.for_each_entry(|hash, bytes| {
-                let p = &raw mut DIGESTS;
-                if n < (*p).len() {
-                    let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
-                    h.update(bytes);
-                    (*p)[n] = (hash, h.finalize());
-                    n += 1;
-                }
-            });
-            DIGEST_COUNT = n;
-            DIGESTS_READY = true;
-        }
-        if out.len() < 4 {
-            return errno::EINVAL;
-        }
-        let count = DIGEST_COUNT;
-        out[0..2].copy_from_slice(&(count as u16).to_le_bytes());
-        out[2..4].copy_from_slice(&[0, 0]);
-        let rec = crate::abi::contracts::workload::MODULE_DIGEST_RECORD;
-        let d = &raw const DIGESTS;
-        for i in 0..count {
-            let at = 4 + i * rec;
-            let Some(slot) = out.get_mut(at..at + rec) else {
-                break;
-            };
-            let (hash, digest) = (*d)[i];
+    let rec = crate::abi::kernel_abi::MODULE_DIGEST_RECORD;
+    let count = node.module_count();
+    let len = 4 + count * rec;
+    let Some(out) = out.get_mut(..len) else {
+        return errno::ERANGE;
+    };
+    out[0..2].copy_from_slice(&(count as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&[0, 0]);
+    let mut slots = out[4..].chunks_exact_mut(rec);
+    node.for_each_entry(|hash, bytes| {
+        if let Some(slot) = slots.next() {
+            let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
+            h.update(bytes);
             slot[0..4].copy_from_slice(&hash.to_le_bytes());
-            slot[4..36].copy_from_slice(&digest);
+            slot[4..36].copy_from_slice(&h.finalize());
         }
-        count as i32
-    }
+    });
+    len as i32
 }
 
 /// The pack an owner's modules resolve from, while its add is in progress:

@@ -564,8 +564,9 @@ fn check_state_budget(
         module_host: crate::capacity::kernel_module_host(target.runtime()),
         natives: crate::capacity::kernel_natives(target.runtime()),
     };
-    // A gated module on a page-table target is isolated: its state and heap
-    // come from the isolated-module arena, page by page, not the state arena.
+    // A gated module on a page-table target is isolated: its state, heap and
+    // EL0 stack come from the isolated-module arena, page by page, not the
+    // state arena.
     let iso_arena = match target.isolation.planner_model() {
         Some(fluxor_contracts::isolation::RegionModel::Pages) => {
             crate::capacity::kernel_iso_arena(target.runtime())
@@ -607,7 +608,11 @@ fn check_state_budget(
         let gated = levels.get(&m.name).copied().unwrap_or(default).is_gated();
         if gated && state != 0 && iso_arena.is_some() {
             use crate::capacity::iso_carve;
-            let bytes = iso_carve(state) + if heap > 0 { iso_carve(heap) } else { 0 };
+            // State and heap, and its EL0 stack slab (a guard page and the
+            // stack), held while it holds an isolation slot.
+            let stack_slab = 4096 + u64::from(target.isolated_stack_kb.unwrap_or(0)) * 1024;
+            let bytes =
+                iso_carve(state) + if heap > 0 { iso_carve(heap) } else { 0 } + stack_slab;
             iso_total += bytes;
             iso_rows.push((m.name.clone(), bytes));
             continue;
@@ -919,51 +924,85 @@ fn check_aarch64_payload_window(config_addr: u32, config: &[u8], firmware_end: u
 /// refused on a target without an MMU, where nothing traps an overrun. A
 /// module in a domain a core other than 0 runs, and not gated, steps on that
 /// core's stack and must also fit what it leaves
-/// (`TargetDescriptor::secondary_stack_limit`).
+/// (`TargetDescriptor::secondary_stack_limit`). The module providers it calls
+/// run in its frame, so it is admitted with its deepest provider chain
+/// (`provider_chain`); a gated module's providers run on its core's stack
+/// above the gateway and are admitted there.
 fn check_stack_budget(
     modules: &[modules::ModuleInfo],
     config: &serde_json::Value,
     target: &crate::target::TargetDescriptor,
+    manifests: &std::collections::HashMap<String, crate::manifest::Manifest>,
 ) -> Result<()> {
+    use crate::protection::Level;
     let levels = module_levels(config, target);
-    let mut rows: Vec<(&str, u64, u64, &'static str)> = Vec::new();
-    for m in modules {
+    let stack_of_type = |ty: &str| -> u64 {
+        modules
+            .iter()
+            .find(|m| m.name == ty)
+            .map_or(0, |m| m.manifest.stack_bytes_64 as u64 * 64)
+    };
+    let instance_type = |instance: &str| -> String {
+        crate::protection::module_entries(config)
+            .into_iter()
+            .find(|(_, e)| e.get("name").and_then(|n| n.as_str()) == Some(instance))
+            .map_or_else(|| instance.to_string(), |(ty, _)| ty)
+    };
+    let stack_of = |instance: &str| stack_of_type(&instance_type(instance));
+    // (what is admitted, its depth, the stack's limit, the stack's name)
+    let mut rows: Vec<(String, u64, u64, &'static str)> = Vec::new();
+    let mut push = |row: (String, u64, u64, &'static str)| {
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    };
+    for (ty, entry) in crate::protection::module_entries(config) {
+        if !modules.iter().any(|m| m.name == ty) {
+            continue;
+        }
+        let instance = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .or_else(|| entry.as_str())
+            .unwrap_or(ty.as_str())
+            .to_string();
         let level = levels
-            .get(&m.name)
+            .get(&ty)
             .copied()
             .unwrap_or_else(|| graph_default_level(config, target));
-        let Some((limit, what)) = target.module_stack_limit(level) else {
-            continue;
+        let domain = crate::config::resolve_domain_id(entry, config)?;
+        // The stack a privileged frame on this module's core runs on: core
+        // 0's kernel stack, or a secondary core's own.
+        let core_stack = if target.smp.domain_core(domain) == 0 {
+            target.kernel_stack_limit()
+        } else {
+            target
+                .secondary_stack_limit()
+                .or_else(|| target.kernel_stack_limit())
         };
-        rows.push((
-            m.name.as_str(),
-            m.manifest.stack_bytes_64 as u64 * 64,
-            limit,
-            what,
-        ));
-    }
-    // A module a core other than 0 steps runs on that core's stack, unless
-    // it is gated, when it steps on the stack in its own region.
-    if let Some((limit, what)) = target.secondary_stack_limit() {
-        for (ty, entry) in crate::protection::module_entries(config) {
-            let domain = crate::config::resolve_domain_id(entry, config)?;
-            if target.smp.domain_core(domain) == 0 {
-                continue;
+        let own = stack_of_type(&ty);
+        // The providers it calls run in its frame: a module stepped
+        // privileged carries them on its own stack; a gated one enters the
+        // kernel through the gateway, and its providers run on the core's
+        // stack above it while its own frames stay on its region's.
+        let chain = crate::provider_chain::deepest_chain(config, manifests, &instance, &stack_of);
+        let label = chain.describe(&instance);
+        if level == Level::Privileged {
+            if let Some((limit, what)) = core_stack {
+                push((label, own + chain.bytes, limit, what));
             }
-            let level = crate::protection::resolve(entry, config, &target.isolation.levels)
-                .map_or(crate::protection::Level::Privileged, |r| r.provided);
-            if level != crate::protection::Level::Privileged {
-                continue;
+        } else {
+            if let Some((limit, what)) = target.module_stack_limit(level) {
+                push((instance.clone(), own, limit, what));
             }
-            if let Some(m) = modules.iter().find(|m| m.name == ty) {
-                let row = (
-                    m.name.as_str(),
-                    m.manifest.stack_bytes_64 as u64 * 64,
-                    limit,
-                    what,
-                );
-                if !rows.contains(&row) {
-                    rows.push(row);
+            if !chain.hops.is_empty() {
+                if let Some((limit, what)) = core_stack {
+                    push((
+                        format!("{label}, called from a gated module"),
+                        chain.bytes,
+                        limit,
+                        what,
+                    ));
                 }
             }
         }
@@ -978,8 +1017,7 @@ fn check_stack_budget(
     stacks.dedup();
     for (limit, what) in &stacks {
         println!("Module stack ({}): {limit} B, {what}", target.id);
-        for (name, bytes, l, _) in rows.iter().filter(|r| r.2 == *limit) {
-            let _ = l;
+        for (name, bytes, _, _) in rows.iter().filter(|r| r.2 == *limit) {
             if *bytes == 0 {
                 println!("  {name:<20} unknown");
             } else {
@@ -988,7 +1026,12 @@ fn check_stack_budget(
         }
     }
 
-    let unknown: Vec<&str> = rows.iter().filter(|r| r.1 == 0).map(|r| r.0).collect();
+    let mut unknown: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.1 == 0)
+        .map(|r| r.0.as_str())
+        .collect();
+    unknown.dedup();
     if !unknown.is_empty() && !target.has_mmu {
         return Err(Error::Config(format!(
             "{} carr(ies) no stack depth, and {} steps every module on one unguarded \
@@ -1005,11 +1048,13 @@ fn check_stack_budget(
         .collect();
     if !over.is_empty() {
         return Err(Error::Config(format!(
-            "{} go(es) deeper than the stack it runs on on {}. Shorten the path \
-             (`fluxor modules build -v` names it) or run the module where the stack \
-             is larger.",
+            "{} go(es) deeper than the stack it runs on on {}. A provider runs in its \
+             caller's frame, so a chain counts the caller, each provider and {} B of kernel \
+             per hop. Shorten the path (`fluxor modules build -v` names it) or run the \
+             module where the stack is larger.",
             over.join(", "),
             target.id,
+            crate::provider_chain::PROVIDER_HOP_BYTES,
         )));
     }
     Ok(())
@@ -1435,7 +1480,7 @@ fn cmd_combine(
 
     check_code_ceiling(&modules, &target_desc)?;
     check_arenas(&config, &config_data, &modules, &target_desc, &r)?;
-    check_stack_budget(&modules, &config, &target_desc)?;
+    check_stack_budget(&modules, &config, &target_desc, &graph.manifests())?;
     check_gated_admission(&modules, &config, &target_desc)?;
     let programs = crate::modules::collect_programs(&config)?;
 
@@ -1708,7 +1753,7 @@ fn build_packaged_blobs(
 
     check_code_ceiling(&modules, target_desc)?;
     check_arenas(config, &config_data, &modules, target_desc, r)?;
-    check_stack_budget(&modules, config, target_desc)?;
+    check_stack_budget(&modules, config, target_desc, &graph.manifests())?;
     check_gated_admission(&modules, config, target_desc)?;
     let programs = crate::modules::collect_programs(config)?;
 
@@ -1744,8 +1789,9 @@ fn build_packaged_blobs(
 /// <dir>/modules/<name>.fmod   every module it runs, its fans' tee and merge
 ///                             included, byte for byte
 /// <dir>/workload-image.json   name, target, module ABI, ABI-surface pin,
-///                             each module's name_hash and sha256, and the
-///                             environment its params are bound to
+///                             each module's name_hash and sha256, the
+///                             environment its params are bound to, and the
+///                             endpoints it listens on
 /// ```
 ///
 /// The workload's modules and `wiring:` are written as a node graph's:
@@ -1760,6 +1806,12 @@ fn build_packaged_blobs(
 /// json lists each binding — `name`, `module`, `param`, `required` — so the
 /// orchestrator can refuse a workload that does not give a required name before
 /// it asks the node.
+///
+/// `endpoints` lists the workload's `endpoints:` (`protocol` `tcp`/`udp`,
+/// `port`): what it asks to listen on. The image grants nothing: its
+/// creator grants them, each as a `CREATE` `net`/`endpoint` option, and a
+/// workload created without one for a port it listens on is refused that
+/// listen.
 ///
 /// A module's sha256 is the pin the kernel admits it by, and the digest the
 /// module's layer has once published (`fluxor publish workload <dir>`).
@@ -1848,6 +1900,18 @@ pub fn cmd_workload_image(
         "abi_surface": hex(&hash::abi_surface_digest()),
         "flxa_sha256": sha(&graph),
         "modules": entries,
+        "endpoints": workloads[0]
+            .endpoints
+            .iter()
+            .map(|e| serde_json::json!({
+                "protocol": if e[0] == fluxor_abi::contracts::net::net_proto::grant::PROTO_TCP {
+                    "tcp"
+                } else {
+                    "udp"
+                },
+                "port": u16::from_le_bytes([e[1], e[2]]),
+            }))
+            .collect::<Vec<_>>(),
         "env": env_binds
             .iter()
             .map(|b| serde_json::json!({
@@ -2359,7 +2423,8 @@ mod state_budget_tests {
                 "modules": [m],
             })
         };
-        let e = check_stack_budget(&deep, &graph("second", None), &target)
+        let no_manifests = std::collections::HashMap::new();
+        let e = check_stack_budget(&deep, &graph("second", None), &target, &no_manifests)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2369,18 +2434,92 @@ mod state_budget_tests {
                 && e.contains(&format!("{limit} B")),
             "{e}"
         );
-        check_stack_budget(&shallow, &graph("second", None), &target).expect("fits core 1's stack");
-        check_stack_budget(&deep, &graph("second", Some("contained")), &target)
-            .expect("a gated module steps on its own region's stack");
-        check_stack_budget(&deep, &graph("main", None), &target).expect("core 0's stack");
-        check_stack_budget(&deep, &graph("third", None), &target)
+        check_stack_budget(&shallow, &graph("second", None), &target, &no_manifests)
+            .expect("fits core 1's stack");
+        check_stack_budget(
+            &deep,
+            &graph("second", Some("contained")),
+            &target,
+            &no_manifests,
+        )
+        .expect("a gated module steps on its own region's stack");
+        check_stack_budget(&deep, &graph("main", None), &target, &no_manifests)
+            .expect("core 0's stack");
+        check_stack_budget(&deep, &graph("third", None), &target, &no_manifests)
             .expect("domain 2 shares core 0's loop");
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let pico = crate::target::load_target("pico", &root).expect("pico target");
         assert_eq!(pico.secondary_stack_limit(), None);
-        check_stack_budget(&deep, &graph("second", None), &pico)
+        check_stack_budget(&deep, &graph("second", None), &pico, &no_manifests)
             .expect("RP2040 steps every domain on core 0");
+    }
+
+    /// A provider runs in its caller's frame, so a pico2w graph placing tls
+    /// and the key vault it signs with in core 1's domain is admitted
+    /// against core 1's stack with the chain's sum, and refused naming it;
+    /// the same graph on core 0 fits the kernel stack.
+    #[test]
+    fn a_vault_chain_on_core_1_is_admitted_with_its_sum() {
+        let target = pico2w();
+        let (size_kb, reserve_kb) = target.smp.secondary_stack_kb.expect("core 1's stack");
+        let limit = u64::from(size_kb - reserve_kb) * 1024;
+        let hop = crate::provider_chain::PROVIDER_HOP_BYTES;
+        // Each fits core 1's stack alone; the chain does not.
+        let tls_stack = limit - 2048;
+        let vault_stack = 2048;
+        let modules = [
+            module_with_stack("tls", tls_stack),
+            module_with_stack("key_vault", vault_stack),
+        ];
+        let manifest = |toml: &str| {
+            crate::manifest::Manifest::from_toml_str_for_target(
+                &format!("version = \"1.0.0\"\n{toml}"),
+                None,
+            )
+            .expect("manifest parses")
+        };
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert(
+            "tls".to_string(),
+            manifest(
+                "[[resources]]\nrequires_contract = \"key_vault\"\naccess = \"write\"\n\
+                 active_when_params = [\"key_file\"]\n",
+            ),
+        );
+        manifests.insert(
+            "vault".to_string(),
+            manifest("provides = [\"key_vault\"]\nprovider_contracts = [\"key_vault\"]\n"),
+        );
+        let graph = |domain: &str| {
+            json!({
+                "execution": {"domains": [{"name": "main"}, {"name": "second"}]},
+                "modules": [
+                    {"name": "tls", "domain": domain, "key_file": "/id.der"},
+                    {"name": "vault", "type": "key_vault", "domain": domain},
+                ],
+            })
+        };
+        let sum = tls_stack + hop + vault_stack;
+        let e = check_stack_budget(&modules, &graph("second"), &target, &manifests)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("tls → vault (key_vault)")
+                && e.contains(&format!("{sum} B"))
+                && e.contains("secondary core")
+                && e.contains(&format!("{limit} B")),
+            "{e}"
+        );
+        check_stack_budget(&modules, &graph("main"), &target, &manifests)
+            .expect("core 0's stack holds the chain");
+        // Without an identity tls never calls the vault.
+        let mut idle = graph("second");
+        idle["modules"][0]
+            .as_object_mut()
+            .expect("entry")
+            .remove("key_file");
+        check_stack_budget(&modules, &idle, &target, &manifests).expect("no call, no chain");
     }
 
     fn wasm() -> crate::target::TargetDescriptor {
@@ -2468,6 +2607,47 @@ mod state_budget_tests {
             let short = json!({"capacity": {"state_arena": need - 1}});
             check_state_budget(&mods, &short, graph, &target).expect_err("a byte short");
         }
+    }
+
+    /// A type stating both per-unit rules (a store: counted tables and a
+    /// pool's subscriptions) is capped at their sum on the one `base`.
+    #[test]
+    fn heap_per_demand_and_heap_per_param_add_to_one_cap() {
+        use crate::manifest::{HeapParamTerm, HeapPerDemand, HeapPerParam};
+        let manifest = Manifest {
+            arena_bytes: 256,
+            heap_per_param: Some(HeapPerParam {
+                params: vec![HeapParamTerm {
+                    tag: 3,
+                    default: 4,
+                    bytes_each: 100,
+                }],
+                base: Some(256),
+            }),
+            heap_per_demand: Some(HeapPerDemand {
+                pool: "store_subs".into(),
+                bytes_each: 96,
+                base: None,
+            }),
+            ..Default::default()
+        };
+        let mut plan = crate::config::HeapPlan::default();
+        plan.ceilings.insert("store_subs".into(), 10);
+        let params = crate::config::insert_heap_tags(
+            Vec::new(),
+            &json!({}),
+            "st",
+            Some(&manifest),
+            &plan,
+        )
+        .expect("heap tags");
+        let cap: u32 = 256 + 4 * 100 + 10 * 96;
+        assert!(
+            params
+                .windows(6)
+                .any(|w| w[..2] == [0xEF, 4] && w[2..] == cap.to_le_bytes()),
+            "cap {cap}: {params:x?}"
+        );
     }
 
     /// A type that sizes its heap from its params (`heap_per_param`) takes

@@ -252,7 +252,27 @@ pub struct Edge {
     /// module at that end, which the add that opened the ring placed.
     /// Only the edge that opened a ring carries its charge.
     pub charge: EdgeCharge,
+    /// Which end, if either, is a lane (`Endpoint::Lane`): the module at
+    /// that end is the lane's target, which takes the channel with
+    /// `LANE_TAKE` and never as a port, so the edge is never collected into
+    /// its port table nor split across cores. Until a node graph's lane
+    /// resolves (`splice::finish`) that end's module is [`LANE_PENDING`].
+    pub lane: LaneEnd,
 }
+
+/// The end of an edge that is a lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneEnd {
+    None,
+    /// The producer end: the edge carries the lane's events.
+    From,
+    /// The consumer end: the edge carries the lane's commands.
+    To,
+}
+
+/// The module index of a lane end whose target has not declared yet: past
+/// every slot, so no port table, wake or channel end names it.
+pub const LANE_PENDING: usize = usize::MAX;
 
 /// The end of an edge whose module's owner was charged the edge's ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +309,7 @@ impl Edge {
             tap: false,
             tap_source: -1,
             charge: EdgeCharge::None,
+            lane: LaneEnd::None,
         }
     }
 
@@ -320,6 +341,7 @@ impl Edge {
             tap: false,
             tap_source: -1,
             charge: EdgeCharge::None,
+            lane: LaneEnd::None,
         }
     }
 
@@ -405,10 +427,18 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     // producer/consumer manifest port capacities and the wiring's
     // `buffer_bytes` — a port capacity is a per-port-type minimum, the
     // wiring field a per-edge one, so the larger wins.
+    // A lane end has no port: what it carries is sized by its peer's port
+    // and the edge's `buffer_bytes`.
     let edge_min_size = |edge: &Edge| -> u32 {
-        let (from_size, _) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
+        let from_size = match port_caps.get(edge.from_module) {
+            Some(c) if edge.lane != LaneEnd::From => c.lookup(1, edge.from_port_index).0,
+            _ => 0,
+        };
         let to_port_type = if edge.is_ctrl() { 2 } else { 0 };
-        let (to_size, _) = port_caps[edge.to_module].lookup(to_port_type, edge.to_port_index);
+        let to_size = match port_caps.get(edge.to_module) {
+            Some(c) if edge.lane != LaneEnd::To => c.lookup(to_port_type, edge.to_port_index).0,
+            _ => 0,
+        };
         rings::edge_request(from_size, to_size, edge.buffer_bytes)
     };
 
@@ -443,9 +473,11 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         let group = edge.buffer_group as usize;
         if group > 0 && group_channel >= 0 {
             // Verify destination module can safely consume from mailbox
-            // SAFETY: SCHED is scheduler-thread owned; `edge.to_module`
-            // is bounded against MAX_MODULES by config validation.
-            let safe = unsafe { SCHED.mailbox_safe[edge.to_module] };
+            // SAFETY: SCHED is scheduler-thread owned; `edge.to_module` is
+            // bounded by the slot check (a pending lane end is past every
+            // slot).
+            let safe =
+                edge.to_module < module_slots() && unsafe { SCHED.mailbox_safe[edge.to_module] };
             if safe {
                 // Alias: reuse existing channel for this group
                 edge.channel = group_channel;
@@ -486,7 +518,10 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         };
         // A ring keeps each record's length beside it; a mailbox's record is
         // the whole buffer.
-        let (_, max_record) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
+        let max_record = match port_caps.get(edge.from_module) {
+            Some(c) if edge.lane != LaneEnd::From => c.lookup(1, edge.from_port_index).1,
+            _ => 0,
+        };
         let footprint = if group > 0 {
             u64::from(max_record)
         } else {
@@ -651,8 +686,8 @@ pub(crate) use instantiation::{collect_one_module_hints, finalize_module};
 pub use instantiation::{
     is_node_param_tag, maybe_emit_alive, module_device_window, module_level,
     module_step_deadline_us, params_carry_tag, params_heap_arena_bytes, params_level,
-    params_node_tag, params_raw_arena, parse_protection_config, sample_flow_stalls, sample_pstatus,
-    set_pstatus_interval_ms, DBG_STEP_MODULE, HEAP_ARENA_TAG, HEAP_RAW_ARENA_TAG,
+    params_node_tag, params_raw_arena, params_u8, parse_protection_config, sample_flow_stalls,
+    sample_pstatus, set_pstatus_interval_ms, DBG_STEP_MODULE, HEAP_ARENA_TAG, HEAP_RAW_ARENA_TAG,
 };
 pub use live_reconfig::{
     active_module_count, begin_stop_drain, call_module_drain, hold_idle, mark_module_finished,
@@ -678,9 +713,8 @@ pub(crate) use multigraph::{
     slot_resident, ResidentGraph,
 };
 pub use ownership::{
-    authorize_module_access, caller_authority, caller_owner, channel_consumer_module,
-    channel_facts, channel_producer_module, channel_producer_owner, free_module_state,
-    module_is_finished, module_owner, module_owner_attribution, owner_live_snapshot,
+    authorize_module_access, caller_authority, caller_owner, channel_facts, channel_producer_owner,
+    free_module_state, module_is_finished, module_owner, module_owner_attribution,
     owner_live_status, owner_modules_quiescent, owners, owners_mut, request_rebuild,
     set_module_owner, take_rebuild_request, OwnerLiveStatus, OWNER_STATE_ACTIVE,
     OWNER_STATE_DRAINING, OWNER_STATE_PAUSED,
@@ -715,9 +749,9 @@ pub use state::{
     module_params, module_port, module_program, module_program_region, module_slot_generation,
     module_state_footprint, module_type_hash, sched_mut, set_caller_module, set_current_module,
     set_graph_sample_rate, set_instantiation_state, set_module_arena, set_module_grants,
-    set_module_params, set_module_port, set_module_type_hash, set_owner_idle_safe,
-    store_dynamic_module, store_native_module, syscall_flow_budget, syscall_input_flow_budget,
-    take_module_arena, tick_us, with_module_context, GraphSnapshot, SchedulerState,
+    set_module_params, set_module_type_hash, set_owner_idle_safe, store_dynamic_module,
+    store_native_module, syscall_flow_budget, syscall_input_flow_budget, take_module_arena,
+    tick_us, with_module_context, GraphSnapshot, SchedulerState,
 };
 use static_storage::MAX_PORTS;
 pub use static_storage::{

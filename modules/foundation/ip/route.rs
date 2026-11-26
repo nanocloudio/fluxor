@@ -1,11 +1,12 @@
 //! The node's segments, peer routes and held addresses, as this module
-//! realizes them (`net.route`).
+//! stores and realizes them (`net.route`).
 //!
-//! The node agent writes the tables to the kernel; this module reads them
-//! with `TAKE` — a provider-only op admitted from the registered
-//! net-identity provider, no `platform_raw` — polling the table generation
-//! (a `TAKE` into an 8-byte buffer answers `ERANGE` and still writes it) and
-//! re-reading only when it moved. Each entry's state goes back with `REPORT`.
+//! This module is the node's `net.route` provider on bare metal: the node
+//! agent's SEGMENTS / ROUTES / HOLD / READ reach it through
+//! `provider.rs`, which keeps the tables here with the shared core
+//! (`fluxor_sdk::cores::net_tables`). A replace lands between steps; the next
+//! step sees the table generation moved and realizes the tables, stating
+//! each entry's state in the store, where READ finds it.
 //!
 //! - **Segments** give each workload address its cluster prefixes: a
 //!   destination inside them is reached from the workload's own address,
@@ -14,29 +15,20 @@
 //!   default gateway; a connection caches its next hop under the route
 //!   epoch, so a stream pays the lookup once per table change. A route
 //!   whose prefix overlaps the primary's link (its connected prefix) is
-//!   never used and is reported `refused(conflict)`: the node's own link and
+//!   never used and is stated `refused(conflict)`: the node's own link and
 //!   its neighbours on it are reached directly whatever the table says.
 //!   Checked again whenever the primary's address or netmask changes.
 //! - **Held addresses** (`deliver` mode) are realized as node addresses
 //!   (`held.rs`).
 //!
 //! The tables live in the module heap, sized from declared inputs
-//! (`max_segments`, `max_peers`, `max_held`). Entries past what this module
-//! declared are not held and are reported refused (`table_full`), so the
-//! writer sees the gap; tables that do not fit `TAKE`'s buffer at all leave
-//! the previous copy in force, and every entry is reported `table_full`.
-//!
-//! A `REPORT` indexes the tables of the last `TAKE`; when they have moved
-//! since, the kernel refuses it (`EAGAIN`) and the tables are taken again at
-//! the next poll.
+//! (`max_segments`, `max_peers`, `max_held`); a replace past them is refused
+//! `ENOSPC` by the store.
 
 use super::*;
 use abi::contracts::net::route as nr;
+use fluxor_sdk::cores::net_tables::RouteTables;
 
-/// How often the table generation is polled, wall clock.
-pub(crate) const ROUTE_POLL_MS: u32 = 200;
-/// How often a node with no `net.route` provider is asked again.
-const ROUTE_ABSENT_POLL_MS: u32 = 5000;
 /// Segments held when the graph declares none (`max_segments`): a node's
 /// own, with room for a few more — none on an MCU-class target, which hosts
 /// no workloads.
@@ -45,50 +37,69 @@ pub(crate) const SEGMENTS_DEFAULT: u8 = 4;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const SEGMENTS_DEFAULT: u8 = 0;
 
-const ERANGE: i32 = -34;
-const EAGAIN: i32 = -11;
-
-/// Bytes `TAKE` needs for the declared tables, at most.
-pub(crate) fn take_bytes(max_segments: u8, max_peers: u16, max_held: u16) -> usize {
-    nr::TAKE_HEAD
-        + max_segments as usize
-            * (nr::segment::HEAD + nr::MAX_CLUSTER_PREFIXES * nr::segment::CLUSTER)
-        + max_peers as usize * nr::peer::SIZE
-        + max_held as usize * nr::held::SIZE
-}
-
-/// Size the route tables into the heap. `false` when the heap cannot hold
-/// them.
+/// Size the route tables into the heap: each table, its spare and its
+/// entry states. `false` when the heap cannot hold them.
 pub(crate) unsafe fn size_tables(s: &mut IpState) -> bool {
     let segs = s.max_segments as usize;
     let peers = s.max_peers as usize;
     let held = s.max_held as usize;
-    let buf = take_bytes(s.max_segments, s.max_peers, s.max_held);
-    s.rt_buf = heap_table(s, buf, 0u8);
-    s.rt_buf_len = buf as u32;
-    if s.rt_buf.is_null() {
-        return false;
-    }
+    s.rt_meta = fluxor_sdk::cores::net_tables::RouteMeta::default();
     if segs > 0 {
         s.rt_segs = heap_table(s, segs, nr::Segment::EMPTY);
-        if s.rt_segs.is_null() {
+        s.rt_spare_segs = heap_table(s, segs, nr::Segment::EMPTY);
+        s.rt_seg_state = heap_table(s, segs, nr::EntryState::EMPTY);
+        if s.rt_segs.is_null() || s.rt_spare_segs.is_null() || s.rt_seg_state.is_null() {
             return false;
         }
     }
     if peers > 0 {
         s.rt_routes = heap_table(s, peers, nr::Route::EMPTY);
-        if s.rt_routes.is_null() {
+        s.rt_spare_routes = heap_table(s, peers, nr::Route::EMPTY);
+        s.rt_route_state = heap_table(s, peers, nr::EntryState::EMPTY);
+        if s.rt_routes.is_null() || s.rt_spare_routes.is_null() || s.rt_route_state.is_null() {
             return false;
         }
     }
     if held > 0 {
         s.rt_held = heap_table(s, held, nr::Held::EMPTY);
-        if s.rt_held.is_null() {
+        s.rt_spare_held = heap_table(s, held, nr::Held::EMPTY);
+        s.rt_held_state = heap_table(s, held, nr::EntryState::EMPTY);
+        if s.rt_held.is_null() || s.rt_spare_held.is_null() || s.rt_held_state.is_null() {
             return false;
         }
     }
     s.route_epoch = 1;
     true
+}
+
+/// A slice over `n` entries at `p` (empty when there is no table).
+#[inline(always)]
+unsafe fn table<'a, T>(p: *mut T, n: usize) -> &'a mut [T] {
+    if p.is_null() || n == 0 {
+        return &mut [];
+    }
+    core::slice::from_raw_parts_mut(p, n)
+}
+
+/// The store over this instance's tables.
+pub(crate) unsafe fn store<'a>(s: &'a mut IpState) -> RouteTables<'a> {
+    let (segs, peers, held) = (
+        s.max_segments as usize,
+        s.max_peers as usize,
+        s.max_held as usize,
+    );
+    RouteTables {
+        segs: table(s.rt_segs, segs),
+        routes: table(s.rt_routes, peers),
+        held: table(s.rt_held, held),
+        spare_segs: table(s.rt_spare_segs, segs),
+        spare_routes: table(s.rt_spare_routes, peers),
+        spare_held: table(s.rt_spare_held, held),
+        seg_state: table(s.rt_seg_state, segs),
+        route_state: table(s.rt_route_state, peers),
+        held_state: table(s.rt_held_state, held),
+        meta: &mut s.rt_meta,
+    }
 }
 
 #[inline(always)]
@@ -210,180 +221,27 @@ pub(crate) unsafe fn in_cluster(s: &IpState, src: u32, dst: u32) -> bool {
     false
 }
 
-/// Poll the table generation; re-read and re-report when it moved.
+/// Realize the tables when a replace moved them, or the node's own address
+/// moved under them; then state every entry.
 pub(crate) unsafe fn step(s: &mut IpState) {
-    let now = dev_millis(&*s.syscalls) as u32;
-    let every = if s.rt_absent {
-        ROUTE_ABSENT_POLL_MS
-    } else {
-        ROUTE_POLL_MS
-    };
-    if s.rt_polled_ms != 0 && now.wrapping_sub(s.rt_polled_ms) < every {
+    let gen = s.rt_meta.table_gen;
+    if gen == s.rt_gen && s.rt_realized_ip == s.local_ip && s.rt_realized_mask == s.netmask {
         return;
     }
-    s.rt_polled_ms = if now == 0 { 1 } else { now };
-    let sys = &*s.syscalls;
-    let mut head = [0u8; 8];
-    let rc = (sys.provider_call)(
-        -1,
-        nr::TAKE,
-        core::ptr::null_mut(),
-        0,
-        head.as_mut_ptr(),
-        head.len(),
-    );
-    if rc != ERANGE && rc < 0 {
-        // No provider, or not the registered net-identity provider: no
-        // tables to realize.
-        s.rt_absent = true;
-        return;
-    }
-    s.rt_absent = false;
-    let gen = u64::from_le_bytes(head);
-    if gen == s.rt_gen && s.rt_have {
-        // The tables are as they were; the node's own address may not be
-        // (a held address is realized only on the primary's link, and a
-        // peer route never over it).
-        if s.rt_realized_ip != s.local_ip || s.rt_realized_mask != s.netmask {
-            s.rt_realized_ip = s.local_ip;
-            s.rt_realized_mask = s.netmask;
-            s.route_epoch = s.route_epoch.wrapping_add(1).max(1);
-            super::held::realize(s);
-            report(s);
-        }
-        return;
-    }
+    s.rt_gen = gen;
     s.rt_realized_ip = s.local_ip;
     s.rt_realized_mask = s.netmask;
-    take(s, gen);
-}
-
-/// The table counts a TAKE header states: `(segments, routes, held)`.
-fn take_counts(buf: &[u8]) -> Option<(u8, u16, u16)> {
-    let (Some(&ns), Some(&r0), Some(&r1), Some(&h0), Some(&h1)) = (
-        buf.get(8),
-        buf.get(10),
-        buf.get(11),
-        buf.get(12),
-        buf.get(13),
-    ) else {
-        return None;
-    };
-    Some((
-        ns,
-        u16::from_le_bytes([r0, r1]),
-        u16::from_le_bytes([h0, h1]),
-    ))
-}
-
-/// Read the whole tables and adopt them.
-///
-/// Entries past what this module declared are not held, and are reported
-/// `refused(table_full)`, so the writer sees the gap. Tables whose records
-/// do not fit TAKE's buffer at all (`ERANGE`) are not adopted: the previous
-/// copy stays in force, and every entry of the new tables is reported
-/// `table_full` against the counts the header still carries.
-unsafe fn take(s: &mut IpState, gen: u64) {
-    let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(
-        -1,
-        nr::TAKE,
-        core::ptr::null_mut(),
-        0,
-        s.rt_buf,
-        s.rt_buf_len as usize,
-    );
-    let buf = core::slice::from_raw_parts(s.rt_buf, s.rt_buf_len as usize);
-    if rc == ERANGE {
-        s.rt_overflow = s.rt_overflow.wrapping_add(1);
-        s.rt_gen = nr::generation(buf).unwrap_or(gen);
-        s.rt_have = true;
-        if let Some((ns, nroutes, nheld)) = take_counts(buf) {
-            report_overflow(s, ns, nroutes, nheld);
-        }
-        return;
-    }
-    if rc < nr::TAKE_HEAD as i32 {
-        return;
-    }
-    let buf = buf.get(..rc as usize).unwrap_or(&[]);
-    let Some((ns, nroutes, nheld)) = take_counts(buf) else {
-        return;
-    };
-    // Decode the whole of it before adopting any: the kernel validated every
-    // record, so a malformed one means the copy is not the tables, and the
-    // previous copy stays.
-    let mut at = nr::TAKE_HEAD;
-    let mut i = 0;
-    while i < ns as usize {
-        let Some((_, next)) = nr::segment_at(buf, at) else {
-            return;
-        };
-        at = next;
-        i += 1;
-    }
-    let routes_at = at;
-    let held_at = routes_at + nroutes as usize * nr::peer::SIZE;
-    if held_at + nheld as usize * nr::held::SIZE != buf.len() {
-        return;
-    }
-    let mut i = 0;
-    while i < nroutes as usize {
-        if nr::route_at(buf, routes_at + i * nr::peer::SIZE).is_none() {
-            return;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < nheld as usize {
-        if nr::held_at(buf, held_at + i * nr::held::SIZE).is_none() {
-            return;
-        }
-        i += 1;
-    }
-    // Adopt each table's leading entries, as many as this module holds.
-    let mut at = nr::TAKE_HEAD;
-    let mut i = 0;
-    while i < ns as usize {
-        if let Some((seg, next)) = nr::segment_at(buf, at) {
-            if i < s.max_segments as usize {
-                *s.rt_segs.add(i) = seg;
-            }
-            at = next;
-        }
-        i += 1;
-    }
-    s.rt_nsegs = ns.min(s.max_segments);
-    let kept = nroutes.min(s.max_peers);
-    let mut i = 0;
-    while i < kept as usize {
-        if let Some(r) = nr::route_at(buf, routes_at + i * nr::peer::SIZE) {
-            *s.rt_routes.add(i) = r;
-        }
-        i += 1;
-    }
-    s.rt_nroutes = kept;
-    let kept = nheld.min(s.max_held);
-    let mut i = 0;
-    while i < kept as usize {
-        if let Some(h) = nr::held_at(buf, held_at + i * nr::held::SIZE) {
-            *s.rt_held.add(i) = h;
-        }
-        i += 1;
-    }
-    s.rt_nheld = kept;
-    s.rt_tsegs = ns;
-    s.rt_troutes = nroutes;
-    s.rt_theld = nheld;
-    s.rt_gen = nr::generation(buf).unwrap_or(gen);
-    s.rt_have = true;
+    let [segs, routes, held] = s.rt_meta.count;
+    s.rt_nsegs = segs.min(u16::from(s.max_segments)) as u8;
+    s.rt_nroutes = routes.min(s.max_peers);
+    s.rt_nheld = held.min(s.max_held);
     // Every cached next hop and source choice is looked up afresh.
     s.route_epoch = s.route_epoch.wrapping_add(1).max(1);
     super::held::realize(s);
     report(s);
 }
 
-/// One entry's state, as REPORT carries it.
+/// One entry's state.
 fn entry(kind: u8, index: usize, state: u8, reason: u8) -> nr::EntryState {
     nr::EntryState {
         kind,
@@ -396,36 +254,29 @@ fn entry(kind: u8, index: usize, state: u8, reason: u8) -> nr::EntryState {
     }
 }
 
-/// Report what took effect: every segment held (its addresses are this
-/// module's to hold), every route held whose peer is on the link (one that
-/// is not cannot be reached directly, the only carriage there is) and that
-/// does not overlap the primary's link (`refused(conflict)`), every
-/// held address held (`held.rs`), and each table's entries past what this
-/// module holds as `table_full`.
+/// State what took effect: every segment held (its addresses are this
+/// module's to hold), every route whose peer is on the link (one that is
+/// not cannot be reached directly, the only carriage there is) and that does
+/// not overlap the primary's link (`refused(conflict)`), and every held
+/// address as `held.rs` holds it.
 pub(crate) unsafe fn report(s: &mut IpState) {
-    let mut n = 0usize;
     let mut i = 0;
-    while i < s.rt_tsegs as usize {
-        let e = if i < s.rt_nsegs as usize {
-            entry(nr::entry::KIND_SEGMENT, i, nr::state::REALIZED, 0)
-        } else {
-            full(nr::entry::KIND_SEGMENT, i)
-        };
-        report_one(s, &mut n, e);
+    while i < s.rt_nsegs as usize {
+        let e = entry(nr::entry::KIND_SEGMENT, i, nr::state::REALIZED, 0);
+        store(s).set_state(e);
         i += 1;
     }
     let mut i = 0;
-    while i < s.rt_troutes as usize {
-        let e = if i >= s.rt_nroutes as usize {
-            full(nr::entry::KIND_ROUTE, i)
-        } else if takes_uplink(s, &*s.rt_routes.add(i)) {
+    while i < s.rt_nroutes as usize {
+        let r = *s.rt_routes.add(i);
+        let e = if takes_uplink(s, &r) {
             entry(
                 nr::entry::KIND_ROUTE,
                 i,
                 nr::state::REFUSED,
                 nr::reason::CONFLICT,
             )
-        } else if on_link(s, ip_of(&(*s.rt_routes.add(i)).peer)) {
+        } else if on_link(s, ip_of(&r.peer)) {
             entry(nr::entry::KIND_ROUTE, i, nr::state::REALIZED, 0)
         } else {
             entry(
@@ -435,82 +286,13 @@ pub(crate) unsafe fn report(s: &mut IpState) {
                 nr::reason::UNSUPPORTED,
             )
         };
-        report_one(s, &mut n, e);
+        store(s).set_state(e);
         i += 1;
     }
     let mut i = 0;
-    while i < s.rt_theld as usize {
-        let e = if i < s.rt_nheld as usize {
-            super::held::entry_state(s, i)
-        } else {
-            full(nr::entry::KIND_HELD, i)
-        };
-        report_one(s, &mut n, e);
+    while i < s.rt_nheld as usize {
+        let e = super::held::entry_state(s, i);
+        store(s).set_state(e);
         i += 1;
     }
-    report_flush(s, &mut n);
 }
-
-/// An entry past what this module holds.
-fn full(kind: u8, index: usize) -> nr::EntryState {
-    entry(kind, index, nr::state::REFUSED, nr::reason::TABLE_FULL)
-}
-
-/// Tables whose records did not fit: none of their entries is in effect as
-/// written. The copy in force is the previous one.
-unsafe fn report_overflow(s: &mut IpState, ns: u8, nroutes: u16, nheld: u16) {
-    let mut n = 0usize;
-    let mut i = 0;
-    while i < ns as usize {
-        report_one(s, &mut n, full(nr::entry::KIND_SEGMENT, i));
-        i += 1;
-    }
-    let mut i = 0;
-    while i < nroutes as usize {
-        report_one(s, &mut n, full(nr::entry::KIND_ROUTE, i));
-        i += 1;
-    }
-    let mut i = 0;
-    while i < nheld as usize {
-        report_one(s, &mut n, full(nr::entry::KIND_HELD, i));
-        i += 1;
-    }
-    report_flush(s, &mut n);
-}
-
-/// Entries REPORT carries per call.
-const REPORT_BATCH: usize = 16;
-
-unsafe fn report_one(s: &mut IpState, n: &mut usize, e: nr::EntryState) {
-    let at = *n * nr::entry::SIZE;
-    let _ = nr::write_entry(&mut s.rt_report, at, &e);
-    *n += 1;
-    if *n == REPORT_BATCH {
-        report_flush(s, n);
-    }
-}
-
-unsafe fn report_flush(s: &mut IpState, n: &mut usize) {
-    if *n == 0 {
-        return;
-    }
-    let len = *n * nr::entry::SIZE;
-    let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(
-        -1,
-        nr::REPORT,
-        core::ptr::null_mut(),
-        0,
-        s.rt_report.as_mut_ptr(),
-        len,
-    );
-    *n = 0;
-    if rc == EAGAIN {
-        // The tables moved since they were taken: take them again at the
-        // next poll, and report against those.
-        s.rt_have = false;
-    }
-}
-
-/// Bytes of one REPORT batch.
-pub(crate) const REPORT_BYTES: usize = REPORT_BATCH * nr::entry::SIZE;

@@ -1,6 +1,8 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "uefi"]
 deferred_ready = true
+# The device's interrupt line signals the module's RX event.
+grants = ["event.bind_irq"]
 
 [[ports]]
 name = "frames_tx"

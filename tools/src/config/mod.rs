@@ -38,7 +38,7 @@ fn end_json(end: graph::Endpoint) -> Value {
         graph::Endpoint::New(i) => json!(i),
         graph::Endpoint::Existing(i) => json!({ "existing": i }),
         graph::Endpoint::Tap(i) => json!({ "tap": i }),
-        graph::Endpoint::Net(k) => json!({ "net": k }),
+        graph::Endpoint::Lane { key, target } => json!({ "lane": key, "target": target }),
         graph::Endpoint::Caller(k) => json!({ "caller": k }),
     }
 }
@@ -148,7 +148,7 @@ pub fn core_crossings(data: &[u8], smp: &crate::target::SmpFacts) -> Result<u64>
     let domain = |end: graph::Endpoint| end.new_index().and_then(|i| domains.get(i).copied());
     Ok(crate::capacity::crossing_count(
         smp,
-        composed.edges().map(|e| {
+        composed.edges().filter(|e| !is_lane_edge(e)).map(|e| {
             (
                 domain(e.from),
                 domain(e.to),
@@ -156,6 +156,12 @@ pub fn core_crossings(data: &[u8], smp: &crate::target::SmpFacts) -> Result<u64>
             )
         }),
     ))
+}
+
+/// Whether an edge has a lane end: its channels are the lane target's to
+/// take whole, never split across cores.
+fn is_lane_edge(e: &graph::EdgeRecord) -> bool {
+    e.from.lane_target().is_some() || e.to.lane_target().is_some()
 }
 
 pub fn module_entries(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
@@ -242,7 +248,20 @@ pub fn decode_config(data: &[u8]) -> Result<Value> {
     if let Some(w) = cfg.workloads() {
         let list: Vec<Value> = w
             .iter()
-            .map(|r| json!({ "idle_safe": r.idle_safe, "blob_bytes": r.blob.len() }))
+            .map(|r| {
+                json!({
+                    "idle_safe": r.idle_safe,
+                    "endpoints": r
+                        .endpoints
+                        .chunks_exact(boot_config::WORKLOAD_ENDPOINT_LEN)
+                        .map(|e| json!({
+                            "protocol": e[0],
+                            "port": u16::from_le_bytes([e[1], e[2]]),
+                        }))
+                        .collect::<Vec<_>>(),
+                    "blob_bytes": r.blob.len(),
+                })
+            })
             .collect();
         out.insert("workloads".into(), json!(list));
     }
@@ -284,4 +303,6 @@ include!("manifest.rs"); // module search paths + manifest loading
 include!("validate.rs"); // presentation-group + continuity validators
 include!("placement.rs"); // members composed from another node
 include!("generate.rs"); // boot config encode, ModuleCaps, generate_config_ext
+include!("lanes.rs"); // the node graph's lanes to its lane targets
+include!("host_provider.rs"); // native modules a host provider serves, as host lanes
 include!("tests.rs"); // #[cfg(test)] suites

@@ -38,7 +38,7 @@ max_record = 512
 
 # The data store: `storage.block` over the 16 KiB directly below the
 # parameter store (`flash_layout::DATA_STORE_SIZE`), in erase-sector blocks.
-# A UF2 reflash never reaches it. `vault_store` keeps the key vault there.
+# A UF2 reflash never reaches it. A `key_vault` keeps its record image there.
 [[ports]]
 name = "store"
 index = 2

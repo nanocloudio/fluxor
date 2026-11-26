@@ -18,7 +18,8 @@
 //! [vault_custody u8]
 //! ```
 //!
-//! The vault signs it (`KEY_VAULT::ATTEST_COMPOSITION`) and reports the
+//! The `key_vault` module reads it through `COMPOSITION_RECORD`, signs it
+//! (`ATTEST_COMPOSITION`) and reports the
 //! custody its key is held at, so the signature's meaning travels with it:
 //! `DEVICE_HW` says this hardware runs this closure; `SOFTWARE` says a
 //! process that could be read runs it. The **composition digest** is the
@@ -46,9 +47,8 @@
 //! - What else reads a listed blob reads bytes, never code: this record and
 //!   the node's module digests (`code_pack::node_digests`) hash the table
 //!   entry; the hints pass (`collect_one_module_hints`) validates before it
-//!   reads the manifest; fan framing (`declared_port_frame_kind`) and an add's
-//!   grant pre-check (`live::module_grants`) read manifest fields
-//!   only. Those reads stay inside the entry's footprint, which the table's
+//!   reads the manifest; an add's grant pre-check (`live::module_grants`)
+//!   reads manifest fields only. Those reads stay inside the entry's footprint, which the table's
 //!   load bounded (`validate_table_layout` covers the header, code, data,
 //!   exports, schema and manifest of every entry), and what they decide is
 //!   advisory: the instantiation that follows validates the blob, so a forged
@@ -59,16 +59,8 @@
 //! digests against its own pins.
 
 use super::static_storage::{static_config, static_loader};
+use crate::abi::kernel_abi::composition::{MAGIC, VERSION};
 use crate::kernel::security::crypto::sha256::Sha256;
-
-/// Record magic.
-pub const MAGIC: [u8; 4] = *b"FXAT";
-/// Record version.
-pub const VERSION: u8 = 1;
-/// Offset of the challenge within the record.
-pub const CHALLENGE_OFF: usize = 4 + 1 + 16;
-/// Fixed prefix length: magic, version, incarnation, challenge, ABI digest.
-pub const PREFIX_LEN: usize = CHALLENGE_OFF + 32 + 32;
 
 /// Append `bytes` to `out` at `pos`, or report that they did not fit.
 fn put(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> bool {
@@ -84,16 +76,22 @@ fn put(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> bool {
 /// `None` when `out` is too small. `custody` is the vault's answer for the
 /// key that will sign it.
 ///
-/// Costs one SHA-256 pass over every loaded module blob, so it is made at
-/// activation, not per request.
+/// Each loaded blob is hashed once per loaded table and cached
+/// ([`forget_blob_digests`]).
 pub fn write_record(challenge: &[u8; 32], custody: u8, out: &mut [u8]) -> Option<usize> {
     let mut pos = 0usize;
-    if !put(out, &mut pos, &MAGIC) || !put(out, &mut pos, &[VERSION]) {
-        return None;
+    write_record_into(challenge, custody, &mut |b| put(out, &mut pos, b)).then_some(pos)
+}
+
+/// [`write_record`] into any sink: `e` takes each piece and answers false to
+/// stop (out of room).
+fn write_record_into(challenge: &[u8; 32], custody: u8, e: &mut dyn FnMut(&[u8]) -> bool) -> bool {
+    if !e(&MAGIC) || !e(&[VERSION]) {
+        return false;
     }
     let incarnation = crate::kernel::sys::incarnation::get();
-    if !put(out, &mut pos, &incarnation) || !put(out, &mut pos, challenge) {
-        return None;
+    if !e(&incarnation) || !e(challenge) {
+        return false;
     }
     // The kernel's own ABI-surface digest, over the canonical stream. Every
     // module the loader instantiates attests this same digest, signed or not
@@ -107,8 +105,8 @@ pub fn write_record(challenge: &[u8; 32], custody: u8, out: &mut [u8]) -> Option
         crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
         h.finalize()
     };
-    if !put(out, &mut pos, &abi) {
-        return None;
+    if !e(&abi) {
+        return false;
     }
 
     // SAFETY: attestation runs on the scheduler thread with no concurrent
@@ -119,32 +117,27 @@ pub fn write_record(challenge: &[u8; 32], custody: u8, out: &mut [u8]) -> Option
     // Every blob the loader holds, hashed in place: the table entry's bytes,
     // header, code, data, exports and manifest.
     let blob_count = loader.module_count();
-    if !put(out, &mut pos, &(blob_count as u16).to_le_bytes()) {
-        return None;
+    if !e(&(blob_count as u16).to_le_bytes()) {
+        return false;
     }
     let mut i = 0;
     while i < blob_count {
-        let entry = loader.get_entry(i)?;
-        let m = loader.find_by_name_hash(entry.name_hash).ok()?;
-        let mut h = Sha256::new();
-        // SAFETY: `base` is the loaded blob the loader admitted and `size`
-        // its length from the module table; both were validated at load.
-        let bytes = unsafe { core::slice::from_raw_parts(m.base, entry.size as usize) };
-        h.update(bytes);
-        let digest = h.finalize();
-        if !put(out, &mut pos, &entry.name_hash.to_le_bytes())
-            || !put(out, &mut pos, &entry.size.to_le_bytes())
-            || !put(out, &mut pos, &digest)
-        {
-            return None;
+        let Some(entry) = loader.get_entry(i) else {
+            return false;
+        };
+        let Some(digest) = blob_digest(loader, i) else {
+            return false;
+        };
+        if !e(&entry.name_hash.to_le_bytes()) || !e(&entry.size.to_le_bytes()) || !e(&digest) {
+            return false;
         }
         i += 1;
     }
 
     // Every instantiated module with its parameters as composed.
     let instance_count = config.module_count as usize;
-    if !put(out, &mut pos, &(instance_count as u16).to_le_bytes()) {
-        return None;
+    if !e(&(instance_count as u16).to_le_bytes()) {
+        return false;
     }
     let mut n = 0;
     let mut i = 0;
@@ -158,61 +151,161 @@ pub fn write_record(challenge: &[u8; 32], custody: u8, out: &mut [u8]) -> Option
                 h.update(p);
             }
             let digest = h.finalize();
-            if !put(out, &mut pos, &entry.name_hash.to_le_bytes())
-                || !put(out, &mut pos, &[entry.domain_id])
-                || !put(out, &mut pos, &digest)
-            {
-                return None;
+            if !e(&entry.name_hash.to_le_bytes()) || !e(&[entry.domain_id]) || !e(&digest) {
+                return false;
             }
             n += 1;
         }
         i += 1;
     }
 
-    // Every edge as composed.
+    // Every edge as composed, a lane end by its side, key and target.
     let edge_count = config.edge_count as usize;
-    if !put(out, &mut pos, &(edge_count as u16).to_le_bytes()) {
-        return None;
+    if !e(&(edge_count as u16).to_le_bytes()) {
+        return false;
     }
     let mut n = 0;
     let mut i = 0;
     while i < config.graph_edges.len() && n < edge_count {
-        if let Some(e) = &config.graph_edges[i] {
-            if !put(out, &mut pos, &e.from_id.to_le_bytes())
-                || !put(out, &mut pos, &[e.from_port_index])
-                || !put(out, &mut pos, &e.to_id.to_le_bytes())
-                || !put(out, &mut pos, &[e.to_port, e.to_port_index])
+        if let Some(g) = &config.graph_edges[i] {
+            if !e(&g.from_id.to_le_bytes())
+                || !e(&[g.from_port_index])
+                || !e(&g.to_id.to_le_bytes())
+                || !e(&[g.to_port, g.to_port_index])
             {
-                return None;
+                return false;
+            }
+            // A lane end, by its side, key and target.
+            if let Some(l) = g.lane {
+                if !e(&[1 + u8::from(l.to), l.key]) || !e(&l.target.to_le_bytes()) {
+                    return false;
+                }
             }
             n += 1;
         }
         i += 1;
     }
 
-    if !put(out, &mut pos, &[custody]) {
-        return None;
+    if !e(&[custody]) {
+        return false;
     }
-    Some(pos)
+    true
 }
 
-/// The composition digest of a record: SHA-256 with the challenge zeroed.
-/// The identity a key-wrap binds to.
-pub fn composition_digest_of(record: &[u8]) -> [u8; 32] {
+/// Blob digests cached per loader-table index: a blob is hashed once per
+/// loaded table, not inside every caller's step that asks for the record.
+#[cfg(any(target_arch = "aarch64", feature = "host-linux"))]
+const DIGEST_CACHE: usize = 128;
+#[cfg(not(any(target_arch = "aarch64", feature = "host-linux")))]
+const DIGEST_CACHE: usize = 32;
+
+struct DigestCache {
+    /// The table the cached digests describe: its base address.
+    table: usize,
+    known: [bool; DIGEST_CACHE],
+    digest: [[u8; 32]; DIGEST_CACHE],
+}
+
+static mut DIGESTS: DigestCache = DigestCache {
+    table: 0,
+    known: [false; DIGEST_CACHE],
+    digest: [[0; 32]; DIGEST_CACHE],
+};
+
+/// Forget every cached blob digest: the loader's table is about to change.
+pub fn forget_blob_digests() {
+    // SAFETY: scheduler thread, outside any record build.
+    unsafe {
+        let c = &mut *core::ptr::addr_of_mut!(DIGESTS);
+        c.table = 0;
+        c.known = [false; DIGEST_CACHE];
+    }
+}
+
+/// The SHA-256 of loader-table blob `i`: its header, code, data, exports
+/// and manifest, as the table holds them.
+fn blob_digest(loader: &crate::kernel::module::loader::ModuleLoader, i: usize) -> Option<[u8; 32]> {
+    let entry = loader.get_entry(i)?;
+    let m = loader.find_by_name_hash(entry.name_hash).ok()?;
+    // SAFETY: scheduler thread, the cache's only user.
+    let c = unsafe { &mut *core::ptr::addr_of_mut!(DIGESTS) };
+    let table = loader.table_base() as usize;
+    if c.table != table {
+        c.table = table;
+        c.known = [false; DIGEST_CACHE];
+    }
+    if i < DIGEST_CACHE && c.known[i] {
+        return Some(c.digest[i]);
+    }
     let mut h = Sha256::new();
-    if record.len() >= PREFIX_LEN {
-        h.update(&record[..CHALLENGE_OFF]);
-        h.update(&[0u8; 32]);
-        h.update(&record[CHALLENGE_OFF + 32..]);
-    } else {
-        h.update(record);
+    // SAFETY: `base` is the loaded blob the loader admitted and `size` its
+    // length from the module table; both were validated at load.
+    let bytes = unsafe { core::slice::from_raw_parts(m.base, entry.size as usize) };
+    h.update(bytes);
+    let d = h.finalize();
+    if i < DIGEST_CACHE {
+        c.digest[i] = d;
+        c.known[i] = true;
     }
-    h.finalize()
+    Some(d)
 }
 
-/// This composition's digest, as a peer's attestation of it would carry.
-/// `None` when the record cannot be built.
-pub fn composition_digest(custody: u8, scratch: &mut [u8]) -> Option<[u8; 32]> {
-    let len = write_record(&[0u8; 32], custody, scratch)?;
-    Some(composition_digest_of(&scratch[..len]))
+/// Serve `COMPOSITION_RECORD`: `arg` = `[challenge 32][custody u8]`, the
+/// record into `out`; with `composition::DIGEST` in the custody byte, the
+/// composition digest (32 bytes) instead. `ERANGE` with the length needed
+/// in `arg[..4]` when `out` is short.
+pub fn serve_record(arg: &mut [u8], out: &mut [u8]) -> i32 {
+    use crate::abi::errno::{EINVAL, ERANGE};
+    use crate::abi::kernel_abi::composition::{DIGEST, DIGEST_LEN};
+    if arg.len() < 33 {
+        return EINVAL;
+    }
+    let mut challenge = [0u8; 32];
+    challenge.copy_from_slice(&arg[..32]);
+    let custody = arg[32];
+    let need = |arg: &mut [u8], n: usize| {
+        arg[..4].copy_from_slice(&(n as u32).to_le_bytes());
+        ERANGE
+    };
+    if custody & DIGEST != 0 {
+        if out.len() < DIGEST_LEN {
+            return need(arg, DIGEST_LEN);
+        }
+        let mut h = Sha256::new();
+        if !stream_record(&[0u8; 32], custody & !DIGEST, &mut |b| h.update(b)) {
+            return EINVAL;
+        }
+        out[..DIGEST_LEN].copy_from_slice(&h.finalize());
+        return DIGEST_LEN as i32;
+    }
+    let n = record_len();
+    if n == 0 {
+        return EINVAL;
+    }
+    if out.len() < n {
+        return need(arg, n);
+    }
+    match write_record(&challenge, custody, out) {
+        Some(len) => len as i32,
+        None => EINVAL,
+    }
+}
+
+/// The length the record has now.
+fn record_len() -> usize {
+    let mut n = 0usize;
+    if stream_record(&[0u8; 32], 0, &mut |b| n += b.len()) {
+        n
+    } else {
+        0
+    }
+}
+
+/// Emit the record piecewise into `sink`, with no buffer. False when a blob
+/// cannot be read.
+fn stream_record(challenge: &[u8; 32], custody: u8, sink: &mut dyn FnMut(&[u8])) -> bool {
+    write_record_into(challenge, custody, &mut |b| {
+        sink(b);
+        true
+    })
 }

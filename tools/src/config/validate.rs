@@ -1221,13 +1221,6 @@ fn resolve_edge_buffer_bytes(config: &Value) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// Contracts that tolerate more than one provider in a single graph
-/// because callers fan through them via the `CHAIN_NEXT` flag rather
-/// than letting the last registration win. No module sets `CHAIN_NEXT`,
-/// so this list is empty and every duplicate provider is an error. It exists so the rule has a documented escape hatch rather than
-/// an invented user.
-const CHAIN_AWARE_PROVIDES: &[&str] = &[];
-
 /// Surfaces that are NOT routed by class-byte contract dispatch, so multiple
 /// providers of them do NOT shadow. A `storage.block` source is the channel
 /// wired to its consumer (`nvme.blocks -> fat32.blocks`), never a class
@@ -1280,7 +1273,85 @@ fn platform_contracts(
 }
 
 /// Contracts the kernel provides on every target, whatever the platform.
-const KERNEL_CONTRACTS: &[&str] = &["channel", "timer", "event", "buffer", "key_vault"];
+const KERNEL_CONTRACTS: &[&str] = &["channel", "timer", "event", "buffer"];
+
+/// The contracts instance `name` serves through a host provider: a
+/// built-in whose manifest declares the `serves` param (`host_lane`)
+/// registers as the provider of each registry contract that param names,
+/// and one a host provider serves (`[host_provider]`) of each its manifest
+/// names.
+fn lane_served_contracts(
+    config: &Value,
+    name: &str,
+    manifests: &HashMap<String, Manifest>,
+) -> Vec<&'static str> {
+    let Some(m) = manifests.get(name) else {
+        return Vec::new();
+    };
+    if m.host_provider.is_some() {
+        let names: Vec<String> = config
+            .get("modules")
+            .and_then(Value::as_array)
+            .map(|l| {
+                l.iter()
+                    .filter_map(|e| {
+                        crate::module_resolver::entry_identity(e).map(|(n, _, _)| n.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return host_provider_serves(name, &names, manifests)
+            .iter()
+            .filter_map(|c| fluxor_abi::registry::contract_id(c))
+            .filter_map(fluxor_abi::registry::contract_name)
+            .collect();
+    }
+    if !m.builtin || !m.params.iter().any(|p| p.name == "serves") {
+        return Vec::new();
+    }
+    instance_str_param(config, name, "serves")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter_map(fluxor_abi::registry::contract_id)
+        .filter_map(fluxor_abi::registry::contract_name)
+        .collect()
+}
+
+/// The contracts the host provider of built-in `name` (`[host_provider]`)
+/// serves in a graph of `names`: those its manifest names that no other
+/// module of the graph provides. A graph that runs a stack of its own (`ip`
+/// over a device) beside the host's sockets has that stack serve its routes
+/// and policy, and the host provider serves its sockets alone.
+pub(crate) fn host_provider_serves(
+    name: &str,
+    names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Vec<String> {
+    let Some(hp) = manifests.get(name).and_then(|m| m.host_provider.as_ref()) else {
+        return Vec::new();
+    };
+    hp.serves
+        .iter()
+        .filter(|c| {
+            !names.iter().any(|n| {
+                n != name
+                    && manifests
+                        .get(n)
+                        .is_some_and(|m| m.provides.iter().any(|p| surface_contract(p) == c.as_str()))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether `contract` is one the node graph's workload layer may serve a
+/// workload (the registry's `workload_served`): a workload's claim of it is
+/// answered by the node it is admitted to, which refuses the `CREATE` when
+/// nothing there serves it, not by its own graph.
+pub(crate) fn workload_served(contract: &str) -> bool {
+    fluxor_abi::registry::contract_id(contract).is_some_and(fluxor_abi::registry::workload_servable)
+}
 
 /// A module claim nothing in the graph or on its target answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1293,15 +1364,106 @@ pub struct ProviderRefusal {
     pub message: String,
 }
 
+/// One claim an instance's module makes, decided over the instance's packed
+/// params.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceClaim {
+    /// The contract claimed.
+    pub contract: u8,
+    /// Whether the instance needs it served (`fmod::claim_required`).
+    pub required: bool,
+    /// Required only once `fluxor exec` gives an applet's client the
+    /// operator's identity.
+    pub by_exec_identity: bool,
+}
+
+/// Each claim the module of an instance makes, decided by
+/// `fmod::claim_required` over the records and conditions block `pack`
+/// writes (`Manifest::conditions_for` against `schema`) and the instance's
+/// packed `params`: the evaluator the kernel admits a workload with.
+///
+/// A param bound to the environment (`{env: NAME}`) is read as the node will
+/// write it: its default where it has one, else as set, with its value the
+/// node's to decide at CREATE. An applet's client `tls` that names no
+/// identity is also judged with the one `fluxor exec` gives it.
+pub fn instance_claims(
+    m: &Manifest,
+    schema: &crate::schema::ParamSchema,
+    name_hash: u32,
+    params: &[u8],
+) -> Result<Vec<InstanceClaim>> {
+    use fluxor_abi::wire::fmod::claim_required;
+    let block = crate::manifest::conditions_block(&m.conditions_for(schema)?);
+    let params = env_binds_as_set(params);
+    let given = (crate::packaging::applet_being_built().is_some()
+        && crate::trust_anchors::takes_operator_identity(name_hash, &params))
+    .then(|| {
+        let mut p = params.clone();
+        for tag in [crate::trust_anchors::TAG_CERT, crate::trust_anchors::TAG_KEY] {
+            p.extend_from_slice(&[tag, 0, 0, 1, 0]);
+        }
+        p
+    });
+    let mut out = Vec::new();
+    for (i, r) in m.emitted_resources().enumerate() {
+        let rec = [r.device_class, r.access_mode, r.instance, r.claim];
+        let i = u8::try_from(i).unwrap_or(u8::MAX);
+        let required = claim_required(&rec, i, &block, &params);
+        let by_exec_identity = !required
+            && given
+                .as_deref()
+                .is_some_and(|g| claim_required(&rec, i, &block, g));
+        out.push(InstanceClaim {
+            contract: r.device_class,
+            required: required || by_exec_identity,
+            by_exec_identity,
+        });
+    }
+    Ok(out)
+}
+
+/// `params` with each env bind record written out as its param's entry: its
+/// default, or one stand-in byte where it has none.
+fn env_binds_as_set(params: &[u8]) -> Vec<u8> {
+    use crate::schema::env_bind;
+    let Some(end) = crate::schema::tlv_basic_end(params) else {
+        return params.to_vec();
+    };
+    let mut out = params[..4].to_vec();
+    let mut pos = 4;
+    while pos + 2 <= end && params[pos] != 0xFF {
+        let len = params[pos + 1] as usize;
+        let entry = &params[pos..(pos + 2 + len).min(end)];
+        pos += 2 + len;
+        let rec = &entry[2..];
+        if entry[0] != env_bind::BIND_TAG || rec.len() < env_bind::HEAD {
+            out.extend_from_slice(entry);
+            continue;
+        }
+        let name_end = env_bind::HEAD + rec[3] as usize;
+        let value = match rec.get(name_end..) {
+            Some(d) if rec[2] & env_bind::FLAG_DEFAULT != 0 && !d.is_empty() => d,
+            _ => &[0u8][..],
+        };
+        for chunk in value.chunks(usize::from(u8::MAX)) {
+            out.extend_from_slice(&[rec[0], chunk.len() as u8]);
+            out.extend_from_slice(chunk);
+        }
+    }
+    out.extend_from_slice(&params[pos.min(params.len())..]);
+    out
+}
+
 /// Every contract claim in the graph that nothing answers: not the kernel,
-/// not the target's platform (`[providers]`), not a module in the graph.
-/// Such a call answers ENOSYS at run time. Empty when the target is not
-/// known. Optional claims (`optional = true`) and claims the instance's
-/// params never exercise are not requirements.
+/// not the target's platform (`[providers]`), not a module in the graph,
+/// and, for a workload's, not the node's workload layer. Such a call answers
+/// ENOSYS at run time. Empty when the target is not known. Only claims the
+/// instance requires as configured count (`claims`, [`instance_claims`]).
 pub fn required_contract_refusals(
     config: &Value,
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
+    claims: &HashMap<String, Vec<InstanceClaim>>,
     reach: ProviderReach<'_>,
 ) -> Vec<ProviderRefusal> {
     let Some(runtime) = reach.runtime else {
@@ -1310,29 +1472,54 @@ pub fn required_contract_refusals(
     let Some(platform) = platform_contracts(runtime, reach.caller, reach.project) else {
         return Vec::new();
     };
-    let provided: std::collections::BTreeSet<&str> = module_names
+    // A workload-scoped layer answers no node module
+    // (`provider::layer_visible`).
+    let mut provided: std::collections::BTreeSet<&str> = module_names
         .iter()
         .filter_map(|n| manifests.get(n))
+        .filter(|m| !(m.workload_scope && reach.caller == ProviderCaller::Node))
         .flat_map(|m| m.provides.iter().map(|s| surface_contract(s)))
         .collect();
+    provided.extend(
+        module_names
+            .iter()
+            .flat_map(|n| lane_served_contracts(config, n, manifests)),
+    );
     let whose = match reach.caller {
         ProviderCaller::Node => "the node's own modules",
         ProviderCaller::Workload => "a workload's modules",
     };
     let mut refusals = Vec::new();
     for name in module_names {
-        let Some(m) = manifests.get(name) else {
-            continue;
-        };
-        for claim in &m.resources {
-            if claim.optional || !claim.exercised_by(|p| runtime_param(config, name, p)) {
+        for claim in claims.get(name).map(Vec::as_slice).unwrap_or_default() {
+            if !claim.required {
                 continue;
             }
-            let contract = crate::manifest::contract_name_to_str(claim.device_class);
+            let contract = crate::manifest::contract_name_to_str(claim.contract);
             if KERNEL_CONTRACTS.contains(&contract)
                 || provided.contains(contract)
                 || platform.iter().any(|c| c == contract)
+                || (reach.caller == ProviderCaller::Workload && workload_served(contract))
             {
+                continue;
+            }
+            // Exercised only by the identity `fluxor exec` gives the applet's
+            // client: say so, since the graph itself names no identity.
+            if let Some(applet) =
+                crate::packaging::applet_being_built().filter(|_| claim.by_exec_identity)
+            {
+                refusals.push(ProviderRefusal {
+                    module: name.clone(),
+                    contract,
+                    message: format!(
+                        "`{name}` requires `{contract}`: it is a client `tls` of applet \
+                         '{applet}' that names no identity, so `fluxor exec` gives it the \
+                         operator's (`--identity CERT,KEY`, else \
+                         `$HOME/.config/<applet>/client.der` and `client.key.der`), and that \
+                         key is taken by the key vault. Compose `key_vault` in the applet's \
+                         graph."
+                    ),
+                });
                 continue;
             }
             refusals.push(ProviderRefusal {
@@ -1341,7 +1528,7 @@ pub fn required_contract_refusals(
                 message: format!(
                     "`{name}` requires `{contract}`, which nothing on {runtime} answers for \
                      {whose}: not the kernel, not the target's `[providers]` ({}), and no \
-                     module in the graph provides it, so its first call would answer ENOSYS. \
+                     module in the graph provides it{}, so its first call would answer ENOSYS. \
                      Add the module that provides `{contract}`, mark the claim \
                      `optional = true` if the module does without it, or declare it in the \
                      target's `[providers]` if the platform registers it.",
@@ -1349,7 +1536,8 @@ pub fn required_contract_refusals(
                         "none".to_string()
                     } else {
                         platform.join(", ")
-                    }
+                    },
+                    hidden_from_node(module_names, manifests, contract, reach.caller)
                 ),
             });
         }
@@ -1357,6 +1545,36 @@ pub fn required_contract_refusals(
     refusals.sort_by(|a, b| a.message.cmp(&b.message));
     refusals.dedup();
     refusals
+}
+
+/// The workload-scoped providers of `contract` among `module_names`, said as
+/// why a node module does not reach them: no visible provider.
+fn hidden_from_node(
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    contract: &str,
+    caller: ProviderCaller,
+) -> String {
+    if caller != ProviderCaller::Node {
+        return String::new();
+    }
+    let hidden: Vec<&str> = module_names
+        .iter()
+        .filter(|n| {
+            manifests.get(*n).is_some_and(|m| {
+                m.workload_scope && m.provides.iter().any(|s| surface_contract(s) == contract)
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if hidden.is_empty() {
+        return String::new();
+    }
+    format!(
+        " to them (`{}` provides it to workloads only: a workload-scoped layer is no \
+         provider of the node's own modules)",
+        hidden.join("`, `")
+    )
 }
 
 /// Fail the build on any refusal, naming every one.
@@ -1387,16 +1605,93 @@ fn instance_str_param(config: &Value, name: &str, key: &str) -> Option<String> {
     entry_str_param(config, entry, key)
 }
 
-/// [`instance_str_param`] as the instance reads it at run time: a value the
+/// Whether instance `name` makes the calls `claim` declares, as it runs:
+/// its params as the graph sets them, and the identity `fluxor exec` gives
+/// an applet's client ([`exec_identity_param`]).
+fn claim_exercised(config: &Value, name: &str, claim: &manifest::ResourceClaim) -> bool {
+    let reads_files = claim_reads_files(claim);
+    claim.exercised_by(|p| {
+        graph_param(config, name, p, reads_files).or_else(|| exec_identity_param(config, name, p))
+    })
+}
+
+/// Whether `claim` is the instance's reach to the file system, which a
+/// credential the builder embeds never calls.
+fn claim_reads_files(claim: &manifest::ResourceClaim) -> bool {
+    u16::from(claim.device_class) == fluxor_abi::registry::fs::ID
+}
+
+/// [`instance_str_param`] as the instance reads it at run time. A value the
 /// builder embeds (`${file:<path>}`, read at build and packed as extended
-/// tags) is no param at run time, so it exercises no claim.
+/// tags) is still the param's value, and exercises what the value is used
+/// for (an embedded key is the vault's to take); it is not read through
+/// `fs`, so for a claim that `reads_files` it is no param.
 ///
 /// A param the packer derives from a structured entry is read as the packer
 /// derives it: the `route_<n>_*` params an http `routes:` list expands to.
-fn runtime_param(config: &Value, name: &str, key: &str) -> Option<String> {
+fn graph_param(config: &Value, name: &str, key: &str, reads_files: bool) -> Option<String> {
     instance_str_param(config, name, key)
         .or_else(|| route_param(config, name, key))
-        .filter(|v| crate::trust_anchors::file_source(v).is_none())
+        .or_else(|| structured_param(config, name, key))
+        .filter(|v| !reads_files || crate::trust_anchors::file_source(v).is_none())
+}
+
+/// A param instance `name` sets to something other than a string — a list
+/// (`update_allow: [..]`), a number, a flag, a mapping — as its JSON text;
+/// `None` when it sets none, or an empty list or mapping. The packer turns
+/// such a value into the param's bytes, so it exercises a claim as a string
+/// does.
+fn structured_param(config: &Value, name: &str, key: &str) -> Option<String> {
+    let entry = config
+        .get("modules")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?;
+    entry_structured_param(entry, key)
+}
+
+/// [`structured_param`] for a module entry already in hand.
+fn entry_structured_param(entry: &Value, key: &str) -> Option<String> {
+    let v = entry
+        .get(key)
+        .or_else(|| entry.get("params").and_then(|p| p.get(key)))?;
+    match v {
+        Value::Null | Value::String(_) => None,
+        Value::Array(a) if a.is_empty() => None,
+        Value::Object(o) if o.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// The identity `fluxor exec` gives a client `tls` of an applet that names
+/// none (`trust_anchors::append_operator_identity`), as the param it fills:
+/// an embedded certificate and key, under `cert_file` and `key_file`. Only
+/// inside an applet's build ([`crate::packaging::with_applet`]); never a
+/// file the instance reads.
+fn exec_identity_param(config: &Value, name: &str, key: &str) -> Option<String> {
+    crate::packaging::applet_being_built()?;
+    if key != "cert_file" && key != "key_file" {
+        return None;
+    }
+    let entry = config
+        .get("modules")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?;
+    let field = |k: &str| {
+        entry
+            .get(k)
+            .or_else(|| entry.get("params").and_then(|p| p.get(k)))
+    };
+    let module_type = entry.get("type").and_then(Value::as_str).unwrap_or(name);
+    let client = match field("mode") {
+        None => true,
+        Some(v) => v.as_u64() == Some(0) || v.as_str() == Some("0"),
+    };
+    let named = ["cert_file", "key_file", "identity_label"]
+        .iter()
+        .any(|k| field(k).is_some_and(|v| !v.is_null() && v.as_str() != Some("")));
+    (module_type == "tls" && client && !named).then(|| "(the identity fluxor exec gives)".to_string())
 }
 
 /// The `route_<n>_*` param `key` of instance `name`, as the packer expands
@@ -1618,9 +1913,7 @@ fn claim_names(selector: &crate::manifest::ClaimSelector, volume: Option<&str>) 
 /// is unreachable. Two providers of a surface with one `volume:` collide the
 /// same way. Both are refused, naming the two modules. Several providers of
 /// one surface are allowed when each declares a distinct `volume:`: they
-/// register as instance-keyed layers a `mount` module routes between. The
-/// escape hatch `CHAIN_AWARE_PROVIDES` (empty) exempts a contract whose
-/// callers fan through `CHAIN_NEXT`.
+/// register as instance-keyed layers a `mount` module routes between.
 ///
 /// **Each claim reaches a provider.** A `[[resources]]` claim reaches the
 /// provider its selector names (`selector`, `selector_param`, each volume a
@@ -1658,16 +1951,25 @@ pub fn validate_single_provider(
         .iter()
         .map(|n| (n.as_str(), provider_volume(config, n)))
         .collect();
-    let mut seen: HashMap<(&str, &str), &str> = HashMap::new();
+    // Keyed by the layer's scope too: a workload-scoped layer and an
+    // owner-scoped one are never visible to the same caller
+    // (`provider::layer_visible`), so they do not collide.
+    let mut seen: HashMap<(&str, &str, bool), &str> = HashMap::new();
     for name in module_names {
         let Some(m) = manifests.get(name) else {
             continue;
         };
         let sel = volumes[name.as_str()].as_str();
-        for surface in &m.provides {
-            if CHAIN_AWARE_PROVIDES.contains(&surface.as_str())
-                || NON_DISPATCH_SURFACES.contains(&surface.as_str())
-            {
+        // A host lane serving a contract registers as its default provider
+        // as surely as a module that declares it.
+        let lane_served = lane_served_contracts(config, name, manifests);
+        for surface in m
+            .provides
+            .iter()
+            .map(String::as_str)
+            .chain(lane_served.iter().copied())
+        {
+            if NON_DISPATCH_SURFACES.contains(&surface) {
                 continue;
             }
             if sel == PLATFORM_SELECTOR {
@@ -1678,14 +1980,23 @@ pub fn validate_single_provider(
                      module under it; pick another `volume:`."
                 )));
             }
-            let key = (surface.as_str(), sel);
+            let key = (surface, sel, m.workload_scope);
             match seen.get(&key) {
                 None => {
                     seen.insert(key, name.as_str());
                 }
                 Some(earlier) if *earlier == name.as_str() => {}
                 Some(earlier) => {
-                    let detail = if sel.is_empty() {
+                    let by_lane = lane_served.contains(&surface)
+                        || lane_served_contracts(config, earlier, manifests).contains(&surface);
+                    let detail = if by_lane {
+                        format!(
+                            "one serves `{surface}` through a host provider and both would be its \
+                             default provider; a graph has one. On Linux the host provider serves \
+                             the node's `{surface}`; a stack of the graph's own (`ip` over a device) \
+                             goes in another graph."
+                        )
+                    } else if sel.is_empty() {
                         format!(
                             "both are default (unkeyed) `{surface}` providers, so `{name}` silently \
                              shadows `{earlier}` at runtime — whatever `{earlier}` backs becomes \
@@ -1711,7 +2022,13 @@ pub fn validate_single_provider(
     let mut keyed: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
         std::collections::BTreeMap::new();
     let mut default_of: HashMap<&str, &str> = HashMap::new();
-    for (&(surface, sel), &provider) in &seen {
+    for (&(surface, sel, workload_scope), &provider) in &seen {
+        // What the claimants here can reach: a workload-scoped layer serves
+        // callers acting with an authority of their own, never a node
+        // module (`provider::layer_visible`).
+        if workload_scope && reach.caller == ProviderCaller::Node {
+            continue;
+        }
         let contract = surface_contract(surface);
         if sel.is_empty() {
             default_of.insert(contract, provider);
@@ -1738,7 +2055,7 @@ pub fn validate_single_provider(
             // A claim the instance's configuration never exercises
             // (`active_when_params`, none of them set) makes no call, so it
             // reaches no provider.
-            if !claim.exercised_by(|p| runtime_param(config, name, p)) {
+            if !claim_exercised(config, name, claim) {
                 continue;
             }
             let contract = crate::manifest::contract_name_to_str(claim.device_class);
@@ -1797,7 +2114,9 @@ pub fn validate_single_provider(
                     None if provides_it => {}
                     None => {
                         if let Some(&provider) = default_of.get(contract) {
-                            if let Some(path) = wiring_path(config, manifests, name, provider, contract) {
+                            if let Some(path) =
+                                wiring_path(config, manifests, name, provider, contract)
+                            {
                                 return Err(Error::Config(format!(
                                     "`{name}`'s `{contract}` claim {how}, so it reaches the graph's \
                                      default `{contract}` provider, `{provider}`, which it feeds \
@@ -2036,7 +2355,11 @@ pub fn validate_provider_domains(
                 // Only a claim the caller's configuration exercises makes
                 // the call (`active_when_params`).
                 let calls = cm.resources.iter().any(|r| {
-                    r.device_class == id && r.exercised_by(|p| entry_str_param(config, entry, p))
+                    r.device_class == id
+                        && r.exercised_by(|p| {
+                            entry_str_param(config, entry, p)
+                                .or_else(|| entry_structured_param(entry, p))
+                        })
                 });
                 if caller == provider || c_domain == p_domain || !calls {
                     continue;
@@ -2117,8 +2440,14 @@ pub fn validate_edge_contracts(
         ) else {
             continue;
         };
-        edges_of.entry(from.to_string()).or_default().push(to.to_string());
-        edges_of.entry(to.to_string()).or_default().push(from.to_string());
+        edges_of
+            .entry(from.to_string())
+            .or_default()
+            .push(to.to_string());
+        edges_of
+            .entry(to.to_string())
+            .or_default()
+            .push(from.to_string());
     }
     let mut ends: Vec<_> = edges_of.iter().collect();
     ends.sort();
@@ -2136,7 +2465,11 @@ pub fn validate_edge_contracts(
                     "`{end}` serves `{served}` to {}. A served port answers the one client \
                      wired to it; give each client its own source, or put one client in \
                      front of the rest.",
-                    clients.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(" and "),
+                    clients
+                        .iter()
+                        .map(|c| format!("`{c}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and "),
                 )));
             }
         }
@@ -2151,12 +2484,17 @@ pub fn validate_edge_contracts(
                 if peers.is_empty() {
                     "nothing".to_string()
                 } else {
-                    peers.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(" and ")
+                    peers
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
                 },
             )));
         }
         let peer = &peers[0];
-        let (Some((client_mod, _)), Some((peer_mod, _))) = (end.split_once('.'), peer.split_once('.'))
+        let (Some((client_mod, _)), Some((peer_mod, _))) =
+            (end.split_once('.'), peer.split_once('.'))
         else {
             continue;
         };
@@ -2236,7 +2574,7 @@ pub fn validate_edge_contracts(
 /// producer into the same input could never be reached. The same holds the
 /// other way: the output feeding such an input feeds nothing else. A second
 /// edge from it builds as a tee, and a tee carries the stream but no
-/// requests, so the second consumer — a `vault_store` wired beside a `fat32`
+/// requests, so the second consumer — a `key_vault` wired beside a `fat32`
 /// on one `nvme.blocks`, say — waits for ever on a source it never reaches.
 ///
 /// FAILS OPEN on a module whose manifest could not be resolved. A pinned
@@ -2286,7 +2624,10 @@ pub fn validate_port_capabilities(
             continue;
         };
 
-        fan_out.entry(from.to_string()).or_default().push(to.to_string());
+        fan_out
+            .entry(from.to_string())
+            .or_default()
+            .push(to.to_string());
         if let Some(wanted) = port_of(&to_mod, &to_port).and_then(|p| p.requires_capability) {
             if is_surface(&wanted) {
                 surface_sources.insert(from.to_string(), wanted.clone());
@@ -2650,11 +2991,15 @@ pub fn validate_port_facts(
                 }
             }
         }
-        for rule in CROSS_FACT_RULES.iter().filter(|r| r.capability == capability) {
+        for rule in CROSS_FACT_RULES
+            .iter()
+            .filter(|r| r.capability == capability)
+        {
             let gate = number(in_facts.get(rule.gate));
             let sent = number(out_facts.get(rule.fact));
             let taken = number(in_facts.get(rule.fact));
-            let show = |v: Option<u32>| v.map_or_else(|| "undeclared".to_string(), |n| n.to_string());
+            let show =
+                |v: Option<u32>| v.map_or_else(|| "undeclared".to_string(), |n| n.to_string());
             if *rule == BANDING && !banding_admits(gate, sent, taken) {
                 return Err(Error::Config(format!(
                     "`{from}` -> `{to}`: the consumer retains no frame (`{gate_name}` = 0), so \
@@ -2914,87 +3259,284 @@ pub fn check_connector_addressing(config: &Value) -> Result<()> {
     Ok(())
 }
 
-/// One keeper of the key vault's durable image per graph: the kernel answers
-/// the first instance holding `seal_key` and refuses every other, so a
-/// second is a graph whose keys go where its author did not mean. Its block
-/// source is held to exactly one by the `blocks` port's
-/// `requires_capability = "storage.block"`.
-pub fn validate_vault_store(config: &Value, manifests: &HashMap<String, Manifest>) -> Result<()> {
-    let Some(mods) = config.get("modules").and_then(|m| m.as_array()) else {
+/// A `key_vault` instance's integer param `key`, as the graph writes it
+/// (number or decimal string, on the entry or under `params:`), else
+/// `default`.
+fn vault_param_u64(entry: &Value, key: &str, default: u64) -> u64 {
+    entry
+        .get(key)
+        .or_else(|| entry.get("params").and_then(|p| p.get(key)))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(default)
+}
+
+/// The `seal` mode a `key_vault` instance runs: `hardware` (the default),
+/// `none` or `owner`, as a name.
+fn vault_seal_mode(entry: &Value) -> Result<&'static str> {
+    let v = entry
+        .get("seal")
+        .or_else(|| entry.get("params").and_then(|p| p.get("seal")));
+    match v {
+        None => Ok("hardware"),
+        Some(v) => match (v.as_str(), v.as_u64()) {
+            (Some("hardware"), _) | (_, Some(0)) => Ok("hardware"),
+            (Some("none"), _) | (_, Some(1)) => Ok("none"),
+            (Some("owner"), _) | (_, Some(2)) => Ok("owner"),
+            _ => Err(Error::Config(format!(
+                "`seal: {v}` is not a key_vault seal mode: hardware | none | owner"
+            ))),
+        },
+    }
+}
+
+/// Whether `custody` names the token: `token` or 1.
+fn vault_custody_is_token(entry: &Value) -> bool {
+    entry
+        .get("custody")
+        .or_else(|| entry.get("params").and_then(|p| p.get("custody")))
+        .is_some_and(|v| v.as_str() == Some("token") || v.as_u64() == Some(1))
+}
+
+/// Whether `key_vault` built for runtime `rt` carries the `key_custody`
+/// client. The provider is a Linux host lane, so the vault's 32-bit Arm
+/// builds (the RP module ABIs, `target_arch = "arm"`) leave the client out
+/// and refuse `custody = token` at construction.
+fn vault_has_token_client(rt: &str) -> bool {
+    crate::runtime_abi::runtime(rt)
+        .is_none_or(|r| !r.abis.iter().any(|abi| abi.starts_with("thumb")))
+}
+
+/// A graph's `key_vault` against its target and wiring (a second unkeyed
+/// provider of the contract is refused by [`validate_single_provider`]):
+///
+/// - `seal: hardware` derives the record key from the platform's sealing
+///   key, so a target with none (`TargetFacts::seal_provenance`, uefi and
+///   rp2040 among them) is refused: `SEAL_KEY_DERIVE` would answer `ENOSYS`.
+///   `none` keeps records readable and `owner` takes its key from the node
+///   agent; neither needs one.
+/// - `custody: token` needs the vault's `key_custody` client, which its RP
+///   builds do not carry.
+/// - with `blocks` wired, `image` is the size of each A/B slot: a whole
+///   number of 512-byte sectors, at least one.
+/// - `slots` keys are each a handle the kernel routes, so they fit the
+///   node's `handles` pool (`capacity: { handles: N }`, else the target's
+///   default reserve).
+pub fn validate_key_vault(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    runtime: Option<&str>,
+    target: &str,
+) -> Result<()> {
+    let Some(mods) = config.get("modules").and_then(Value::as_array) else {
         return Ok(());
     };
-    let keepers: Vec<&str> = mods
-        .iter()
-        .filter_map(|m| {
-            let name = m.get("name").and_then(|v| v.as_str())?;
-            // The manifest map is keyed by instance name.
-            manifests
-                .get(name)
-                .filter(|mf| mf.grants[1] & (1u64 << fluxor_abi::registry::grant::SEAL_KEY) != 0)
-                .map(|_| name)
-        })
-        .collect();
-    if keepers.len() > 1 {
-        return Err(Error::Config(format!(
-            "{} keep the key vault's records (`seal_key`); a graph has one. \
-             The kernel answers the first and refuses the rest.",
-            keepers.join(", ")
-        )));
+    for name in module_names {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        if !m.provides.iter().any(|p| p == "key_vault") {
+            continue;
+        }
+        let Some(entry) = mods
+            .iter()
+            .find(|e| e.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        else {
+            continue;
+        };
+        let seal = vault_seal_mode(entry).map_err(|e| Error::Config(format!("`{name}`: {e}")))?;
+        if seal == "owner" {
+            return Err(Error::Config(format!(
+                "`{name}` keeps its records under its owner's key (`seal: owner`), which only \
+                 a workload's vault has: the node agent writes that key over the caller lane \
+                 the composer wires into a workload graph (`key_vault.seal_in`). A node \
+                 graph's vault seals with `hardware` or `none`."
+            )));
+        }
+        if let Some(rt) = runtime {
+            if vault_custody_is_token(entry) && !vault_has_token_client(rt) {
+                return Err(Error::Config(format!(
+                    "`{name}` holds its identity keys on a token (`custody: token`), and \
+                     runtime `{rt}` has no `key_custody` provider: its vault build carries \
+                     no token client and would refuse to construct. Set `custody: software`, \
+                     or place it on a Linux node that serves `key_custody`."
+                )));
+            }
+            let facts = crate::target_facts::TargetFacts::for_runtime(rt);
+            if seal == "hardware" && facts.seal_provenance.is_none() {
+                return Err(Error::Config(format!(
+                    "`{name}` seals its records under the platform's key (`seal: hardware`, \
+                     the default), and runtime `{rt}` has no sealing key: the vault could \
+                     derive none. Set `seal: none` (records kept readable: whoever holds the \
+                     medium holds the keys) or place it on a target that seals."
+                )));
+            }
+        }
+        let blocks = format!("{name}.blocks");
+        let wired = config
+            .get("wiring")
+            .and_then(Value::as_array)
+            .is_some_and(|w| {
+                w.iter()
+                    .any(|e| e.get("to").and_then(Value::as_str) == Some(blocks.as_str()))
+            });
+        let image = vault_param_u64(entry, "image", 0);
+        if wired && (image < 512 || !image.is_multiple_of(512)) {
+            return Err(Error::Config(format!(
+                "`{name}` keeps its records on the source wired to `{blocks}`, and `image: \
+                 {image}` is not a slot size: name a whole number of 512-byte sectors (at \
+                 least 512; a device key and its certificate take about 1 KiB)."
+            )));
+        }
+        if !wired && image != 0 {
+            return Err(Error::Config(format!(
+                "`{name}` sizes a record image (`image: {image}`) but nothing is wired to \
+                 `{blocks}`, so it would hold that heap and persist nothing. Wire a block \
+                 source to `{blocks}`, or drop `image`."
+            )));
+        }
+        let slots = vault_param_u64(entry, "slots", 8);
+        let handles = config
+            .get("capacity")
+            .and_then(|c| c.get("handles"))
+            .and_then(Value::as_u64)
+            .or_else(|| crate::capacity::kernel_pool_default_reserve(target, "handles"));
+        if let Some(h) = handles {
+            if slots > h {
+                return Err(Error::Config(format!(
+                    "`{name}` holds up to {slots} keys (`slots`), and each open key is a \
+                     handle the kernel routes, but the node's `handles` pool reserves {h}. \
+                     Lower `slots`, or raise `capacity: {{ handles: {slots} }}`."
+                )));
+            }
+        }
     }
     Ok(())
 }
 
-/// Coordinator exclusivity for the node's network identities.
+/// The one writer of the node's address control (`net::identity`).
 ///
-/// A graph is a *workload node* when it holds a workload creator — a module
-/// holding `workload.create` (the network stack holds `workload.net` for its
-/// lane ops, and creates nothing) — or says so (`workload_node: true`).
-/// On a workload node the kernel installs workload identities into the
-/// network stack's `addr_ctl` and held addresses come from `net.route` HOLD,
-/// so `addr_ctl` must have no other writer: a coordinator wired into it
-/// would race the kernel on one ring. Other graphs keep the direct
-/// `addr_ctl`/`addr_evt` path (a fence coordinator, a capture harness).
-/// The kernel enforces the same at bind: `NET_PROVIDE` and a module-realized
-/// HOLD refuse while a module writes `addr_ctl`.
+/// On a node whose graph holds a workload creator — a module holding
+/// `workload.create` — the creator gives each workload its address: it is
+/// the one writer of the net provider's `addr_ctl` (the kernel installs
+/// nothing). So every edge into an `addr_ctl` comes from a creator, and a
+/// creator that writes addresses (it declares an `addr_ctl_out` output)
+/// reaches the `addr_ctl` of every module that serves one. A creator whose
+/// workloads take no address writes nothing there. A node with no creator
+/// keeps whichever writer it wires — a VIP or fence coordinator, a capture
+/// harness — or none.
+///
+/// Every graph wires at most one writer into a module's `addr_ctl`. The
+/// stack keys each address by the owner tag its record names, and two
+/// writers on one port reach it merged into one channel, the node's
+/// addresses under owner 0 alike: it could not tell whose `ADDR_ADD` a
+/// re-add, an `ARM` or a `FENCE` is, so a second writer would be answered
+/// as the first. One writer is the port's contract, refused here.
 pub fn validate_net_identity_writers(
     config: &Value,
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<()> {
-    let declared = config
-        .get("workload_node")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let creator = module_names.iter().find(|n| {
-        manifests.get(n.as_str()).is_some_and(|m| {
-            m.grants[1] & (1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE) != 0
-        })
-    });
-    if !declared && creator.is_none() {
-        return Ok(());
-    }
-    let why = match creator {
-        Some(c) => format!("`{c}` creates workloads (`workload.create`)"),
-        None => "the graph declares `workload_node: true`".to_string(),
-    };
-    let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) else {
-        return Ok(());
-    };
-    for entry in wiring {
+    const ADDR_CTL: &str = "addr_ctl";
+    const WRITER_PORT: &str = "addr_ctl_out";
+    let mut writers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in config
+        .get("wiring")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let (Some(from), Some(to)) = (
-            entry.get("from").and_then(|v| v.as_str()),
-            entry.get("to").and_then(|v| v.as_str()),
+            e.get("from").and_then(Value::as_str),
+            e.get("to").and_then(Value::as_str),
         ) else {
             continue;
         };
-        if to.split_once('.').map(|(_, p)| p) == Some("addr_ctl") {
+        if to.split_once('.').map(|(_, p)| p) != Some(ADDR_CTL) {
+            continue;
+        }
+        let from_module = from.split_once('.').map_or(from, |(m, _)| m);
+        let list = writers.entry(to).or_default();
+        if !list.contains(&from_module) {
+            list.push(from_module);
+        }
+        if list.len() > 1 {
             return Err(Error::Config(format!(
-                "`{from}` is wired into `{to}` on a workload node ({why}). There the kernel \
-                 installs workload identities into `addr_ctl` and held addresses come from \
-                 net.route HOLD, so `addr_ctl` has one writer; a coordinator on it would race \
-                 the kernel. Write held addresses with net.route HOLD, or run the coordinator \
-                 in a graph that creates no workloads."
+                "`{to}` is written by `{}` and `{}`: the stack keys an address by the owner \
+                 its record names, and two writers on one port arrive as one, so it cannot \
+                 tell whose re-add, ARM or FENCE a record is. Wire one writer into `{to}`.",
+                list[0], list[1]
             )));
+        }
+    }
+    let creators: Vec<&str> = module_names
+        .iter()
+        .filter(|n| {
+            manifests.get(n.as_str()).is_some_and(|m| {
+                m.grants[1] & (1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE) != 0
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if creators.is_empty() {
+        return Ok(());
+    }
+    let has_port = |module: &str, dir: u8, port: &str| {
+        manifests.get(module).is_some_and(|m| {
+            m.ports
+                .iter()
+                .any(|p| p.direction == dir && p.name.as_deref() == Some(port))
+        })
+    };
+    let edges: Vec<(&str, &str)> = config
+        .get("wiring")
+        .and_then(|w| w.as_array())
+        .map(|w| {
+            w.iter()
+                .filter_map(|e| Some((e.get("from")?.as_str()?, e.get("to")?.as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    fn module_of(end: &str) -> &str {
+        end.split_once('.').map_or(end, |(m, _)| m)
+    }
+    fn port_of(end: &str) -> Option<&str> {
+        end.split_once('.').map(|(_, p)| p)
+    }
+    for (from, to) in &edges {
+        if port_of(to) == Some(ADDR_CTL) && !creators.contains(&module_of(from)) {
+            return Err(Error::Config(format!(
+                "`{from}` is wired into `{to}`, but `{}` creates workloads \
+                 (`workload.create`): the creator gives each workload its address and is the \
+                 one writer of `addr_ctl`. Run the coordinator in a graph that creates no \
+                 workloads.",
+                creators[0]
+            )));
+        }
+    }
+    let servers: Vec<&str> = module_names
+        .iter()
+        .map(String::as_str)
+        .filter(|m| has_port(m, 0, ADDR_CTL))
+        .collect();
+    for creator in creators.iter().filter(|c| has_port(c, 1, WRITER_PORT)) {
+        for server in &servers {
+            let wired = edges.iter().any(|(from, to)| {
+                module_of(from) == *creator
+                    && module_of(to) == *server
+                    && port_of(to) == Some(ADDR_CTL)
+            });
+            if !wired {
+                return Err(Error::Config(format!(
+                    "`{creator}` creates workloads and writes their addresses \
+                     (`{WRITER_PORT}`), but nothing wires it into `{server}.{ADDR_CTL}`. The \
+                     kernel installs no address: wire `{creator}.{WRITER_PORT}` -> \
+                     `{server}.{ADDR_CTL}`."
+                )));
+            }
         }
     }
     Ok(())

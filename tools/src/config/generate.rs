@@ -47,10 +47,17 @@ fn generate_config_impl(
     pio_count: u8,
     resolved_target: Option<&str>,
 ) -> Result<Vec<u8>> {
+    // The kernel constructs a graph's modules in the order they are listed,
+    // on every target, so the list is put in construction order first and
+    // everything after it reads the reordered graph.
+    let reordered = in_construction_order(config, r)?;
+    let config = reordered.as_ref().unwrap_or(config);
     let project_root = r.project_root();
     let modules = config
         .get("modules")
         .ok_or_else(|| Error::Config("modules section required".into()))?;
+    // `${applet:data_dir}` is an applet graph's alone; `fluxor exec` gives it.
+    crate::packaging::check_applet_placeholders(config).map_err(Error::Config)?;
     if config.get("boot").is_some() {
         return Err(Error::Config(
             "`boot:` is not a graph key: a machine's rig behaviour (summary cadence, \
@@ -199,6 +206,13 @@ fn generate_config_impl(
                                 // unique by construction; `type` is preserved
                                 // (manifests resolve by type). Duplicate local names
                                 // are separately rejected in `build_workload_section`.
+                                // A `name`-only entry names its type by its name.
+                                let ty = obj
+                                    .get("type")
+                                    .or_else(|| obj.get("name"))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                obj.insert("type".to_string(), ty);
                                 obj.insert(
                                     "name".to_string(),
                                     Value::String(format!("__workload{pi}__m{li}")),
@@ -288,13 +302,22 @@ fn generate_config_impl(
     let manifests = manifests;
 
     // Send pools are sized from the graph: what each instance retains for
-    // its consumers depends on who consumes it, which the wiring says.
+    // its consumers depends on who consumes it, which the wiring says. Each
+    // lane target then serves the node graph's lanes beside its workload
+    // lanes, which the pool was sized for.
     let modules_with_pools;
     let modules_ref = match (modules_ref.as_array(), config.get("wiring")) {
         (Some(list), Some(wiring)) => {
             let names: Vec<String> = list
                 .iter()
                 .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect();
+            let types: Vec<String> = list
+                .iter()
+                .map(|e| {
+                    crate::module_resolver::entry_identity(e)
+                        .map_or_else(String::new, |(_, t, _)| t.to_string())
+                })
                 .collect();
             // A wiring that does not parse is refused below, by name.
             match parse_wiring_edges(wiring, &names, &manifests) {
@@ -306,6 +329,15 @@ fn generate_config_impl(
                         Some(u64::from(p.default))
                     };
                     derive_send_pools(&mut list, &edges, &names, &manifests, &default_of)?;
+                    let lanes = assign_node_lanes(config, &edges, &names, &types, &manifests)?;
+                    add_node_lanes(&mut list, &lanes, &names, &manifests, &default_of, r)?;
+                    check_lane_capacity(
+                        &list,
+                        &names,
+                        &manifests,
+                        resolved_target.unwrap_or("linux"),
+                        r,
+                    )?;
                     modules_with_pools = Value::Array(list);
                     &modules_with_pools
                 }
@@ -437,11 +469,9 @@ fn generate_config_impl(
                     crate::trust_anchors::KEY_LABELS,
                 )
                 .map_err(|e| Error::Config(format!("modules[{i}] ({name}): key_file: {e}")))?;
-                let facts = crate::target_facts::TargetFacts::for_runtime(runtime);
                 let key = crate::identity_key::classify(&der);
-                if let Err(e) =
-                    crate::identity_key::admit_identity(key, runtime, facts.vault_suites)
-                {
+                let (vault, suites) = graph_vault_suites(config, &manifests);
+                if let Err(e) = crate::identity_key::admit_identity(key, &vault, &suites) {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
             }
@@ -481,8 +511,18 @@ fn generate_config_impl(
                                 },
                             })
                             .collect();
+                        let active: Vec<Option<bool>> = rw
+                            .active_when_params
+                            .iter()
+                            .map(|param| {
+                                param_schema
+                                    .as_ref()
+                                    .and_then(|ps| schema::param_is_set(m, ps, param))
+                            })
+                            .collect();
                         if let Err(e) = crate::target_facts::check_requires_when(
                             &resolutions,
+                            &active,
                             rw,
                             &facts,
                             runtime,
@@ -620,11 +660,20 @@ fn generate_config_impl(
             project: project_root,
         },
     )?;
+    let node_claims = instance_claims_of(
+        module_names.iter().zip(&module_entries).map(|(n, e)| {
+            (n.as_str(), e.name_hash, e.params.as_slice())
+        }),
+        modules_ref.as_array().map(Vec::as_slice).unwrap_or(&[]),
+        &manifests,
+        r,
+    )?;
     enforce_required_contracts(
         required_contract_refusals(
             config,
             &module_names,
-            &claim_manifests,
+            &manifests,
+            &node_claims,
             ProviderReach {
                 runtime: runtime_owned.as_deref(),
                 caller: ProviderCaller::Node,
@@ -636,8 +685,14 @@ fn generate_config_impl(
     // One writer of the network stack's `addr_ctl` on a node that creates
     // workloads: the kernel.
     validate_net_identity_writers(config, &module_names, &manifests)?;
-    // One keeper of the key vault's durable image.
-    validate_vault_store(config, &manifests)?;
+    // The key vault's seal and store against the target.
+    validate_key_vault(
+        config,
+        &module_names,
+        &manifests,
+        runtime_owned.as_deref(),
+        resolved_target.unwrap_or("linux"),
+    )?;
     // A module provider and the modules it serves share a domain (provider
     // code runs on the caller's core); one live-added workloads may reach
     // sits in the primary domain.
@@ -827,12 +882,52 @@ fn generate_config_impl(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // One record per edge, in wiring order: its index is its channel id.
-    let edge_records: Vec<graph::EdgeRecord> = edges
+    // Every edge to a lane target's `net_in` or from its `net_out` is a lane
+    // of the node owner. A built-in a host provider serves is built as the
+    // `host_lane` that runs it, its remaining edges renumbered onto the
+    // lane's address-control pair.
+    let mut realized_entries = module_entries.clone();
+    let mut realized_edges = edges.clone();
+    let module_types: Vec<String> = modules_ref
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .map(|e| {
+                    crate::module_resolver::entry_identity(e)
+                        .map_or_else(String::new, |(_, t, _)| t.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let node_lanes = assign_node_lanes(config, &edges, &module_names, &module_types, &manifests)?;
+    let is_lane: Vec<bool> = (0..edges.len())
+        .map(|i| lane_of_edge(&node_lanes, i).is_some())
+        .collect();
+    realize_host_providers(
+        &mut realized_entries,
+        &module_names,
+        &module_types,
+        &manifests,
+        &mut realized_edges,
+        &is_lane,
+        r,
+    )?;
+
+    // One record per edge, in wiring order: its index is its channel id. A
+    // lane's edge carries at least what the target's port declares, which
+    // its channel is sized for where a port's would be.
+    let lane_floor = |m: u16, direction: u8, index: u8| -> u32 {
+        module_names
+            .get(usize::from(m))
+            .and_then(|n| manifests.get(n))
+            .and_then(|mf| mf.find_port_spec(direction, index))
+            .map_or(0, |p| p.buffer_size)
+    };
+    let edge_records: Vec<graph::EdgeRecord> = realized_edges
         .iter()
         .enumerate()
-        .map(
-            |(i, &(from, to, to_port, from_port, to_port_index))| graph::EdgeRecord {
+        .map(|(i, &(from, to, to_port, from_port, to_port_index))| {
+            let mut record = graph::EdgeRecord {
                 from: graph::Endpoint::New(from),
                 from_port,
                 to: graph::Endpoint::New(to),
@@ -849,17 +944,36 @@ fn generate_config_impl(
                 wake_on_write: edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01 != 0,
                 retains_send: edge_wake_flags.get(i).copied().unwrap_or(0) & 0x02 != 0,
                 buffer_bytes: edge_buffer_bytes.get(i).copied().unwrap_or(0),
-            },
-        )
+            };
+            if let Some((l, key)) = lane_of_edge(&node_lanes, i) {
+                let lane = graph::Endpoint::Lane {
+                    key,
+                    target: l.target,
+                };
+                // A lane carries its own framing: never a mailbox.
+                record.buffer_group = 0;
+                if to == l.module {
+                    record.buffer_bytes = record.buffer_bytes.max(lane_floor(to, 0, to_port_index));
+                    record.to = lane;
+                    record.to_port = 0;
+                    record.to_ctrl = false;
+                } else {
+                    record.buffer_bytes = record.buffer_bytes.max(lane_floor(from, 1, from_port));
+                    record.from = lane;
+                    record.from_port = 0;
+                }
+            }
+            record
+        })
         .collect();
 
     // The composed graph: the declared modules are nodes `0..n` in config
     // order (a module's index is its id), its fans after them.
     let runtime = runtime_owned.as_deref().unwrap_or("linux");
-    let graph_modules: Vec<crate::add_subgraph::GraphModule> = module_entries
+    let graph_modules: Vec<crate::add_subgraph::GraphModule> = realized_entries
         .iter()
         .zip(&module_names)
-        .map(|(e, name)| graph_module(e, name, manifests.get(name), runtime))
+        .map(|(e, name)| graph_module(e, name, manifests.get(name)))
         .collect();
     let composition = crate::add_subgraph::compose(
         &graph_modules,
@@ -875,6 +989,9 @@ fn generate_config_impl(
         },
     )
     .map_err(Error::Config)?;
+    // Each lane is one edge each way once its fans are in: the kernel's
+    // lane rule, said at build.
+    crate::add_subgraph::check_net_lanes(&composition.edges).map_err(Error::Config)?;
 
     // One record per declared domain, at least one. A domain's tick of 0
     // takes the graph's; tick_min_us/tick_max_us of 0 take the domain's
@@ -928,15 +1045,19 @@ fn generate_config_impl(
 
     // Resident workloads: each top-level `workloads:` entry is a
     // self-contained composed graph the kernel admits at boot.
-    let workload_blobs: Vec<(bool, Vec<u8>)> = workloads
+    let workload_blobs: Vec<(bool, Vec<u8>, Vec<u8>)> = workloads
         .iter()
-        .map(|w| crate::add_subgraph::encode_workload(w).map(|b| (w.idle_safe, b)))
+        .map(|w| {
+            crate::add_subgraph::encode_workload(w)
+                .map(|b| (w.idle_safe, w.endpoints.concat(), b))
+        })
         .collect::<std::result::Result<_, String>>()
         .map_err(Error::Config)?;
     let workload_records: Vec<boot_config::WorkloadRecord<'_>> = workload_blobs
         .iter()
-        .map(|(idle_safe, blob)| boot_config::WorkloadRecord {
+        .map(|(idle_safe, endpoints, blob)| boot_config::WorkloadRecord {
             idle_safe: *idle_safe,
+            endpoints,
             blob,
         })
         .collect();
@@ -950,7 +1071,7 @@ fn generate_config_impl(
     // Declared demand: what the graph's modules declare of the kernel pools,
     // which the kernel adds to their derived sizes. Absent when nothing
     // declares.
-    let declared = declared_demand(config, &module_names, &manifests, &demand)?;
+    let declared = declared_demand(&demand)?;
     if let Some(line) = heap_per_demand_report(&plan, &demand, &module_entries) {
         println!("{line}");
     }
@@ -967,9 +1088,10 @@ fn generate_config_impl(
     // edges edges.
     let composed_edges = composed_edge_tuples(&composition.edges);
     let smp = crate::target::smp_of(target, project_root);
+    // A lane is never split across cores.
     let crossings = crate::capacity::crossing_count(
         &smp,
-        composition.edges.iter().map(|e| {
+        composition.edges.iter().filter(|e| !is_lane_edge(e)).map(|e| {
             let domain = |end: graph::Endpoint| {
                 end.new_index()
                     .and_then(|i| composition.modules.get(i))
@@ -1019,14 +1141,11 @@ fn generate_config_impl(
 
 /// A declared module as composition sees it: its record's fields, and what
 /// its manifest says of its ports. A module the node runs built in declares
-/// no ports to the composer (the kernel holds no manifest for it), and the
-/// Linux network provider keeps one channel per edge
-/// (`ring_demand::multi_channel`).
+/// no ports to the composer (the kernel holds no manifest for it).
 fn graph_module(
     entry: &ModuleEntry,
     name: &str,
     manifest: Option<&Manifest>,
-    runtime: &str,
 ) -> crate::add_subgraph::GraphModule {
     let loaded = manifest.filter(|m| !m.builtin);
     crate::add_subgraph::GraphModule {
@@ -1040,7 +1159,6 @@ fn graph_module(
             .map(crate::add_subgraph::plan_ports)
             .unwrap_or_default(),
         mailbox_safe: loaded.is_some_and(|m| m.facts.mailbox_safe),
-        multi_channel: crate::ring_demand::multi_channel(runtime, entry.name_hash),
     }
 }
 
@@ -1065,7 +1183,7 @@ fn fan_module_params(
         )
     })?;
     let manifest = &fan_module.manifest;
-    let tlv = plan::fan_params(fan.kind, plan::FRAMES_PER_STEP_DEFAULT, scratch).to_vec();
+    let tlv = plan::fan_params(plan::FRAMES_PER_STEP_DEFAULT, scratch).to_vec();
     insert_heap_tags(tlv, &json!({}), ty, Some(manifest), &HeapPlan::default())
         .map_err(|e| e.to_string())
 }
@@ -1135,9 +1253,8 @@ fn envelope_entries(config: &Value, target: &str) -> Result<Vec<(&'static str, u
     let mut entries = Vec::new();
     println!("Capacity envelope ({target}):");
     for (name, val) in obj {
-        let Some(&(pool, pool_id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| n == name)
-        else {
-            let known: Vec<&str> = crate::capacity::POOL_IDS.iter().map(|(n, _)| *n).collect();
+        let Some((pool, pool_id)) = crate::capacity::pool_ids().find(|(n, _)| n == name) else {
+            let known: Vec<&str> = crate::capacity::pool_ids().map(|(n, _)| n).collect();
             return Err(Error::Config(format!(
                 "capacity: unknown pool '{name}' (known: {})",
                 known.join(", ")
@@ -1154,7 +1271,9 @@ fn envelope_entries(config: &Value, target: &str) -> Result<Vec<(&'static str, u
                     .into(),
             ));
         }
-        if !crate::capacity::kernel_has_pool(target, pool) {
+        if crate::capacity::module_pool_contract(pool).is_none()
+            && !crate::capacity::kernel_has_pool(target, pool)
+        {
             return Err(Error::Config(format!(
                 "capacity: the {target} kernel has no '{pool}' table (`{}` names no such pool), \
                  so an entry for it would bound nothing",
@@ -1437,7 +1556,8 @@ fn envelope_figures(config: &Value) -> Vec<(String, u64)> {
 /// planned ceiling on `target` of every pool a `heap_per_demand` rule names —
 /// what the graph declares for it (all of it, a module-provided pool's
 /// included: the provider serves it), plus the `capacity:` entry, else the
-/// profile's default reserve. Those pools have no structural part
+/// profile's default reserve (a kernel pool's; a module-served pool has
+/// none). Those pools have no structural part
 /// (`manifest::heap_per_demand_pool_allowed`), so the graph's shape is not
 /// needed.
 fn heap_plan(target: &str, config: &Value, demand: &[InstanceDemand]) -> HeapPlan {
@@ -1461,51 +1581,21 @@ fn heap_plan(target: &str, config: &Value, demand: &[InstanceDemand]) -> HeapPla
     plan
 }
 
-/// The unkeyed module provider of `contract` in the node graph, if any: a
-/// module whose manifest `provides` it with no `volume:` selector, so it is
-/// the layer class-byte calls reach.
-fn unkeyed_module_provider<'a>(
-    config: &Value,
-    module_names: &'a [String],
-    manifests: &HashMap<String, Manifest>,
-    contract: &str,
-) -> Option<&'a str> {
-    module_names
-        .iter()
-        .find(|n| {
-            manifests
-                .get(*n)
-                .is_some_and(|m| m.provides.iter().any(|p| p == contract))
-                && provider_volume(config, n).is_empty()
-        })
-        .map(String::as_str)
-}
-
-/// The graph's declared demand on the kernel's tables, `(pool, id, n)`: per
-/// pool, what its instances declare ([`instance_demand`]), node graph and
-/// resident workloads summed. The kernel adds it to the pool's derived size,
-/// so a pool sized by its consumers — the store's subscription table — grows
-/// with the graph that boots. The `DMND` section carries it; empty when
-/// nothing declares.
-///
-/// A pool a module provider serves from its own heap
-/// (`capacity::MODULE_PROVIDED_POOLS`) is left out when the node graph has an
-/// unkeyed module provider of its contract: the consumers call that module,
-/// not the host table, and the demand is spent once — on the provider's
-/// `heap_per_demand` figure — rather than twice.
-fn declared_demand(
-    config: &Value,
-    module_names: &[String],
-    manifests: &HashMap<String, Manifest>,
-    demand: &[InstanceDemand],
-) -> Result<Vec<(&'static str, u16, u32)>> {
+/// The graph's declared demand, `(pool, id, n)`: per pool, what its
+/// instances declare ([`instance_demand`]), node graph and resident workloads
+/// summed. The `DMND` section carries it; empty when nothing declares. For a
+/// kernel pool the kernel adds it to the pool's derived size, so a table
+/// sized by its consumers grows with the graph that boots. For a pool the
+/// graph's module providers serve, it is the figure their heap is sized to
+/// (`heap_per_demand`), and the kernel reports the pool against it.
+fn declared_demand(demand: &[InstanceDemand]) -> Result<Vec<(&'static str, u16, u32)>> {
     let mut entries = Vec::new();
     for &(_, pool) in crate::capacity::DECLARED_DEMAND {
         let total = demand_total(demand, pool);
         if total == 0 {
             continue;
         }
-        let Some(&(_, id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| *n == pool) else {
+        let Some(id) = crate::capacity::pool_id(pool) else {
             continue;
         };
         let n = u32::try_from(total).map_err(|_| {
@@ -1513,30 +1603,12 @@ fn declared_demand(
                 "the graph declares {total} {pool}, which overflows u32"
             ))
         })?;
-        let provider = crate::capacity::MODULE_PROVIDED_POOLS
-            .iter()
-            .find(|&&(p, _)| p == pool)
-            .and_then(|&(_, contract)| {
-                unkeyed_module_provider(config, module_names, manifests, contract)
-                    .map(|m| (m, contract))
-            });
-        if let Some((module, contract)) = provider {
-            let per_demand = manifests
-                .get(module)
-                .and_then(|m| m.heap_per_demand.as_ref())
-                .is_some_and(|r| r.pool == pool);
-            println!(
-                "Declared demand: {pool} {n}, served by module '{module}' (provides `{contract}`){}; \
-                 not added to the host table",
-                if per_demand {
-                    ", sized into its heap by `heap_per_demand`"
-                } else {
-                    ""
-                }
-            );
-            continue;
+        match crate::capacity::module_pool_contract(pool) {
+            Some(contract) => {
+                println!("Declared demand: {pool} {n}, served by the graph's `{contract}` providers")
+            }
+            None => println!("Declared demand: {pool} {n}"),
         }
-        println!("Declared demand: {pool} {n}");
         entries.push((pool, id, n));
     }
     Ok(entries)
@@ -1616,6 +1688,45 @@ fn build_workload_section(config: &Value, r: &ModuleResolver) -> Result<Vec<Vec<
 /// instance's effective value of `param` is one of `values`: `Ok(None)` when
 /// the module has no schema, `Ok(Some(None))` when the schema does not declare
 /// the param or values.
+/// Each instance's claims as its packed params decide them
+/// ([`instance_claims`]): `instances` are `(name, type hash,
+/// packed params)`, `entries` the graph's module entries. An instance whose
+/// module has no schema to resolve its conditions against (not built) is
+/// left out.
+fn instance_claims_of<'a>(
+    instances: impl Iterator<Item = (&'a str, u32, &'a [u8])>,
+    entries: &[Value],
+    manifests: &HashMap<String, Manifest>,
+    r: &ModuleResolver,
+) -> Result<HashMap<String, Vec<InstanceClaim>>> {
+    let mut out = HashMap::new();
+    for (name, hash, params) in instances {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        let Some(entry) = entries
+            .iter()
+            .find(|e| e.get("name").and_then(Value::as_str) == Some(name))
+        else {
+            continue;
+        };
+        let Some(schema) = schema::entry_schema(entry, r)? else {
+            continue;
+        };
+        let claims = instance_claims(m, &schema, hash, params).map_err(|e| {
+            Error::Config(format!(
+                "module '{name}': {}",
+                match e {
+                    Error::Config(m) | Error::Module(m) => m,
+                    other => other.to_string(),
+                }
+            ))
+        })?;
+        out.insert(name.to_string(), claims);
+    }
+    Ok(out)
+}
+
 pub(crate) fn exercised_claims(
     entries: &[Value],
     manifests: &HashMap<String, Manifest>,
@@ -1671,6 +1782,195 @@ pub(crate) fn exercised_claims(
         out.insert(name.clone(), m);
     }
     Ok(out)
+}
+
+/// `config` with its `modules` listed in construction order, or `None` when
+/// they already are.
+///
+/// Every module is constructed (`module_new`) in the order the composed
+/// graph lists it — the boot walk and a live add alike, on every target —
+/// and a module may call a provider from `module_new` (`tls` deposits its
+/// identity key in `key_vault`, a token minter asks the vault for custody).
+/// A provider in the graph registers when it is constructed, so it is
+/// listed before every module whose exercised claim it can answer: a
+/// node-owned provider of the claimed contract other than the claimant
+/// (a workload-scoped layer answers no node module). Otherwise the order is
+/// the graph's own. A provider and a claimant that each claim what the
+/// other provides cannot both come first, and the graph is refused naming
+/// the cycle.
+fn in_construction_order(config: &Value, r: &ModuleResolver) -> Result<Option<Value>> {
+    let mut out: Option<Value> = None;
+    if let Some(order) = list_order(config, r)? {
+        let entries = config["modules"].as_array().cloned().unwrap_or_default();
+        let c = out.get_or_insert_with(|| config.clone());
+        c["modules"] = Value::Array(order.iter().map(|&k| entries[k].clone()).collect());
+    }
+    // A workload's modules are constructed in its own list's order when it
+    // is created, so each list is ordered the same way.
+    let workloads = config
+        .get("workloads")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (w, workload) in workloads.iter().enumerate() {
+        let Some(order) = list_order(workload, r)? else {
+            continue;
+        };
+        let entries = workload["modules"].as_array().cloned().unwrap_or_default();
+        let c = out.get_or_insert_with(|| config.clone());
+        c["workloads"][w]["modules"] =
+            Value::Array(order.iter().map(|&k| entries[k].clone()).collect());
+    }
+    Ok(out)
+}
+
+/// Put `config`'s module lists in construction order, in place
+/// ([`in_construction_order`]). The graph expansion every build, check and
+/// id-table export shares does this, so each reader of the expanded graph
+/// indexes its modules as the kernel does.
+pub(crate) fn order_for_construction(config: &mut Value, r: &ModuleResolver) -> Result<()> {
+    if let Some(ordered) = in_construction_order(config, r)? {
+        *config = ordered;
+    }
+    Ok(())
+}
+
+/// The construction order of `graph`'s `modules` list (a node graph, or a
+/// workload's), or `None` when it is listed in it already.
+fn list_order(graph: &Value, r: &ModuleResolver) -> Result<Option<Vec<usize>>> {
+    let Some(entries) = graph.get("modules").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if entries.iter().any(|e| e.get("include").is_some()) {
+        return Ok(None);
+    }
+    let names: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            e.get("name")
+                .or_else(|| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    // Two entries under one name are refused by name, at the indices as
+    // written.
+    if names
+        .iter()
+        .enumerate()
+        .any(|(i, n)| names[..i].contains(n))
+    {
+        return Ok(None);
+    }
+    // A graph whose modules do not all resolve, or whose claims cannot be
+    // read against their schemas, is left as written: the composer's own
+    // checks refuse it, naming what is wrong, and no order is owed to a
+    // graph that does not build.
+    let Ok(resolved) = r.graph_modules(entries) else {
+        return Ok(None);
+    };
+    let Ok(manifests) = exercised_claims(entries, &resolved.manifests(), schema_param_is_one_of(r))
+    else {
+        return Ok(None);
+    };
+    let order = construction_order(graph, &names, &manifests)?;
+    Ok((!order.iter().enumerate().all(|(i, &k)| i == k)).then_some(order))
+}
+
+/// The construction order of the modules `names` (indices into it, see
+/// [`in_construction_order`]): each module where it is written, with the
+/// providers its exercised claims call pulled forward to just before it.
+/// Nothing else moves, so a graph that breaks a cycle by its order
+/// (`accept_cycles`) keeps the order it wrote between the modules in it.
+fn construction_order(
+    config: &Value,
+    names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<Vec<usize>> {
+    let n = names.len();
+    // `first[c]`: the modules that must be constructed before `c`, each with
+    // the contract `c` calls it through.
+    let mut first: Vec<Vec<(usize, &'static str)>> = vec![Vec::new(); n];
+    for (c, name) in names.iter().enumerate() {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        for claim in &m.resources {
+            if !claim_exercised(config, name, claim) {
+                continue;
+            }
+            let contract = crate::manifest::contract_name_to_str(claim.device_class);
+            for (p, provider) in names.iter().enumerate() {
+                let serves = p != c
+                    && manifests.get(provider).is_some_and(|pm| {
+                        !pm.workload_scope
+                            && pm.provides.iter().any(|s| surface_contract(s) == contract)
+                    });
+                if serves && !first[c].iter().any(|&(q, _)| q == p) {
+                    first[c].push((p, contract));
+                }
+            }
+        }
+    }
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    // The modules being placed, each with the contract through which the
+    // one after it on this path called it.
+    let mut path: Vec<(usize, &'static str)> = Vec::new();
+    for i in 0..n {
+        place(i, "", &first, &mut placed, &mut path, &mut order, names)?;
+    }
+    Ok(order)
+}
+
+/// Place module `i` in `order`: the providers it calls first, then `i`.
+fn place(
+    i: usize,
+    via: &'static str,
+    first: &[Vec<(usize, &'static str)>],
+    placed: &mut [bool],
+    path: &mut Vec<(usize, &'static str)>,
+    order: &mut Vec<usize>,
+    names: &[String],
+) -> Result<()> {
+    if placed[i] {
+        return Ok(());
+    }
+    if let Some(k) = path.iter().position(|&(m, _)| m == i) {
+        return Err(Error::Config(construction_cycle(names, &path[k..], via)));
+    }
+    path.push((i, via));
+    for &(p, contract) in &first[i] {
+        place(p, contract, first, placed, path, order, names)?;
+    }
+    path.pop();
+    placed[i] = true;
+    order.push(i);
+    Ok(())
+}
+
+/// The refusal for modules no construction order can serve: the cycle
+/// `cycle` (each module with the contract its predecessor calls it
+/// through), closed by `via`, the contract its last module calls the first
+/// through.
+fn construction_cycle(names: &[String], cycle: &[(usize, &'static str)], via: &'static str) -> String {
+    let mut steps: Vec<String> = Vec::new();
+    for (k, &(m, _)) in cycle.iter().enumerate() {
+        let contract = cycle.get(k + 1).map_or(via, |&(_, c)| c);
+        steps.push(format!("`{}` calls `{contract}` on", names[m]));
+    }
+    if let Some(&(m, _)) = cycle.first() {
+        steps.push(format!("`{}`", names[m]));
+    }
+    format!(
+        "no construction order serves this graph: {}. A module may call a provider from \
+         `module_new`, so each provider is constructed before its callers, and these cannot \
+         all come first. Make one of the claims `optional` or conditional (`active_when_params`) \
+         where the module does without it, or name a provider outside the cycle with a \
+         selector.",
+        steps.join(" ")
+    )
 }
 
 /// [`exercised_claims`]'s value test against the module's built schema.
@@ -1731,9 +2031,33 @@ pub fn build_workloads(
     Ok(workloads)
 }
 
+/// How a node of `runtime` runs a workload's modules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WorkloadGating {
+    /// In the runtime's own process (Linux): the isolation is the process.
+    Host,
+    /// Unprivileged, each under the strongest level the target implements.
+    Gated,
+    /// Not at all: a metal target with no protection backend.
+    Unavailable,
+}
+
+/// [`WorkloadGating`] for `runtime` (none known: the host's).
+pub(crate) fn workload_gating(runtime: Option<&str>, project: &Path) -> WorkloadGating {
+    match runtime {
+        None | Some("linux") => WorkloadGating::Host,
+        Some(rt) => match crate::target::load_target(rt, project) {
+            Ok(t) if !t.isolation.levels.is_empty() => WorkloadGating::Gated,
+            Ok(_) => WorkloadGating::Unavailable,
+            Err(_) => WorkloadGating::Host,
+        },
+    }
+}
+
 /// Whether the platform of `runtime` answers `caller`'s `fs` calls.
 fn fs_reachable(runtime: &str, caller: ProviderCaller, project: &Path) -> bool {
-    platform_contracts(runtime, caller, project).is_some_and(|c| c.iter().any(|x| x == "fs"))
+    (caller == ProviderCaller::Workload && workload_served("fs"))
+        || platform_contracts(runtime, caller, project).is_some_and(|c| c.iter().any(|x| x == "fs"))
 }
 
 /// Refuse a credential form the instance could not use where it runs.
@@ -1823,6 +2147,14 @@ fn build_workloads_counted(
         .into_iter()
         .map(|(_, exec)| exec.mode)
         .collect();
+    let gating = workload_gating(runtime, r.project_root());
+    if gating == WorkloadGating::Unavailable {
+        return Err(Error::Config(format!(
+            "workloads: {} has no protection backend, and a metal node runs a workload's \
+             modules only unprivileged — it admits no workload (CREATE answers ENOSYS)",
+            runtime.unwrap_or("?")
+        )));
+    }
     let mut workloads = Vec::new();
     for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
         let mods_yaml = workload_yaml
@@ -1866,6 +2198,15 @@ fn build_workloads_counted(
             let resolved = r
                 .require(mname, mtype, m.get("variant").and_then(Value::as_str))
                 .map_err(|e| Error::Config(format!("workload {pi}: {e}")))?;
+            // A workload layer serves every workload with what the node holds;
+            // it is the node's to compose (the kernel refuses its registration
+            // from a workload's module).
+            if resolved.manifest.workload_scope {
+                return Err(Error::Config(format!(
+                    "workload {pi} module '{mname}': `{mtype}` declares provider_scope = \
+                     \"workloads\", a layer only the node graph composes"
+                )));
+            }
             // PIC-only: a workload's modules are admitted via the loader by
             // name_hash; a native module has no .fmod for apply_add to load.
             if resolved.is_native() {
@@ -1879,6 +2220,23 @@ fn build_workloads_counted(
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' is a native module; resident workloads are PIC-only \
                      (no .fmod for apply_add to load). Use a PIC module, or place it in the node graph."
+                )));
+            }
+            // On a metal node every module a workload brings runs gated, and a
+            // provider other modules call into cannot be: one runs in a
+            // workload only as a type the node vouches for
+            // (`workload_instantiable`, which a module holding grants cannot
+            // declare). The kernel refuses the rest at CREATE (`EACCES`).
+            if gating == WorkloadGating::Gated
+                && !resolved.manifest.provider_contracts.is_empty()
+                && !resolved.manifest.workload_instantiable
+            {
+                return Err(Error::Config(format!(
+                    "workload {pi} module '{mname}': `{mtype}` provides a contract, and a metal \
+                     node runs a workload's provider only when the module declares \
+                     `workload_instantiable = true` (every other module of a workload runs \
+                     unprivileged, and other modules' calls into a provider would run its code \
+                     privileged)"
                 )));
             }
             // Reject duplicate local names within a workload: `name_to_local` resolves
@@ -1992,7 +2350,6 @@ fn build_workloads_counted(
                     .map(crate::add_subgraph::plan_ports)
                     .unwrap_or_default(),
                 mailbox_safe: manifest.as_ref().is_some_and(|m| m.facts.mailbox_safe),
-                multi_channel: false,
             });
         }
         let local_claims =
@@ -2015,6 +2372,18 @@ fn build_workloads_counted(
             Error::Config(why) => Error::Config(format!("workload {pi}: {why}")),
             other => other,
         })?;
+        let workload_claims = instance_claims_of(
+            modules
+                .iter()
+                .map(|m| (m.name.as_str(), m.name_hash, m.params.as_slice())),
+            &local_entries,
+            &local_manifests,
+            r,
+        )
+        .map_err(|e| match e {
+            Error::Config(why) => Error::Config(format!("workload {pi}: {why}")),
+            other => other,
+        })?;
         enforce_required_contracts(
             required_contract_refusals(
                 &json!({
@@ -2023,7 +2392,8 @@ fn build_workloads_counted(
                     "data": data_section.cloned().unwrap_or(Value::Null),
                 }),
                 &local_names,
-                &local_claims,
+                &local_manifests,
+                &workload_claims,
                 ProviderReach {
                     runtime,
                     caller: ProviderCaller::Workload,
@@ -2049,7 +2419,15 @@ fn build_workloads_counted(
                 )))
             }
         };
-        let edges = workload_edges(pi, &wiring, &name_to_local, &local_names, &local_manifests)?;
+        let mut edges =
+            workload_edges(pi, &wiring, &name_to_local, &local_names, &local_manifests)?;
+        edges.extend(owner_key_lanes(
+            pi,
+            &local_entries,
+            &local_names,
+            &local_manifests,
+            &edges,
+        )?);
         for e in &edges {
             // The domain check applies between two of the workload's
             // modules; a lane has no domain of its own.
@@ -2123,15 +2501,84 @@ fn build_workloads_counted(
             },
         )
         .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
+        let endpoints = workload_endpoints(workload_yaml, pi)?;
+        if let Some((other, _)) = workloads.iter().enumerate().find(|(_, w)| {
+            let w: &crate::add_subgraph::Workload = w;
+            w.endpoints.iter().any(|e| endpoints.contains(e))
+        }) {
+            return Err(Error::Config(format!(
+                "workload {pi}: an endpoint it declares is workload {other}'s: an endpoint is \
+                 one owner's"
+            )));
+        }
         workloads.push(crate::add_subgraph::Workload {
             owner_uid,
             state_cap,
             buffer_cap,
             graph,
             idle_safe,
+            endpoints,
         });
     }
     Ok((workloads, demand, heaps))
+}
+
+/// A workload's `endpoints:`: what its lanes may listen on, each a mapping
+/// `{protocol: tcp|udp, port: 1..=65535}` (an optional `name` says what it
+/// serves), as `[protocol u8][port u16 LE]`. Its owner is granted these and
+/// no others: a workload that declares none listens nowhere, and a listen
+/// on an undeclared port is refused (`EACCES`) where it runs. At most
+/// `net_proto::grant::MAX_ADMITTED_ENDPOINTS`, each once.
+fn workload_endpoints(workload_yaml: &Value, pi: usize) -> Result<Vec<[u8; 3]>> {
+    use fluxor_abi::contracts::net::net_proto::grant;
+    let Some(list) = workload_yaml.get("endpoints") else {
+        return Ok(Vec::new());
+    };
+    let list = list.as_array().ok_or_else(|| {
+        Error::Config(format!(
+            "workload {pi}: `endpoints:` is a list of {{protocol, port}}"
+        ))
+    })?;
+    if list.len() > grant::MAX_ADMITTED_ENDPOINTS {
+        return Err(Error::Config(format!(
+            "workload {pi}: {} endpoints declared, at most {} per workload",
+            list.len(),
+            grant::MAX_ADMITTED_ENDPOINTS
+        )));
+    }
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(list.len());
+    for (i, e) in list.iter().enumerate() {
+        let bad = |why: &str| Error::Config(format!("workload {pi} endpoint {i}: {why}"));
+        let map = e
+            .as_object()
+            .ok_or_else(|| bad("is a mapping {protocol, port}"))?;
+        if let Some(k) = map
+            .keys()
+            .find(|k| !matches!(k.as_str(), "protocol" | "port" | "name"))
+        {
+            return Err(bad(&format!("unknown key `{k}`")));
+        }
+        let protocol = match map.get("protocol").and_then(Value::as_str) {
+            Some("tcp") => grant::PROTO_TCP,
+            Some("udp") => grant::PROTO_UDP,
+            _ => return Err(bad("`protocol` is tcp or udp")),
+        };
+        let port = map
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p != 0)
+            .ok_or_else(|| {
+                bad("`port` is 1..=65535 (port 0 is an ephemeral source, never a listen)")
+            })?;
+        let p = port.to_le_bytes();
+        let ep = [protocol, p[0], p[1]];
+        if out.contains(&ep) {
+            return Err(bad("declared twice"));
+        }
+        out.push(ep);
+    }
+    Ok(out)
 }
 
 /// The node's network as a workload's `wiring:` names it
@@ -2144,8 +2591,9 @@ enum WireEnd {
     /// One of the workload's modules, the port's index, and whether the
     /// port is a control input.
     Module(u8, u8, bool),
-    /// The node's network.
-    Net,
+    /// The node's network: the module that serves the lane, by type name
+    /// hash.
+    Net(u32),
 }
 
 /// A workload's `wiring:` as the edges its graph carries. Ends are written as a
@@ -2163,7 +2611,7 @@ fn workload_edges(
     local_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<Vec<graph::EdgeRecord>> {
-    let mut lanes: Vec<u8> = Vec::new();
+    let mut lanes: Vec<(u8, u32)> = Vec::new();
     let mut edges = Vec::new();
     for (ei, e) in wiring.iter().enumerate() {
         let at = |why: String| Error::Config(format!("workload {pi} wiring {ei}: {why}"));
@@ -2176,6 +2624,19 @@ fn workload_edges(
             }
         }
         let end = |key: &str, is_from: bool| -> Result<WireEnd> {
+            let caller = |v: &Value| {
+                v.get("caller").is_some()
+                    || v.as_str().is_some_and(|s| {
+                        let m = s.split('.').next().unwrap_or(s).trim();
+                        m == "caller" && !name_to_local.contains_key(m)
+                    })
+            };
+            if e.get(key).is_some_and(caller) {
+                return Err(at(format!(
+                    "`{key}` names the creator's lane: a `Caller` edge is the composer's to \
+                     wire (the owner's key into a `seal: owner` vault), never a graph's"
+                )));
+            }
             let spec = e
                 .get(key)
                 .and_then(Value::as_str)
@@ -2208,7 +2669,7 @@ fn workload_edges(
                          alone — `{module}.net_out` in `from:`, `{module}.net_in` in `to:`"
                     )));
                 }
-                return Ok(WireEnd::Net);
+                return Ok(WireEnd::Net(fluxor_abi::wire::fnv1a32(module.as_bytes())));
             }
             let hint = crate::target::closest_match(module, local_names, 3)
                 .map(|s| format!(" Did you mean '{s}'?"))
@@ -2221,29 +2682,30 @@ fn workload_edges(
         };
         let from = end("from", true)?;
         let to = end("to", false)?;
-        let mut lane = |local: u8| -> Result<u8> {
-            let key = match lanes.iter().position(|&l| l == local) {
+        let mut lane = |local: u8, target: u32| -> Result<graph::Endpoint> {
+            let key = match lanes.iter().position(|&l| l == (local, target)) {
                 Some(k) => k,
                 None => {
-                    lanes.push(local);
+                    lanes.push((local, target));
                     lanes.len() - 1
                 }
             };
-            u8::try_from(key)
-                .map_err(|_| at("more than 256 modules are wired to the node's network".into()))
+            let key = u8::try_from(key)
+                .map_err(|_| at("more than 256 modules are wired to the node's network".into()))?;
+            Ok(graph::Endpoint::Lane { key, target })
         };
         let local = |i: u8| graph::Endpoint::New(u16::from(i));
         let (from, from_port, to, to_port, to_ctrl) = match (from, to) {
             (WireEnd::Module(f, fp, _), WireEnd::Module(t, tp, ctrl)) => {
                 (local(f), fp, local(t), tp, ctrl)
             }
-            (WireEnd::Net, WireEnd::Module(t, tp, ctrl)) => {
-                (graph::Endpoint::Net(lane(t)?), 0, local(t), tp, ctrl)
+            (WireEnd::Net(n), WireEnd::Module(t, tp, ctrl)) => {
+                (lane(t, n)?, 0, local(t), tp, ctrl)
             }
-            (WireEnd::Module(f, fp, _), WireEnd::Net) => {
-                (local(f), fp, graph::Endpoint::Net(lane(f)?), 0, false)
+            (WireEnd::Module(f, fp, _), WireEnd::Net(n)) => {
+                (local(f), fp, lane(f, n)?, 0, false)
             }
-            (WireEnd::Net, WireEnd::Net) => {
+            (WireEnd::Net(_), WireEnd::Net(_)) => {
                 return Err(at(
                     "the node's network connects to a module of the workload, not to itself".into(),
                 ))
@@ -2261,8 +2723,11 @@ fn workload_edges(
     }
     // The kernel's lane rule, said of the module it binds: one edge each
     // way between a module and the network.
-    for (key, &local) in lanes.iter().enumerate() {
-        let k = graph::Endpoint::Net(key as u8);
+    for (key, &(local, target)) in lanes.iter().enumerate() {
+        let k = graph::Endpoint::Lane {
+            key: key as u8,
+            target,
+        };
         let into = edges.iter().filter(|x| x.to == k).count();
         let out = edges.iter().filter(|x| x.from == k).count();
         if into != 1 || out != 1 {
@@ -2276,6 +2741,64 @@ fn workload_edges(
     }
     Ok(edges)
 }
+/// The creator's lanes into a workload's own vaults: for every `key_vault`
+/// kept under its owner's key (`seal: owner`), `Caller(k) ->
+/// <vault>.seal_in`, over which the node agent writes the owner's 32-byte
+/// key after `CREATE` and before `START` (`workload::LANE`, `FROM_CALLER`).
+/// Keys count down from 7, past any the graph's other edges hold.
+fn owner_key_lanes(
+    pi: usize,
+    entries: &[Value],
+    local_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    edges: &[graph::EdgeRecord],
+) -> Result<Vec<graph::EdgeRecord>> {
+    let mut held: Vec<u8> = edges
+        .iter()
+        .flat_map(|e| [e.from, e.to])
+        .filter_map(|end| match end {
+            graph::Endpoint::Caller(k) => Some(k),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let name = &local_names[i];
+        let provides_vault = manifests
+            .get(name)
+            .is_some_and(|m| m.provides.iter().any(|p| p == "key_vault"));
+        if !provides_vault {
+            continue;
+        }
+        let seal = vault_seal_mode(entry)
+            .map_err(|e| Error::Config(format!("workload {pi}: `{name}`: {e}")))?;
+        if seal != "owner" {
+            continue;
+        }
+        let (_, _, port) = resolve_port_spec(&format!("{name}.seal_in"), false, manifests, local_names)
+            .map_err(|why| {
+                Error::Config(format!(
+                    "workload {pi}: `{name}` keeps its records under its owner's key, and \
+                     its build has no `seal_in` port to take the key on: {why}"
+                ))
+            })?;
+        let Some(k) = (0..=7u8).rev().find(|k| !held.contains(k)) else {
+            return Err(Error::Config(format!(
+                "workload {pi}: more vaults kept under their owner's key than the creator's \
+                 lanes 0..=7 seat"
+            )));
+        };
+        held.push(k);
+        out.push(graph::EdgeRecord {
+            from: graph::Endpoint::Caller(k),
+            to: graph::Endpoint::New(i as u16),
+            to_port: port,
+            ..graph::EdgeRecord::default()
+        });
+    }
+    Ok(out)
+}
+
 /// YAML keys a node-graph module turns into node tags (the params TLV's
 /// trust class, protection level, device window, ISR budget, IRQ, quarantine
 /// partner and restart settings), or that would emit one (`voices:` packs
@@ -2673,9 +3196,6 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
     }
 
     // Check exclusive resource conflicts (instance-aware).
-    // Chain providers (access_mode 3) sit on top of exclusive providers via the
-    // provider chain pattern (CHAIN_NEXT dispatch). They coexist with exclusive
-    // providers and with each other on the same device class.
     // (device_class, instance, module_name)
     let mut exclusive_claims: Vec<(u8, u8, &str)> = Vec::new();
     for cap in module_caps {
@@ -2699,7 +3219,6 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
                 }
                 exclusive_claims.push((res.device_class, res.instance, &cap.name));
             }
-            // access_mode 3 (chain) — no conflict check, chains stack on top
         }
     }
 
@@ -2829,4 +3348,49 @@ mod buffer_group_tests {
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 0, 0]);
     }
+}
+
+/// The graph's key vault, named for a refusal, and the suites it holds: the
+/// suites of the `key_vault` variant the graph composes, none when it
+/// composes no vault.
+fn graph_vault_suites(
+    config: &Value,
+    manifests: &HashMap<String, crate::manifest::Manifest>,
+) -> (String, Vec<u16>) {
+    let vault = config
+        .get("modules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("name").and_then(Value::as_str))
+        .find_map(|n| {
+            manifests
+                .get(n)
+                .filter(|m| m.provides.iter().any(|p| p == "key_vault"))
+                .map(|m| (n, m))
+        });
+    let Some((name, m)) = vault else {
+        return (
+            "the graph, which composes no key_vault,".to_string(),
+            Vec::new(),
+        );
+    };
+    let selected = m.selected_variant.clone().or_else(|| {
+        m.variants
+            .iter()
+            .find(|v| v.default)
+            .map(|v| v.name.clone())
+    });
+    let features = selected
+        .as_deref()
+        .and_then(|s| m.variants.iter().find(|v| v.name == s))
+        .map(|v| v.features.clone())
+        .unwrap_or_default();
+    (
+        format!(
+            "the graph's vault `{name}` (variant {})",
+            selected.as_deref().unwrap_or("default")
+        ),
+        crate::target_facts::key_vault_suites(&features),
+    )
 }

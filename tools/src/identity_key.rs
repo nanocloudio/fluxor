@@ -1,11 +1,12 @@
 //! What an identity `key_file` is, read at compose.
 //!
 //! A tls instance signs its CertificateVerify with the key the graph names,
-//! and an RSA key can only be signed with by a vault that holds RSA — a
-//! per-target capability (`target_facts::vault_suites`). The composer reads
-//! enough of the DER to know which kind of key it is, so a graph that names
-//! an RSA identity on a target that cannot sign with one is refused here,
-//! with the reason, rather than at the module's first handshake.
+//! and an RSA key can only be signed with by a vault that holds RSA — a fact
+//! of the `key_vault` variant the graph composes
+//! (`target_facts::key_vault_suites`). The composer reads enough of the DER
+//! to know which kind of key it is, so a graph that names an RSA identity
+//! beside a vault that cannot sign with one is refused here, with the
+//! reason, rather than at the module's first handshake.
 //!
 //! Only the shape is read: the outer SEQUENCE, the version, and either the
 //! modulus (PKCS#1 `RSAPrivateKey`) or the algorithm identifier and the
@@ -137,17 +138,17 @@ pub fn classify(der: &[u8]) -> IdentityKey {
     }
 }
 
-/// Whether a target whose vault holds `vault_suites` can sign with `key`.
-/// `Ok(())` when it can, or when the key is not RSA (every target signs
-/// P-256 in-module); `Err` names the width and what the target lacks.
-pub fn admit_identity(key: IdentityKey, target: &str, vault_suites: &[u16]) -> Result<(), String> {
+/// Whether the graph's vault, holding `vault_suites`, can sign with `key`.
+/// `vault` names it for the refusal (`key_vault variant p256_ed25519`, or
+/// that the graph composes none). `Ok(())` when it can, or when the key is
+/// not RSA; `Err` names the width and what the vault lacks.
+pub fn admit_identity(key: IdentityKey, vault: &str, vault_suites: &[u16]) -> Result<(), String> {
     match key {
         IdentityKey::Rsa { bits } => match vault_suite_for_rsa_bits(bits) {
             Some(suite) if vault_suites.contains(&suite) => Ok(()),
             Some(_) => Err(format!(
-                "key_file is an RSA-{bits} identity, and the {target} vault holds no RSA suite \
-                 (a private operation is far past its step budget); use a P-256 identity here, \
-                 or a target whose kernel carries `rsa-vault`"
+                "key_file is an RSA-{bits} identity, and {vault} holds no RSA suite; compose \
+                 `key_vault` with `variant: rsa` (or `full`), or use a P-256 identity"
             )),
             None => Err(format!(
                 "key_file is an RSA key of {bits} bits; the tls module signs with 2048, 3072 \

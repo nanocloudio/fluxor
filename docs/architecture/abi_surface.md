@@ -109,8 +109,8 @@ the packer copies only when it equals its own: the module was compiled
 against this surface, not merely packed by a current tool. A wasm module's
 payload must contain the current digest, and the packer stamps it. At load,
 the attestation sits at its canonical offset (after the integrity hash and
-the signature block, where present), followed only by the conditional-grant
-block where the manifest has one; a signature covers it. The loader applies the check to every module it admits: the node
+the signature block, where present), followed only by the conditions block
+where the manifest has one; a signature covers it. The loader applies the check to every module it admits: the node
 graph, a live subgraph add, a workload's subgraph, the modules of a code
 pack and a wasm child alike. An unsigned module's attestation is the
 builder's claim, so the check catches a stale or mismatched build rather than

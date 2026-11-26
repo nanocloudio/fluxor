@@ -1726,7 +1726,9 @@ impl HeapPlan {
 ///   inline value needs no hand-written cap;
 /// - `[capacities] heap_per_demand` adds `bytes_each` × the planned ceiling
 ///   of its pool (`plan`) to that figure — or to the rule's own `base`, for a
-///   type with no heap rule. The two are summed.
+///   type with no heap rule;
+/// - `[capacities] heap_per_param` adds `bytes_each` × each counted param.
+///   Every rule a type states is summed.
 ///
 /// An explicit cap below what the params need is kept, and warned: the module
 /// will refuse its params. One below a figure that includes per-demand bytes
@@ -1773,29 +1775,36 @@ fn instance_heap_cap(
             None => type_figure().map(to_cap).transpose(),
         };
     }
-    // The bytes a per-unit rule adds, and what they are for: a pool's planned
-    // ceiling (`heap_per_demand`), or the instance's own count param
-    // (`heap_per_param`). A type states at most one.
-    let per_unit: Option<(u64, String, &str)> = plan
-        .per_demand(manifest)
-        .map(|(extra, pool, ceiling)| {
-            (
-                extra,
-                format!("`{pool}` planned to {ceiling}"),
-                "heap_per_demand",
-            )
-        })
-        .or_else(|| {
-            let r = manifest?.heap_per_param.as_ref()?;
+    // The bytes the per-unit rules add, and what they are for: a pool's
+    // planned ceiling (`heap_per_demand`) and the instance's own count params
+    // (`heap_per_param`), summed when a type states both.
+    let demand = plan.per_demand(manifest).map(|(extra, pool, ceiling)| {
+        (
+            extra,
+            format!("`{pool}` planned to {ceiling}"),
+            "heap_per_demand",
+        )
+    });
+    let counted = manifest
+        .and_then(|m| m.heap_per_param.as_ref())
+        .map(|r| {
             let (extra, terms) = r.extra_for(tlv);
             let what = terms
                 .iter()
                 .map(|(tag, count, each)| format!("{count} × {each} B of params tag {tag}"))
                 .collect::<Vec<_>>()
                 .join(" + ");
-            Some((extra, what, "heap_per_param"))
-        })
-        .filter(|&(extra, ..)| extra > 0);
+            (extra, what, "heap_per_param")
+        });
+    let per_unit: Option<(u64, String, &str)> = match (demand, counted) {
+        (Some(d), Some(c)) => Some((
+            d.0.saturating_add(c.0),
+            format!("{} and {}", d.1, c.1),
+            "heap_per_demand` + `heap_per_param",
+        )),
+        (d, c) => d.or(c),
+    }
+    .filter(|&(extra, ..)| extra > 0);
     if rule.is_none() && per_unit.is_none() {
         return Ok(explicit);
     }
@@ -2128,62 +2137,6 @@ fn validate_required_params(
                     module_name, p.name,
                 )));
             }
-        }
-    }
-    Ok(())
-}
-
-/// Range-check numeric params against the manifest's `range = [min, max]`.
-/// Honors both top-level placement and the transparent `params: {...}`
-/// wrapper so the check stays in lock-step with the packer's view.
-fn validate_param_ranges(
-    module: &Value,
-    manifest: &crate::manifest::Manifest,
-    module_name: &str,
-) -> Result<()> {
-    let obj = match module.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
-    let inner = obj.get("params").and_then(|v| v.as_object());
-    for p in &manifest.params {
-        let Some((min, max)) = p.range else {
-            continue;
-        };
-        let Some(raw) = obj
-            .get(&p.name)
-            .or_else(|| inner.and_then(|i| i.get(&p.name)))
-        else {
-            continue;
-        };
-        // The value as the packer will read it, never truncated to the
-        // param's width first: 4294967298 is not 2.
-        let v: Option<i128> = if let Some(n) = raw.as_u64() {
-            Some(i128::from(n))
-        } else if let Some(n) = raw.as_i64() {
-            Some(i128::from(n))
-        } else if let Some(t) = raw.as_str() {
-            if p.enum_values.iter().any(|(name, _)| name == t) {
-                continue;
-            }
-            match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                Some(h) => i128::from_str_radix(h, 16).ok(),
-                None => t.parse::<i128>().ok(),
-            }
-        } else {
-            None
-        };
-        let Some(v) = v else {
-            return Err(Error::Config(format!(
-                "module '{}': param '{}'={} is not an integer in [{}, {}]",
-                module_name, p.name, raw, min, max,
-            )));
-        };
-        if v < i128::from(min) || v > i128::from(max) {
-            return Err(Error::Config(format!(
-                "module '{}': param '{}'={} is outside [{}, {}]",
-                module_name, p.name, raw, min, max,
-            )));
         }
     }
     Ok(())
@@ -2746,6 +2699,7 @@ fn build_module_entry_in(
     // schema params (e.g. `broker: "host:port"` in mqtt). Expand them
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
+    let normalized_module = pin_host_lane(type_name, normalized_module, r)?;
     // PIC modules embed their schema in the `.fmod`; native modules declare
     // it in their manifest's `[[params]]`. Both feed the same TLV packer, so
     // the wire format is identical at the kernel boundary; a native module's
@@ -2804,11 +2758,11 @@ fn build_module_entry_in(
             )
             .map_err(|e| out_of_room_or(out_of_room, e))?
         };
+        schema::check_bounds(&param_schema, &entry[..params_len], name).map_err(Error::Config)?;
     } else if let Some(native) = native {
         let manifest = &native.manifest;
         let param_schema = schema::ParamSchema::from_manifest(manifest);
         validate_yaml_params(module, &param_schema, type_name)?;
-        validate_param_ranges(module, manifest, type_name)?;
         validate_required_params(module, manifest, type_name)?;
         // Inject manifest defaults into a YAML clone so every declared
         // param produces a TLV entry. The native module's step function
@@ -2828,6 +2782,7 @@ fn build_module_entry_in(
             )
             .map_err(|e| out_of_room_or(out_of_room, e))?
         };
+        schema::check_bounds(&param_schema, &entry[..params_len], name).map_err(Error::Config)?;
     } else {
         // Module type with no schema source — typically a misnamed
         // YAML entry. Emit an empty params section; downstream
@@ -3661,10 +3616,11 @@ fn check_verify_uri(uri: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
 
-    /// A ranged native param is checked at the value the packer reads:
-    /// past `u32` it is not wrapped into range, a numeric string (what a
-    /// stack's `user:` source resolves to) is checked like a number, and a
-    /// negative or non-numeric value is refused.
+    /// A ranged native param is checked on the packed value, and a value
+    /// its type cannot carry is refused before it is packed: past `u32` it
+    /// is not wrapped into range, a numeric string (what a stack's `user:`
+    /// source resolves to) is checked like a number, and a negative or
+    /// non-numeric value is refused.
     #[test]
     fn a_ranged_param_is_checked_at_its_whole_value() {
         let fluxor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -3676,10 +3632,15 @@ mod tests {
             .expect("linux_net is a module of fluxor")
             .manifest
             .clone();
-        let check =
-            |v: Value| validate_param_ranges(&json!({ "max_conns": v }), &manifest, "linux_net");
+        let schema = schema::ParamSchema::from_manifest(&manifest);
+        let check = |module: Value| -> std::result::Result<(), String> {
+            let mut entry = vec![0u8; 512];
+            let n = schema::build_params_from_schema(&module, &schema, &mut entry, 0, None, "x")?;
+            schema::check_bounds(&schema, &entry[..n], "linux_net")
+        };
+        let check_one = |v: Value| check(json!({ "max_conns": v }));
         for ok in [json!(2), json!(65535), json!("128"), json!("0x80")] {
-            assert!(check(ok.clone()).is_ok(), "{ok}");
+            assert!(check_one(ok.clone()).is_ok(), "{ok}");
         }
         for bad in [
             json!(1),
@@ -3691,21 +3652,16 @@ mod tests {
             json!("lots"),
             json!(2.5),
         ] {
-            assert!(check(bad.clone()).is_err(), "{bad} accepted");
+            assert!(check_one(bad.clone()).is_err(), "{bad} accepted");
         }
-        let wrapped = validate_param_ranges(
-            &json!({ "params": { "max_conns": 70000 } }),
-            &manifest,
-            "linux_net",
-        );
+        let wrapped = check(json!({ "params": { "max_conns": 70000 } }));
         assert!(wrapped.is_err(), "the params: wrapper is checked too");
     }
 
     /// A one-param schema as an `.fmod` embeds it: `decision`, a blob (tag 15).
     fn blob_param_schema() -> schema::ParamSchema {
-        let mut b = vec![b'S', b'P', 1, 1, 15, 5, 0, 0, 0, 0, 8];
-        b.extend_from_slice(b"decision");
-        b.push(0); // no enum values
+        let mut b = vec![b'S', b'P', 1, 1];
+        b.extend_from_slice(&schema::raw_param(15, 5, 0, "decision"));
         schema::ParamSchema::from_bytes(&b).expect("schema bytes")
     }
 
@@ -3802,9 +3758,8 @@ mod tests {
 
         // `trust`, a string param (tag 3) of this schema: the trust
         // anchors of tls and quic.
-        let mut b = vec![b'S', b'P', 1, 1, 3, 5, 0, 0, 0, 0, 5];
-        b.extend_from_slice(b"trust");
-        b.push(0);
+        let mut b = vec![b'S', b'P', 1, 1];
+        b.extend_from_slice(&schema::raw_param(3, 5, 0, "trust"));
         let anchors = schema::ParamSchema::from_bytes(&b).expect("schema bytes");
         validate_yaml_params(
             &serde_json::json!({ "name": "srv", "trust": "system", "max_cycles": 1 }),

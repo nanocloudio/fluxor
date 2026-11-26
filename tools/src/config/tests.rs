@@ -619,6 +619,231 @@ mod scheduler_validation_tests {
         );
     }
 
+    /// A static graph is explicit about what its workloads listen on: each
+    /// workload's `endpoints:` become its owner's grants, carried in its boot
+    /// record, and a workload declaring none is granted none, so every
+    /// listen it makes is refused where it runs.
+    #[test]
+    fn a_workloads_declared_endpoints_are_its_grants_and_none_is_none() {
+        use fluxor_abi::contracts::net::net_proto::grant;
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
+        let cfg = json!({
+            "execution": {"domains": [{"name": "coop"}]},
+            "workloads": [
+                {
+                    "modules": [{"name": "a", "type": "workload_pic_mod", "domain": "coop"}],
+                    "endpoints": [
+                        {"protocol": "tcp", "port": 8080},
+                        {"name": "dns", "protocol": "udp", "port": 5353}
+                    ]
+                },
+                {"modules": [{"name": "b", "type": "workload_pic_mod2", "domain": "coop"}]}
+            ]
+        });
+        let w = build_workloads(&cfg, &r, "linux").expect("composes");
+        assert_eq!(
+            w[0].endpoints,
+            vec![
+                [grant::PROTO_TCP, 0x90, 0x1F],
+                [grant::PROTO_UDP, 0xE9, 0x14]
+            ]
+        );
+        assert!(w[1].endpoints.is_empty(), "none declared, none granted");
+
+        // Carried in the boot record, as the kernel admits them.
+        let records: Vec<(Vec<u8>, Vec<u8>)> = w
+            .iter()
+            .map(|w| {
+                (
+                    w.endpoints.concat(),
+                    crate::add_subgraph::encode_workload(w).unwrap(),
+                )
+            })
+            .collect();
+        let wr: Vec<fluxor_contracts::boot_config::WorkloadRecord<'_>> = records
+            .iter()
+            .map(|(e, b)| fluxor_contracts::boot_config::WorkloadRecord {
+                idle_safe: false,
+                endpoints: e,
+                blob: b,
+            })
+            .collect();
+        let blob = fluxor_contracts::boot_config::encode(
+            &fluxor_contracts::boot_config::BootConfigSpec {
+                tick_us: 1000,
+                workloads: Some(&wr),
+                ..Default::default()
+            },
+        )
+        .expect("encodes");
+        let v = crate::config::decode_config(&blob).expect("decodes");
+        assert_eq!(
+            v["workloads"][0]["endpoints"],
+            json!([{"protocol": 6, "port": 8080}, {"protocol": 17, "port": 5353}])
+        );
+        assert_eq!(v["workloads"][1]["endpoints"], json!([]));
+    }
+
+    /// What a workload may declare: tcp or udp, a nonzero port, each once,
+    /// at most the admitted bound, and one owner's per endpoint across the
+    /// graph's workloads.
+    #[test]
+    fn a_workloads_endpoints_are_refused_unless_well_formed_and_its_own() {
+        use fluxor_abi::contracts::net::net_proto::grant;
+        let (_stub, r) = stub_resolver(&["workload_pic_mod", "workload_pic_mod2"]);
+        let with = |a: Value, b: Value| {
+            let cfg = json!({
+                "execution": {"domains": [{"name": "coop"}]},
+                "workloads": [
+                    {"modules": [{"name": "a", "type": "workload_pic_mod", "domain": "coop"}],
+                     "endpoints": a},
+                    {"modules": [{"name": "b", "type": "workload_pic_mod2", "domain": "coop"}],
+                     "endpoints": b}
+                ]
+            });
+            build_workloads(&cfg, &r, "linux")
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        };
+        let tcp = |port: u64| json!({"protocol": "tcp", "port": port});
+        assert!(with(json!([tcp(80)]), json!([tcp(81)])).is_ok());
+        for (a, b, why) in [
+            (json!([tcp(80)]), json!([tcp(80)]), "workload 0's"),
+            (json!([tcp(0)]), json!([]), "port 0 is an ephemeral source"),
+            (json!([tcp(70000)]), json!([]), "`port` is 1..=65535"),
+            (
+                json!([{"protocol": "sctp", "port": 80}]),
+                json!([]),
+                "`protocol` is tcp or udp",
+            ),
+            (json!([tcp(80), tcp(80)]), json!([]), "declared twice"),
+            (
+                json!([{"protocol": "tcp", "port": 80, "host": "x"}]),
+                json!([]),
+                "unknown key `host`",
+            ),
+            (json!({"protocol": "tcp"}), json!([]), "is a list"),
+        ] {
+            let e = with(a.clone(), b).expect_err(why);
+            assert!(e.contains(why), "{a}: {e}");
+        }
+        let many: Vec<Value> = (0..=grant::MAX_ADMITTED_ENDPOINTS as u64)
+            .map(|i| tcp(1000 + i))
+            .collect();
+        let e = with(json!(many), json!([])).expect_err("past the bound");
+        assert!(e.contains("at most"), "{e}");
+    }
+
+    /// On a metal node every module a workload brings runs unprivileged: a
+    /// provider runs in a workload only as a type the node vouches for
+    /// (`workload_instantiable`); the Linux runtime runs a workload's modules
+    /// in its process and admits any; a metal target with no protection
+    /// backend admits no workload.
+    #[test]
+    fn a_metal_workload_composes_a_provider_only_as_a_workload_instantiable_type() {
+        let r = fluxor_resolver();
+        let with = |ty: &str| {
+            json!({
+                "execution": {"domains": [{"name": "coop"}]},
+                "workloads": [{"modules": [
+                    {"name": "w", "type": ty, "domain": "coop"},
+                    {"name": "probe", "type": "churn_probe", "domain": "coop"}
+                ]}]
+            })
+        };
+        // `key_vault` provides and is not workload_instantiable.
+        let e = build_workloads(&with("key_vault"), &r, "pi5")
+            .expect_err("an unvouched provider in a metal workload")
+            .to_string();
+        assert!(e.contains("workload_instantiable"), "{e}");
+        // `fs_object` is vouched for.
+        build_workloads(&with("fs_object"), &r, "pi5").expect("a vouched provider composes");
+        // The Linux runtime runs both in its process.
+        assert_eq!(
+            super::workload_gating(Some("linux"), fluxor_root()),
+            super::WorkloadGating::Host
+        );
+        assert_eq!(
+            super::workload_gating(Some("bcm2712"), fluxor_root()),
+            super::WorkloadGating::Gated
+        );
+        // No protection backend: no workload at all.
+        assert_eq!(
+            super::workload_gating(Some("uefi"), fluxor_root()),
+            super::WorkloadGating::Unavailable
+        );
+        let e = build_workloads(&with("fs_object"), &r, "uefi")
+            .expect_err("a workload on a node with no protection backend")
+            .to_string();
+        assert!(e.contains("no protection backend"), "{e}");
+    }
+
+    /// A workload's vault kept under its owner's key is given the creator's
+    /// lane into `seal_in`, keyed from 7 down; a node graph's vault cannot
+    /// be kept so, and no graph writes a `Caller` edge of its own.
+    #[test]
+    fn a_workloads_owner_sealed_vault_takes_its_key_over_the_creators_lane() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let vault = Manifest::from_toml_for_target(
+            &root.join("modules/foundation/key_vault/manifest.toml"),
+            Some("linux"),
+        )
+        .expect("key_vault manifest");
+        let names: Vec<String> = ["v", "plain", "u"].iter().map(|s| s.to_string()).collect();
+        let manifests: HashMap<String, Manifest> =
+            names.iter().map(|n| (n.clone(), vault.clone())).collect();
+        let entries = vec![
+            json!({"name": "v", "type": "key_vault", "seal": "owner"}),
+            json!({"name": "plain", "type": "key_vault", "seal": "none"}),
+            json!({"name": "u", "type": "key_vault", "seal": 2}),
+        ];
+        let lanes = super::owner_key_lanes(0, &entries, &names, &manifests, &[]).unwrap();
+        let got: Vec<_> = lanes.iter().map(|e| (e.from, e.to, e.to_port, e.to_ctrl)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (graph::Endpoint::Caller(7), graph::Endpoint::New(0), 1, false),
+                (graph::Endpoint::Caller(6), graph::Endpoint::New(2), 1, false),
+            ],
+            "seal_in is input 1, keys from 7 down, none for `seal: none`"
+        );
+        // A key another edge holds is passed over.
+        let held = [graph::EdgeRecord {
+            from: graph::Endpoint::New(1),
+            to: graph::Endpoint::Caller(7),
+            ..graph::EdgeRecord::default()
+        }];
+        let lanes = super::owner_key_lanes(0, &entries, &names, &manifests, &held).unwrap();
+        assert_eq!(lanes[0].from, graph::Endpoint::Caller(6));
+        assert_eq!(lanes[1].from, graph::Endpoint::Caller(5));
+
+        // A hand-written lane end is refused, as a name or as a record.
+        let name_to_local: HashMap<String, u8> =
+            names.iter().enumerate().map(|(i, n)| (n.clone(), i as u8)).collect();
+        for end in [json!("caller.0"), json!({"caller": 7})] {
+            let wiring = vec![json!({"from": end, "to": "v.seal_in"})];
+            let e = super::workload_edges(0, &wiring, &name_to_local, &names, &manifests)
+                .expect_err("a hand-authored Caller edge")
+                .to_string();
+            assert!(e.contains("the composer's to wire"), "{e}");
+        }
+
+        // A node graph's vault is never kept under an owner's key.
+        let mut m = HashMap::new();
+        m.insert(
+            "vault".to_string(),
+            Manifest {
+                provides: vec!["key_vault".to_string()],
+                ..Manifest::default()
+            },
+        );
+        let g = json!({"modules": [{"name": "vault", "seal": "owner"}]});
+        let e = validate_key_vault(&g, &["vault".to_string()], &m, Some("linux"), "linux")
+            .expect_err("seal: owner in a node graph")
+            .to_string();
+        assert!(e.contains("only a workload's vault has"), "{e}");
+    }
+
     /// A workload module's YAML step budget reaches its module record.
     #[test]
     fn workload_module_step_budget_rides_the_module_record() {
@@ -650,9 +875,11 @@ mod scheduler_validation_tests {
         assert_eq!(r.fault_policy, FaultPolicy::Skip);
     }
 
-    /// A workload's modules reach only providers of their own and the
-    /// platform, so a workload's claims are checked against its own
-    /// providers, as a graph's are against its own.
+    /// A workload's modules reach only providers of their own, the node's
+    /// workload layers and the platform providers that serve workloads, so a
+    /// workload's claims are checked against its own providers, as a graph's
+    /// are against its own. The host fs is the node's alone: a workload that
+    /// names it (`platform`) is refused.
     #[test]
     fn workload_claims_are_checked_against_the_workloads_providers() {
         let r = fluxor_resolver();
@@ -679,7 +906,12 @@ mod scheduler_validation_tests {
             e.contains("names volume `nvme0`") && e.contains("declared: none"),
             "{e}"
         );
-        build(json!("platform")).expect("the workload's root on the host");
+        let e = build(json!("platform")).unwrap_err();
+        assert!(
+            e.contains("names volume `platform`")
+                && e.contains("on linux answers no `fs` call of a workload's modules"),
+            "{e}"
+        );
     }
 
     /// A workload's `mount` table names volumes of the workload's own.
@@ -754,7 +986,11 @@ mod scheduler_validation_tests {
             .iter()
             .map(|e| (e.from, e.from_port, e.to, e.to_port, e.buffer_bytes))
             .collect();
-        let (l, n) = (graph::Endpoint::New, graph::Endpoint::Net);
+        let l = graph::Endpoint::New;
+        let n = |key| graph::Endpoint::Lane {
+            key,
+            target: fluxor_abi::wire::fnv1a32(b"linux_net"),
+        };
         assert_eq!(
             shape,
             vec![
@@ -2646,7 +2882,97 @@ mod continuity_tests {
             optional,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: ResourceClaim::claim_byte(optional, !active_when.is_empty()),
         }
+    }
+
+    /// The schema a test instance is packed against: `tls`'s and `dns`'s
+    /// params at their own tags, any other module's claim params as `str`
+    /// (a number in the graph as `u32`), tagged in name order.
+    fn test_schema(ty: &str, m: &Manifest, entry: &Value) -> crate::schema::ParamSchema {
+        use crate::schema::{ParamSchema, ParamType, SchemaParam};
+        let p = |tag: u8, ptype: ParamType, name: &str| SchemaParam {
+            tag,
+            ptype,
+            name: name.to_string(),
+            default: 0,
+            min: 0,
+            max: fluxor_abi::wire::param_schema::type_ceiling(ptype as u8),
+            enums: HashMap::new(),
+        };
+        let params = match ty {
+            "tls" => vec![
+                p(1, ParamType::U8, "mode"),
+                p(6, ParamType::Str, "cert_file"),
+                p(7, ParamType::Str, "key_file"),
+                p(16, ParamType::Str, "trust"),
+                p(19, ParamType::Str, "identity_label"),
+            ],
+            "dns" => vec![
+                p(9, ParamType::Str, "update_zone"),
+                p(11, ParamType::StrChunked, "update_allow"),
+            ],
+            _ => {
+                let mut names: Vec<&str> = m
+                    .resources
+                    .iter()
+                    .flat_map(|r| r.active_when_params.iter().map(String::as_str))
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let numeric = entry.get(n).is_some_and(Value::is_number);
+                        p(
+                            i as u8 + 1,
+                            if numeric { ParamType::U32 } else { ParamType::Str },
+                            n,
+                        )
+                    })
+                    .collect()
+            }
+        };
+        ParamSchema::from_params(params)
+    }
+
+    /// Each instance's claims as the composer decides them: its params
+    /// packed against [`test_schema`], a credential given `${file:..}`
+    /// embedded under its extended tag as the builder embeds it.
+    fn test_claims(graph: &Value, m: &HashMap<String, Manifest>) -> HashMap<String, Vec<InstanceClaim>> {
+        let mut out = HashMap::new();
+        for entry in graph["modules"].as_array().into_iter().flatten() {
+            let name = entry["name"].as_str().unwrap();
+            let ty = entry.get("type").and_then(Value::as_str).unwrap_or(name);
+            let Some(man) = m.get(name) else {
+                continue;
+            };
+            let schema = test_schema(ty, man, entry);
+            let mut basic = entry.clone();
+            let mut ext: Vec<u8> = Vec::new();
+            for key in ["cert_file", "key_file", "trust"] {
+                let embedded = entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(crate::trust_anchors::file_source)
+                    .is_some();
+                if embedded {
+                    basic.as_object_mut().unwrap().remove(key);
+                    let tag = crate::trust_anchors::embedded_tags(key)[0];
+                    ext.extend_from_slice(&[tag, 0, 0, 1, 0x30]);
+                }
+            }
+            let mut params = vec![0u8; 4096];
+            let n = crate::schema::build_params_from_schema(&basic, &schema, &mut params, 0, None, ty)
+                .expect("pack");
+            params.truncate(n);
+            params.extend_from_slice(&ext);
+            let claims = instance_claims(man, &schema, crate::hash::fnv1a_hash(ty.as_bytes()), &params)
+                .expect("claims");
+            out.insert(name.to_string(), claims);
+        }
+        out
     }
 
     fn refusals(target: &str, graph: &Value, m: &HashMap<String, Manifest>) -> Vec<String> {
@@ -2656,6 +2982,7 @@ mod continuity_tests {
             graph,
             &module_names,
             m,
+            &test_claims(graph, m),
             ProviderReach {
                 runtime: Some(target),
                 caller: ProviderCaller::Node,
@@ -2663,6 +2990,306 @@ mod continuity_tests {
             },
         );
         found.into_iter().map(|r| r.message).collect()
+    }
+
+    /// The key vault is a module provider, not the kernel's: an exercised
+    /// `key_vault` claim with no `key_vault` in the graph is refused on every
+    /// target, one the instance's params never exercise is not, and the
+    /// vault composed beside it answers it.
+    #[test]
+    fn a_key_vault_claim_needs_a_vault_in_the_graph() {
+        let caller = Manifest {
+            resources: vec![claim(
+                fluxor_abi::registry::key_vault::ID as u8,
+                false,
+                &["key_file"],
+            )],
+            ..Manifest::default()
+        };
+        let mut m = HashMap::new();
+        m.insert("tls".to_string(), caller);
+        let exercised = json!({"modules": [{"name": "tls", "key_file": "/k.der"}]});
+        for target in ["linux", "bcm2712", "rp2350", "rp2040"] {
+            let found = refusals(target, &exercised, &m);
+            assert!(
+                found.len() == 1 && found[0].contains("`tls` requires `key_vault`"),
+                "{target}: {found:?}"
+            );
+        }
+        let idle = json!({"modules": [{"name": "tls"}]});
+        assert!(refusals("linux", &idle, &m).is_empty());
+        m.insert(
+            "key_vault".to_string(),
+            Manifest {
+                provides: vec!["key_vault".to_string()],
+                ..Manifest::default()
+            },
+        );
+        let composed = json!({"modules": [
+            {"name": "tls", "key_file": "/k.der"},
+            {"name": "key_vault"},
+        ]});
+        assert!(refusals("linux", &composed, &m).is_empty());
+    }
+
+    /// The real `tls` manifest and `key_vault`'s `provides`, keyed as a graph
+    /// names them.
+    fn tls_and_vault(target: &str, vault: bool) -> HashMap<String, Manifest> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut m = HashMap::new();
+        m.insert(
+            "tls".to_string(),
+            Manifest::from_toml_for_target(
+                &root.join("modules/foundation/tls/manifest.toml"),
+                Some(target),
+            )
+            .expect("tls manifest"),
+        );
+        if vault {
+            m.insert(
+                "key_vault".to_string(),
+                Manifest {
+                    provides: vec!["key_vault".to_string()],
+                    ..Manifest::default()
+                },
+            );
+        }
+        m
+    }
+
+    /// An identity the builder embeds (`${file:}`) is not read through `fs`,
+    /// but its key is still the vault's to take: on every target a `tls`
+    /// naming one is refused without `key_vault`, and is not held to `fs`.
+    #[test]
+    fn an_embedded_identity_needs_a_vault_on_every_target() {
+        let embedded = json!({"modules": [{
+            "name": "tls",
+            "mode": 1,
+            "cert_file": "${file:server.der}",
+            "key_file": "${file:server.key.der}",
+        }]});
+        for target in ["linux", "bcm2712", "rp2350"] {
+            let found = refusals(target, &embedded, &tls_and_vault(target, false));
+            assert!(
+                found.iter().any(|f| f.contains("`tls` requires `key_vault`")),
+                "{target}: {found:?}"
+            );
+            assert!(
+                !found.iter().any(|f| f.contains("requires `fs`")),
+                "{target}: an embedded credential is not read through fs: {found:?}"
+            );
+            let with_vault = json!({"modules": [
+                embedded["modules"][0].clone(),
+                {"name": "key_vault"},
+            ]});
+            assert!(
+                refusals(target, &with_vault, &tls_and_vault(target, true)).is_empty(),
+                "{target}"
+            );
+        }
+        // A key read at runtime through `fs` exercises both claims; rp2350
+        // serves no `fs` to the node.
+        let by_path = json!({"modules": [
+            {"name": "tls", "mode": 1, "cert_file": "/c.der", "key_file": "/k.der"},
+            {"name": "key_vault"},
+        ]});
+        let found = refusals("rp2350", &by_path, &tls_and_vault("rp2350", true));
+        assert!(
+            found.len() == 1 && found[0].contains("`tls` requires `fs`"),
+            "{found:?}"
+        );
+    }
+
+    /// `fluxor exec` gives a client `tls` of an applet that names no identity
+    /// the operator's, whose key the vault takes: in an applet's build such an
+    /// instance needs `key_vault`, and the refusal says why. A server, one
+    /// that names its own identity's source, and any graph built outside an
+    /// applet are not held to it.
+    #[test]
+    fn an_applets_client_tls_needs_the_vault_exec_gives_its_identity_to() {
+        let m = tls_and_vault("linux", false);
+        let client = json!({"modules": [{"name": "tls"}]});
+        let explicit_client = json!({"modules": [{"name": "tls", "mode": 0}]});
+        let server = json!({"modules": [{"name": "tls", "mode": 1}]});
+        let typed = json!({"modules": [{"name": "dial", "type": "tls"}]});
+        let mut typed_m = HashMap::new();
+        typed_m.insert("dial".to_string(), m["tls"].clone());
+
+        assert!(refusals("linux", &client, &m).is_empty(), "not an applet");
+        crate::packaging::with_applet("tool", || {
+            for g in [&client, &explicit_client] {
+                let found = refusals("linux", g, &m);
+                assert!(
+                    found.len() == 1
+                        && found[0].contains("`tls` requires `key_vault`")
+                        && found[0].contains("client `tls` of applet 'tool'")
+                        && found[0].contains("fluxor exec"),
+                    "{found:?}"
+                );
+            }
+            let found = refusals("linux", &typed, &typed_m);
+            assert!(
+                found.len() == 1 && found[0].contains("`dial` requires `key_vault`"),
+                "a `tls` named otherwise: {found:?}"
+            );
+            assert!(refusals("linux", &server, &m).is_empty(), "a server");
+            // An identity the graph names is its own: the usual refusal.
+            let labelled = json!({"modules": [{"name": "tls", "identity_label": "me"}]});
+            let found = refusals("linux", &labelled, &m);
+            assert!(
+                found.len() == 1
+                    && found[0].contains("`tls` requires `key_vault`")
+                    && !found[0].contains("fluxor exec"),
+                "{found:?}"
+            );
+            let composed = json!({"modules": [{"name": "tls"}, {"name": "key_vault"}]});
+            assert!(refusals("linux", &composed, &tls_and_vault("linux", true)).is_empty());
+        });
+    }
+
+    /// A param set to a list (dns's `update_allow: [..]`) or another
+    /// non-string value exercises a claim gated on it, as a string does; an
+    /// empty list does not.
+    #[test]
+    fn a_list_valued_param_exercises_its_claim() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let dns = Manifest::from_toml_for_target(
+            &root.join("modules/foundation/dns/manifest.toml"),
+            Some("linux"),
+        )
+        .expect("dns manifest");
+        let mut m = HashMap::new();
+        m.insert("dns".to_string(), dns);
+        let listed = json!({"modules": [{
+            "name": "dns",
+            "update_zone": "example.org",
+            "update_allow": ["k1=host.example.org,A"],
+        }]});
+        let found = refusals("linux", &listed, &m);
+        assert!(
+            found.iter().any(|f| f.contains("`dns` requires `key_vault`")),
+            "{found:?}"
+        );
+        let in_params = json!({"modules": [{
+            "name": "dns",
+            "params": {"update_allow": ["k1=host.example.org,A"]},
+        }]});
+        assert!(refusals("linux", &in_params, &m)
+            .iter()
+            .any(|f| f.contains("`dns` requires `key_vault`")));
+        let empty = json!({"modules": [{"name": "dns", "update_allow": []}]});
+        assert!(!refusals("linux", &empty, &m)
+            .iter()
+            .any(|f| f.contains("key_vault")));
+        let numeric = Manifest {
+            resources: vec![claim(
+                fluxor_abi::registry::key_vault::ID as u8,
+                false,
+                &["slots"],
+            )],
+            ..Manifest::default()
+        };
+        let mut n = HashMap::new();
+        n.insert("m".to_string(), numeric);
+        let set = json!({"modules": [{"name": "m", "slots": 4}]});
+        assert!(refusals("linux", &set, &n)
+            .iter()
+            .any(|f| f.contains("`m` requires `key_vault`")));
+    }
+
+    /// The modules are listed in construction order: each provider before
+    /// the modules whose exercised claims it answers, the graph's own order
+    /// otherwise; a workload-scoped layer answers no node module; a provider
+    /// and a claimant that each need the other first are refused, naming the
+    /// cycle.
+    #[test]
+    fn providers_are_constructed_before_the_modules_that_call_them() {
+        let vault = fluxor_abi::registry::key_vault::ID as u8;
+        let fs = fluxor_abi::registry::fs::ID as u8;
+        let provides = |c: &str| Manifest {
+            provides: vec![c.to_string()],
+            ..Manifest::default()
+        };
+        let calls = |class: u8| Manifest {
+            resources: vec![claim(class, false, &[])],
+            ..Manifest::default()
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let graph = |n: &[&str]| {
+            json!({"modules": n.iter().map(|m| json!({"name": m})).collect::<Vec<_>>()})
+        };
+        let mut m = HashMap::new();
+        m.insert("minter".to_string(), calls(vault));
+        m.insert("plain".to_string(), Manifest::default());
+        m.insert("key_vault".to_string(), provides("key_vault"));
+        let order = |n: &[&str], m: &HashMap<String, Manifest>| {
+            construction_order(&graph(n), &names(n), m)
+        };
+        // The vault, listed last, is pulled forward to just before the
+        // minter; the rest keep their places.
+        assert_eq!(
+            order(&["minter", "plain", "key_vault"], &m).unwrap(),
+            vec![2, 0, 1]
+        );
+        // Only the provider moves: modules a graph orders to break a cycle
+        // between them (`accept_cycles`, e.g. a tls client and the volume
+        // it carries) keep the order written.
+        assert_eq!(
+            order(&["minter", "volume", "plain", "key_vault"], &m).unwrap(),
+            vec![3, 0, 1, 2]
+        );
+        assert_eq!(
+            order(&["key_vault", "plain", "minter"], &m).unwrap(),
+            vec![0, 1, 2],
+            "already in order"
+        );
+        // A claim the instance's params never exercise orders nothing.
+        m.insert(
+            "minter".to_string(),
+            Manifest {
+                resources: vec![claim(vault, false, &["key_file"])],
+                ..Manifest::default()
+            },
+        );
+        assert_eq!(
+            order(&["minter", "plain", "key_vault"], &m).unwrap(),
+            vec![0, 1, 2]
+        );
+        // A workload-scoped layer serves no node module.
+        let mut scoped = provides("fs");
+        scoped.workload_scope = true;
+        m.insert("owner_fs".to_string(), scoped);
+        m.insert("reader".to_string(), calls(fs));
+        assert_eq!(
+            order(&["reader", "owner_fs"], &m).unwrap(),
+            vec![0, 1]
+        );
+        // Each calls what the other provides: no order serves both.
+        let mut a = provides("key_vault");
+        a.resources = vec![claim(fs, false, &[])];
+        let mut b = provides("fs");
+        b.resources = vec![claim(vault, false, &[])];
+        m.insert("a".to_string(), a);
+        m.insert("b".to_string(), b);
+        let e = order(&["plain", "a", "b"], &m).unwrap_err().to_string();
+        assert!(e.contains("no construction order serves this graph"), "{e}");
+        assert!(
+            e.contains("`a` calls `fs` on `b` calls `key_vault` on `a`"),
+            "{e}"
+        );
+    }
+
+    /// A graph not built as an applet's that names `${applet:data_dir}` is
+    /// refused when it is composed, naming the placeholder and why.
+    #[test]
+    fn a_graph_built_outside_an_applet_cannot_name_its_data_dir() {
+        let g = json!({"modules": [{"name": "store", "dir": "${applet:data_dir}/store"}]});
+        let e = crate::packaging::check_applet_placeholders(&g).unwrap_err();
+        assert!(e.contains("${applet:data_dir}/store"), "{e}");
+        assert!(e.contains("not built as one"), "{e}");
+        crate::packaging::with_applet("tool", || {
+            assert!(crate::packaging::check_applet_placeholders(&g).is_ok());
+        });
     }
 
     /// A claim nothing answers is refused, naming module, contract and target;
@@ -2846,8 +3473,9 @@ mod continuity_tests {
         assert!(e.contains("`dsk`"), "{e}");
     }
 
-    /// bcm2712 answers `fs` for a workload's modules and `storage.*` for the
-    /// node's own, from its `[providers]` table.
+    /// bcm2712's platform answers neither `fs` nor `storage.*` to anyone: the
+    /// node composes its providers, and a workload's `fs` is the node's workload
+    /// layer, checked when the workload is admitted rather than in its graph.
     #[test]
     fn the_target_table_separates_node_and_workload_callers() {
         let m: HashMap<String, Manifest> = [(
@@ -2863,11 +3491,17 @@ mod continuity_tests {
         .into();
         let graph = json!({"modules": [{"name": "w"}]});
         let node = refusals("bcm2712", &graph, &m);
-        assert!(node.len() == 1 && node[0].contains("`fs`"), "{node:?}");
+        assert!(
+            node.len() == 2
+                && node.iter().any(|r| r.contains("`fs`"))
+                && node.iter().any(|r| r.contains("`storage.object`")),
+            "{node:?}"
+        );
         let workload = required_contract_refusals(
             &graph,
             &names(&["w"]),
             &m,
+            &test_claims(&graph, &m),
             ProviderReach {
                 runtime: Some("bcm2712"),
                 caller: ProviderCaller::Workload,
@@ -2895,6 +3529,7 @@ mod continuity_tests {
                 optional: false,
                 variants: Vec::new(),
                 when: Vec::new(),
+                claim: fluxor_abi::wire::fmod::claim::REQUIRED,
             }],
             ..Manifest::default()
         };
@@ -2948,6 +3583,43 @@ mod continuity_tests {
         check(&graph(Some("io"), Some("io"), json!({})), "rp2350").unwrap();
     }
 
+    /// `ip` serves `net.policy` to `pkt_filter`: a provider call runs `ip`'s
+    /// code on the caller's core, so a graph splitting them across domains is
+    /// refused at build, and `ip`'s tables are only ever touched from its own.
+    #[test]
+    fn ip_and_the_enforcer_it_serves_share_a_domain() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let load = |n: &str| {
+            Manifest::from_toml_for_target(
+                &root.join(format!("modules/foundation/{n}/manifest.toml")),
+                Some("bcm2712"),
+            )
+            .expect("manifest")
+        };
+        let m: HashMap<String, Manifest> = [
+            ("ip".to_string(), load("ip")),
+            ("pkt_filter".to_string(), load("pkt_filter")),
+        ]
+        .into();
+        let cfg = |filter_dom: &str| {
+            json!({
+                "execution": {"domains": [{"name": "main"}, {"name": "nic"}]},
+                "capacity": {"owners": 0},
+                "modules": [
+                    {"name": "ip"},
+                    {"name": "pkt_filter", "domain": filter_dom, "table": "t"},
+                ],
+            })
+        };
+        let check = |c: &Value| {
+            let list = c["modules"].as_array().unwrap().clone();
+            validate_provider_domains(c, &list, &m, "bcm2712")
+        };
+        check(&cfg("main")).unwrap();
+        let e = check(&cfg("nic")).unwrap_err().to_string();
+        assert!(e.contains("'pkt_filter'") && e.contains("net_policy"), "{e}");
+    }
+
     /// Every other policy, and a graph with no policy at all, is
     /// unaffected — the gate is specific to the resuming one.
     #[test]
@@ -2969,75 +3641,354 @@ mod continuity_tests {
     /// A workload node's network stack has one `addr_ctl` writer, the
     /// kernel: a coordinator wired into it is refused there, and allowed in a
     /// graph that creates no workloads.
+    /// On a node with a workload creator the creator is the one writer of
+    /// `addr_ctl`: a coordinator wired into it is refused, and a creator that
+    /// writes addresses must reach every `addr_ctl` the graph serves, since
+    /// the kernel installs none. A creator whose workloads take no address,
+    /// and a node with no creator, wire what they like.
     #[test]
-    fn a_workload_node_refuses_a_second_addr_ctl_writer() {
-        use crate::manifest::ResourceClaim;
-        let creator = Manifest {
-            resources: vec![ResourceClaim {
-                device_class: fluxor_abi::registry::workload::ID as u8,
-                access_mode: 1,
-                instance: 0xFF,
-                selector: crate::manifest::ClaimSelector::Default,
-                active_when_params: Vec::new(),
-                optional: false,
-                variants: Vec::new(),
-                when: Vec::new(),
-            }],
+    fn the_workload_creator_is_the_one_addr_ctl_writer() {
+        let net = Manifest {
+            ports: vec![named_port("addr_ctl", 0, "NetProto")],
+            ..Manifest::default()
+        };
+        let writes_addresses = Manifest {
+            ports: vec![named_port("addr_ctl_out", 1, "NetProto")],
             grants: [0, 1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE],
             ..Manifest::default()
         };
-        // The network stack declares the contract for its lane ops, without
-        // `workload.create`: not a creator.
-        let stack = Manifest {
-            resources: vec![ResourceClaim {
-                device_class: fluxor_abi::registry::workload::ID as u8,
-                access_mode: 1,
-                instance: 0xFF,
-                selector: crate::manifest::ClaimSelector::Default,
-                active_when_params: Vec::new(),
-                optional: false,
-                variants: Vec::new(),
-                when: Vec::new(),
-            }],
+        let creates_only = Manifest {
+            grants: [0, 1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE],
             ..Manifest::default()
         };
-        let wired = json!({"wiring": [{"from": "fence.ctl", "to": "net.addr_ctl"}]});
+        let fence = Manifest {
+            ports: vec![named_port("addr_ctl_out", 1, "NetProto")],
+            ..Manifest::default()
+        };
         let mut m = HashMap::new();
-        m.insert("net".to_string(), stack.clone());
-        m.insert("fence".to_string(), Manifest::default());
-        validate_net_identity_writers(&wired, &names(&["net", "fence"]), &m)
-            .expect("no creator: the direct path stands");
-        m.insert("effect".to_string(), creator);
-        let e = validate_net_identity_writers(&wired, &names(&["net", "fence", "effect"]), &m)
+        m.insert("net".to_string(), net);
+        m.insert("fence".to_string(), fence);
+        m.insert("effect".to_string(), writes_addresses);
+        m.insert("driver".to_string(), creates_only);
+        let fence_wired = json!({"wiring": [{"from": "fence.addr_ctl_out", "to": "net.addr_ctl"}]});
+        let effect_wired =
+            json!({"wiring": [{"from": "effect.addr_ctl_out", "to": "net.addr_ctl"}]});
+        let nothing = json!({"wiring": []});
+
+        // No creator: a coordinator writes, or nobody does.
+        validate_net_identity_writers(&fence_wired, &names(&["net", "fence"]), &m)
+            .expect("no creator: the coordinator is the writer");
+        validate_net_identity_writers(&nothing, &names(&["net"]), &m)
+            .expect("no creator, no writer");
+
+        // A creator: it is the one writer.
+        validate_net_identity_writers(&effect_wired, &names(&["net", "effect"]), &m)
+            .expect("the creator writes addr_ctl");
+        let e = validate_net_identity_writers(&fence_wired, &names(&["net", "fence", "effect"]), &m)
             .unwrap_err();
-        assert!(e.to_string().contains("workload node"), "{e}");
-        let mut declared = wired.clone();
-        declared["workload_node"] = json!(true);
-        let mut m2 = HashMap::new();
-        m2.insert("net".to_string(), stack);
-        assert!(validate_net_identity_writers(&declared, &names(&["net"]), &m2).is_err());
-        validate_net_identity_writers(&json!({"workload_node": true}), &names(&["net"]), &m2)
-            .expect("nothing wired into addr_ctl");
+        assert!(e.to_string().contains("one writer"), "{e}");
+        let both = json!({"wiring": [
+            {"from": "effect.addr_ctl_out", "to": "net.addr_ctl"},
+            {"from": "fence.addr_ctl_out", "to": "net.addr_ctl"}
+        ]});
+        assert!(
+            validate_net_identity_writers(&both, &names(&["net", "fence", "effect"]), &m).is_err(),
+            "a second writer beside the creator"
+        );
+
+        // The creator's edge is required: the kernel installs nothing.
+        let e = validate_net_identity_writers(&nothing, &names(&["net", "effect"]), &m)
+            .unwrap_err();
+        assert!(e.to_string().contains("effect.addr_ctl_out"), "{e}");
+
+        // A creator whose workloads take no address writes nothing there.
+        validate_net_identity_writers(&nothing, &names(&["net", "driver"]), &m)
+            .expect("a creator without an address port");
+        assert!(
+            validate_net_identity_writers(&fence_wired, &names(&["net", "fence", "driver"]), &m)
+                .is_err(),
+            "and still admits no other writer"
+        );
+    }
+
+    /// The composer and the kernel decide a claim with one evaluator: over
+    /// a corpus of manifests and instance params, what `instance_claims`
+    /// says is required is what `fmod::claim_required` says over the packed
+    /// manifest's own records and conditions block, as the loader reads them.
+    #[test]
+    fn the_composer_and_the_kernel_agree_on_a_shared_corpus() {
+        use fluxor_abi::wire::fmod::{
+            claim_required, validate_conditions, ManifestLayout, FLAG_CONDITIONS,
+            MANIFEST_FLAGS_AT, MANIFEST_HEADER_SIZE,
+        };
+        use fluxor_abi::wire::param_schema::{encode_into, encoded_len, ty, Entry};
+        let entries = [
+            Entry { tag: 1, ptype: ty::U8, default: 0, min: 0, max: 255, name: "mode", enums: &[] },
+            Entry {
+                tag: 3,
+                ptype: ty::U8,
+                default: 0,
+                min: 0,
+                max: 1,
+                name: "custody",
+                enums: &[("software", 0), ("token", 1)],
+            },
+            Entry { tag: 6, ptype: ty::STR, default: 0, min: 0, max: 255, name: "cert_file", enums: &[] },
+            Entry { tag: 9, ptype: ty::STR, default: 0, min: 0, max: 255, name: "persist", enums: &[] },
+            Entry { tag: 11, ptype: ty::STR, default: 0, min: 0, max: 255, name: "routes_prefix", enums: &[] },
+        ];
+        let mut schema_bytes = vec![0u8; encoded_len(&entries)];
+        encode_into(&entries, &mut schema_bytes);
+        let schema = schema::ParamSchema::from_bytes(&schema_bytes).expect("schema");
+        let manifest = r#"
+version = "1.0.0"
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { custody = ["token"] }
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
+active_when_params = ["cert_file"]
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["cert_file"]
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+when = { persist = ["fs", "kv"] }
+active_when_params = ["routes_prefix"]
+
+[[resources]]
+requires_contract = "trust"
+access = "read"
+optional = true
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+"#;
+        let mut m = Manifest::from_toml_str_for_target(manifest, None).expect("manifest");
+        m.resolve_conditions(&schema_bytes).expect("resolve");
+        let bytes = m.to_bytes();
+        let at = MANIFEST_HEADER_SIZE + bytes[5] as usize * 4;
+        let records = &bytes[at..at + bytes[6] as usize * 4];
+        let from = ManifestLayout::read(&bytes).expect("layout").conditions;
+        assert_ne!(bytes[MANIFEST_FLAGS_AT] & FLAG_CONDITIONS, 0);
+        let n = validate_conditions(records, Some(&bytes[from..])).expect("the loader's check");
+        let block = &bytes[from..from + n];
+        let tlv = |basic: &[(u8, &[u8])], ext: &[(u8, &[u8])]| {
+            let mut v = vec![0xFE, 0x01, 0, 0];
+            for (t, b) in basic {
+                v.extend_from_slice(&[*t, b.len() as u8]);
+                v.extend_from_slice(b);
+            }
+            v.extend_from_slice(&[0xFF, 0]);
+            for (t, b) in ext {
+                v.extend_from_slice(&[*t, 0, 0, b.len() as u8]);
+                v.extend_from_slice(b);
+            }
+            v
+        };
+        let corpus = [
+            tlv(&[], &[]),
+            tlv(&[(3, &[1])], &[]),
+            tlv(&[(3, &[0]), (6, b"/c.der")], &[]),
+            tlv(&[], &[(crate::trust_anchors::TAG_CERT, b"der")]),
+            tlv(&[(9, b"kv"), (11, b"/r/")], &[]),
+            tlv(&[(9, b"kv")], &[]),
+            tlv(&[(11, b"/r/")], &[]),
+            tlv(&[(9, b"mem"), (11, b"/r/")], &[]),
+            tlv(&[(11, b"")], &[]),
+        ];
+        for params in &corpus {
+            let kernel: Vec<bool> = records
+                .chunks_exact(4)
+                .enumerate()
+                .map(|(i, r)| claim_required(r, i as u8, block, params))
+                .collect();
+            let tools: Vec<bool> = instance_claims(&m, &schema, 0, params)
+                .expect("claims")
+                .iter()
+                .map(|c| c.required)
+                .collect();
+            assert_eq!(kernel, tools, "params {params:02x?}");
+        }
+        // The corpus exercises each claim both ways but the timer's, which
+        // is required, and trust's, which never is.
+        let req = |p: &[u8]| instance_claims(&m, &schema, 0, p).unwrap();
+        assert!(req(&corpus[0]).iter().map(|c| c.required).eq([false, false, false, false, false, true]));
+        assert!(req(&corpus[4])[3].required && !req(&corpus[5])[3].required);
+        assert!(!req(&corpus[7])[3].required, "`persist` is neither fs nor kv");
+        assert!(!req(&corpus[3])[1].required && req(&corpus[3])[2].required);
+    }
+
+    /// One writer per `addr_ctl` in any graph: two coordinators on one
+    /// stack's port reach it as one channel, under one owner tag, and are
+    /// refused at build, naming both; one writer per stack is admitted.
+    #[test]
+    fn a_second_addr_ctl_writer_is_refused_in_any_graph() {
+        let net = Manifest {
+            ports: vec![named_port("addr_ctl", 0, "NetProto")],
+            ..Manifest::default()
+        };
+        let coordinator = Manifest {
+            ports: vec![named_port("addr_ctl_out", 1, "NetProto")],
+            ..Manifest::default()
+        };
+        let mut m = HashMap::new();
+        m.insert("net".to_string(), net.clone());
+        m.insert("net2".to_string(), net);
+        m.insert("vip".to_string(), coordinator.clone());
+        m.insert("fence".to_string(), coordinator);
+        let two = json!({"wiring": [
+            {"from": "vip.addr_ctl_out", "to": "net.addr_ctl"},
+            {"from": "fence.addr_ctl_out", "to": "net.addr_ctl"}
+        ]});
+        let e = validate_net_identity_writers(&two, &names(&["net", "vip", "fence"]), &m)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`vip`") && e.contains("`fence`"), "{e}");
+        let one_each = json!({"wiring": [
+            {"from": "vip.addr_ctl_out", "to": "net.addr_ctl"},
+            {"from": "fence.addr_ctl_out", "to": "net2.addr_ctl"}
+        ]});
+        validate_net_identity_writers(&one_each, &names(&["net", "net2", "vip", "fence"]), &m)
+            .expect("one writer per stack");
     }
 
     #[test]
-    fn a_graph_keeps_the_vaults_records_through_one_vault_store() {
-        let keeper = Manifest {
-            grants: [0, 1u64 << fluxor_abi::registry::grant::SEAL_KEY],
+    fn a_key_vault_is_held_to_its_target_seal_its_store_and_its_handles() {
+        let vault = Manifest {
+            provides: vec!["key_vault".to_string()],
             ..Manifest::default()
         };
         let mut m = HashMap::new();
-        m.insert("vault".to_string(), keeper.clone());
-        m.insert("sd".to_string(), Manifest::default());
-        let one = json!({"modules": [{"name": "vault", "type": "vault_store"}, {"name": "sd"}]});
-        validate_vault_store(&one, &m).expect("one keeper");
-        m.insert("vault2".to_string(), keeper);
-        let two = json!({"modules": [
-            {"name": "vault", "type": "vault_store"},
-            {"name": "vault2", "type": "vault_store"},
-        ]});
-        let e = validate_vault_store(&two, &m).unwrap_err();
-        assert!(e.to_string().contains("vault, vault2"), "{e}");
+        m.insert("vault".to_string(), vault);
+        let n = names(&["vault"]);
+        let check = |g: serde_json::Value, rt: &str, target: &str| {
+            validate_key_vault(&g, &n, &m, Some(rt), target)
+        };
+        // The default seal derives from the platform key: refused where
+        // there is none, admitted where there is.
+        let plain = json!({"modules": [{"name": "vault", "type": "key_vault"}]});
+        let e = check(plain.clone(), "uefi", "qemu-uefi-arm64").unwrap_err();
+        assert!(e.to_string().contains("no sealing key"), "{e}");
+        let e = check(plain.clone(), "rp2040", "pico").unwrap_err();
+        assert!(e.to_string().contains("`seal: none`"), "{e}");
+        check(plain.clone(), "bcm2712", "pi5").expect("bcm2712 seals");
+        check(plain, "linux", "linux").expect("linux seals");
+        for seal in [json!("none"), json!(1)] {
+            let g = json!({"modules": [{"name": "vault", "type": "key_vault", "seal": seal}]});
+            check(g, "uefi", "qemu-uefi-arm64").expect("needs no platform key");
+        }
+        // `seal: owner` is a workload's vault alone: a node graph's is refused
+        // whatever the target
+        // (`a_workloads_owner_sealed_vault_takes_its_key_over_the_creators_lane`).
+        let g = json!({"modules": [{"name": "vault", "type": "key_vault", "seal": "owner"}]});
+        assert!(check(g, "uefi", "qemu-uefi-arm64").is_err());
+        let bad = json!({"modules": [{"name": "vault", "seal": "otp"}]});
+        assert!(check(bad, "linux", "linux").is_err());
+
+        // A token holds identity keys only where the vault build carries
+        // the `key_custody` client: never on RP.
+        for custody in [json!("token"), json!(1)] {
+            let g = json!({"modules": [{"name": "vault", "seal": "none", "custody": custody}]});
+            for (rt, target) in [("rp2040", "pico"), ("rp2350", "pico2w")] {
+                let e = check(g.clone(), rt, target).unwrap_err();
+                assert!(e.to_string().contains("no token client"), "{rt}: {e}");
+            }
+            check(g.clone(), "linux", "linux").expect("linux carries the client");
+            check(g, "bcm2712", "pi5").expect("the aarch64 build carries the client");
+        }
+        let soft = json!({"modules": [{
+            "name": "vault", "seal": "none", "params": {"custody": "software"},
+        }]});
+        check(soft, "rp2040", "pico").expect("software custody on RP");
+
+        // A wired store needs a slot size in whole sectors; an image with no
+        // store is heap for nothing.
+        let wired = |image: serde_json::Value| {
+            json!({
+                "modules": [{"name": "vault", "image": image}],
+                "wiring": [{"from": "disk.blocks", "to": "vault.blocks"}],
+            })
+        };
+        check(wired(json!(8192)), "linux", "linux").expect("8 KiB slots");
+        for image in [json!(0), json!(100), json!(1000)] {
+            let e = check(wired(image), "linux", "linux").unwrap_err();
+            assert!(e.to_string().contains("not a slot size"), "{e}");
+        }
+        let unwired = json!({"modules": [{"name": "vault", "image": 4096}]});
+        let e = check(unwired, "linux", "linux").unwrap_err();
+        assert!(e.to_string().contains("nothing is wired"), "{e}");
+
+        // Each key is a routed handle: an RP node reserves 16.
+        let many = json!({"modules": [{"name": "vault", "slots": 32}]});
+        let e = check(many.clone(), "rp2350", "pico2w").unwrap_err();
+        assert!(e.to_string().contains("handles: 32"), "{e}");
+        let raised = json!({
+            "modules": [{"name": "vault", "slots": 32}],
+            "capacity": {"handles": 32},
+        });
+        check(raised, "rp2350", "pico2w").expect("raised pool");
+        check(many, "linux", "linux").expect("128 on linux");
+    }
+
+    /// A workload-scoped layer (`owner_fs`) is no provider of a node module,
+    /// as the kernel's `layer_visible` has it: a node module that feeds
+    /// `owner_fs.ctl` and claims `fs` does not reach `owner_fs` (no cycle),
+    /// and on a target whose node has no `fs` of its own the claim is
+    /// refused saying the only provider is not visible to it.
+    #[test]
+    fn a_workload_scoped_layer_is_no_provider_of_a_node_module() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let owner_fs = Manifest::from_toml_for_target(
+            &root.join("modules/foundation/owner_fs/manifest.toml"),
+            Some("bcm2712"),
+        )
+        .expect("owner_fs manifest");
+        assert!(owner_fs.workload_scope);
+        let mut wl = Manifest {
+            resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &[])],
+            ..Manifest::default()
+        };
+        wl.ports = owner_fs
+            .ports
+            .iter()
+            .filter(|p| p.name.as_deref() == Some("ctl"))
+            .cloned()
+            .map(|mut p| {
+                p.name = Some("fs_ctl".to_string());
+                p.direction = 1;
+                p
+            })
+            .collect();
+        let mut m = HashMap::new();
+        m.insert("owner_fs".to_string(), owner_fs);
+        m.insert("wl".to_string(), wl);
+        let cfg = json!({
+            "modules": [{"name": "wl"}, {"name": "owner_fs"}],
+            "wiring": [{"from": "wl.fs_ctl", "to": "owner_fs.ctl"}],
+        });
+        let n = names(&["wl", "owner_fs"]);
+        validate_single_provider(&cfg, &n, &m, linux()).expect("no cycle through owner_fs");
+        // Construction order: owner_fs orders nothing for a node module.
+        assert_eq!(construction_order(&cfg, &n, &m).unwrap(), vec![0, 1]);
+        // Linux answers the node's `fs` itself; bcm2712 does not, and
+        // owner_fs is not visible to the node.
+        assert!(refusals("linux", &cfg, &m).is_empty());
+        let found = refusals("bcm2712", &cfg, &m);
+        assert!(
+            found.iter().any(|f| f.contains("`wl` requires `fs`")
+                && f.contains("`owner_fs` provides it to workloads only")),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -3056,6 +4007,78 @@ mod continuity_tests {
             prov(&["file.data", "storage.namespace"]),
         );
         validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m, linux()).unwrap();
+    }
+
+    /// A host lane serving a contract is its default provider, as a module
+    /// that declares it is: a Linux graph composing `ip` (which provides
+    /// `net_route` and `net_policy` on every target) and the host network
+    /// provider has two, and is refused naming both. Either alone composes.
+    #[test]
+    fn a_host_lane_serving_a_contract_counts_as_its_provider() {
+        use crate::manifest::{ManifestParam, ManifestParamType};
+        let lane = Manifest {
+            builtin: true,
+            params: vec![ManifestParam {
+                tag: 14,
+                name: "serves".into(),
+                ptype: ManifestParamType::Str,
+                default_num: 0,
+                default_str: String::new(),
+                enum_values: Vec::new(),
+                range: None,
+                required: false,
+            }],
+            ..Manifest::default()
+        };
+        let mut m = HashMap::new();
+        m.insert("ip".to_string(), prov(&["net_route", "net_policy"]));
+        m.insert("net".to_string(), lane);
+        let cfg = json!({"modules": [
+            {"name": "ip"},
+            {"name": "net", "serves": "net_route,net_policy"},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["ip", "net"]), &m, linux()).unwrap_err();
+        let s = format!("{e:?}");
+        assert!(s.contains("`ip`") && s.contains("`net`"), "names both: {s}");
+        assert!(s.contains("host provider"), "says why: {s}");
+        validate_single_provider(&cfg, &names(&["net"]), &m, linux()).expect("the lane alone");
+        validate_single_provider(&cfg, &names(&["ip"]), &m, linux()).expect("ip alone");
+        let other = json!({"modules": [{"name": "net", "serves": "key_custody"}]});
+        validate_single_provider(&other, &names(&["ip", "net"]), &m, linux())
+            .expect("a lane serving another contract");
+    }
+
+    /// A built-in a host provider serves (`linux_net`) is the default
+    /// provider of the contracts its manifest names only where no other
+    /// module of the graph provides them: beside `ip` it serves its sockets
+    /// alone, and the graph composes; two of it both serve them, and are
+    /// refused.
+    #[test]
+    fn a_host_provider_serves_only_what_no_other_module_provides() {
+        let net = Manifest {
+            builtin: true,
+            host_provider: Some(crate::manifest::HostProvider {
+                runtime: "fluxor-provider-net".into(),
+                serves: vec!["net_route".into(), "net_policy".into()],
+            }),
+            ..Manifest::default()
+        };
+        let mut m = HashMap::new();
+        m.insert("ip".to_string(), prov(&["net_route", "net_policy"]));
+        m.insert("linux_net".to_string(), net.clone());
+        m.insert("second_net".to_string(), net);
+        assert!(host_provider_serves("linux_net", &names(&["ip", "linux_net"]), &m).is_empty());
+        assert_eq!(
+            host_provider_serves("linux_net", &names(&["linux_net"]), &m),
+            vec!["net_route".to_string(), "net_policy".to_string()]
+        );
+        let cfg = json!({"modules": [{"name": "ip"}, {"name": "linux_net"}]});
+        validate_single_provider(&cfg, &names(&["ip", "linux_net"]), &m, linux())
+            .expect("ip serves the routes, linux_net its sockets");
+        let two = json!({"modules": [{"name": "linux_net"}, {"name": "second_net"}]});
+        let e = validate_single_provider(&two, &names(&["linux_net", "second_net"]), &m, linux())
+            .unwrap_err();
+        assert!(format!("{e:?}").contains("host provider"), "{e:?}");
     }
 
     #[test]
@@ -3163,6 +4186,7 @@ mod continuity_tests {
                 optional: false,
                 variants: Vec::new(),
                 when: Vec::new(),
+                claim: fluxor_abi::wire::fmod::claim::REQUIRED,
             }],
             ..Manifest::default()
         }
@@ -3438,7 +4462,12 @@ mod continuity_tests {
         };
         let check = |r| validate_single_provider(&cfg, &names(&["img"]), &m, r);
         check(linux()).expect("Linux answers fs from the host");
-        check(reach("bcm2712", ProviderCaller::Workload)).expect("bcm2712 roots a workload");
+        let e = check(reach("bcm2712", ProviderCaller::Workload)).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("on bcm2712 answers no `fs` call of a workload's modules"),
+            "a workload's `fs` is the workload layer, never the platform's: {e}"
+        );
         let e = check(reach("bcm2712", ProviderCaller::Node)).unwrap_err();
         assert!(
             e.to_string()
@@ -3509,6 +4538,7 @@ mod continuity_tests {
                 optional: false,
                 variants: Vec::new(),
                 when: Vec::new(),
+                claim: fluxor_abi::wire::fmod::claim::REQUIRED,
             }];
             (name.to_string(), m)
         };
@@ -3685,6 +4715,7 @@ mod continuity_tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         }];
         m.insert("http".to_string(), http);
         let config = |routes: Value| {
@@ -4641,17 +5672,18 @@ mod capacity_envelope_tests {
         assert!(format!("{err:?}").contains("positive"));
     }
 
-    /// A pool the target's kernel has no table for — the control-plane
-    /// store's on RP and wasm, host-process sandboxes off Linux — is refused
-    /// by name: the entry would bound nothing.
+    /// A pool the target's kernel has no table for — host-process sandboxes
+    /// off Linux — is refused by name: the entry would bound nothing. A
+    /// module-served pool (`store_subs`) is no kernel table, and its entry is
+    /// the reserve its providers' heap takes on every target.
     #[test]
     fn an_entry_for_a_pool_the_kernel_lacks_is_refused() {
+        assert!(build_capacity_envelope(&json!({"capacity": {"store_subs": 4}}), Some("rp2350"))
+            .is_ok());
         for (target, pool) in [
-            ("rp2350", "store_subs"),
-            ("wasm", "store_reads"),
+            ("wasm", "sandboxes"),
             ("pi5", "sandboxes"),
             ("pi5", "tty_sessions"),
-            ("pi5", "store_writes"),
         ] {
             let cfg = json!({"capacity": {pool: 4}});
             let err = build_capacity_envelope(&cfg, Some(target))
@@ -4665,6 +5697,22 @@ mod capacity_envelope_tests {
         for (target, pool) in [("linux", "sandboxes"), ("pi5", "store_subs")] {
             let cfg = json!({"capacity": {pool: 4}});
             build_capacity_envelope(&cfg, Some(target)).expect("the kernel has this table");
+        }
+        // The store's read, write and grant tables are its own params, and a
+        // workload's store is a module like any other: no pool names them.
+        for pool in [
+            "store_reads",
+            "store_writes",
+            "store_grants",
+            "owner_store_subs",
+            "owner_store_reads",
+            "owner_store_writes",
+        ] {
+            let cfg = json!({"capacity": {pool: 4}});
+            let err = build_capacity_envelope(&cfg, Some("linux"))
+                .expect_err("no such pool")
+                .to_string();
+            assert!(err.contains(&format!("unknown pool '{pool}'")), "{err}");
         }
     }
 
@@ -4739,9 +5787,8 @@ mod dynamic_capacity_tests {
 
     /// A schema with one blob param, `payload` (tag 1).
     fn blob_schema() -> schema::ParamSchema {
-        let mut b = vec![0x53, 0x50, 1, 1, 1, 5, 0, 0, 0, 0, 7];
-        b.extend_from_slice(b"payload");
-        b.push(0);
+        let mut b = vec![0x53, 0x50, 1, 1];
+        b.extend_from_slice(&schema::raw_param(1, 5, 0, "payload"));
         schema::ParamSchema::from_bytes(&b).expect("schema")
     }
 
@@ -4798,7 +5845,11 @@ mod dynamic_capacity_tests {
         );
         assert_eq!(kernel_pool_static_size("linux", "events"), None);
         assert_eq!(kernel_pool_default_reserve("linux", "events"), Some(32));
-        assert_eq!(kernel_pool_default_reserve("linux", "store_subs"), Some(64));
+        assert_eq!(
+            kernel_pool_default_reserve("linux", "store_subs"),
+            None,
+            "a module-served pool has no kernel row"
+        );
         assert_eq!(kernel_pool_default_reserve("pi5", "events"), Some(32));
         assert_eq!(
             kernel_pool_default_reserve("pi5", "module_slots"),
@@ -4811,11 +5862,13 @@ mod dynamic_capacity_tests {
             assert_eq!(kernel_max_owners(t), 4096, "{t}");
         }
         assert!(kernel_has_pool("linux", "tty_sessions"));
-        assert!(kernel_has_pool("pi5", "store_reads"));
-        assert!(!kernel_has_pool("pi5", "store_writes"));
+        assert!(!kernel_has_pool("pi5", "store_reads"));
         assert!(kernel_has_pool("rp2350", "state_arena"));
-        assert!(!kernel_has_pool("rp2350", "store_subs"));
-        // uefi: bare-metal aarch64 like bcm2712, without its control-plane store.
+        // Store subscriptions are module-served: no kernel has a table for them.
+        for t in ["linux", "pi5", "rp2350"] {
+            assert!(!kernel_has_pool(t, "store_subs"), "{t}");
+        }
+        // uefi: bare-metal aarch64 like bcm2712, with no store-subscription reserve.
         for t in ["uefi", "qemu-uefi-arm64", "ec2-arm64"] {
             assert_eq!(crate::capacity::kernel_profile(t), "profile_uefi");
             assert!(crate::capacity::edge_tables_sized_at_boot(t));
@@ -4826,7 +5879,7 @@ mod dynamic_capacity_tests {
                 kernel_pool_default_reserve(t, "state_arena"),
                 Some(512 * 1024 * 1024)
             );
-            assert!(kernel_has_pool(t, "net_route_peers"));
+            assert!(kernel_has_pool(t, "lends"));
             assert!(!kernel_has_pool(t, "store_subs"));
             assert!(!kernel_has_pool(t, "store_reads"));
         }
@@ -4872,13 +5925,9 @@ mod dynamic_capacity_tests {
         }
         let names: Vec<String> = ["watch_a", "watch_b", "plain"].map(String::from).to_vec();
         let demand = demand_of(&names, &manifests);
-        let declared = declared_demand(&json!({}), &names, &manifests, &demand).expect("declared");
-        assert_eq!(declared, vec![("store_subs", 0x000A, 12)]);
-        assert!(
-            declared_demand(&json!({}), &names[2..], &manifests, &demand[2..])
-                .unwrap()
-                .is_empty()
-        );
+        let declared = declared_demand(&demand).expect("declared");
+        assert_eq!(declared, vec![("store_subs", 0x0100, 12)]);
+        assert!(declared_demand(&demand[2..]).unwrap().is_empty());
     }
 
     /// A subscriber's `store_subscribers` demand counts against the events
@@ -4893,10 +5942,10 @@ mod dynamic_capacity_tests {
             .into();
         let names: Vec<String> = ["a", "b"].map(String::from).to_vec();
         let demand = demand_of(&names, &manifests);
-        let declared = declared_demand(&json!({}), &names, &manifests, &demand).unwrap();
+        let declared = declared_demand(&demand).unwrap();
         assert_eq!(
             declared,
-            vec![("store_subs", 0x000A, 6), ("events", 0x0005, 2)]
+            vec![("store_subs", 0x0100, 6), ("events", 0x0005, 2)]
         );
     }
 
@@ -5184,8 +6233,8 @@ mod dynamic_capacity_tests {
     }
 
     /// The plan's ceiling for a `heap_per_demand` pool is the graph's whole
-    /// declared demand plus the reserve: the `capacity:` entry, else the
-    /// profile's default.
+    /// declared demand plus the reserve: the `capacity:` entry, else none,
+    /// since a module-served pool has no kernel default.
     #[test]
     fn the_heap_plan_takes_the_full_planned_ceiling() {
         let demand = vec![
@@ -5202,10 +6251,13 @@ mod dynamic_capacity_tests {
         ];
         let plan = heap_plan("linux", &json!({"capacity": {"store_subs": 5}}), &demand);
         assert_eq!(plan.ceilings.get("store_subs"), Some(&20));
-        let default = crate::capacity::kernel_pool_default_reserve("linux", "store_subs")
-            .expect("linux has a store_subs reserve");
+        assert_eq!(
+            crate::capacity::kernel_pool_default_reserve("linux", "store_subs"),
+            None,
+            "no kernel row for a module-served pool"
+        );
         let plan = heap_plan("linux", &json!({}), &demand);
-        assert_eq!(plan.ceilings.get("store_subs"), Some(&(15 + default)));
+        assert_eq!(plan.ceilings.get("store_subs"), Some(&15));
         let line = heap_per_demand_report(&plan, &demand, &[]).expect("a figure to print");
         assert!(
             line.contains("store +") && line.contains("heap caps"),
@@ -5213,11 +6265,11 @@ mod dynamic_capacity_tests {
         );
     }
 
-    /// When the graph has an unkeyed module provider of `storage.namespace`,
-    /// the subscription demand leaves the host `store_subs` table — the
-    /// provider serves it from its heap; a keyed provider leaves it there.
+    /// The subscription demand is the module pool's whoever serves it: the
+    /// `DMND` entry the kernel reports `store_subs` against, a keyed
+    /// provider or an unkeyed one alike, and no host table takes it.
     #[test]
-    fn a_module_store_takes_the_subscription_demand_off_the_host_pool() {
+    fn the_subscription_demand_is_the_module_pools() {
         let mut watch = Manifest::default();
         watch.capacities.insert("store_subscriptions".into(), 4);
         watch.capacities.insert("store_subscribers".into(), 1);
@@ -5228,26 +6280,11 @@ mod dynamic_capacity_tests {
         .into();
         let names: Vec<String> = ["store", "watch"].map(String::from).to_vec();
         let demand = demand_of(&names, &manifests);
-        let cfg = json!({"modules": [{"name": "store"}, {"name": "watch"}]});
-        let declared = declared_demand(&cfg, &names, &manifests, &demand).unwrap();
         assert_eq!(
-            declared,
-            vec![("events", 0x0005, 1)],
-            "events stay kernel's"
+            declared_demand(&demand).unwrap(),
+            vec![("store_subs", 0x0100, 4), ("events", 0x0005, 1)]
         );
-        // A keyed provider is not the layer class-byte calls reach, whether
-        // its `volume` is set on the entry or inside its `params:`.
-        for store in [
-            json!({"name": "store", "params": {"volume": "v"}}),
-            json!({"name": "store", "volume": "v"}),
-        ] {
-            let keyed = json!({"modules": [store, {"name": "watch"}]});
-            let declared = declared_demand(&keyed, &names, &manifests, &demand).unwrap();
-            assert_eq!(
-                declared,
-                vec![("store_subs", 0x000A, 4), ("events", 0x0005, 1)]
-            );
-        }
+        assert_eq!(crate::capacity::module_pool_contract("store_subs"), Some("storage.namespace"));
     }
 
     /// A module's id is its index among the records, which has a full-width
@@ -5778,6 +6815,8 @@ mod asset_param_tests {
             ptype,
             name: name.to_string(),
             default: 0,
+            min: 0,
+            max: u32::MAX,
             enums: std::collections::HashMap::new(),
         };
         ParamSchema::from_params(vec![
@@ -6178,6 +7217,8 @@ mod port_fact_tests {
                 ptype: ParamType::U32,
                 name: "refresh_mhz".to_string(),
                 default: 40000,
+                min: 0,
+                max: u32::MAX,
                 enums: HashMap::new(),
             },
             SchemaParam {
@@ -6185,6 +7226,8 @@ mod port_fact_tests {
                 ptype: ParamType::Str,
                 name: "label".to_string(),
                 default: 0,
+                min: 0,
+                max: u32::MAX,
                 enums: HashMap::new(),
             },
         ]);
@@ -6286,6 +7329,8 @@ mod port_fact_tests {
             ptype: ParamType::U32,
             name: "interval_ms".to_string(),
             default: 5000,
+            min: 0,
+            max: u32::MAX,
             enums: HashMap::new(),
         }]);
         let param_of = |entry: &Value, param: &str| -> Result<BoundParam> {
@@ -6973,6 +8018,7 @@ mod config_decode_tests {
             hardware: Some(&hw),
             workloads: Some(&[WorkloadRecord {
                 idle_safe: true,
+                endpoints: &[],
                 blob: &[1, 2, 3, 4],
             }]),
             envelope: Some(&[PoolEntry { pool: 5, n: 40 }]),
@@ -7110,9 +8156,8 @@ mod heap_from_params_tests {
 
     /// A schema with one chunked string param, `body` (tag 2).
     fn body_schema() -> schema::ParamSchema {
-        let mut b = vec![0x53, 0x50, 1, 1, 2, 6, 0, 0, 0, 0, 4];
-        b.extend_from_slice(b"body");
-        b.push(0);
+        let mut b = vec![0x53, 0x50, 1, 1];
+        b.extend_from_slice(&schema::raw_param(2, 6, 0, "body"));
         schema::ParamSchema::from_bytes(&b).expect("schema")
     }
 
@@ -7427,12 +8472,16 @@ mod boot_plan_tests {
         );
     }
 
-    /// Declared demand adds to the derived part, as `DMND` does in the kernel.
+    /// Declared demand adds to the derived part, as `DMND` does in the kernel;
+    /// a module-served pool takes no default reserve.
     #[test]
     fn declared_demand_is_derived() {
         let declared = figures(&[("store_subs", 400)]);
         let plan = plan_pool("linux", "store_subs", &shape(1, 0), &declared, NONE);
-        assert_eq!((plan.derived, plan.reserve), (400, 64));
+        assert_eq!((plan.derived, plan.reserve), (400, 0));
+        let declared = figures(&[("events", 400)]);
+        let plan = plan_pool("linux", "events", &shape(1, 0), &declared, NONE);
+        assert_eq!((plan.derived, plan.reserve), (400, 32));
     }
 
     /// Fans are counted as the kernel counts them: one per port carrying two
@@ -7481,6 +8530,7 @@ mod boot_plan_tests {
         let blobs = [workload(2), workload(3)].map(|w| encode_workload(&w).expect("blob"));
         let records = blobs.each_ref().map(|blob| WorkloadRecord {
             idle_safe: false,
+            endpoints: &[],
             blob,
         });
         assert_eq!(resident_demand(&records), (2, 5, 0));
@@ -7629,6 +8679,8 @@ mod check_mode_file_tests {
             ptype: ParamType::Str,
             name: name.into(),
             default: 0,
+            min: 0,
+            max: u32::MAX,
             enums: std::collections::HashMap::new(),
         };
         ParamSchema::from_params(vec![
@@ -7696,6 +8748,8 @@ mod check_mode_file_tests {
                 crate::schema::env_bind::FLAG_REQUIRED,
                 name.len() as u8,
             ];
+            // The param's bounds: the test schema's 0..=u32::MAX.
+            v.extend_from_slice(&[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
             v.extend_from_slice(name.as_bytes());
             (crate::schema::env_bind::BIND_TAG, v)
         };
@@ -8010,6 +9064,18 @@ mod boot_composition_tests {
         generate_config_ext(config, &ConfigBuilder::new(), &[], &r, 0, 0, Some("linux"))
     }
 
+    /// The composer refuses `${applet:data_dir}` in a graph not built as an
+    /// applet's, naming the value and why, before anything else is read.
+    #[test]
+    fn a_graph_built_outside_an_applet_is_refused_its_data_dir() {
+        let g = json!({"target": "linux", "modules": [
+            {"name": "store", "dir": "${applet:data_dir}/store"},
+        ]});
+        let e = generate(&g).unwrap_err().to_string();
+        assert!(e.contains("${applet:data_dir}/store"), "{e}");
+        assert!(e.contains("not built as one"), "{e}");
+    }
+
     fn probes(names: &[&str]) -> Value {
         names
             .iter()
@@ -8017,10 +9083,401 @@ mod boot_composition_tests {
             .collect()
     }
 
+    /// The `host_lane` params of the composed module at `i`, by tag.
+    fn lane_params(
+        g: &graph::ComposedGraph<'_>,
+        i: usize,
+    ) -> std::collections::BTreeMap<u8, Vec<u8>> {
+        let m = g.modules().nth(i).expect("the module");
+        assert_eq!(
+            m.name_hash,
+            fnv1a_hash(b"host_lane"),
+            "built as a host lane"
+        );
+        let mut tags = std::collections::BTreeMap::new();
+        fluxor_contracts::params_tlv::walk_declared(m.params, |tag, v| {
+            tags.insert(tag, v.to_vec());
+        });
+        tags
+    }
+
+    /// The lane end of a composed edge, `(key, target)`, if it has one.
+    fn lane_of(e: &graph::EdgeRecord) -> Option<(u8, u32)> {
+        match (e.from, e.to) {
+            (graph::Endpoint::Lane { key, target }, _) | (_, graph::Endpoint::Lane { key, target }) => {
+                Some((key, target))
+            }
+            _ => None,
+        }
+    }
+
+    /// A graph of `n` `conn_sink`s, each wired into `linux_net.net_in` and
+    /// back from `linux_net.net_out`, as a node graph's socket consumers
+    /// are.
+    fn paired_sinks(n: usize) -> Value {
+        let mut modules = vec![json!({"name": "linux_net"})];
+        let mut wiring = Vec::new();
+        for i in 0..n {
+            let name = format!("s{i}");
+            modules.push(json!({"name": name, "type": "conn_sink", "port": 9000 + i}));
+            wiring.push(json!({"from": format!("{name}.net_out"), "to": "linux_net.net_in"}));
+            wiring.push(json!({"from": "linux_net.net_out", "to": format!("{name}.net_in")}));
+        }
+        json!({
+            "modules": modules,
+            "wiring": wiring,
+            "scheduler": {"accept_cycles": true},
+        })
+    }
+
+    /// `linux_net` is built as the `host_lane` that runs its host provider:
+    /// its one static pair address control, and every socket consumer a
+    /// lane of its own — keyed in wiring order, its events back to its
+    /// producer, no tee and no merge — reached by the `linux_net` lane
+    /// target, which serves them beside its workload lanes. The provider is
+    /// told the instance's sizes and the contracts it serves, and nothing of
+    /// lanes or pairs.
+    #[test]
+    fn linux_net_is_a_host_lane_and_each_producer_a_lane_of_its_own() {
+        let config = json!({
+            "modules": [
+                {"name": "linux_net", "max_conns": 200},
+                {"name": "a", "type": "conn_sink", "port": 9001},
+                {"name": "b", "type": "conn_sink", "port": 9002},
+            ],
+            "wiring": [
+                {"from": "a.net_out", "to": "linux_net.net_in"},
+                {"from": "b.net_out", "to": "linux_net.net_in"},
+                {"from": "linux_net.net_out", "to": "b.net_in"},
+                {"from": "linux_net.net_out", "to": "a.net_in"},
+            ],
+            "scheduler": {"accept_cycles": true},
+        });
+        let blob = generate(&config).expect("generates");
+        let cfg = boot_config::decode(&blob).expect("decodes");
+        let g = cfg.graph().composed();
+        assert_eq!(g.modules().count(), 3, "no tee and no merge");
+        let target = fluxor_abi::wire::fnv1a32(b"linux_net");
+        let lane = |key| graph::Endpoint::Lane { key, target };
+        let ends: Vec<(graph::Endpoint, graph::Endpoint)> =
+            g.edges().map(|e| (e.from, e.to)).collect();
+        assert_eq!(
+            ends,
+            vec![
+                (graph::Endpoint::New(1), lane(0)),
+                (graph::Endpoint::New(2), lane(1)),
+                (lane(1), graph::Endpoint::New(2)),
+                (lane(0), graph::Endpoint::New(1)),
+            ],
+            "lane k for the k-th producer; each consumer reads its own lane"
+        );
+        let t = lane_params(&g, 0);
+        let s = |tag: u8| String::from_utf8(t[&tag].clone()).unwrap();
+        assert_eq!(s(10), "fluxor-provider-net");
+        assert_eq!(s(11), "NetProto:tlv16:265", "the static pair is address control alone");
+        assert_eq!(
+            s(12),
+            "max_conns=200 write_buf_kib=128 listen_backlog=128 serves=net_route,net_policy"
+        );
+        assert_eq!(t[&13], vec![0], "a full lane holds its producer");
+        assert_eq!(s(14), "net_route,net_policy");
+        assert_eq!(s(15), "linux_net");
+        assert_eq!(t[&16], vec![32 + 2], "its workload lanes and the graph's two");
+    }
+
+    /// Eight producers, and forty — far past what any static table carried
+    /// — each get a lane of their own, and the lane target serves them all.
+    #[test]
+    fn eight_and_forty_producers_each_get_a_lane_of_their_own() {
+        for n in [8usize, 40] {
+            let blob = generate(&paired_sinks(n)).expect("generates");
+            let cfg = boot_config::decode(&blob).expect("decodes");
+            let g = cfg.graph().composed();
+            assert_eq!(g.modules().count(), 1 + n, "{n}: no tee and no merge");
+            for k in 0..n {
+                let producer = graph::Endpoint::New(1 + k as u16);
+                let into: Vec<_> = g.edges().filter(|e| e.from == producer).collect();
+                let out: Vec<_> = g.edges().filter(|e| e.to == producer).collect();
+                assert_eq!((into.len(), out.len()), (1, 1), "{n}: one edge each way");
+                assert_eq!(lane_of(&into[0]).map(|l| l.0), Some(k as u8), "{n}: lane {k}");
+                assert_eq!(
+                    lane_of(&out[0]).map(|l| l.0),
+                    Some(k as u8),
+                    "{n}: lane {k}'s events to its producer"
+                );
+            }
+            assert_eq!(lane_params(&g, 0)[&16], vec![(32 + n) as u8]);
+        }
+    }
+
+    /// The shape `connlanes` takes: two producers marked `edge_class:
+    /// merge` share one lane through a merge, and its events reach every
+    /// `net_out` consumer through a tee — the shared lane's producers, and
+    /// one producing into none.
+    #[test]
+    fn merged_producers_share_one_lane_with_a_merge_and_a_tee() {
+        let config = json!({
+            "modules": [
+                {"name": "linux_net"},
+                {"name": "a", "type": "conn_sink", "port": 9001},
+                {"name": "b", "type": "conn_sink", "port": 9002},
+                {"name": "c", "type": "conn_sink", "port": 9003},
+            ],
+            "wiring": [
+                {"from": "a.net_out", "to": "linux_net.net_in", "edge_class": "merge"},
+                {"from": "b.net_out", "to": "linux_net.net_in", "edge_class": "merge"},
+                {"from": "linux_net.net_out", "to": "c.net_in"},
+                {"from": "linux_net.net_out", "to": "a.net_in"},
+                {"from": "linux_net.net_out", "to": "b.net_in"},
+            ],
+            "scheduler": {"accept_cycles": true},
+        });
+        let blob = generate(&config).expect("generates");
+        let cfg = boot_config::decode(&blob).expect("decodes");
+        let g = cfg.graph().composed();
+        let target = fluxor_abi::wire::fnv1a32(b"linux_net");
+        let lane = graph::Endpoint::Lane { key: 0, target };
+        let mut fans: Vec<u32> = g.modules().skip(4).map(|m| m.name_hash).collect();
+        fans.sort_unstable();
+        let mut want = vec![graph::TEE_NAME_HASH, graph::MERGE_NAME_HASH];
+        want.sort_unstable();
+        assert_eq!(fans, want, "a merge into the lane and a tee out of it");
+        assert_eq!(g.edges().filter(|e| e.to == lane).count(), 1, "one commands edge");
+        assert_eq!(g.edges().filter(|e| e.from == lane).count(), 1, "one events edge");
+        assert!(
+            g.edges().all(|e| lane_of(&e).is_none_or(|(k, _)| k == 0)),
+            "one lane"
+        );
+        assert_eq!(lane_params(&g, 0)[&16], vec![33]);
+    }
+
+    /// A consumer of `net_out` that produces into no lane of its own reads
+    /// the shared lane; address-control events leave the static pair.
+    #[test]
+    fn a_consumer_of_no_lane_reads_the_shared_lane() {
+        let config = json!({
+            "modules": [
+                {"name": "linux_net"},
+                {"name": "a", "type": "conn_sink", "port": 9001},
+                {"name": "b", "type": "conn_sink", "port": 9002},
+            ],
+            "wiring": [
+                {"from": "a.net_out", "to": "linux_net.net_in", "edge_class": "merge"},
+                {"from": "linux_net.net_out", "to": "a.net_in"},
+                {"from": "linux_net.net_out", "to": "b.net_in"},
+                {"from": "linux_net.addr_evt", "to": "b.net_in"},
+            ],
+            "scheduler": {"accept_cycles": true},
+        });
+        let blob = generate(&config).expect("generates");
+        let cfg = boot_config::decode(&blob).expect("decodes");
+        let g = cfg.graph().composed();
+        let target = fluxor_abi::wire::fnv1a32(b"linux_net");
+        let lane = graph::Endpoint::Lane { key: 0, target };
+        assert_eq!(g.edges().filter(|e| e.from == lane).count(), 1, "the lane's events, teed");
+        let static_out: Vec<u8> = g
+            .edges()
+            .filter(|e| e.from.new_index() == Some(0))
+            .map(|e| e.from_port)
+            .collect();
+        assert_eq!(static_out, vec![0], "the address events leave pair 0");
+        assert!(
+            g.edges().all(|e| e.to.new_index() != Some(0)),
+            "nothing reaches a static input pair"
+        );
+    }
+
+    /// A producer into `net_in` whose lane's events nobody reads is refused,
+    /// naming it: its connections' events would have nowhere to go.
+    #[test]
+    fn a_producer_whose_lane_nobody_reads_is_refused() {
+        let config = json!({
+            "modules": [
+                {"name": "linux_net"},
+                {"name": "a", "type": "conn_sink", "port": 9001},
+                {"name": "b", "type": "conn_sink", "port": 9002},
+            ],
+            "wiring": [
+                {"from": "a.net_out", "to": "linux_net.net_in"},
+                {"from": "linux_net.net_out", "to": "a.net_in"},
+                {"from": "b.net_out", "to": "linux_net.net_in"},
+            ],
+            "scheduler": {"accept_cycles": true},
+        });
+        let e = generate(&config).unwrap_err().to_string();
+        assert!(e.contains("`b` produces into `linux_net.net_in` and nothing reads"), "{e}");
+    }
+
+    /// Wiring that leaves a lane's events no one place to go is refused at
+    /// build: a module producing into one target twice, or both alone and
+    /// in the shared lane; a consumer with no lane to read; and `merge` on
+    /// an edge that reaches no lane.
+    #[test]
+    fn an_ambiguous_lane_is_refused() {
+        let with = |wiring: Value| {
+            json!({
+                "modules": [
+                    {"name": "linux_net"},
+                    {"name": "a", "type": "conn_sink", "port": 9001},
+                    {"name": "b", "type": "conn_sink", "port": 9002},
+                    {"name": "c", "type": "conn_sink", "port": 9003},
+                ],
+                "wiring": wiring,
+                "scheduler": {"accept_cycles": true},
+            })
+        };
+        let twice = with(json!([
+            {"from": "a.net_out", "to": "linux_net.net_in"},
+            {"from": "a.net_out", "to": "linux_net.net_in"},
+            {"from": "linux_net.net_out", "to": "a.net_in"},
+        ]));
+        let e = generate(&twice).unwrap_err().to_string();
+        assert!(e.contains("`a` already produces into a lane of `linux_net`"), "{e}");
+        let both = with(json!([
+            {"from": "a.net_out", "to": "linux_net.net_in", "edge_class": "merge"},
+            {"from": "a.net_out", "to": "linux_net.net_in"},
+            {"from": "linux_net.net_out", "to": "a.net_in"},
+        ]));
+        let e = generate(&both).unwrap_err().to_string();
+        assert!(e.contains("`a` already produces into a lane of `linux_net`"), "{e}");
+        let unread = with(json!([
+            {"from": "a.net_out", "to": "linux_net.net_in"},
+            {"from": "linux_net.net_out", "to": "a.net_in"},
+            {"from": "linux_net.net_out", "to": "c.net_in"},
+        ]));
+        let e = generate(&unread).unwrap_err().to_string();
+        assert!(e.contains("`c` reads `linux_net`'s events but produces into no lane"), "{e}");
+        let stray = with(json!([
+            {"from": "a.net_out", "to": "linux_net.net_in"},
+            {"from": "linux_net.net_out", "to": "a.net_in"},
+            {"from": "b.net_out", "to": "c.net_in", "edge_class": "merge"},
+        ]));
+        let e = generate(&stray).unwrap_err().to_string();
+        assert!(e.contains("this edge reaches no lane"), "{e}");
+    }
+
+    /// The lanes a target serves, its workloads' and the node graph's
+    /// together, are at most what a lane key names (255): more are refused
+    /// at build, naming both.
+    #[test]
+    fn more_than_255_lanes_are_refused() {
+        let mut config = paired_sinks(6);
+        config["modules"][0]["lanes"] = json!(250);
+        let e = generate(&config).unwrap_err().to_string();
+        assert!(
+            e.contains("serves 250 workload lane(s) (`lanes`) and the node's graph wires 6"),
+            "{e}"
+        );
+        assert!(e.contains("256, past the 255"), "{e}");
+        config["modules"][0]["lanes"] = json!(249);
+        assert!(generate(&config).is_ok(), "255 lanes are served");
+    }
+
+    /// A static `host_lane` pair carries fixed-role channels alone: one that
+    /// states socket traffic is refused at build.
+    #[test]
+    fn socket_traffic_on_a_static_pair_is_refused() {
+        let config = json!({
+            "modules": [{
+                "name": "carrier",
+                "type": "host_lane",
+                "runtime": "fluxor-provider-net",
+                "channels": "NetProto:tlv16:265;NetProto:tlv16:65538",
+            }],
+            "wiring": [],
+        });
+        let e = generate(&config).unwrap_err().to_string();
+        assert!(e.contains("socket traffic on its static pair 1"), "{e}");
+    }
+
+    /// A `host_lane` of an image to run pins its provider binary (tag 17); a
+    /// check composes it the same and pins nothing, so no runtime runs its
+    /// image; a composition to run inside a check pins again.
+    #[test]
+    fn a_check_composes_host_lanes_without_a_provider_pin() {
+        let config = json!({
+            "modules": [{
+                "name": "carrier",
+                "type": "host_lane",
+                "runtime": "fluxor-provider-net",
+                "channels": "NetProto:tlv16:265",
+            }],
+            "wiring": [],
+        });
+        let pin = |blob: Vec<u8>| {
+            let cfg = boot_config::decode(&blob).expect("decodes");
+            let modules: Vec<_> = cfg.graph().composed().modules().collect();
+            let mut digest = None;
+            fluxor_contracts::params_tlv::walk_declared(modules[0].params, |tag, v| {
+                if tag == 17 {
+                    digest = Some(v.to_vec());
+                }
+            });
+            digest
+        };
+        let run = pin(generate(&config).expect("an image to run composes"));
+        assert_eq!(run.map(|d| d.len()), Some(64), "the run pins the provider");
+        let check = compose_as_check(|| generate(&config)).expect("a check composes");
+        assert_eq!(pin(check), None, "a check pins nothing");
+        let inner = compose_as_check(|| compose_to_run(|| generate(&config)))
+            .expect("a run inside a check composes");
+        assert!(pin(inner).is_some(), "a run inside a check pins");
+        let mut stated = config.clone();
+        stated["modules"][0]["runtime_digest"] = json!("00");
+        let e = compose_as_check(|| generate(&stated)).unwrap_err().to_string();
+        assert!(e.contains("states `runtime_digest`"), "a check refuses as a run does: {e}");
+    }
+
+    /// A launch's image pins the provider beside the runtime that launch
+    /// runs, not the one its project would build: a rebuilt provider is a
+    /// different pin on the next launch's image.
+    #[test]
+    fn a_launch_pins_the_provider_beside_the_runtime_it_runs() {
+        let config = json!({
+            "modules": [{
+                "name": "carrier",
+                "type": "host_lane",
+                "runtime": "fluxor-provider-net",
+                "channels": "NetProto:tlv16:265",
+            }],
+            "wiring": [],
+        });
+        let pin = |blob: Vec<u8>| {
+            let cfg = boot_config::decode(&blob).expect("decodes");
+            let modules: Vec<_> = cfg.graph().composed().modules().collect();
+            let mut digest = None;
+            fluxor_contracts::params_tlv::walk_declared(modules[0].params, |tag, v| {
+                if tag == 17 {
+                    digest = Some(String::from_utf8(v.to_vec()).expect("hex"));
+                }
+            });
+            digest
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("fluxor-linux");
+        let provider = dir.path().join("fluxor-provider-net");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        for bytes in [&b"provider one"[..], &b"provider two"[..]] {
+            std::fs::write(&provider, bytes).unwrap();
+            let image = compose_on_runtime(&runtime, || generate(&config)).expect("composes");
+            assert_eq!(
+                pin(image),
+                Some(crate::hash::hex(&crate::crypto::sha256(bytes))),
+                "the pin is the provider beside the runtime the launch runs"
+            );
+        }
+        let gone = compose_on_runtime(&dir.path().join("elsewhere/fluxor-linux"), || {
+            generate(&config)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(gone.contains("elsewhere/fluxor-provider-net"), "{gone}");
+    }
+
     /// The node graph arrives composed: an output wired to two inputs gets a
     /// tee, a module of the graph after the declared ones, whose params name
-    /// its frame kind, frames per step and scratch — the largest ring beside
-    /// it — and the heap the tee's type derives for that scratch; the
+    /// its records per step and scratch — the largest ring beside it, the
+    /// producer declaring no `max_record` — and the heap the tee's type derives for that scratch; the
     /// joining edge follows the declared ones, and the order steps the tee
     /// between its producer and consumers.
     #[test]
@@ -8042,10 +9499,6 @@ mod boot_composition_tests {
         fluxor_contracts::params_tlv::walk_declared(modules[3].params, |tag, v| {
             tags.insert(tag, v.to_vec());
         });
-        assert_eq!(
-            tags[&plan::fan_param::FRAME_KIND],
-            [plan::FrameKind::Stream as u8]
-        );
         assert_eq!(tags[&plan::fan_param::FRAMES_PER_STEP], 64u16.to_le_bytes());
         assert_eq!(
             tags[&plan::fan_param::SCRATCH_BYTES],
@@ -8159,9 +9612,8 @@ mod pinned_variant_tests {
         std::fs::create_dir_all(&project).unwrap();
         let store = OciStore::open(dir.path().join("store")).unwrap();
         // One U16 param, tag 1, `port`, default 80.
-        let schema = [
-            0x53, 0x50, 1, 1, 1, 1, 80, 0, 0, 0, 4, b'p', b'o', b'r', b't', 0,
-        ];
+        let mut schema = vec![0x53, 0x50, 1, 1];
+        schema.extend_from_slice(&schema::raw_param(1, 1, 80, "port"));
         let mut lock = String::new();
         for (name, toml, bytes) in [
             ("http-exchange", VARIANTS, fmod("http", &schema)),

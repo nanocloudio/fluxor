@@ -24,29 +24,12 @@ use crate::abi::platform::linux::host_process as hp;
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::workload::owner::OwnerHandle;
 
-// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class `host_process`): the host class
-// numbers them and owns the consts. Only their arg/out wire formats — backend
-// detail, not contract surface — are documented here:
-//
-// Workload-scoped ops name the workload by its 16-byte identity at the head
-// of `arg` (handle = -1 calls).
-//
-// * `READ` — `arg` = `[identity]`; `data` out = merged stdout/stderr;
-//   return = bytes.
-// * `EXEC` — one-shot: run a command inside a workload and capture
-//   its output. `arg` in = `[identity][cmd_len:u32]`, out =
-//   `[identity][out_len:u32]`; `data` in = command line, out = output;
-//   return = exit code.
-// * `TTY_OPEN` (`host_process::TTY_OPEN`) — start an interactive PTY session.
-//   `arg` = `[identity][rows:u16][cols:u16]`; `data` = command line; return =
-//   session id.
-// * `TTY_STEP` — pump a session: write stdin, drain output, poll
-//   exit. `arg` in = `[sid:u32][wlen:u32]`, out =
-//   `[sid:u32][rlen:u32][state:u8][code:i32]`; `data` in = stdin, out =
-//   output.
-// * `TTY_RESIZE` — `arg` = `[sid:u32][rows:u16][cols:u16]`.
-// * `TTY_CLOSE` — kill+reap+free a session. `arg` = `[sid:u32]`;
-//   return = exit code.
+// Host-process ops (class `host_process`, `abi::platform::linux::host_process`
+// has the wire formats) arrive at [`host_process_dispatch`] with what the
+// handle names, as this provider calls it: an op on a workload with the
+// workload's index (its `workload` handle, which the contract accepts), a
+// session op with the session's index, a node command op with the
+// command's.
 
 /// The workload-index range: one workload per sandbox. The table is sized
 /// at boot with the sandbox table ([`size_workloads`]).
@@ -95,6 +78,7 @@ unsafe fn release_slot(idx: usize) -> i32 {
     let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
     let slot = slots[idx];
     let rc = hp_destroy(slot.backend_idx);
+    super::host_lane::owner_facts::ended(slot.owner);
     slots[idx] = WORKLOAD_EMPTY;
     retire_handles(idx);
     if slot.allocated {
@@ -131,10 +115,6 @@ pub unsafe fn size_workloads(n: usize) -> Result<(), crate::kernel::mem::table::
     t.grow(n)
 }
 
-#[inline]
-fn rd_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
-}
 #[inline]
 fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -175,10 +155,10 @@ fn host_backend_honors_option(ns: &[u8], key: &[u8]) -> bool {
     (ns == wl::volume::NS && key == wl::volume::KEY) || (ns == wl::env::NS && key == wl::env::KEY)
 }
 
-/// The options directory [`CAPS`](wl::CAPS) lists: what both backends
-/// realize. The graph backend realizes the same two
-/// (`workload_graph::GRAPH_OPTIONS`): a volume as its modules' `fs` root,
-/// the environment as their env binds.
+/// The options directory [`OPTIONS`](wl::OPTIONS) lists: what the
+/// host-process backend realizes. The graph backend realizes none: a graph
+/// workload's environment is bound into its params by its creator, and its
+/// volumes are lent by the node's workload `fs` layer.
 const LINUX_OPTIONS: &[(&[u8], &[&[u8]])] = &[
     (wl::volume::NS, &[wl::volume::KEY]),
     (wl::env::NS, &[wl::env::KEY]),
@@ -189,25 +169,12 @@ const LINUX_OPTIONS: &[(&[u8], &[&[u8]])] = &[
 /// no name or one that is not UTF-8.
 fn apply_env_options(opts: &[u8], env: &mut std::vec::Vec<std::string::String>) -> Result<(), i32> {
     use crate::kernel::sys::errno;
-    let mut p = 0usize;
-    while p < opts.len() {
-        let ns_len = opts[p] as usize;
-        let ns = opts.get(p + 1..p + 1 + ns_len).ok_or(errno::EINVAL)?;
-        p += 1 + ns_len;
-        let key_len = *opts.get(p).ok_or(errno::EINVAL)? as usize;
-        let key = opts.get(p + 1..p + 1 + key_len).ok_or(errno::EINVAL)?;
-        p += 1 + key_len + 1;
-        if p + 2 > opts.len() {
-            return Err(errno::EINVAL);
-        }
-        let vl = rd_u16(opts, p) as usize;
-        p += 2;
-        let val = opts.get(p..p + vl).ok_or(errno::EINVAL)?;
-        p += vl;
-        if ns != wl::env::NS || key != wl::env::KEY {
+    for o in wl::opt::iter(opts) {
+        let o = o.map_err(|()| errno::EINVAL)?;
+        if o.ns != wl::env::NS || o.key != wl::env::KEY {
             continue;
         }
-        let entry = core::str::from_utf8(val).map_err(|_| errno::EINVAL)?;
+        let entry = core::str::from_utf8(o.val).map_err(|_| errno::EINVAL)?;
         let Some(eq) = entry.find('=').filter(|&eq| eq > 0) else {
             return Err(errno::EINVAL);
         };
@@ -239,13 +206,6 @@ fn parse_bind(val: &[u8]) -> Option<super::host_backend::VolumeBind> {
         ro,
     })
 }
-/// Network fields the backend realizes (`net_identity.rs`): own netns and an
-/// IPv4 identity. An IPv6 identity is not realized, so it fails admission
-/// (`ENOSYS`) per the same fail-closed rule — never a silently-unaddressed
-/// workload.
-fn host_backend_net_caps() -> u32 {
-    wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY
-}
 /// Whether this host can freeze at all: cgroup2 is mounted (`cgroup.freeze`
 /// is core cgroup2 surface, present on every v2 cgroup since Linux 5.2 — not
 /// a controller) and a base cgroup for per-sandbox dirs resolves — the same
@@ -262,49 +222,22 @@ fn host_backend_can_freeze() -> bool {
 
 /// Validate the TLV options envelope. Advisory entries a backend does not
 /// understand are ignored; a REQUIRED entry it does not advertise fails
-/// admission. Returns `Ok(())` or a negative errno. TLV entry:
-/// `[ns_len:u8][ns][key_len:u8][key][flags:u8][val_len:u16 LE][val]`.
-unsafe fn validate_options(
+/// admission. Returns `Ok(())` or a negative errno.
+fn validate_options(
     opts: &[u8],
     binds: &mut std::vec::Vec<super::host_backend::VolumeBind>,
 ) -> Result<(), i32> {
     use crate::kernel::sys::errno;
-    let mut p = 0usize;
-    while p < opts.len() {
-        if p + 1 > opts.len() {
-            return Err(errno::EINVAL);
-        }
-        let ns_len = opts[p] as usize;
-        p += 1;
-        if p + ns_len + 1 > opts.len() {
-            return Err(errno::EINVAL);
-        }
-        let ns = &opts[p..p + ns_len];
-        p += ns_len;
-        let key_len = opts[p] as usize;
-        p += 1;
-        if p + key_len + 3 > opts.len() {
-            return Err(errno::EINVAL);
-        }
-        let key = &opts[p..p + key_len];
-        p += key_len;
-        let flags = opts[p];
-        p += 1;
-        let val_len = rd_u16(opts, p) as usize;
-        p += 2;
-        if p + val_len > opts.len() {
-            return Err(errno::EINVAL);
-        }
-        let val = &opts[p..p + val_len];
-        p += val_len;
-        if ns == wl::volume::NS && key == wl::volume::KEY {
-            match parse_bind(val) {
+    for o in wl::opt::iter(opts) {
+        let o = o.map_err(|()| errno::EINVAL)?;
+        if o.ns == wl::volume::NS && o.key == wl::volume::KEY {
+            match parse_bind(o.val) {
                 Some(b) => binds.push(b),
                 None => return Err(errno::EINVAL),
             }
         }
         // Fail-closed: a required entry the backend cannot honor blocks admission.
-        if (flags & wl::opt::OPT_REQUIRED) != 0 && !host_backend_honors_option(ns, key) {
+        if o.required() && !host_backend_honors_option(o.ns, o.key) {
             return Err(errno::ENOSYS);
         }
     }
@@ -315,7 +248,8 @@ unsafe fn validate_options(
 /// every part length-prefixed and present, in this order:
 /// ```text
 ///   [flags:u8]                         SRC_ISOLATED | SRC_ROOT_READ_ONLY |
-///                                      SRC_CAP_ADD | SRC_NO_SYSCALL_FILTER
+///                                      SRC_CAP_ADD | SRC_NO_SYSCALL_FILTER |
+///                                      SRC_OWN_NETWORK
 ///   [rootfs_len:u16][rootfs]           the root to pivot into; empty = none
 ///   [argv_len:u16][argv]               NUL-separated tokens, at least one
 ///   [env_len:u16][env]                 NUL-separated `NAME=VALUE` — the WHOLE
@@ -334,6 +268,8 @@ unsafe fn validate_options(
 /// each part are `host_backend`'s (`plan_process`).
 pub struct HostSource<'a> {
     pub isolate: bool,
+    /// A network namespace of its own (`SRC_OWN_NETWORK`).
+    pub own_network: bool,
     pub rootfs: Option<&'a str>,
     pub argv: std::vec::Vec<&'a str>,
     pub process: super::host_backend::ProcessParams,
@@ -351,14 +287,19 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     let mut p = 1usize;
     let flags = *src.first().ok_or(errno::EINVAL)?;
     if flags
-        & !(hp::SRC_ISOLATED | hp::SRC_ROOT_READ_ONLY | hp::SRC_CAP_ADD | hp::SRC_NO_SYSCALL_FILTER)
+        & !(hp::SRC_ISOLATED
+            | hp::SRC_ROOT_READ_ONLY
+            | hp::SRC_CAP_ADD
+            | hp::SRC_NO_SYSCALL_FILTER
+            | hp::SRC_OWN_NETWORK)
         != 0
     {
         return Err(errno::EINVAL);
     }
     let isolate = flags & hp::SRC_ISOLATED != 0;
     let root_read_only = flags & hp::SRC_ROOT_READ_ONLY != 0;
-    if root_read_only && !isolate {
+    let own_network = flags & hp::SRC_OWN_NETWORK != 0;
+    if (root_read_only || own_network) && !isolate {
         return Err(errno::EINVAL);
     }
     let mut part = || -> Result<&[u8], i32> {
@@ -405,6 +346,7 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     }
     Ok(HostSource {
         isolate,
+        own_network,
         rootfs,
         argv: args,
         process: super::host_backend::ProcessParams {
@@ -443,70 +385,22 @@ unsafe fn workload_create(arg: &[u8]) -> i32 {
 unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) -> i32 {
     use crate::kernel::sys::errno;
 
-    let arg_len = buf.len();
-    if arg_len < wl::CREATE_HEADER_SIZE {
+    let Some((h, src_range, opt_range)) = wl::CreateHeader::parse(buf) else {
         return errno::EINVAL;
-    }
-
-    let mut identity = [0u8; 16];
-    identity.copy_from_slice(&buf[0..16]);
-    let posture = buf[16];
-    let source_kind = buf[17];
-    let net_iso = buf[18];
-    if net_iso > wl::NET_ISO_OWN {
-        return errno::EINVAL;
-    }
-    let Some(storage_grant) = crate::kernel::workload::storage::StorageGrant::from_wire(buf[19])
-    else {
-        return errno::EINVAL;
+    };
+    let identity = h.identity;
+    let posture = h.posture;
+    let source_kind = h.source_kind;
+    let storage_line = match h.storage {
+        wl::STORAGE_OWN_ROOT => true,
+        wl::STORAGE_NONE => false,
+        _ => return errno::EINVAL,
     };
     let envelope = ResourceEnvelope {
-        compute_milli: rd_u32(buf, 20),
-        memory_bytes: u64::from_le_bytes([
-            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-        ]),
-        max_tasks: rd_u32(buf, 32),
+        compute_milli: h.compute_milli,
+        memory_bytes: h.memory_bytes,
+        max_tasks: h.max_tasks,
     };
-    let source_ref_len = rd_u16(buf, 40) as usize;
-    let endpoint_count = rd_u16(buf, 42) as usize;
-    let options_len = rd_u32(buf, 44) as usize;
-    // Header network identity: an input computed by the
-    // orchestrator's address policy; the backend realizes it.
-    let net_family = buf[48];
-    let net_prefix_len = buf[49];
-    let net_segment = rd_u16(buf, 50);
-    let mut net_addr = [0u8; 16];
-    net_addr.copy_from_slice(&buf[52..68]);
-    // A segment ≥ 1 is a `net.route` segment: it must exist (ENOENT), hold
-    // the address and not as its gateway (EINVAL), and this backend must
-    // attach workloads to segments (ENOSYS otherwise) — never run on segment
-    // 0 as if it were the requested one. The attachment itself checks again,
-    // under the flag a SEGMENTS replace holds (`net_route::attach`), so a
-    // segment removed or changed since fails the CREATE, rolled back whole.
-    let attach = if net_segment != 0 {
-        let attaches =
-            (super::net_route::caps() & crate::abi::contracts::net::route::caps::SEGMENTS) != 0;
-        match crate::kernel::net_route::validate_attach(
-            net_family,
-            &net_addr,
-            net_segment,
-            attaches,
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => return e,
-        }
-    } else {
-        None
-    };
-
-    // Section bounds.
-    let src_start = wl::CREATE_HEADER_SIZE;
-    let ep_start = src_start + source_ref_len;
-    let opt_start = ep_start + endpoint_count * wl::NET_ENDPOINT_SIZE;
-    let opt_end = opt_start + options_len;
-    if opt_end > arg_len {
-        return errno::EINVAL;
-    }
 
     // An fmod graph went to the module-graph backend in the dispatch; any
     // other kind this backend does not run.
@@ -554,83 +448,21 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
     if !crate::kernel::exec::scheduler::owners().authorize_admit(owner) {
         return errno::EACCES; // draining/revoked owner cannot admit new work
     }
-    // What the owner may hold in the node's storage.
-    let storage_bytes = u64::from_le_bytes([
-        buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
-    ]);
-    crate::kernel::exec::scheduler::owners_mut().set_storage_cap(owner, storage_bytes);
-    crate::kernel::exec::scheduler::owners_mut().set_storage_grant(owner, storage_grant);
-
-    // Lease-gate each declared endpoint against the owner's lease before any
-    // mechanism runs. A refusal blocks admission. The workload-level net_iso
-    // field — or any endpoint asking for its own network domain — puts the
-    // whole workload in its own netns.
-    let mut own_netns = net_iso == wl::NET_ISO_OWN;
-    for i in 0..endpoint_count {
-        let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
-        let proto = buf[e];
-        // Unknown net_iso values must not degrade to SHARED — same rule as
-        // the workload-level field above.
-        if buf[e + 1] > wl::NET_ISO_OWN {
-            return errno::EINVAL;
+    // The owner's storage line, as the header names it.
+    let storage_bytes = h.storage_bytes;
+    {
+        use crate::abi::contracts::resource::OWNER_LINE_STORAGE;
+        let owners = crate::kernel::exec::scheduler::owners_mut();
+        if storage_line {
+            owners.set_line(owner, OWNER_LINE_STORAGE, storage_bytes);
+        } else {
+            owners.remove_line(owner, OWNER_LINE_STORAGE);
         }
-        if buf[e + 1] == wl::NET_ISO_OWN {
-            own_netns = true;
-        }
-        let port = rd_u16(buf, e + 2);
-        let gate = crate::kernel::workload::owner_plan::lease_gate(
-            owner.slot,
-            owner.generation,
-            proto,
-            port,
-        );
-        if matches!(
-            gate,
-            crate::kernel::workload::owner_plan::LeaseGate::Refused
-        ) {
-            return errno::EACCES;
-        }
-    }
-
-    // Network identity: fail-closed validation against the backend's honest
-    // net capabilities (never silently weaker networking). An identity only
-    // makes sense in an own network domain — assigning a workload address in
-    // the shared host domain is routing policy, not workload mechanism.
-    let net_ident = match net_family {
-        wl::NET_FAM_NONE => None,
-        wl::NET_FAM_IPV4 => {
-            if (host_backend_net_caps() & wl::caps::NET_IDENTITY) == 0 {
-                return errno::ENOSYS;
-            }
-            if !own_netns || net_prefix_len == 0 || net_prefix_len > 32 {
-                return errno::EINVAL;
-            }
-            // Contract: IPv4 lives in bytes 0..4, rest zero. Trailing garbage
-            // means a malformed header (or a v6 address under a v4 family) —
-            // refuse rather than guess.
-            if net_addr[4..].iter().any(|&b| b != 0) {
-                return errno::EINVAL;
-            }
-            let mut v4 = [0u8; 4];
-            v4.copy_from_slice(&net_addr[..4]);
-            Some(super::net_identity::NetIdentity {
-                addr_v4: v4,
-                prefix_len: net_prefix_len,
-                segment: attach,
-            })
-        }
-        // An IPv6 identity is not realized by this backend (`net_identity`
-        // addresses IPv4 only).
-        wl::NET_FAM_IPV6 => return errno::ENOSYS,
-        _ => return errno::EINVAL,
-    };
-    if own_netns && (host_backend_net_caps() & wl::caps::NET_ISO_OWN) == 0 {
-        return errno::ENOSYS;
     }
 
     // Options: fail-closed against the backend's advertised capabilities.
     let mut binds = std::vec::Vec::new();
-    if let Err(e) = validate_options(&buf[opt_start..opt_end], &mut binds) {
+    if let Err(e) = validate_options(&buf[opt_range.clone()], &mut binds) {
         return e;
     }
 
@@ -638,11 +470,11 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
     // carries EXPLICIT spawn params (the orchestrator composes them from its own
     // bundle/OCI format — this backend has no bundle knowledge), see
     // `parse_host_source`.
-    let mut src = match parse_host_source(&buf[src_start..ep_start]) {
+    let mut src = match parse_host_source(&buf[src_range]) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    if let Err(e) = apply_env_options(&buf[opt_start..opt_end], &mut src.process.env) {
+    if let Err(e) = apply_env_options(&buf[opt_range], &mut src.process.env) {
         return e;
     }
     // The posture is the isolation: namespaces of its own at ISOLATED and
@@ -662,8 +494,7 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
         src.rootfs,
         src.isolate,
         &envelope,
-        own_netns,
-        net_ident.as_ref(),
+        src.own_network,
         &binds,
         &src.process,
     );
@@ -703,6 +534,10 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
         allocated: allocated.is_some(),
         holder: crate::kernel::exec::scheduler::caller_owner(),
     };
+    // Host providers that take owner facts learn the owner's process.
+    if let Some(pid) = super::host_backend::hp_container_pid(backend_idx) {
+        super::host_lane::owner_facts::started(owner, pid);
+    }
     widx as i32
 }
 
@@ -769,6 +604,19 @@ pub fn linux_workload_dispatch(
     arg: &mut [u8],
     data: UserSpan<'_>,
 ) -> i32 {
+    // The kernel's release notice (`provider::observe_owner_release`): what
+    // the owner holds of the host goes with it.
+    if opcode == crate::abi::internal::reconfigure::OWNER_RELEASED {
+        let Some(rec) = arg.get(..8) else {
+            return crate::kernel::sys::errno::EINVAL;
+        };
+        let owner = OwnerHandle {
+            slot: u16::from_le_bytes([rec[0], rec[1]]),
+            generation: u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
+        };
+        super::owner_release::release_owner(owner);
+        return 0;
+    }
     // SAFETY: provider dispatch runs on the scheduler thread, the only
     // thread touching the workload and backend tables.
     unsafe { workload_dispatch_on_thread(handle, opcode, arg, data) }
@@ -807,10 +655,11 @@ unsafe fn workload_dispatch_on_thread(
     if opcode == wl::OPTIONS {
         return workload_options(data.as_mut());
     }
-    // What the node's own image holds, for pinning a pack against it.
-    if opcode == wl::MODULE_DIGESTS {
+    // The owner facts are the kernel's, the same read on every target.
+    if opcode == wl::OWNERS {
         return workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
     }
+    // What the node's own image holds, for pinning a pack against it.
     // By identity: the graph backend first (a staged CREATE, or a graph
     // workload), then the host-process slots.
     if opcode == wl::LOOKUP || (opcode == wl::DESTROY && handle < 0) {
@@ -885,7 +734,7 @@ fn workload_caps() -> u32 {
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
     }
-    host_backend_postures() | sources | ops | host_backend_net_caps()
+    host_backend_postures() | sources | ops
 }
 
 /// `OPTIONS`: the namespace directory ([`LINUX_OPTIONS`]): `mount`/`bind` (a
@@ -915,12 +764,13 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
     }
 }
 
-/// Host-process (0x1B) provider dispatch — the linux host mechanics that sit
-/// beside the stable `workload` surface. Every op is a `handle = -1`
-/// call; workload-targeting ops name the workload by its identity at the
-/// head of `arg`, TTY session ops their session id.
+/// Host-process provider dispatch — the linux host mechanics that sit
+/// beside the stable `workload` surface. `handle` is the provider's index of
+/// what the op acts on: READ, EXEC and TTY_OPEN a workload's (the index its
+/// `workload` handle carries), the TTY ops a session's, the PROC ops a node
+/// command's; PROC_SPAWN and CAPS take none.
 pub fn host_process_dispatch(
-    _handle: i32,
+    handle: i32,
     opcode: u32,
     arg: &mut [u8],
     mut data: UserSpan<'_>,
@@ -931,33 +781,32 @@ pub fn host_process_dispatch(
     if opcode == hp::CAPS {
         return crate::abi::kernel_abi::caps_word::answer(arg, super::host_backend::hp_caps());
     }
+    // The node's own commands.
+    if matches!(
+        opcode,
+        hp::PROC_SPAWN | hp::PROC_READ | hp::PROC_STATUS | hp::PROC_CLOSE
+    ) {
+        return super::providers::proc_dispatch(handle, opcode, arg, data);
+    }
     // SAFETY (each block below): provider dispatch runs on the scheduler
     // thread, the only thread touching the backend's slot and session tables.
-    // Session-scoped ops (no workload fd prefix).
-    if opcode == hp::TTY_STEP {
+    match opcode {
         // SAFETY: as above.
-        return unsafe { hp_tty_step(arg, data.as_mut()) };
-    }
-    if opcode == hp::TTY_RESIZE {
+        hp::TTY_STEP => return unsafe { hp_tty_step(handle, arg, data.as_mut()) },
         // SAFETY: as above.
-        return unsafe { hp_tty_resize(arg) };
-    }
-    if opcode == hp::TTY_CLOSE {
+        hp::TTY_RESIZE => return unsafe { hp_tty_resize(handle, arg) },
         // SAFETY: as above.
-        return unsafe { hp_tty_close(arg) };
+        hp::TTY_CLOSE => return unsafe { hp_tty_close(handle) },
+        hp::READ | hp::EXEC | hp::TTY_OPEN => {}
+        _ => return errno::ENOSYS,
     }
 
-    // Workload-scoped ops: `[identity]` prefix.
-    if arg.len() < hp::IDENTITY_LEN {
+    // Workload ops: a graph workload's index runs no host process.
+    if handle < HOST_SLOT_BASE {
         return errno::EINVAL;
     }
-    let (id, body) = arg.split_at_mut(hp::IDENTITY_LEN);
     // SAFETY: as above.
-    let Some(idx) = (unsafe { slot_by_identity(id) }) else {
-        return errno::EINVAL;
-    };
-    // SAFETY: as above.
-    let bidx = match unsafe { workload_backend_idx(idx as i32) } {
+    let bidx = match unsafe { workload_backend_idx(handle - HOST_SLOT_BASE) } {
         Ok(b) => b,
         Err(e) => return e,
     };
@@ -965,9 +814,8 @@ pub fn host_process_dispatch(
     unsafe {
         match opcode {
             hp::READ => hp_read(bidx, data.as_mut()),
-            hp::EXEC => hp_exec(bidx, body, data.as_mut()),
-            hp::TTY_OPEN => hp_tty_open(bidx, body, data.as_slice()),
-            _ => errno::ENOSYS,
+            hp::EXEC => hp_exec(bidx, arg, data.as_mut()),
+            _ => hp_tty_open(bidx, arg, data.as_slice()),
         }
     }
 }

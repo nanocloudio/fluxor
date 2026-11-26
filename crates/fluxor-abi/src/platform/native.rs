@@ -39,8 +39,34 @@ pub mod linux {
         pub const PORT_ENCODED: (u8, u8) = (0, 0);
         pub const PORT_PIXELS: (u8, u8) = (1, 0);
     }
-    pub mod hsm_key_vault {
-        pub const NAME_HASH: u32 = 0x17cd1360;
+    pub mod host_lane {
+        pub const NAME_HASH: u32 = 0x4e0d4a22;
+        pub const STATE_BYTES: u32 = 64;
+        pub const TAG_RUNTIME: u8 = 10;
+        pub const TAG_CHANNELS: u8 = 11;
+        pub const TAG_ARGS: u8 = 12;
+        pub const TAG_OVERLOAD: u8 = 13;
+        pub const TAG_SERVES: u8 = 14;
+        pub const TAG_LANE_TARGET: u8 = 15;
+        pub const TAG_LANES: u8 = 16;
+        pub const TAG_RUNTIME_DIGEST: u8 = 17;
+        pub const PORT_CH0: (u8, u8) = (0, 0);
+        pub const PORT_CH1: (u8, u8) = (0, 1);
+        pub const PORT_CH2: (u8, u8) = (0, 2);
+        pub const PORT_CH3: (u8, u8) = (0, 3);
+        pub const PORT_CH4: (u8, u8) = (0, 4);
+        pub const PORT_CH5: (u8, u8) = (0, 5);
+        pub const PORT_CH6: (u8, u8) = (0, 6);
+        pub const PORT_CH7: (u8, u8) = (0, 7);
+        pub const PORT_CH0_RX: (u8, u8) = (1, 0);
+        pub const PORT_CH1_RX: (u8, u8) = (1, 1);
+        pub const PORT_CH2_RX: (u8, u8) = (1, 2);
+        pub const PORT_CH3_RX: (u8, u8) = (1, 3);
+        pub const PORT_CH4_RX: (u8, u8) = (1, 4);
+        pub const PORT_CH5_RX: (u8, u8) = (1, 5);
+        pub const PORT_CH6_RX: (u8, u8) = (1, 6);
+        pub const PORT_CH7_RX: (u8, u8) = (1, 7);
+        pub const PORT_EVENTS: (u8, u8) = (1, 8);
     }
     pub mod linux_alsa_midi {
         pub const NAME_HASH: u32 = 0xc38e5605;
@@ -91,15 +117,6 @@ pub mod linux {
         pub const PORT_COMMANDS: (u8, u8) = (0, 0);
         pub const PORT_OUTCOMES: (u8, u8) = (1, 0);
     }
-    pub mod linux_net {
-        pub const NAME_HASH: u32 = 0xfbcc7dc9;
-        pub const STATE_BYTES: u32 = 64;
-        pub const TAG_MAX_CONNS: u8 = 10;
-        pub const TAG_WRITE_BUF_KIB: u8 = 11;
-        pub const TAG_LISTEN_BACKLOG: u8 = 12;
-        pub const PORT_NET_OUT: (u8, u8) = (1, 0);
-        pub const PORT_NET_IN: (u8, u8) = (0, 0);
-    }
     pub mod linux_pointer {
         pub const NAME_HASH: u32 = 0xeea312ef;
         pub const STATE_BYTES: u32 = 64;
@@ -129,12 +146,12 @@ pub mod linux {
         (host_asset_index::NAME_HASH, host_asset_index::STATE_BYTES),
         (host_asset_source::NAME_HASH, host_asset_source::STATE_BYTES),
         (host_image_codec::NAME_HASH, host_image_codec::STATE_BYTES),
+        (host_lane::NAME_HASH, host_lane::STATE_BYTES),
         (linux_alsa_midi::NAME_HASH, linux_alsa_midi::STATE_BYTES),
         (linux_audio::NAME_HASH, linux_audio::STATE_BYTES),
         (linux_display::NAME_HASH, linux_display::STATE_BYTES),
         (linux_eth::NAME_HASH, linux_eth::STATE_BYTES),
         (linux_gpu::NAME_HASH, linux_gpu::STATE_BYTES),
-        (linux_net::NAME_HASH, linux_net::STATE_BYTES),
         (linux_pointer::NAME_HASH, linux_pointer::STATE_BYTES),
         (
             linux_surface_traits::NAME_HASH,

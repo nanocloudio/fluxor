@@ -649,8 +649,14 @@ pub fn free_streaming(slot: i32) {
         abandon_buffer(size);
     } else {
         // SAFETY: the slot no longer names the buffer, its channel is
-        // closed, and no lend of it is outstanding.
-        unsafe { release_buffer(ptr, size) };
+        // closed, and no lend of it is outstanding. What it carried (a key
+        // handed over a lane among it) does not outlive the channel.
+        unsafe {
+            if !ptr.is_null() {
+                core::ptr::write_bytes(ptr, 0, size);
+            }
+            release_buffer(ptr, size)
+        };
     }
 }
 

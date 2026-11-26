@@ -217,7 +217,7 @@ mod params_def {
                 }
             }
         };
-        2, flows, u16, 2 => |s, d, len| { s.flows = p_u16(d, len, 0, 2); };
+        2, flows, u16, 2, range 1..=u16::MAX => |s, d, len| { s.flows = p_u16(d, len, 0, 2); };
     }
 }
 

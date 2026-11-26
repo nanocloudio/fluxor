@@ -147,7 +147,7 @@ const MAX_ALPN_CFG: usize = 64;
 const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 
 // The application surface is the multiplexed-session contract
-// (`abi::contracts::net::mux`, opcode range 0xB0..0xCF) — the channel
+// (`abi::contracts::net::mux`, opcode range 0xB1..0xCF) — the channel
 // surface reserved for QUIC. Every message is the universal
 // `[msg_type:u8][len:u16 LE][payload]` TLV (written via `net_write_frame`,
 // read via `net_read_frame`), so back-to-back stream writes / datagrams
@@ -386,9 +386,12 @@ pub(crate) struct QuicState {
     /// Parity of the generation sealing new tickets.
     ticket_parity: u8,
     ticket_vault_warned: bool,
-    /// The vault answered `E_AGAIN` (its durable store not readable yet):
-    /// the ticket keys are asked for again.
+    /// The ticket keys are still to be asked for: at the first step, and
+    /// again while the vault answers `E_AGAIN` (its durable store not
+    /// readable yet).
     ticket_keys_pending: bool,
+    /// When the pending ticket keys are next asked for.
+    ticket_keys_due_ms: u64,
     /// Seconds between key rotations; 0 = never.
     ticket_rotate_s: u32,
     ticket_rotated_ms: u64,
@@ -443,7 +446,7 @@ pub(crate) struct QuicState {
     /// fallback, §6.4.4) regardless of the `authority` — a proxy, or a
     /// pinned host reached by address. Unset, the `authority` supplies
     /// the identity.
-    verify_hostname: [u8; 64],
+    verify_hostname: [u8; MAX_PEER_NAME],
     verify_hostname_len: usize,
     /// A `verify_hostname` longer than the field holds was dropped and the
     /// instance declines to construct: a truncated name authenticates a
@@ -627,7 +630,7 @@ fluxor_rt::define_params! {
     // the leaf must hold, whatever the `authority`. Held whole or refused:
     // a truncated name authenticates a different host. A schema string, so
     // a workload binds it from its environment (`{env: NAME}`).
-    26, verify_hostname, str, 0
+    26, verify_hostname, str, 0, max MAX_PEER_NAME
         => |s, d, len| {
             if len <= s.verify_hostname.len() {
                 core::ptr::copy_nonoverlapping(d, s.verify_hostname.as_mut_ptr(), len);
@@ -863,6 +866,7 @@ pub unsafe extern "C" fn module_new(
     s.ticket_parity = 0;
     s.ticket_vault_warned = false;
     s.ticket_keys_pending = false;
+    s.ticket_keys_due_ms = 0;
     s.ticket_rotate_s = 3600;
     s.ticket_rotated_ms = 0;
     s.ticket_seen = [TicketClaim::EMPTY; TICKET_SEEN];
@@ -981,8 +985,10 @@ pub unsafe extern "C" fn module_new(
         return -1;
     }
     // The ticket-sealing keys live in the vault; without them no ticket
-    // is issued and every handshake is a full one.
-    ticket_keys_open(s);
+    // is issued and every handshake is a full one. They are asked for from
+    // the first step: the vault is a provider of the graph, reachable once
+    // the graph is instantiated, not while this module is constructed.
+    s.ticket_keys_pending = s.mode == 1;
 
     // Pre-compute ECDH keys for each connection slot.
     let mut i = 0;
@@ -1549,8 +1555,8 @@ unsafe fn open_sealed<const N: usize>(
 /// Open both ticket-key generations. Without a vault no ticket is ever
 /// issued: resumption that cannot be sealed is not offered. A vault whose
 /// durable store is not readable yet answers `E_AGAIN`, and the keys are
-/// asked for again (`ticket_rotate_if_due`) until it answers; any other
-/// refusal is final for the life of the instance.
+/// asked for again a second later (`ticket_rotate_if_due`) until it
+/// answers; any other refusal is final for the life of the instance.
 unsafe fn ticket_keys_open(s: &mut QuicState) {
     if s.mode != 1 {
         return;
@@ -1580,6 +1586,7 @@ unsafe fn ticket_keys_open(s: &mut QuicState) {
     }
     s.ticket_key = [-1, -1];
     s.ticket_keys_pending = k0 == E_AGAIN || k1 == E_AGAIN;
+    s.ticket_keys_due_ms = s.ticket_rotated_ms.saturating_add(1000);
     if !s.ticket_keys_pending && !s.ticket_vault_warned {
         s.ticket_vault_warned = true;
         let msg = b"[quic] no vault ticket key: resumption not offered";
@@ -1593,12 +1600,11 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
     if s.mode != 1 {
         return;
     }
-    // The vault's durable store was not readable when the keys were asked
-    // for: ask again once a second rather than never offering resumption
-    // for the life of the server.
+    // The keys are asked for at the first step, and again once a second
+    // while the vault's durable store is not readable, rather than never
+    // offering resumption for the life of the server.
     if s.ticket_keys_pending {
-        let now = dev_millis(&*s.syscalls);
-        if now.saturating_sub(s.ticket_rotated_ms) >= 1000 {
+        if dev_millis(&*s.syscalls) >= s.ticket_keys_due_ms {
             ticket_keys_open(s);
         }
         return;

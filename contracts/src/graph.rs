@@ -12,6 +12,7 @@
 //! edge    from_kind u8 | from_port u8 | from_idx u16
 //!         | to_kind u8 | to_port u8 | to_idx u16
 //!         | class u8 | buffer_group u8 | rate_class u8 | flags u8 | buffer_bytes u32
+//!         | lane_target u32
 //! ```
 //!
 //! Every field is little-endian. A module's index is its position among the
@@ -22,7 +23,10 @@
 //! starts at the next 4-aligned offset.
 //!
 //! An edge end is one of [`Endpoint`]'s kinds. A tap is named by its
-//! producer end alone (kind 2), so no edge flag repeats it. An unknown flag
+//! producer end alone (kind 2), so no edge flag repeats it. A lane end
+//! (kind 3) carries its key as the index and names the module serving it in
+//! `lane_target` by the name hash it declares its lanes under, which is 0
+//! on an edge with no lane end; an edge has at most one lane end. An unknown flag
 //! bit, endpoint kind, edge class, rate class or fault policy, a reserved or
 //! pad byte that is not zero, an order that is not a permutation, a `New`
 //! end past the module records, a port past [`MAX_PORT_INDEX`], or bytes
@@ -34,6 +38,7 @@
 //! `alloc`. The composition rules that produce a graph — the fan pass, the
 //! mailbox groups, the ring plan and the order — are [`plan`].
 
+pub mod env_bind;
 pub mod plan;
 
 pub use crate::boot_config::EdgeClass;
@@ -49,7 +54,7 @@ pub const HEADER_LEN: usize = 36;
 /// Bytes of a module record before its params.
 pub const MODULE_HEAD_LEN: usize = 20;
 /// Bytes of one edge record.
-pub const EDGE_LEN: usize = 16;
+pub const EDGE_LEN: usize = 20;
 /// Every module record and the edge table start on this boundary.
 pub const RECORD_ALIGN: usize = 4;
 
@@ -150,8 +155,11 @@ pub enum Endpoint {
     /// A copy of what a running module's output port already carries, by
     /// global slot. A producer end only.
     Tap(u16),
-    /// A lane to the node's network, by key.
-    Net(u8),
+    /// A lane to a node module that serves lanes (the node's network
+    /// stack), by key and the name hash the serving module declares its
+    /// lanes under: an edge into it carries the lane's commands, an edge out
+    /// of it the lane's events.
+    Lane { key: u8, target: u32 },
     /// The module that places the graph, by key.
     Caller(u8),
 }
@@ -163,28 +171,52 @@ impl Default for Endpoint {
 }
 
 impl Endpoint {
-    /// The endpoint's wire kind byte and index.
+    /// The endpoint's wire kind byte and index. A lane's target travels in
+    /// the edge's `lane_target` ([`Endpoint::lane_target`]).
     #[must_use]
     pub const fn to_wire(self) -> (u8, u16) {
         match self {
             Self::New(i) => (0, i),
             Self::Existing(i) => (1, i),
             Self::Tap(i) => (2, i),
-            Self::Net(k) => (3, k as u16),
+            Self::Lane { key, .. } => (3, key as u16),
             Self::Caller(k) => (4, k as u16),
         }
     }
 
-    /// The endpoint a wire kind and index name, or `None` for a kind no
-    /// endpoint has or a key past a byte.
+    /// The endpoint a wire kind and index name, with the edge's
+    /// `lane_target` for a lane end, or `None` for a kind no endpoint has, a
+    /// key past a byte or a lane with no target.
     #[must_use]
-    pub const fn from_wire(kind: u8, idx: u16) -> Option<Self> {
+    pub const fn from_wire(kind: u8, idx: u16, lane_target: u32) -> Option<Self> {
         match kind {
             0 => Some(Self::New(idx)),
             1 => Some(Self::Existing(idx)),
             2 => Some(Self::Tap(idx)),
-            3 if idx <= u8::MAX as u16 => Some(Self::Net(idx as u8)),
+            3 if idx <= u8::MAX as u16 && lane_target != 0 => Some(Self::Lane {
+                key: idx as u8,
+                target: lane_target,
+            }),
             4 if idx <= u8::MAX as u16 => Some(Self::Caller(idx as u8)),
+            _ => None,
+        }
+    }
+
+    /// A lane end's target: the name hash the module serving it declares
+    /// its lanes under.
+    #[must_use]
+    pub const fn lane_target(self) -> Option<u32> {
+        match self {
+            Self::Lane { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// A lane end's key.
+    #[must_use]
+    pub const fn lane_key(self) -> Option<u8> {
+        match self {
+            Self::Lane { key, .. } => Some(key),
             _ => None,
         }
     }
@@ -489,9 +521,9 @@ fn read_edge(r: &[u8]) -> EdgeRecord {
     let flags = r[11];
     EdgeRecord {
         // `decode` refused every kind and key that names no endpoint.
-        from: Endpoint::from_wire(r[0], le16(r, 2)).unwrap_or_default(),
+        from: Endpoint::from_wire(r[0], le16(r, 2), le32(r, 16)).unwrap_or_default(),
         from_port: r[1],
-        to: Endpoint::from_wire(r[4], le16(r, 6)).unwrap_or_default(),
+        to: Endpoint::from_wire(r[4], le16(r, 6), le32(r, 16)).unwrap_or_default(),
         to_port: r[5],
         to_ctrl: flags & EDGE_FLAG_TO_CTRL != 0,
         class: match r[8] {
@@ -619,8 +651,14 @@ pub fn decode(bytes: &[u8]) -> Result<ComposedGraph<'_>, DecodeError> {
 }
 
 fn check_edge(r: &[u8], n: usize) -> Result<(), &'static str> {
-    let from = Endpoint::from_wire(r[0], le16(r, 2)).ok_or("unknown producer endpoint")?;
-    let to = Endpoint::from_wire(r[4], le16(r, 6)).ok_or("unknown consumer endpoint")?;
+    let target = le32(r, 16);
+    let from = Endpoint::from_wire(r[0], le16(r, 2), target).ok_or("unknown producer endpoint")?;
+    let to = Endpoint::from_wire(r[4], le16(r, 6), target).ok_or("unknown consumer endpoint")?;
+    match (from.lane_target(), to.lane_target()) {
+        (Some(_), Some(_)) => return Err("an edge with two lane ends"),
+        (None, None) if target != 0 => return Err("a lane target on an edge with no lane end"),
+        _ => {}
+    }
     for end in [from, to] {
         if end.new_index().is_some_and(|i| i >= n) {
             return Err("module index out of range");
@@ -716,6 +754,12 @@ fn check_spec(spec: &GraphSpec<'_>) -> Result<(u16, u16), EncodeError> {
                 return Err(field("edge module index"));
             }
         }
+        if edge.from.lane_target().is_some() && edge.to.lane_target().is_some()
+            || edge.from.lane_target() == Some(0)
+            || edge.to.lane_target() == Some(0)
+        {
+            return Err(field("edge lane end"));
+        }
         if matches!(edge.to, Endpoint::Tap(_)) {
             return Err(field("edge consumer endpoint"));
         }
@@ -794,6 +838,14 @@ pub fn encode_into(spec: &GraphSpec<'_>, out: &mut [u8]) -> Result<usize, Encode
             | (u8::from(edge.retains_send) * EDGE_FLAG_RETAINS_SEND)
             | (u8::from(edge.to_ctrl) * EDGE_FLAG_TO_CTRL);
         put32(out, off + 12, edge.buffer_bytes);
+        put32(
+            out,
+            off + 16,
+            edge.from
+                .lane_target()
+                .or(edge.to.lane_target())
+                .unwrap_or(0),
+        );
         off += EDGE_LEN;
     }
     Ok(need)

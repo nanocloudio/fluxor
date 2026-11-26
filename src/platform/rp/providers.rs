@@ -2428,11 +2428,11 @@ static RAW_VTABLE: crate::kernel::module::provider::ProviderVTable =
 
 /// Handles the RP platform's own provider tables can hand out at once: a
 /// claim and a watch per pin, an allocatable DMA channel each, the DMA fds, a
-/// claim per raw peripheral instance, and the kernel vault's key slots.
+/// claim per raw peripheral instance.
 fn platform_handle_slots() -> usize {
     let pins = gpio::runtime_max_gpio() as usize;
     let channels = (implemented_channel_mask() & 0xFF00).count_ones() as usize;
-    2 * pins + channels + MAX_DMA_FDS + RAW_SLOTS + crate::kernel::security::key_vault::MAX_SLOTS
+    2 * pins + channels + MAX_DMA_FDS + RAW_SLOTS
 }
 
 /// Release all RP-specific hardware handles owned by a module.

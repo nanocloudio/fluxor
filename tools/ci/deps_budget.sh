@@ -37,7 +37,7 @@ check "kernel rp2350"  thumbv8m.main-none-eabihf   chip-rp2350b  7
 check "kernel rp2040"  thumbv6m-none-eabi          chip-rp2040   7
 check "kernel bcm2712" aarch64-unknown-none        chip-bcm2712  6
 check "kernel wasm"    wasm32-unknown-unknown      host-wasm     6
-check "kernel linux"   aarch64-unknown-linux-gnu   host-linux    22
+check "kernel linux"   aarch64-unknown-linux-gnu   host-linux    24
 
 # The CLI is measured as a whole package graph rather than by feature.
 #

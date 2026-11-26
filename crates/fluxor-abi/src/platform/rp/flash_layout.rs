@@ -54,7 +54,7 @@ pub const PARAM_STORE_SIZE: usize = 4096;
 //
 // The sectors directly below the parameter store, served by `flash_rp` as a
 // `storage.block` source of erase-sector blocks (its `store` output): where a
-// `vault_store` keeps the key vault's two image slots (8 KiB each on an RP2350,
+// `key_vault` keeps its two record-image slots (8 KiB each on an RP2350,
 // 4 KiB on an RP2040). A UF2 writes only
 // the addresses it carries, and no image reaches past slot B, so reflashing
 // the firmware leaves this region and the parameter store as they are.

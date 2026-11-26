@@ -105,6 +105,11 @@ modules:
   - name: stdio_out
     type: cli_out
 
+  # The key vault: every key its callers hold lives in its heap and none
+  # outlives the instance (no block source), so it seals nothing.
+  - name: key_vault
+    seal: none
+
 wiring:
   - from: net.net_out
     to: tls.cipher_in

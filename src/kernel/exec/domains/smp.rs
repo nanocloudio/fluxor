@@ -49,9 +49,6 @@ pub struct Platform {
     /// uptime limit, and on the core that runs domain 0 from this loop,
     /// [`primary_upkeep`].
     pub after_pass: fn(domain_id: usize, core_id: usize, mode: ExecMode, passes: u32),
-    /// After a `tick` domain has stepped its modules, on its core: work that
-    /// must not race those steps.
-    pub after_step: fn(domain_id: usize),
 }
 
 /// The platform [`install`] named; null before it.
@@ -699,7 +696,7 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 park_if_requested(core_id, platform);
                 let woke = (platform.counter)();
                 interrupts_before_pass = (platform.interrupts)(core_id);
-                run_domain_passes(domain_id, platform);
+                run_domain_passes(domain_id);
                 cross::pump(domain_id);
                 let elapsed = (platform.counter)().wrapping_sub(woke) as u32;
                 // With no core of its own, a polled `timer` domain is fired
@@ -816,12 +813,11 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
 
 /// Run `domain_id`'s tick pass (`pass::run`), then its latched wakes, and
 /// publish the pass's deadline for the core's timer.
-fn run_domain_passes(domain_id: usize, platform: &Platform) {
+fn run_domain_passes(domain_id: usize) {
     let pass = scheduler::pass::run(domain_id, scheduler::PassKind::Tick);
     let woken = scheduler::pass::take_domain_wakes(domain_id);
     if !woken.is_empty() {
         let _ = scheduler::pass::run(domain_id, scheduler::PassKind::Wake(&woken));
     }
-    (platform.after_step)(domain_id);
     DOMAIN_LOOP_DEADLINE_US[domain_id].store(pass.deadline_us, Ordering::Relaxed);
 }

@@ -33,6 +33,7 @@ pub mod b64;
 pub mod capacity;
 pub mod ci_schema;
 pub mod compose;
+pub mod contract_claims;
 pub mod error;
 pub mod genstore;
 pub mod gpu_contract;
@@ -90,9 +91,13 @@ pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
 pub mod protection;
+pub mod provider_chain;
 pub mod publish;
 pub mod render_template;
 pub mod runtime_abi;
+// Param schemas and the TLV packer, which the manifest's conditions and
+// the packed-value bounds read.
+pub mod schema;
 pub mod signing;
 // The consolidated store flow: `store_publish` (the single store-write
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
@@ -110,6 +115,7 @@ pub mod target_facts;
 pub mod text_distance;
 pub mod trust;
 pub mod trust_anchors;
+pub mod vault;
 pub mod workload;
 pub mod workspace;
 

@@ -1,78 +1,79 @@
 // Platform: linux host-process operations (contract class `host_process`).
 //
 // Layer: platform/linux (host-specific, unstable). Host-PROCESS mechanics —
-// command execution, PTY sessions, stdout/stderr drains, the host-process
-// source (root, argv, environment, identity) — are one backend's
-// implementation vocabulary, not native Fluxor workload semantics, so they
-// live here rather than in the stable `workload` (0x1A) contract. The native surface is
+// command execution, PTY sessions, output drains, commands the node runs
+// itself, the host-process source (root, argv, environment, identity) — are
+// one backend's implementation vocabulary, not native Fluxor workload
+// semantics, so they live here rather than in the stable `workload`
+// contract. The native surface is
 // CREATE/START/WAIT/SIGNAL/DESTROY/PAUSE/RESUME/CAPS/OPTIONS.
 //
-// Calling convention: every op is a `handle = -1` call. An op that targets a
-// workload names it by its 16-byte identity (the one `workload::CREATE`
-// staged it under) at the head of `arg`; TTY session ops carry the session id
-// there.
-// Command lines, stdin and output travel in `data`. All fields little-endian.
-// The class is present only where the linux host platform registered it — an
-// unregistered class returns `ENOSYS`, which IS the discovery.
+// Calling convention: every op names what it acts on in the handle slot.
+// An op on a workload ([`READ`], [`EXEC`], [`TTY_OPEN`]) takes the caller's
+// `workload` handle (the contract accepts that contract's handles, so the
+// kernel resolves it for the handle's owner); a terminal session and a
+// spawned command are handles this contract mints ([`TTY_OPEN`],
+// [`PROC_SPAWN`]) and the ops on them take. [`PROC_SPAWN`] and [`CAPS`] take
+// `-1`. Command lines, stdin and output travel in `data`. All fields
+// little-endian. The class is present only where the linux host platform
+// registered it — an unregistered class returns `ENOSYS`, which IS the
+// discovery. Every op needs the `host_process.exec` grant, which a gated
+// module never holds.
 
 /// Provider contract class for host-process ops.
 pub const CLASS: u16 = super::super::super::registry::host_process::ID;
 
-/// One-shot command in a running workload. `arg` in = `[identity:16]
-/// [cmd_len:u32]`, out = `[identity:16][out_len:u32]` ([`EXEC_ARG_LEN`]);
-/// `data` in = the command line (UTF-8, words split on whitespace,
-/// NUL-bounded) in its first `cmd_len` bytes, out = the merged
-/// stdout/stderr in its first `out_len`, truncated to fit `data`. Returns
-/// the command's exit code (0–255, `128 + signal` when a signal ended it)
-/// or a negative errno. Synchronous: the call returns once the command has
-/// exited and its output was drained. The command
+/// One-shot command in a running workload, through its handle. `arg` in =
+/// `[cmd_len:u32]`, out = `[out_len:u32]` ([`EXEC_ARG_LEN`]); `data` in =
+/// the command line (UTF-8, words split on whitespace, NUL-bounded) in its
+/// first `cmd_len` bytes, out = the merged stdout/stderr in its first
+/// `out_len`, truncated to fit `data`. Returns the command's exit code
+/// (0–255, `128 + signal` when a signal ended it) or a negative errno.
+/// Synchronous: the call returns once the command has exited and its output
+/// was drained. The command
 /// joins the workload — its namespaces (every one, or it does not run), its
 /// cgroup, its environment, cwd and user, its capabilities, `no_new_privs`
 /// and system-call filter (see [`SOURCE_HOST_PROCESS`]) — and holds no
 /// descriptor of the runtime's. `EINVAL` before START or while the workload
-/// is PAUSEd, `ESRCH` when its container is gone.
+/// is PAUSEd or for a workload that is not a host process, `ESRCH` when its
+/// container is gone.
 pub use super::super::super::registry::host_process::EXEC;
-/// Drain a workload's merged stdout/stderr. `arg` = `[identity:16]`
-/// ([`READ_ARG_LEN`]); `data` out = the output. Returns the bytes written
-/// into `data` (0 = none pending).
+/// Drain a workload's merged stdout/stderr, through its handle. No `arg`;
+/// `data` out = the output. Returns the bytes written into `data` (0 = none
+/// pending).
 pub use super::super::super::registry::host_process::READ;
-/// Kill+reap+free a session. `arg` = `[sid:u32]` ([`TTY_CLOSE_ARG_LEN`]).
-/// Returns its exit code.
+/// Kill, reap and free a session, through its handle; the handle closes.
+/// No `arg`. Returns its exit code.
 pub use super::super::super::registry::host_process::TTY_CLOSE;
-/// Open an interactive PTY session. `arg` = `[identity:16][rows:u16][cols:u16]`
-/// ([`TTY_OPEN_ARG_LEN`]); `data` in = the command line (UTF-8, words split
-/// on whitespace, NUL-bounded). Returns the session id. The session joins the workload as [`EXEC`] does, with the same refusals.
+/// Open an interactive PTY session in a workload, through its handle. `arg`
+/// = `[rows:u16][cols:u16]` ([`TTY_OPEN_ARG_LEN`]); `data` in = the command
+/// line (UTF-8, words split on whitespace, NUL-bounded). Returns the
+/// session's handle. The session joins the workload as [`EXEC`] does, with
+/// the same refusals.
 /// The session belongs to whoever opened it — the calling module, under its
 /// owner: [`TTY_STEP`], [`TTY_RESIZE`] and [`TTY_CLOSE`] from any other
-/// module or owner answer `EACCES`, and an unknown session id `EINVAL`. The
-/// session is closed (its process killed and reaped) when the opener's owner
-/// is released, and when the workload it joined is destroyed.
+/// module or owner answer `EACCES`. The session is closed (its process
+/// killed and reaped, its handle retired) when the opener's owner is
+/// released, and when the workload it joined is destroyed.
 pub use super::super::super::registry::host_process::TTY_OPEN;
-/// Resize a session's window. `arg` = `[sid:u32][rows:u16][cols:u16]`
-/// ([`TTY_RESIZE_ARG_LEN`]).
+/// Resize a session's window, through its handle. `arg` =
+/// `[rows:u16][cols:u16]` ([`TTY_RESIZE_ARG_LEN`]).
 pub use super::super::super::registry::host_process::TTY_RESIZE;
-/// Pump a session: write stdin, drain output, poll for exit. `arg` in =
-/// `[sid:u32][wlen:u32]`, out = `[sid:u32][rlen:u32][state:u8][code:i32]`
+/// Pump a session, through its handle: write stdin, drain output, poll for
+/// exit. `arg` in = `[wlen:u32]`, out = `[rlen:u32][state:u8][code:i32]`
 /// ([`TTY_STEP_ARG_LEN`]; `state` [`TTY_RUNNING`] or [`TTY_EXITED`], `code`
 /// the exit code once exited); `data` in = stdin in its first `wlen` bytes,
 /// out = the output in its first `rlen`. Returns 0.
 pub use super::super::super::registry::host_process::TTY_STEP;
 
-/// A workload's identity, as `workload::CREATE` staged it: the head of every
-/// op that targets one.
-pub const IDENTITY_LEN: usize = 16;
-/// [`READ`]'s `arg` length.
-pub const READ_ARG_LEN: usize = IDENTITY_LEN;
 /// [`EXEC`]'s `arg` length, in and out.
-pub const EXEC_ARG_LEN: usize = IDENTITY_LEN + 4;
+pub const EXEC_ARG_LEN: usize = 4;
 /// [`TTY_OPEN`]'s `arg` length.
-pub const TTY_OPEN_ARG_LEN: usize = IDENTITY_LEN + 4;
-/// [`TTY_STEP`]'s `arg` length: the answer's (the request is its first 8).
-pub const TTY_STEP_ARG_LEN: usize = 13;
+pub const TTY_OPEN_ARG_LEN: usize = 4;
+/// [`TTY_STEP`]'s `arg` length: the answer's (the request is its first 4).
+pub const TTY_STEP_ARG_LEN: usize = 9;
 /// [`TTY_RESIZE`]'s `arg` length.
-pub const TTY_RESIZE_ARG_LEN: usize = 8;
-/// [`TTY_CLOSE`]'s `arg` length.
-pub const TTY_CLOSE_ARG_LEN: usize = 4;
+pub const TTY_RESIZE_ARG_LEN: usize = 4;
 /// [`TTY_STEP`] `state`: the session's process runs.
 pub const TTY_RUNNING: u8 = 0;
 /// [`TTY_STEP`] `state`: it exited; `code` holds how.
@@ -92,8 +93,10 @@ pub const TTY_EXITED: u8 = 1;
 ///                                 (needs SRC_ISOLATED, else EINVAL);
 ///                                 SRC_CAP_ADD: the cap_add part follows
 ///                                 the groups part; SRC_NO_SYSCALL_FILTER:
-///                                 no system-call filter. Any other bit is
-///                                 EINVAL
+///                                 no system-call filter;
+///                                 SRC_OWN_NETWORK: a network namespace of
+///                                 its own (needs SRC_ISOLATED, else
+///                                 EINVAL). Any other bit is EINVAL
 ///   [rootfs_len:u16][rootfs]      the root to pivot into; empty = none
 ///   [argv_len:u16][argv]          NUL-separated tokens, at least one
 ///   [env_len:u16][env]            NUL-separated `NAME=VALUE`: the WHOLE
@@ -174,10 +177,10 @@ pub const TTY_EXITED: u8 = 1;
 /// an intermediate of their own that relays their status the same way; both
 /// end with the runtime's dispatch thread.
 ///
-/// Workload naming: READ, EXEC and TTY_OPEN name the workload by identity
-/// under the `workload` contract's rule — a workload another owner's module
-/// created answers `EACCES`, unless the caller acts with the node's
-/// authority.
+/// Workload naming: READ, EXEC and TTY_OPEN take a `workload` handle under
+/// that contract's rule — a handle is its minting module's owner's, and a
+/// workload another owner's module created answers `EACCES`, unless the
+/// caller acts with the node's authority (which names it by `LOOKUP`).
 ///
 /// Devices (SRC_ISOLATED with a rootfs): the root and every volume are
 /// `nodev`, and `/dev` is the workload's own memory filesystem (mode 0755,
@@ -221,6 +224,13 @@ pub const SRC_ROOT_READ_ONLY: u8 = 1 << 1;
 pub const SRC_CAP_ADD: u8 = 1 << 2;
 /// Source `flags` bit: the workload runs without a system-call filter.
 pub const SRC_NO_SYSCALL_FILTER: u8 = 1 << 3;
+/// Source `flags` bit: the workload gets a network namespace of its own,
+/// with only `lo` up (with [`SRC_ISOLATED`] only). Its address, the name
+/// service it asks and the endpoints it may bind are the node's net
+/// provider's to give it, from the node agent (`net::identity` on the
+/// provider's `addr_ctl`, the owner plan's grants); without the bit it
+/// shares the host's network.
+pub const SRC_OWN_NETWORK: u8 = 1 << 4;
 /// Source `groups_flags` bit: the listed groups and the primary only.
 pub const GROUPS_STRICT: u8 = 1 << 0;
 
@@ -247,29 +257,31 @@ pub mod caps {
     pub const SYSCALL_FILTER: u32 = 1 << 4;
 }
 
-/// Host process-executor provider class (opcode class 0x16xx): a host-side
-/// provider spawns a command and streams its output. Registered only by the
-/// linux platform, keeping the generic kernel free of host vocabulary.
-pub const PROC_CLASS: u16 = super::super::super::registry::proc::ID;
-
-/// Kill if still running, reap, and free the slot.
-pub use super::super::super::registry::proc::PROC_CLOSE;
-/// Read merged stdout and stderr. `arg` out = the output, at most
-/// [`PROC_READ_MAX`] bytes; returns the bytes written, 0 when nothing is
-/// ready this step.
-pub use super::super::super::registry::proc::PROC_READ;
-/// Spawn a command. `handle = -1`, no `arg`; `data` in = the command line
-/// (UTF-8, words split on whitespace). The executable must be on the node's allowlist
-/// (`SECTOR_PROC_ALLOW`); it starts in the granted root with only the
-/// granted environment. Returns the process's handle, `EACCES`
-/// for a command off the allowlist, `ENOMEM` with every slot in use.
-pub use super::super::super::registry::proc::PROC_SPAWN;
-/// Whether the command has finished: 1 while it runs or output is still to
-/// be read, 0 once it has exited and every byte was read. On 0, `arg` out
-/// `[code:i32]` ([`PROC_STATUS_ARG_LEN`]) receives its exit code (i32 LE): `128 + signal` when a
-/// signal ended it, -1 when it could not be read. A command past the grant's
-/// timeout is killed and reported so.
-pub use super::super::super::registry::proc::PROC_STATUS;
+/// Kill the command if still running, reap it, and free its slot, through
+/// its handle; the handle closes. No `arg`. Returns 0.
+pub use super::super::super::registry::host_process::PROC_CLOSE;
+/// Read the command's merged stdout and stderr, through its handle. `arg`
+/// out = the output, at most [`PROC_READ_MAX`] bytes; returns the bytes
+/// written, 0 when nothing is ready this step.
+pub use super::super::super::registry::host_process::PROC_READ;
+/// Run a command on the node itself (not in a workload): `handle = -1`, no
+/// `arg`; `data` in = the command line (UTF-8, words split on whitespace).
+/// A command runs with the node's authority, so a caller acting with an
+/// authority of its own is refused `EACCES`. The executable must be on the
+/// node's allowlist, which the operator configures for the host runtime
+/// (empty unless configured: nothing runs); it starts in the configured
+/// working directory with only the configured environment names. Returns
+/// the command's handle, `EACCES` for a command off the allowlist, `ENOMEM`
+/// with every slot in use. The command is its spawner's owner's, and is
+/// killed when that owner is released.
+pub use super::super::super::registry::host_process::PROC_SPAWN;
+/// Whether the command has finished, through its handle: 1 while it runs
+/// or output is still to be read, 0 once it has exited and every byte was
+/// read. On 0, `arg` out `[code:i32]` ([`PROC_STATUS_ARG_LEN`]) receives its
+/// exit code (i32 LE): `128 + signal` when a signal ended it, -1 when it
+/// could not be read. A command past the configured timeout is killed and
+/// reported so.
+pub use super::super::super::registry::host_process::PROC_STATUS;
 
 /// Most bytes one [`PROC_READ`] answers (its `arg` bound).
 pub const PROC_READ_MAX: usize = 1024;

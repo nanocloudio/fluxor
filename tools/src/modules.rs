@@ -1022,39 +1022,17 @@ fn check_heap_rule_base(
 }
 
 /// `(tag, type id, name, default)` of each param a `define_params!` schema
-/// declares (`[S][P][version][count]`, then per param its tag, type id, u32
-/// default, length-prefixed name and enum table).
+/// (`fluxor_abi::wire::param_schema`) declares.
 pub(crate) fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String, u32)> {
     let mut out = Vec::new();
-    if schema.len() < 4 || schema[..2] != [0x53, 0x50] {
-        return out;
-    }
-    let mut pos = 4usize;
-    for _ in 0..schema[3] {
-        let Some(&[tag, ty, d0, d1, d2, d3]) = schema.get(pos..pos + 6) else {
-            break;
-        };
-        let default = u32::from_le_bytes([d0, d1, d2, d3]);
-        pos += 6; // tag, type, default
-        let Some(&name_len) = schema.get(pos) else {
-            break;
-        };
-        let Some(name) = schema.get(pos + 1..pos + 1 + name_len as usize) else {
-            break;
-        };
-        out.push((tag, ty, String::from_utf8_lossy(name).into_owned(), default));
-        pos += 1 + name_len as usize;
-        let Some(&enums) = schema.get(pos) else {
-            break;
-        };
-        pos += 1;
-        for _ in 0..enums {
-            let Some(&elen) = schema.get(pos + 1) else {
-                break;
-            };
-            pos += 2 + elen as usize;
-        }
-    }
+    fluxor_abi::wire::param_schema::for_each_param(schema, |p| {
+        out.push((
+            p.tag,
+            p.ptype,
+            String::from_utf8_lossy(p.name).into_owned(),
+            p.default,
+        ));
+    });
     out
 }
 
@@ -1364,49 +1342,29 @@ pub fn pack_fmod(
         .map(|s| &s.data[..])
         .unwrap_or(&[]);
 
-    // Extract param schema (optional — only present if module uses define_params!)
-    let schema_data = find_section(&sections, ".param_schema")
-        .map(|s| {
-            // Trim trailing zeros from the fixed-size SCHEMA_MAX buffer
-            let data = &s.data[..];
-            if data.len() >= 4 && data[0] == 0x53 && data[1] == 0x50 {
-                let count = data[3] as usize;
-                if count > 0 {
-                    // Find actual end by scanning past all entries
-                    let mut pos = 4usize;
-                    for _ in 0..count {
-                        if pos + 6 >= data.len() {
-                            break;
-                        }
-                        pos += 6; // tag + type + default(4)
-                        let name_len = data[pos] as usize;
-                        pos += 1 + name_len;
-                        if pos >= data.len() {
-                            break;
-                        }
-                        let enum_count = data[pos] as usize;
-                        pos += 1;
-                        for _ in 0..enum_count {
-                            if pos >= data.len() {
-                                break;
-                            }
-                            pos += 1; // val
-                            if pos >= data.len() {
-                                break;
-                            }
-                            let ename_len = data[pos] as usize;
-                            pos += 1 + ename_len;
-                        }
-                    }
-                    &data[..pos.min(data.len())]
-                } else {
-                    &data[..4] // header only
-                }
-            } else {
-                &[] as &[u8]
+    // The param schema (`define_params!`), exactly as long as its own
+    // header and entries say; a section that is not one is refused.
+    let schema_data: &[u8] = match find_section(&sections, ".param_schema") {
+        Some(sec) if !sec.data.is_empty() => {
+            let len = fluxor_abi::wire::param_schema::schema_len(&sec.data).ok_or_else(|| {
+                Error::Module(format!(
+                    "{}: its `.param_schema` section is not a param schema",
+                    input.display()
+                ))
+            })?;
+            // The linker pads the section to its output alignment, with
+            // zeros; anything else past the schema is not the schema's.
+            if sec.data[len..].iter().any(|&b| b != 0) {
+                return Err(Error::Module(format!(
+                    "{}: its `.param_schema` section holds {} bytes past its schema",
+                    input.display(),
+                    sec.data.len() - len
+                )));
             }
-        })
-        .unwrap_or(&[]);
+            &sec.data[..len]
+        }
+        _ => &[],
+    };
 
     // Combine code sections (text + rodata), preserving ELF layout.
     // ADRP on aarch64 uses PC-relative page addressing — the relative offset between
@@ -1584,7 +1542,9 @@ pub fn pack_fmod(
     module_manifest.grant_set()?;
     // A grant's `when` names a parameter; the manifest carries its tag and
     // the schema's default reading of it, because the kernel has neither.
-    module_manifest.resolve_grant_conditions(schema_data)?;
+    module_manifest.resolve_conditions(schema_data)?;
+    // `[lanes]` names its capacity param; the kernel reads it by tag.
+    module_manifest.resolve_lanes(schema_data)?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Calculate sizes
@@ -1709,11 +1669,11 @@ pub fn pack_fmod_wasm(
         )));
     }
 
-    // wasm32 `#[link_section]` lands bytes in unnamed data segments,
-    // so the named-section lookup ELF PIC builds use doesn't apply.
-    // Scan for the SP-magic header `define_params!` emits and
-    // structurally validate the trailing entries instead.
-    let schema_owned = find_param_schema_in_wasm(&wasm_data).unwrap_or_default();
+    // On wasm32 `#[link_section]` places the schema in a custom section of
+    // that name.
+    let schema_owned = param_schema_in_wasm(&wasm_data)
+        .map_err(|e| Error::Module(format!("{}: {e}", input.display())))?
+        .unwrap_or_default();
     let schema_data: &[u8] = &schema_owned;
 
     // Load or create manifest.
@@ -1778,7 +1738,9 @@ pub fn pack_fmod_wasm(
     module_manifest.grant_set()?;
     // A grant's `when` names a parameter; the manifest carries its tag and
     // the schema's default reading of it, because the kernel has neither.
-    module_manifest.resolve_grant_conditions(schema_data)?;
+    module_manifest.resolve_conditions(schema_data)?;
+    // `[lanes]` names its capacity param; the kernel reads it by tag.
+    module_manifest.resolve_lanes(schema_data)?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Layout: header + wasm code + (no data) + (no exports) + schema + manifest
@@ -1828,104 +1790,51 @@ pub fn pack_fmod_wasm(
     })
 }
 
-/// Scan `wasm` for the embedded `define_params!` schema buffer.
-///
-/// The macro emits a `[u8; SCHEMA_MAX]` static beginning with the
-/// 4-byte header `[0x53 'S', 0x50 'P', version=1, count]` followed by
-/// `count` variable-length param entries. On wasm32 the bytes land in
-/// an unnamed data segment, so we recover them by searching for the
-/// header and structurally validating the trailing entries.
-///
-/// Validation walks each declared entry — type byte must be a known
-/// `ParamType` id, name and enum lengths must fit in the surrounding
-/// bytes, name bytes must be ASCII identifier characters. Any
-/// candidate that fails these checks is skipped, so the first
-/// remaining match is the real schema (the linker may emit one or two
-/// byte-identical copies; either is correct).
-///
-/// Returns `None` for modules built without `define_params!` (no
-/// header to find).
-fn find_param_schema_in_wasm(wasm: &[u8]) -> Option<Vec<u8>> {
-    let mut i = 0usize;
-    while i + 4 <= wasm.len() {
-        if wasm[i] == 0x53 && wasm[i + 1] == 0x50 && wasm[i + 2] == 0x01 {
-            if let Some(end) = validate_param_schema(wasm, i) {
-                return Some(wasm[i..end].to_vec());
-            }
+/// Read a LEB128 `u32` at `at`: the value and the offset past it.
+fn leb_u32(b: &[u8], mut at: usize) -> Option<(u32, usize)> {
+    let mut v: u32 = 0;
+    for shift in (0..35).step_by(7) {
+        let byte = *b.get(at)?;
+        at += 1;
+        v |= u32::from(byte & 0x7F).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((v, at));
         }
-        i += 1;
     }
     None
 }
 
-/// Walk a candidate schema starting at `start`, returning the
-/// one-past-end offset on success or `None` if any entry is malformed.
-fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
-    if start + 4 > data.len() {
-        return None;
-    }
-    // The count field is a u8, so it bounds itself at 255 — modules legitimately
-    // declare far more than a round-number guess would allow (grove's `effects`
-    // declares 88). An arbitrary cap here rejects the whole schema silently, and
-    // every param and voice blob then packs empty.
-    let count = data[start + 3] as usize;
-    if count == 0 {
-        return None;
-    }
-    let mut pos = start + 4;
-    for _ in 0..count {
-        // tag(1) + type(1) + default(4)
-        if pos + 6 > data.len() {
-            return None;
-        }
-        // ParamType ids (`schema::ParamType`): 0=u8, 1=u16, 2=u32, 3=str,
-        // 4=u16_array, 5=blob, 6=str_chunked. This copy once stopped at
-        // `blob`, so a module with a `str_chunked` param lost its whole
-        // schema on wasm and every param it took packed empty; the test
-        // below holds the two together.
-        if data[pos + 1] > 6 {
-            return None;
-        }
-        pos += 6;
-        // name_len + name_bytes
-        if pos >= data.len() {
-            return None;
-        }
-        let name_len = data[pos] as usize;
-        pos += 1;
-        if pos + name_len > data.len() {
-            return None;
-        }
-        for j in 0..name_len {
-            let b = data[pos + j];
-            if !(b == b'_' || b.is_ascii_alphanumeric()) {
-                return None;
+/// The `define_params!` schema of a wasm module: the content of its
+/// `.param_schema` custom section, which `#[link_section]` emits on wasm32.
+/// `None` for a module that declares no params; `Err` for a malformed
+/// module or a section that is not a schema.
+fn param_schema_in_wasm(wasm: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+    let mut at = 8usize;
+    let mut found: Option<Vec<u8>> = None;
+    while at < wasm.len() {
+        let id = wasm[at];
+        let (size, body) = leb_u32(wasm, at + 1).ok_or("a section's size is malformed")?;
+        let end = body
+            .checked_add(size as usize)
+            .filter(|&e| e <= wasm.len())
+            .ok_or("a section runs past the module")?;
+        if id == 0 {
+            let (n, name_at) = leb_u32(wasm, body).ok_or("a custom section's name is malformed")?;
+            let content = name_at + n as usize;
+            if content <= end && &wasm[name_at..content] == b".param_schema" {
+                if found.is_some() {
+                    return Err("it carries two `.param_schema` sections".into());
+                }
+                let bytes = &wasm[content..end];
+                let len = fluxor_abi::wire::param_schema::schema_len(bytes)
+                    .filter(|&l| l == bytes.len())
+                    .ok_or("its `.param_schema` section is not one param schema")?;
+                found = Some(bytes[..len].to_vec());
             }
         }
-        pos += name_len;
-        // enum_count + (val + ename_len + ename_bytes) * enum_count
-        if pos >= data.len() {
-            return None;
-        }
-        let enum_count = data[pos] as usize;
-        pos += 1;
-        if enum_count > 32 {
-            return None;
-        }
-        for _ in 0..enum_count {
-            if pos + 2 > data.len() {
-                return None;
-            }
-            pos += 1; // value byte
-            let ename_len = data[pos] as usize;
-            pos += 1;
-            if pos + ename_len > data.len() {
-                return None;
-            }
-            pos += ename_len;
-        }
+        at = end;
     }
-    Some(pos)
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -2171,11 +2080,8 @@ content_type = "NetProto"
         assert!(e.contains("heap_per_param.base` is 4096 B"), "{e}");
 
         let schema = |ty: u8, default: u32| {
-            let mut s = vec![0x53, 0x50, 1, 1, 3, ty];
-            s.extend_from_slice(&default.to_le_bytes());
-            s.push(5);
-            s.extend_from_slice(b"flows");
-            s.push(0);
+            let mut s = vec![0x53, 0x50, 1, 1];
+            s.extend_from_slice(&crate::schema::raw_param(3, ty, default, "flows"));
             s
         };
         check_param_rule_tags(p, &m, &schema(1, 2)).expect("a u16 defaulting to 2");
@@ -2210,8 +2116,8 @@ content_type = "NetProto"
             ),
             (
                 "heap_per_demand = { pool = \"store_subs\", bytes_each = 96, base = 4096 }\n\
-                 heap_per_param = { params = [{ tag = 3, default = 2, bytes_each = 64 }] }",
-                "a type states one",
+                 heap_per_param = { base = 4096, params = [{ tag = 3, default = 2, bytes_each = 64 }] }",
+                "drop `base` here",
             ),
             ("heap_per_param = { base = 64, params = [] }", "params is empty"),
             (
@@ -2237,9 +2143,7 @@ content_type = "NetProto"
     fn two_params_on_one_tag_are_refused_at_pack() {
         let mut schema = vec![0x53, 0x50, 1, 2];
         for name in ["capacity", "step_budget_us"] {
-            schema.extend_from_slice(&[54, 2, 0, 0, 0, 0, name.len() as u8]);
-            schema.extend_from_slice(name.as_bytes());
-            schema.push(0);
+            schema.extend_from_slice(&crate::schema::raw_param(54, 2, 0, name));
         }
         let p = Path::new("store_source.elf");
         let e = check_param_rule_tags(p, &Manifest::default(), &schema)
@@ -2257,9 +2161,7 @@ content_type = "NetProto"
     fn a_selector_param_names_a_str_param_of_the_module() {
         let mut schema = vec![0x53, 0x50, 1, 2];
         for (tag, ty, name) in [(1u8, 3u8, "path"), (4, 3, "volume")] {
-            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
-            schema.extend_from_slice(name.as_bytes());
-            schema.push(0);
+            schema.extend_from_slice(&crate::schema::raw_param(tag, ty, 0, name));
         }
         let claim = |param: &str| {
             Manifest::from_toml_str_for_target(
@@ -2300,9 +2202,7 @@ content_type = "NetProto"
             (2, 3, "table_volume"),
             (3, 2, "depth"),
         ] {
-            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
-            schema.extend_from_slice(name.as_bytes());
-            schema.push(0);
+            schema.extend_from_slice(&crate::schema::raw_param(tag, ty, 0, name));
         }
         let claim = |active: &str| {
             Manifest::from_toml_str_for_target(
@@ -2348,9 +2248,7 @@ content_type = "NetProto"
             (3, 2, "depth"),
             (4, 4, "notes"),
         ] {
-            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
-            schema.extend_from_slice(name.as_bytes());
-            schema.push(0);
+            schema.extend_from_slice(&crate::schema::raw_param(tag, ty, 0, name));
         }
         let p = Path::new("watch.elf");
         let parse = |caps: &str| {
@@ -2386,22 +2284,50 @@ content_type = "NetProto"
         check_param_rule_tags(p, &Manifest::default(), &[]).expect("no rule");
     }
 
-    /// A wasm module whose schema has a `str_chunked` param keeps its
-    /// schema: the scanner knows every type id the schema table does.
+    /// A wasm module's schema is its `.param_schema` custom section, read
+    /// whole; a section that is not one schema is refused.
     #[test]
-    fn wasm_schema_with_a_chunked_string_is_found() {
-        let mut blob = vec![0u8, 1, 2, 3];
-        let start = blob.len();
-        blob.extend_from_slice(&[0x53, 0x50, 0x01, 2]);
-        for (tag, ptype, name) in [(2u8, 3u8, &b"namespace"[..]), (4, 6, &b"capability"[..])] {
-            blob.extend_from_slice(&[tag, ptype, 0, 0, 0, 0, name.len() as u8]);
-            blob.extend_from_slice(name);
-            blob.push(0);
-        }
-        let end = blob.len();
-        blob.extend_from_slice(&[9, 9, 9]);
-        let found = find_param_schema_in_wasm(&blob).expect("the schema is found");
-        assert_eq!(found, blob[start..end].to_vec());
+    fn a_wasm_modules_schema_is_its_custom_section() {
+        use fluxor_abi::wire::param_schema::{encode, encoded_len, ty, Entry};
+        const E: &[Entry<'static>] = &[
+            Entry {
+                tag: 2,
+                ptype: ty::STR,
+                default: 0,
+                min: 0,
+                max: 96,
+                name: "namespace",
+                enums: &[],
+            },
+            Entry {
+                tag: 4,
+                ptype: ty::STR_CHUNKED,
+                default: 0,
+                min: 0,
+                max: 4096,
+                name: "capability",
+                enums: &[],
+            },
+        ];
+        let schema: [u8; encoded_len(E)] = encode(E);
+        let custom = |name: &[u8], body: &[u8]| {
+            let mut c = vec![name.len() as u8];
+            c.extend_from_slice(name);
+            c.extend_from_slice(body);
+            let mut s = vec![0u8, c.len() as u8];
+            s.extend_from_slice(&c);
+            s
+        };
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        wasm.extend_from_slice(&custom(b"other", &[1, 2, 3]));
+        wasm.extend_from_slice(&custom(b".param_schema", &schema));
+        assert_eq!(param_schema_in_wasm(&wasm).unwrap(), Some(schema.to_vec()));
+        let mut none = b"\0asm\x01\0\0\0".to_vec();
+        none.extend_from_slice(&custom(b"other", &[1]));
+        assert_eq!(param_schema_in_wasm(&none).unwrap(), None);
+        let mut bad = b"\0asm\x01\0\0\0".to_vec();
+        bad.extend_from_slice(&custom(b".param_schema", &schema[..schema.len() - 1]));
+        assert!(param_schema_in_wasm(&bad).is_err());
     }
 
     #[test]

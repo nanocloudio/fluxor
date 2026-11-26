@@ -24,27 +24,21 @@ pub mod evdev_pointer;
 /// harness can drive it against a real adapter.
 pub mod gpu;
 pub mod host_backend;
+/// A host provider process behind ports or contracts, through a host lane.
+pub mod host_lane;
 pub mod host_mount;
-#[cfg(feature = "host-hsm")]
-pub mod hsm_key_vault;
 /// Where a window's input method stands: the focused editable node of an
 /// accessibility tree.
 pub mod ime_target;
 /// The bounded record queue between a host input source and its step.
 pub mod input_queue;
-/// Instance scoping: this runtime's tag, the host registry runtimes on one
-/// host share, and dead-tag collection.
-pub mod instance;
 pub mod native_params;
-pub mod net_identity;
-pub mod net_policy;
-pub mod net_route;
-pub mod owner_drain;
+/// Where the kernel's owner facts land for the node agent.
+pub mod owner_facts;
 pub mod owner_release;
-pub mod owner_root;
-pub mod owner_status;
 pub mod providers;
-pub mod store;
+/// The runtime's own state directory, held exclusively.
+pub mod state_dir;
 /// Window events as pointer, key and text records.
 pub mod window_input;
 pub mod workload;

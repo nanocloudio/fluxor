@@ -355,49 +355,50 @@ to construct on one that breaks it, rather than truncating or dropping it.
 ### Volumes lent to a workload
 
 Source: `crates/fluxor-abi/src/contracts/workload.rs` (`volume`),
-`src/platform/linux/owner_root.rs` (`lend`)
+`modules/foundation/owner_fs` (`ctl`)
 
-A `CREATE` lends a workload a host directory with the options entry
-`mount`/`bind`, `<src>\0<dst>\0<ro>`: a host process has it bind-mounted at
-`dst` in its root, and on Linux a graph workload's `fs` paths at or under
-`dst` resolve beneath `src` (see
+A host-process workload is lent a host directory by its `CREATE`, with the
+options entry `mount`/`bind`, `<src>\0<dst>\0<ro>`: it is bind-mounted at
+`dst` in its root, read-only when asked, at most 16 per workload. A graph
+workload is lent volumes by the node's workload `fs` layer instead: the node
+agent writes `ADD` records keyed by the workload's uid to `owner_fs`'s `ctl`
+input before the `CREATE`, and the workload's paths at or under `dst` are
+served from that volume (see
 [the storage surface](storage_capability_surface.md#what-a-workload-reaches)).
-A read-only volume takes no change; nothing in a volume is charged to the
-owner; the owner's release closes it and leaves its directory as it was.
-At most 16 per workload. A node that does not lend volumes does not list
-the entry in `OPTIONS`, and a required entry it does not list fails the
-`CREATE` with `ENOSYS`, so an orchestrator marks every volume required.
+Nothing in a volume is charged to the owner; the owner's release leaves its
+directory as it was. The graph backend does not list the entry in
+`OPTIONS`, and a required entry it does not list fails the `CREATE` with
+`ENOSYS`, so an orchestrator marks every volume required.
 
 ### A workload's own vault
 
-Source: `crates/fluxor-abi/src/contracts/workload.rs` (`vault`),
-`src/platform/linux/owner_root.rs` (`set_vault`),
-`src/kernel/security/key_vault.rs` (`Scope`, `Keeper`)
+Source: `modules/foundation/key_vault/` (its `seal_in` port), the
+composer's workload build
 
-A workload's labelled keys are its own whatever it brings: a label lives in
-its module type's namespace within its owner's realm, the workload's
-durable owner uid, so two workloads running one module type, and a workload
-and the node, never reach each other's labels (a token's labels name a
-module type and nothing narrower, so a workload's labels are the software
-vault's alone). Kept in the node's store, under the node's sealing key and
-bound to the realm, they stay with the node.
+The kernel holds no workload's key. A workload that wants its labelled keys
+kept composes its own `key_vault` in its graph, over a block source on its
+own storage (`file_block` on a volume it is lent), with `seal: owner`. Its
+modules reach that vault, not the node's: which vault a caller reaches is
+decided by provider visibility, as for any provider a workload composes.
 
-The options entry `vault`/`store`, `<dir>\0<seal_key>`, gives the workload
-a vault of its own on Linux: `dir` lies in one of its writable volumes (made
-when absent), `seal_key` is 64 hex digits its owner supplies. Every key a
-module of the workload persists by label is sealed with ChaCha20-Poly1305
-under `seal_key` and kept as one file per label in `dir`, and nothing of it
-is in the node's store: the keys follow the volume and the seal key. The
-same volume and seal key given to a workload on another node open the same
-keys; a record that does not open under the key given is refused `EACCES`,
-never written over by a fresh key. Such a key's custody is `SOFTWARE`
+The node agent holds the owner's 32-byte key and hands it to the vault over
+a caller lane. The composer wires `Caller(k) -> <vault>.seal_in` for every
+`seal: owner` vault of a workload graph (k from 7 down); it refuses
+`seal: owner` in a node graph and a `Caller` edge a graph writes itself.
+After `CREATE` and before `START` the agent takes the lane
+(`workload::LANE`, `[k, FROM_CALLER]`) and writes one 32-byte frame: only
+the module that staged the add writes that end. The vault takes the first
+32-byte frame, derives its record key from it and zeroes it; a later frame
+is drained with no effect and a frame of another length is refused, and
+every labelled op answers `EAGAIN` until the key has arrived. A workload
+add with two edges into one input port is refused, so no edge of the
+workload's own takes `seal_in` ahead of the lane, and a channel's buffer is
+zeroed when it is closed. The keys follow the storage and that key, not the
+node: the same volume and key given to the workload on another node open the
+same keys, and a record that does not open under the key given is never
+written over by a fresh one. Such a key's custody is `SOFTWARE`
 (`DESCRIBE`) whatever the node's sealing key is worth: whoever holds the
-volume and the seal key holds the key, which is the point of keeping it
-there, and the trade against a node-held key a device-unique seal or a
-token would bind to the node. One vault per workload; `dir` outside a lent
-volume, or in a read-only one, refuses the `CREATE`. The graph backend lists
-the entry in `OPTIONS`; a host process (which reaches no kernel vault) and a
-metal node do not, and answer a required entry `ENOSYS`.
+storage and the key holds the key, which is the point of keeping it there.
 
 ## Where the execution mode is declared
 

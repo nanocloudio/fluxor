@@ -38,6 +38,9 @@ fluxor-contracts = { path = "contracts", default-features = false }
 # both link.
 fluxor-abi = { path = "crates/fluxor-abi" }
 fluxor-sdk = { path = "crates/fluxor-sdk" }
+# The host lane: the rings and control socket between this runtime and a
+# host provider process (`host_lane`). Linux only.
+fluxor-host-lane = { path = "hosts/linux/lane", optional = true }
 # RP2040's second-stage bootloader: a 256-byte SPI-flash setup blob with the
 # bootrom's checksum over it. The chip will not run an image without one.
 #
@@ -84,13 +87,6 @@ cpal = { version = "0.15.3", optional = true }
 wgpu = { version = "26.0.1", default-features = false, features = ["vulkan", "wgsl"], optional = true }
 pollster = { version = "0.4.0", optional = true }
 
-# ── host-hsm: PKCS#11 key_vault backend ────────────────────────────────
-# Hardware binding for the key_vault contract: the cryptoki dependency
-# lives here in fluxor's Linux platform,
-# never in a consumer. It resolves its PKCS#11 module by path at
-# runtime, so it links no token library and costs nothing until one is
-# configured — which is why the published runtime carries it.
-cryptoki = { version = "0.12.0", optional = true }
 # The trust contract's Linux provider. On Linux there is no OS verification
 # API to call -- `rustls-platform-verifier` itself falls back to webpki over
 # the system roots there -- so this IS the platform path, not a substitute
@@ -171,25 +167,10 @@ rp-otp-provision = []
 #              bridging the edges between cores, and the quiesce that parks
 #              the other cores.
 #   dtb:       boot configuration/identity read from a device tree.
-#   pq-vault:  the key vault's ML-DSA suites. A signing operation needs ~58 KB
-#              of polynomial scratch and it is a kernel static, so this is a
-#              capability a target either has the RAM for or does not — the
-#              RP chip features leave it out. A target without it reports
-#              the ML-DSA suites as unsupported through SUITE_QUERY and omits
-#              them from SUITE_ENUM, rather than admitting a key it could not
-#              then sign with.
-#   rsa-vault: the key vault's RSA suites. Two CRT keys of up to 4096 bits
-#              with their Montgomery constants and one signing job are
-#              about 22 KB of kernel static, so like ML-DSA it is a
-#              capability a target has the RAM for or does not. A target
-#              without it reports the RSA suites unsupported and a graph
-#              naming an RSA identity there is refused at compose.
 kernel-vm = []
 kernel-mpu = []
 smp = []
 dtb = []
-pq-vault = []
-rsa-vault = []
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Bare-metal from scratch.
@@ -201,14 +182,11 @@ chip-bcm2712 = [
 
 # What every aarch64 kernel without a host OS under it shares, whatever started
 # it (a device tree on bcm2712, UEFI and ACPI on uefi): page-table virtual
-# memory, tables carved at boot from the machine's memory and the full key
-# vault.
+# memory and tables carved at boot from the machine's memory.
 aarch64-metal = [
     "portable-atomic",
     "embedded-platform",
     "kernel-vm",
-    "pq-vault",
-    "rsa-vault",
 ]
 
 # Board-level selection for BCM2712 targets.
@@ -221,7 +199,7 @@ board-qemu-uefi = ["host-uefi"]
 
 # Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "env_logger", "libc", "fluxor-contracts/alloc", "pq-vault", "rsa-vault", "trust-system"]
+host-linux = ["portable-atomic", "env_logger", "libc", "dep:fluxor-host-lane", "fluxor-contracts/alloc", "trust-system"]
 # The `trust` contract's Linux provider. Separable from host-linux so a build
 # that does not want the verifier's dependency tree can drop it and have
 # `trust = "system"` refuse at compose instead of at runtime.
@@ -234,7 +212,7 @@ trust-system = ["rustls", "rustls-pki-types", "rustls-pemfile"]
 # This feature gates the kernel into the same code paths as
 # `host-linux` for std/no-std purposes, except `no_std` and without
 # Linux-specific deps.
-host-wasm = ["portable-atomic", "pq-vault", "rsa-vault"]
+host-wasm = ["portable-atomic"]
 # UEFI-booted bare metal (aarch64): the kernel entry the UEFI loader jumps
 # to, with the machine as the loader read it from the firmware.
 host-uefi = ["aarch64-metal", "smp"]
@@ -256,15 +234,6 @@ host-playback = ["host-linux", "cpal"]
 # a reason, which is a fact a graph can act on, rather than silently
 # accepting work nothing will run.
 host-gpu = ["host-linux", "wgpu", "pollster"]
-
-# PKCS#11 `key_vault` backend: overrides the kernel software vault with
-# an HSM/token (SoftHSM2 in tests) when FLUXOR_HSM_PKCS11_MODULE + token
-# selector + PIN are set. Carried by the published runtime (Makefile
-# `install`), so reaching a PROCESS_HW custody level is a matter of
-# configuration rather than of rebuilding. Unconfigured, the backend
-# never registers and KEY_VAULT stays on the software one
-# (CUSTODY=SOFTWARE).
-host-hsm = ["host-linux", "cryptoki"]
 
 # Optional `host_image_codec` built-in: decode JPEG/PNG/BMP/GIF into
 # RGB565 frames, sized to a target width/height. Lets hosted graphs
@@ -318,7 +287,7 @@ split-debuginfo = "unpacked"
 opt-level = 1
 
 [workspace]
-members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-rt", "crates/fluxor-sdk", "crates/fluxor-uefi-loader", "tools", "tools/rig-observers"]
+members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-rt", "crates/fluxor-sdk", "crates/fluxor-uefi-loader", "hosts/linux/hsm", "hosts/linux/lane", "hosts/linux/net", "tools", "tools/rig-observers"]
 # `tests/harness` is a self-contained sub-workspace (its Cargo.toml
 # declares its own `[workspace]`) that depends on the crates above
 # via path. It is intentionally not a member here — host integration

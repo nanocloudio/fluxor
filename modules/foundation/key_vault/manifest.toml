@@ -1,0 +1,86 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "linux", "uefi"]
+
+# The key vault: opaque custody of asymmetric and symmetric keys for every
+# module in its execution domain that claims `key_vault`. Keys live in this
+# instance's heap and are never returned to callers; a caller holds handles.
+# Labelled keys persist as sealed records in an FXVS A/B image on the block
+# source wired to `blocks`; with nothing wired, keys live as long as the
+# instance. With `custody = token`, identity keys are generated and held by
+# the `key_custody` provider (a host PKCS#11 token behind `host_lane`).
+provides = ["key_vault"]
+provider_contracts = ["key_vault"]
+
+# `seal = hardware`: the record key is derived from the platform's sealing
+# key (`SEAL_KEY_DERIVE`). `owner` takes the owner's key from the node agent
+# over `seal_in` and `none` keeps records readable; neither needs the grant.
+grants = [{ name = "seal_key", when = { seal = [0] } }]
+
+observes_owner_release = true
+
+[[ports]]
+name = "blocks"
+direction = "input"
+content_type = "OctetStream"
+required = false
+contract = "storage.block"
+
+# `seal = owner`: the owner's 32-byte key, one frame, written by the node
+# agent over the caller lane the composer wires to a workload's vault
+# (`Caller(k) -> key_vault.seal_in`). Read, used and zeroed; nothing else
+# is taken from it.
+[[ports]]
+name = "seal_in"
+direction = "input"
+content_type = "OctetStream"
+required = false
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { custody = ["token"] }
+
+# One source; the suites a build serves are its variant's. ML-DSA's signing
+# workspace (66,804 bytes) and RSA's two CRT keys and signing job (21,768)
+# come from the heap of the variants that carry them.
+[[variant]]
+name = "p256_ed25519"
+features = []
+default = true
+
+[[variant]]
+name = "pq"
+features = ["ml_dsa"]
+
+[variant.capacities]
+heap_per_param = { base = 67072 }
+
+[[variant]]
+name = "rsa"
+features = ["rsa"]
+
+[variant.capacities]
+heap_per_param = { base = 22032 }
+
+[[variant]]
+name = "full"
+features = ["ml_dsa", "rsa"]
+
+[variant.capacities]
+heap_per_param = { base = 88848 }
+
+[capacities]
+# Every table from the heap, one allocation each (the base covers the
+# allocator's per-allocation rounding): a slot is 176 bytes, a persisted
+# record 200, a sign job 448 (its P-256 state), an anti-replay id 16, and
+# the store's image with its bounce block at most twice `image`.
+heap_per_param = { base = 256, params = [
+    { tag = 1, default = 8, bytes_each = 176 },
+    { tag = 2, default = 8, bytes_each = 200 },
+    { tag = 3, default = 2, bytes_each = 448 },
+    { tag = 4, default = 0, bytes_each = 2 },
+    { tag = 5, default = 32, bytes_each = 16 },
+] }
+
+[observability]
+exempt = "a key custodian: its '[key_vault]' construct, store and custody lines are the observable; key material is never logged"

@@ -1,0 +1,35 @@
+[package]
+name              = "fluxor-host-lane"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+repository        = "https://github.com/nanocloudio/fluxor"
+description       = "The host lane: sealed shared-memory rings and a control socket between fluxor-linux and a host provider process"
+
+# A host provider is a process of its own, holding a third-party tree the
+# runtime does not link (a PKCS#11 module, a window system, a GPU driver).
+# This crate is the seam both ends link: the runtime side spawns the
+# provider and moves records and calls across; the provider side connects
+# on its inherited socket and serves them.
+
+[lib]
+path = "src/lib.rs"
+
+# A provider used only by tests: it echoes port records and serves the
+# loopback test contract. Never listed in `[project].runtimes`.
+[[bin]]
+name = "fluxor-lane-loopback"
+path = "src/bin/loopback.rs"
+
+[dependencies]
+# The ABI surface digest a HELLO carries, errno values, and the contracts a
+# lane serves (`key_custody`'s record sizes and content types).
+fluxor-abi = { path = "../../../crates/fluxor-abi" }
+# The channel-table vocabulary both ends state.
+fluxor-contracts = { path = "../../../contracts", default-features = false }
+# SHA-256 of a call's arg, the key a resumed call is matched on.
+fluxor-sdk = { path = "../../../crates/fluxor-sdk" }
+libc = "0.2.186"
+
+[lints]
+workspace = true

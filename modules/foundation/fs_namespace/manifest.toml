@@ -1,0 +1,24 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Readiness-driven; no scheduler-step deadline.
+timer_class = "wall_clock"
+
+# `storage.namespace` over `fs`: the directory questions a scanner asks —
+# what lives under this prefix (`LIST`), what is this entry (`STAT`) —
+# answered from the `fs` provider beneath, under the `root` param. Read only.
+# A key is the `fs` path relative to `root`, so with `root` unset a consumer
+# LISTs here and opens each hit through `fs` by the same key.
+provides = ["storage.namespace"]
+provider_contracts = ["storage.namespace"]
+# A metal node runs it privileged inside a workload that composes it from the
+# node's image: it holds no grant and touches no device.
+workload_instantiable = true
+
+observes_owner_release = true
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
+[observability]
+exempt = "a read-only view over `fs`: what it answers is the file system's, which reports for itself"

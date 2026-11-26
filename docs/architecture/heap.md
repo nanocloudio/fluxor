@@ -291,8 +291,10 @@ allocation the cap holds is always served from one segment.
 
 `pack` holds the rule to the module: `base` to the declared arena, each
 `tag` to an integer param of the module's `define_params!` schema, and each
-`default` to that param's schema default. A type states at most one
-per-unit rule, `heap_per_demand` or `heap_per_param`.
+`default` to that param's schema default. A type may state both per-unit
+rules: its cap is `base` plus what each adds (a `store` holds counted tables
+and the graph's `store_subs` demand), and `base` is then stated once, on
+`heap_per_param`.
 
 ### Declared demand per instance: `[capacities] demand_from_params`
 

@@ -8,15 +8,14 @@ mailbox_safe = true
 # on it (`fluxor_contracts::graph::plan::fan_pass`). The producer writes to
 # `in0`; each consumer reads one of `out0`..`out15`, numbered from 0 in the
 # order the composer joins them. Every output gets every unit, whole and in
-# order; a unit leaves `in0` only once every output can take it whole, so one
+# order; a record leaves `in0` only once every output can take it whole, so one
 # slow consumer holds the stream and back pressure reaches the producer.
 #
 # ─── Parameters (TLV) ──────────────────────────────────────────────────
 # | Tag | Name            | Type | Default | Description |
 # |-----|-----------------|------|---------|-------------|
-# | 1   | frame_kind      | u8   | 0       | `stream` 0, `eth` 1, `net` 2, `telemetry` 3, `record` 4: what one unit on the fanned port is. |
-# | 2   | frames_per_step | u16  | 64      | Whole frames or records moved per step, at most. |
-# | 3   | scratch_bytes   | u32  | 32768 on aarch64, 2048 on thumb, 8192 elsewhere | Bytes of scratch from the heap: the largest unit moved whole. The composer sets it to the largest ring beside the fan. |
+# | 1   | frames_per_step | u16  | 64      | Whole records moved per step, at most. |
+# | 2   | scratch_bytes   | u32  | 32768 on aarch64, 2048 on thumb, 8192 elsewhere | Bytes of scratch from the heap: the largest record moved whole. The composer sets it to the largest `max_record` its producers declare, or the largest ring beside the fan where one declares none. |
 
 [[ports]]
 name = "in0"
@@ -121,10 +120,10 @@ direction = "output"
 content_type = "OctetStream"
 
 [capacities]
-# The scratch, from the heap: one byte per `scratch_bytes` (params tag 3),
+# The scratch, from the heap: one byte per `scratch_bytes` (params tag 2),
 # on top of the declared arena (the allocation header).
 heap_per_param = { base = 64, params = [
-    { tag = 3, default = { default = 8192, aarch64 = 32768, thumbv6m = 2048, thumbv8m = 2048 }, bytes_each = 1 },
+    { tag = 2, default = { default = 8192, aarch64 = 32768, thumbv6m = 2048, thumbv8m = 2048 }, bytes_each = 1 },
 ] }
 
 [observability]

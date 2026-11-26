@@ -106,13 +106,14 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 //
 // `[[resources]] requires_contract` claims a contract a provider in the graph
 // serves; `grants = [...]` names what else the module may call: a contract
-// it reaches with no provider to select (`key_vault`, `monitor`), or an
-// op-level grant (`timer.discipline`). Both resolve against the ABI
-// registry, the one list of names.
+// the kernel serves with no provider to select (`monitor`, `flash`), or an
+// op-level grant (`timer.discipline`). A grant naming a contract a module
+// provides (`key_vault`) is refused: that is a claim. Both resolve against
+// the ABI registry, the one list of names.
 //
 // Either may be scoped to the builds that make the call — `[[resources]]`
 // with its own `variants = [...]`, a grant as
-// `{ name = "key_vault", variants = ["disk"] }` — and the grant set is
+// `{ name = "counters", variants = ["disk"] }` — and the grant set is
 // resolved against the selected variant, so a build never holds a
 // capability only another build calls. That matters because the grant set
 // is what a node enforces: a workload is refused outright for holding a
@@ -712,10 +713,19 @@ fn validate_requires_when(entries: Vec<TomlRequiresWhen>) -> Result<Vec<Requires
                 fluxor_contracts::vocabulary::TARGET_CAPABILITIES.join(", "),
             )));
         }
-        if e.when.is_empty() {
+        let active_when_params = e.active_when_params.clone().unwrap_or_default();
+        if e.active_when_params.as_ref().is_some_and(Vec::is_empty)
+            || active_when_params.iter().any(String::is_empty)
+        {
             return Err(Error::Module(format!(
-                "[[requires_when]] for `{capability}` has an empty `when`; an unconditional \
-                 requirement belongs in `[requires]`"
+                "[[requires_when]] for `{capability}`: `active_when_params` names each param \
+                 whose value exercises the requirement"
+            )));
+        }
+        if e.when.is_empty() && active_when_params.is_empty() {
+            return Err(Error::Module(format!(
+                "[[requires_when]] for `{capability}` has no `when` and no \
+                 `active_when_params`; an unconditional requirement belongs in `[requires]`"
             )));
         }
         let when = parse_when(e.when, &format!("[[requires_when]] for `{capability}`"))?;
@@ -747,6 +757,7 @@ fn validate_requires_when(entries: Vec<TomlRequiresWhen>) -> Result<Vec<Requires
         out.push(RequiresWhen {
             capability,
             when,
+            active_when_params,
             facts,
         });
     }
@@ -854,6 +865,41 @@ pub fn edge_contract_id(name: &str) -> Option<u16> {
 /// most one end of one contract; a port serves only a contract the module
 /// names in `provider_contracts`; and every edge contract it names there is
 /// served on some port.
+/// `provider_scope = "owner" | "workloads"`: whether the module's provider
+/// layers serve its own owner (the default) or every workload and not the
+/// node. A workload layer is how a workload reaches what the node holds, so it
+/// is stated only by a module that provides something, and only for the
+/// contracts the registry lets a workload layer serve.
+fn provider_scope(scope: Option<&str>, provider_contracts: &[u16]) -> Result<bool> {
+    match scope {
+        None | Some("owner") => Ok(false),
+        Some("workloads") => {
+            if provider_contracts.is_empty() {
+                return Err(Error::Module(
+                    "provider_scope = \"workloads\" on a module with no provider_contracts: \
+                     there is no provider layer to scope"
+                        .into(),
+                ));
+            }
+            if let Some(&c) = provider_contracts
+                .iter()
+                .find(|&&c| !fluxor_abi::registry::workload_servable(c))
+            {
+                return Err(Error::Module(format!(
+                    "provider_scope = \"workloads\": `{}` is not a contract a workload layer \
+                     serves (the registry's `workload_served`)",
+                    fluxor_abi::registry::contract_name(c).unwrap_or("?")
+                )));
+            }
+            Ok(true)
+        }
+        Some(other) => Err(Error::Module(format!(
+            "provider_scope = \"{other}\": the scopes are \"owner\" (the default) and \
+             \"workloads\""
+        ))),
+    }
+}
+
 fn validate_edge_ports(ports: &[PortSpec], provider_contracts: &[u16]) -> Result<()> {
     for p in ports {
         let name = p.name.as_deref().unwrap_or("?");
@@ -912,14 +958,77 @@ fn validate_provides_names(provides: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The conditions block (`fmod::FLAG_CONDITIONS`) carrying `entries`;
+/// empty for none.
+pub fn conditions_block(entries: &[CondEntry]) -> Vec<u8> {
+    let mut block = Vec::new();
+    if !entries.is_empty() {
+        block.push(entries.len().min(usize::from(u8::MAX)) as u8);
+        for c in entries {
+            c.write(&mut block);
+        }
+    }
+    block
+}
+
+/// The entries of a conditions block `validate_conditions` accepted.
+fn read_conditions(block: &[u8]) -> Vec<CondEntry> {
+    use fluxor_abi::wire::fmod::{cond, for_each_condition};
+    let mut out = Vec::new();
+    for_each_condition(block, |c| {
+        let at = c.values_at;
+        let values = match c.flags & cond::KIND_MASK {
+            cond::KIND_INT_IN => CondValues::Int(
+                (0..c.count as usize)
+                    .map(|i| {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&block[at + i * 8..at + i * 8 + 8]);
+                        i64::from_le_bytes(b)
+                    })
+                    .collect(),
+            ),
+            cond::KIND_STR_IN => {
+                let mut v = Vec::new();
+                let mut p = at;
+                for _ in 0..c.count {
+                    let n = block[p] as usize;
+                    v.push(block[p + 1..p + 1 + n].to_vec());
+                    p += 1 + n;
+                }
+                CondValues::Str(v)
+            }
+            _ => CondValues::Set,
+        };
+        out.push(CondEntry {
+            subject: c.subject,
+            index: c.index,
+            param: c.param as u8,
+            group: c.group,
+            flags: c.flags & !cond::KIND_MASK,
+            values,
+        });
+    });
+    out
+}
+
+/// A param value as the kernel reads it from the packed params: an integer
+/// param sign-extended from its packed width.
+fn read_packed(ptype: crate::schema::ParamType, v: u32) -> i64 {
+    use crate::schema::ParamType;
+    match ptype {
+        ParamType::U8 => i64::from(v as u8 as i8),
+        ParamType::U16 => i64::from(v as u16 as i16),
+        _ => i64::from(v as i32),
+    }
+}
+
 fn access_mode_from_str(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "read" => Ok(0),
         "write" => Ok(1),
         "exclusive" => Ok(2),
-        "chain" => Ok(3),
         _ => {
-            let valid = ["read", "write", "exclusive", "chain"]
+            let valid = ["read", "write", "exclusive"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
@@ -927,7 +1036,7 @@ fn access_mode_from_str(s: &str) -> Result<u8> {
                 .map(|h| format!(" Did you mean '{h}'?"))
                 .unwrap_or_default();
             Err(Error::Module(format!(
-                "unknown access mode: '{s}'.{did_you_mean} Expected: read, write, exclusive, chain."
+                "unknown access mode: '{s}'.{did_you_mean} Expected: read, write, exclusive."
             )))
         }
     }
@@ -938,7 +1047,6 @@ fn access_mode_to_str(mode: u8) -> &'static str {
         0 => "read",
         1 => "write",
         2 => "exclusive",
-        3 => "chain",
         _ => "unknown",
     }
 }
@@ -1190,9 +1298,26 @@ pub struct ResourceClaim {
     /// schema default standing in for an unset parameter, every condition
     /// holding); empty, always. Tools-side only.
     pub when: Vec<(String, Vec<String>)>,
+    /// The record's claim byte (`fmod::claim`): `OPTIONAL` for an
+    /// `optional` claim, `CONDITIONAL` for one with `when` or
+    /// `active_when_params`, else `REQUIRED`. Serialised; the conditions it
+    /// is held to are the manifest's [`Manifest::conditions`].
+    pub claim: u8,
 }
 
 impl ResourceClaim {
+    /// The claim byte its declaration states.
+    pub fn claim_byte(optional: bool, conditioned: bool) -> u8 {
+        use fluxor_abi::wire::fmod::claim;
+        if optional {
+            claim::OPTIONAL
+        } else if conditioned {
+            claim::CONDITIONAL
+        } else {
+            claim::REQUIRED
+        }
+    }
+
     /// Whether an instance whose params read through `param` exercises the
     /// claim: always, unless the claim names `active_when_params`, in which
     /// case only when one of them is non-empty.
@@ -1276,6 +1401,10 @@ pub struct VariantDecl {
     /// its heap holds, so its `base` differs). Unset fields keep the
     /// module-scope rule's.
     pub heap_from_params: Option<HeapFromParamsOverride>,
+    /// `[variant.capacities] heap_per_param = { base = N }`: this variant's
+    /// base for the module-scope [`HeapPerParam`] rule, the fixed heap its
+    /// feature set needs (a signing workspace only it carries).
+    pub heap_per_param_base: Option<u32>,
 }
 
 /// `[capacities] heap_from_params`: the module's heap cap scales with the
@@ -1481,13 +1610,13 @@ impl HeapPerParam {
     }
 }
 
-/// Pools a `heap_per_demand` rule may name: every kernel pool but those
+/// Pools a `heap_per_demand` rule may name: every pool but those
 /// sized in bytes (the arenas and `config_arena`) and those whose plan the
 /// graph's shape derives (`capacity::plan_pool`'s structural part), which
 /// the composer knows only once the graph is laid out — after the heap caps
 /// are packed.
 pub fn heap_per_demand_pool_allowed(pool: &str) -> bool {
-    crate::capacity::POOL_IDS.iter().any(|&(n, _)| n == pool)
+    crate::capacity::pool_id(pool).is_some()
         && !crate::capacity::is_arena_name(pool)
         && !matches!(
             pool,
@@ -1525,22 +1654,63 @@ pub struct ScopedGrant {
     pub bit: u8,
     pub variants: Vec<String>,
     /// `when = { <param> = [values] }` as declared: the parameter's NAME and
-    /// the values that make the call. Resolved to a tag by
-    /// [`Manifest::resolve_grant_conditions`], which has the schema.
+    /// the values that make the call, every condition holding. Resolved to
+    /// conditions entries by [`Manifest::resolve_conditions`], which has the
+    /// schema.
     pub when: Vec<(String, Vec<i64>)>,
-    /// The condition as the kernel evaluates it: the parameter's tag, the
-    /// values, and whether the schema default satisfies it (so an instance
-    /// that sets nothing still needs the grant). `None` until resolved.
-    pub resolved: Option<ResolvedCondition>,
 }
 
-/// A grant condition in the form the manifest serialises and the kernel
-/// evaluates: no names, no schema.
-#[derive(Debug, Clone)]
-pub struct ResolvedCondition {
-    pub tag: u8,
-    pub values: Vec<i64>,
-    pub when_unset: bool,
+/// One entry of the manifest's conditions block (`fmod::cond`), in the
+/// form the kernel evaluates: no names, no schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondEntry {
+    /// `fmod::cond::SUBJECT_*`.
+    pub subject: u8,
+    /// The grant bit, or the resource record's index.
+    pub index: u8,
+    /// The param's TLV tag (basic, or extended with `fmod::cond::EXTENDED`).
+    pub param: u8,
+    /// The disjunct it belongs to: a subject holds when every entry of one
+    /// of its groups holds.
+    pub group: u8,
+    /// `fmod::cond::WHEN_UNSET`, `EXTENDED`; the kind follows `values`.
+    pub flags: u8,
+    pub values: CondValues,
+}
+
+/// What a [`CondEntry`] compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CondValues {
+    /// `INT_IN`: the param reads as one of these.
+    Int(Vec<i64>),
+    /// `STR_IN`: the param's bytes are one of these.
+    Str(Vec<Vec<u8>>),
+    /// `SET`: the param carries a non-empty entry.
+    Set,
+}
+
+impl CondEntry {
+    fn write(&self, out: &mut Vec<u8>) {
+        use fluxor_abi::wire::fmod::cond;
+        let (kind, count) = match &self.values {
+            CondValues::Int(v) => (cond::KIND_INT_IN, v.len()),
+            CondValues::Str(v) => (cond::KIND_STR_IN, v.len()),
+            CondValues::Set => (cond::KIND_SET, 0),
+        };
+        out.extend_from_slice(&[self.subject, self.index]);
+        out.extend_from_slice(&u16::from(self.param).to_le_bytes());
+        out.extend_from_slice(&[self.group, self.flags | kind, count as u8]);
+        match &self.values {
+            CondValues::Int(v) => v
+                .iter()
+                .for_each(|n| out.extend_from_slice(&n.to_le_bytes())),
+            CondValues::Str(v) => v.iter().for_each(|b| {
+                out.push(b.len() as u8);
+                out.extend_from_slice(b);
+            }),
+            CondValues::Set => {}
+        }
+    }
 }
 
 /// One `grants = [...]` entry: a bare name, or a table naming the
@@ -1610,6 +1780,32 @@ impl GrantEntry {
         }
         Ok(out)
     }
+}
+
+/// The refusal of a `grants` entry naming a contract a module provides:
+/// such a contract is reached through a provider the graph composes, so
+/// the module claims it, and the composer holds the graph to having one.
+fn provided_contract_grant(entry: &GrantEntry) -> Error {
+    let name = entry.name();
+    let scope = match entry {
+        GrantEntry::Name(_) => String::new(),
+        GrantEntry::Scoped { variants, when, .. } => {
+            let mut s = String::new();
+            if !variants.is_empty() {
+                s.push_str(&format!("\nvariants = {variants:?}"));
+            }
+            if !when.is_empty() {
+                s.push_str("\nwhen = { ... }   # the same condition, as the claim reads it");
+            }
+            s
+        }
+    };
+    Error::Module(format!(
+        "grants = [\"{name}\"]: `{name}` is a contract a module provides, so it is reached \
+         through the provider the graph composes, not granted. Claim it:\n\n\
+         [[resources]]\nrequires_contract = \"{name}\"\naccess = \"write\"{scope}\n\n\
+         and the composer refuses a graph with no `{name}` provider."
+    ))
 }
 
 /// The bit a `grants = [...]` name stands for: `(word, bit)`, word 0 for a
@@ -1694,7 +1890,8 @@ pub struct ManifestParam {
     pub default_str: String,
     /// Enum: list of (name, value) mappings. Values are u8.
     pub enum_values: Vec<(String, u8)>,
-    /// Optional inclusive range for numeric params: [min, max].
+    /// Inclusive bounds, `range = [min, max]` or `max = N`: a numeric
+    /// param's value, a `str`'s bytes.
     pub range: Option<(u32, u32)>,
     /// When true, the YAML must specify this param — build fails if
     /// missing. Equivalent to "no safe default exists." Set on params
@@ -1857,6 +2054,40 @@ pub struct ExecutionEnvelope {
     pub evidence: Option<String>,
 }
 
+/// A module's `[lanes]`: the param its lane capacity is, as `pack`
+/// resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanesDecl {
+    /// The param's name, as the TOML gives it (empty when read back).
+    pub param: String,
+    /// The param's TLV tag.
+    pub tag: u8,
+    /// The param's schema default.
+    pub default: u8,
+}
+
+/// A native module served by a host provider (`[host_provider]`): an
+/// instance is built as a `host_lane` running `runtime`, which serves
+/// `serves` and carries the instance's ports as its port pairs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProvider {
+    /// The provider binary, beside the runtime.
+    pub runtime: String,
+    /// Registry contracts the provider serves for the graph.
+    #[serde(default)]
+    pub serves: Vec<String>,
+}
+
+/// `[lanes]` in a module's TOML.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlLanes {
+    /// The `u8` param that states how many workload lanes the instance
+    /// serves.
+    capacity_param: String,
+}
+
 /// The facts a module's manifest TOML states as booleans, carried as the
 /// module header's flag bits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1933,6 +2164,22 @@ pub struct Manifest {
     /// the TOML). The kernel registers it as their provider after
     /// `module_new` returns Ready.
     pub provider_contracts: Vec<u16>,
+    /// `provider_scope = "workloads"`: its provider layers serve every workload
+    /// and not the node (manifest flag `FLAG_WORKLOAD_SCOPE`). `"owner"`, the
+    /// default, serves the module's own owner.
+    pub workload_scope: bool,
+    /// `workload_instantiable = true`: the node vouches for this module serving
+    /// inside a workload (manifest bit `PROVIDES_WORKLOAD_INSTANTIABLE`). A
+    /// metal node runs such a module privileged in a workload when its own
+    /// image carries the type; every other module a workload brings runs
+    /// gated, and a provider without the fact is refused there. Refused on a
+    /// module that holds grants or requires a hardware capability.
+    pub workload_instantiable: bool,
+    /// `[lanes] capacity_param = "<param>"`: the module serves workload
+    /// lanes as a base-graph module, as many as that param says. Resolved
+    /// by `pack` against the schema into the manifest's lanes block
+    /// ([`LanesDecl`]); `None` for a module that serves none.
+    pub lanes: Option<LanesDecl>,
     /// Header facts the TOML states (`mailbox_safe`, `in_place_writer`,
     /// `deferred_ready`, `observes_owner_release`, `samples_pool`); `pack`
     /// writes them as the header's flag bits
@@ -1948,6 +2195,11 @@ pub struct Manifest {
     /// as declared so [`Manifest::grant_set`] can resolve them against the
     /// selected variant. Unscoped grants are already folded into `grants`.
     pub scoped_grants: Vec<ScopedGrant>,
+    /// The conditions block (`fmod::FLAG_CONDITIONS`): under which params
+    /// each conditional grant and each `CONDITIONAL` claim holds, as
+    /// [`Manifest::resolve_conditions`] resolves them against the schema.
+    /// Empty until resolved.
+    pub conditions: Vec<CondEntry>,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
     /// ABI wire-surface digest of the SDK/kernel tree this module was built
@@ -1998,9 +2250,12 @@ pub struct Manifest {
     /// (parsed from TOML, not serialized to the binary `.fmod`). Consulted by
     /// `fluxor lint observability`.
     pub observability: Observability,
-    /// Module is built into the kernel (no .fmod file needed).
-    /// Used by platform-specific modules like linux_net.
+    /// Module is built into the runtime (no .fmod file needed): a platform
+    /// native module, or one a host provider serves (`host_provider`).
     pub builtin: bool,
+    /// `[host_provider]`: a built-in served by a host provider process. TOML
+    /// only.
+    pub host_provider: Option<HostProvider>,
     /// `[[variant]]` feature-set variants. Parsed from TOML, tools-side
     /// only, never serialized to binary — the binary manifest a variant
     /// fmod embeds is the already-filtered port table, not the variant
@@ -2132,11 +2387,15 @@ impl Default for Manifest {
             stack_bytes_64: 0,
             arena_bytes: 0,
             provider_contracts: Vec::new(),
+            workload_scope: false,
+            workload_instantiable: false,
+            lanes: None,
             facts: ModuleFacts::default(),
             ports: Vec::new(),
             resources: Vec::new(),
             grants: [0; 2],
             scoped_grants: Vec::new(),
+            conditions: Vec::new(),
             dependencies: Vec::new(),
             integrity_hash: None,
             abi_surface: None,
@@ -2149,6 +2408,7 @@ impl Default for Manifest {
             capabilities: Vec::new(),
             observability: Observability::default(),
             builtin: false,
+            host_provider: None,
             variants: Vec::new(),
             selected_variant: None,
             capacities: std::collections::BTreeMap::new(),
@@ -2538,53 +2798,276 @@ impl Manifest {
                 .is_some_and(|sel| variants.iter().any(|v| v == sel))
     }
 
-    /// Resolve each grant's `when` condition against the module's parameter
-    /// schema: the parameter's name becomes its tag, and the schema default
-    /// decides whether an instance that sets nothing still needs the grant.
-    /// The kernel has neither the schema nor the names, so this is where
-    /// that reading is made — and it is then signed with the manifest.
-    ///
-    /// Called by `pack`, before `to_bytes`. A condition naming a parameter
-    /// the schema does not declare is refused: it would otherwise never
-    /// hold, and the grant would be silently unadmittable.
-    pub fn resolve_grant_conditions(&mut self, schema: &[u8]) -> Result<()> {
+    /// Resolve `[lanes] capacity_param` against the module's schema: the
+    /// param's tag and its default go into the manifest's lanes block. A
+    /// param the schema does not declare, or a non-`u8` one, is refused. An
+    /// instance whose capacity reads 0 serves no lanes.
+    pub fn resolve_lanes(&mut self, schema: &[u8]) -> Result<()> {
+        let Some(l) = self.lanes.as_mut() else {
+            return Ok(());
+        };
+        if l.param.is_empty() {
+            return Ok(()); // read back from a packed manifest
+        }
         let params = crate::modules::schema_params(schema);
-        for g in &mut self.scoped_grants {
-            let Some((param, values)) = g.when.first().cloned() else {
+        let Some((tag, ty, _, default)) = params.iter().find(|(_, _, n, _)| *n == l.param) else {
+            return Err(Error::Module(format!(
+                "[lanes] capacity_param = \"{}\" names a parameter this module's schema does \
+                 not declare",
+                l.param
+            )));
+        };
+        // The schema's type byte for a `u8` param (`define_params!`'s `u8`).
+        if *ty != 0 {
+            return Err(Error::Module(format!(
+                "[lanes] capacity_param \"{}\" must be a u8 param: a lane key is a byte",
+                l.param
+            )));
+        }
+        let Ok(default) = u8::try_from(*default) else {
+            return Err(Error::Module(format!(
+                "[lanes] capacity_param \"{}\" defaults to {default}: a lane key is a byte",
+                l.param
+            )));
+        };
+        l.tag = *tag;
+        l.default = default;
+        Ok(())
+    }
+
+    /// Resolve the conditional grants' and claims' conditions against the
+    /// module's parameter schema ([`Manifest::conditions_for`]): each
+    /// parameter's name becomes its tag, and the schema default decides
+    /// whether an instance that sets nothing meets it. The kernel has
+    /// neither the schema nor the names, so this is where that reading is
+    /// made, and it is then signed with the manifest. Called by `pack`,
+    /// before `to_bytes`.
+    pub fn resolve_conditions(&mut self, schema: &[u8]) -> Result<()> {
+        let parsed = if schema.is_empty() {
+            crate::schema::ParamSchema::empty()
+        } else {
+            crate::schema::ParamSchema::from_bytes(schema).ok_or_else(|| {
+                Error::Module("the module's param schema is malformed".to_string())
+            })?
+        };
+        self.conditions = self.conditions_for(&parsed)?;
+        Ok(())
+    }
+
+    /// The resource records `to_bytes` emits: the claims the selected
+    /// variant makes, in declaration order. A claim's index in the
+    /// conditions block is its place here.
+    pub fn emitted_resources(&self) -> impl Iterator<Item = &ResourceClaim> {
+        self.resources
+            .iter()
+            .filter(|r| self.variant_applies(&r.variants))
+    }
+
+    /// The conditions block's entries for this manifest under `schema`:
+    ///
+    /// - a scoped grant's `when` is one group, an `INT_IN` entry per param
+    ///   (all of them holding). A grant on a contract a module may provide
+    ///   is refused: claims grant those, and their conditions are the
+    ///   claim's.
+    /// - a `CONDITIONAL` claim's `when` is one group: `INT_IN` for an integer
+    ///   param (enum names or numbers, read as the kernel reads the packed
+    ///   width), `STR_IN` for a `str` one. Its `active_when_params` make one
+    ///   group per param, each a `SET` entry crossed with the `when`
+    ///   entries; a param the builder embeds at build or launch
+    ///   (`trust_anchors::embedded_tags`) adds a group per extended tag,
+    ///   except on an `fs` claim, since an embedded value is never read
+    ///   through `fs`.
+    ///
+    /// `WHEN_UNSET` is set where the schema default satisfies an entry, so
+    /// an instance that sets nothing is judged as the module runs it. A
+    /// condition on a param the schema does not declare is refused: it
+    /// would never hold.
+    pub fn conditions_for(&self, schema: &crate::schema::ParamSchema) -> Result<Vec<CondEntry>> {
+        use crate::schema::ParamType;
+        use fluxor_abi::wire::fmod::{claim, cond};
+        let declared = || -> String {
+            let known: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
+            if known.is_empty() {
+                String::new()
+            } else {
+                format!(" — declared: {}", known.join(", "))
+            }
+        };
+        let mut out = Vec::new();
+        for g in &self.scoped_grants {
+            if g.when.is_empty() || !self.variant_applies(&g.variants) {
                 continue;
-            };
-            if g.when.len() > 1 {
+            }
+            let name = grant_names(one_grant(g.word, g.bit)).join(", ");
+            if g.word == 0 && fluxor_abi::registry::module_providable(u16::from(g.bit)) {
                 return Err(Error::Module(format!(
-                    "grant `{}` names {} `when` conditions; one parameter at most for now, \
-                     because the manifest carries one condition per grant",
-                    grant_names(one_grant(g.word, g.bit)).join(", "),
-                    g.when.len(),
+                    "grant `{name}` is conditioned, and it names a contract a module may \
+                     provide: claims grant such a contract, so condition the claim instead"
                 )));
             }
-            let Some((tag, _ty, _name, default)) = params.iter().find(|(_, _, n, _)| *n == param)
-            else {
-                let known: Vec<&str> = params.iter().map(|(_, _, n, _)| n.as_str()).collect();
+            if g.word == 0 && (self.grants[0] | self.claimed_contracts()?) & (1u64 << g.bit) != 0 {
                 return Err(Error::Module(format!(
-                    "grant `{}` is conditional on parameter `{param}`, which this module's \
-                     schema does not declare{}{}. A condition on a parameter that cannot be \
-                     read never holds, so the grant could never be admitted.",
-                    grant_names(one_grant(g.word, g.bit)).join(", "),
-                    if known.is_empty() {
-                        ""
-                    } else {
-                        " — declared: "
-                    },
-                    known.join(", "),
+                    "grant `{name}` is conditioned, and the module also holds it \
+                     unconditionally (a claim, an edge port or a plain grant): the condition \
+                     would narrow what it always uses"
                 )));
-            };
-            let when_unset = values.contains(&i64::from(*default));
-            g.resolved = Some(ResolvedCondition {
-                tag: *tag,
-                values,
-                when_unset,
-            });
+            }
+            for (param, values) in &g.when {
+                let Some(p) = schema.params.iter().find(|p| &p.name == param) else {
+                    return Err(Error::Module(format!(
+                        "grant `{name}` is conditional on parameter `{param}`, which this \
+                         module's schema does not declare{}. A condition on a parameter that \
+                         cannot be read never holds, so the grant could never be admitted.",
+                        declared()
+                    )));
+                };
+                if !p.ptype.is_integer() {
+                    return Err(Error::Module(format!(
+                        "grant `{name}` is conditional on `{param}`, which is not an integer \
+                         param"
+                    )));
+                }
+                let read = |v: u32| read_packed(p.ptype, v);
+                out.push(CondEntry {
+                    subject: if g.word == 0 {
+                        cond::SUBJECT_CONTRACT_GRANT
+                    } else {
+                        cond::SUBJECT_OP_GRANT
+                    },
+                    index: g.bit,
+                    param: p.tag,
+                    group: 0,
+                    flags: if values.contains(&read(p.default)) {
+                        cond::WHEN_UNSET
+                    } else {
+                        0
+                    },
+                    values: CondValues::Int(values.clone()),
+                });
+            }
         }
-        Ok(())
+        for (index, r) in self.emitted_resources().enumerate() {
+            if r.claim != claim::CONDITIONAL {
+                continue;
+            }
+            let contract = contract_name_to_str(r.device_class);
+            let index = u8::try_from(index)
+                .map_err(|_| Error::Module("more than 255 resource claims".to_string()))?;
+            let mut when = Vec::with_capacity(r.when.len());
+            for (param, wanted) in &r.when {
+                let Some(p) = schema.params.iter().find(|p| &p.name == param) else {
+                    return Err(Error::Module(format!(
+                        "the `{contract}` claim is conditional on parameter `{param}`, which \
+                         this module's schema does not declare{}. A condition on a parameter \
+                         that cannot be read never holds.",
+                        declared()
+                    )));
+                };
+                let entry = match p.ptype {
+                    ParamType::U8 | ParamType::U16 | ParamType::U32 => {
+                        let mut values = Vec::with_capacity(wanted.len());
+                        for w in wanted {
+                            let named = p
+                                .enums
+                                .iter()
+                                .find(|(n, _)| *n == w || **n == w.to_lowercase())
+                                .map(|(_, &v)| u32::from(v));
+                            let v = match named {
+                                Some(v) => v,
+                                None => w.parse::<u32>().map_err(|_| {
+                                    Error::Module(format!(
+                                        "the `{contract}` claim's `when` names `{param}` = \
+                                         \"{w}\", which is neither a value the schema declares \
+                                         for it nor a number"
+                                    ))
+                                })?,
+                            };
+                            values.push(read_packed(p.ptype, v));
+                        }
+                        let unset = values.contains(&read_packed(p.ptype, p.default));
+                        (CondValues::Int(values), unset)
+                    }
+                    ParamType::Str => {
+                        let values: Vec<Vec<u8>> =
+                            wanted.iter().map(|w| w.as_bytes().to_vec()).collect();
+                        if let Some(long) = values.iter().find(|v| v.len() > usize::from(u8::MAX)) {
+                            return Err(Error::Module(format!(
+                                "the `{contract}` claim's `when` value for `{param}` is {} \
+                                 bytes, past the 255 a `str` param holds",
+                                long.len()
+                            )));
+                        }
+                        // A `str` param's default is the empty string.
+                        let unset = values.iter().any(Vec::is_empty);
+                        (CondValues::Str(values), unset)
+                    }
+                    other => {
+                        return Err(Error::Module(format!(
+                            "the `{contract}` claim's `when` names `{param}`, a {other:?} \
+                             param: a `when` compares an integer or a one-entry `str`"
+                        )))
+                    }
+                };
+                when.push(CondEntry {
+                    subject: cond::SUBJECT_CLAIM,
+                    index,
+                    param: p.tag,
+                    group: 0,
+                    flags: if entry.1 { cond::WHEN_UNSET } else { 0 },
+                    values: entry.0,
+                });
+            }
+            if r.active_when_params.is_empty() {
+                out.extend(when);
+                continue;
+            }
+            // One group per way the instance can set one of the params.
+            let mut sets: Vec<(u8, u8)> = Vec::new();
+            for param in &r.active_when_params {
+                let Some(p) = schema.params.iter().find(|p| &p.name == param) else {
+                    return Err(Error::Module(format!(
+                        "the `{contract}` claim's `active_when_params` names `{param}`, which \
+                         this module's schema does not declare{}",
+                        declared()
+                    )));
+                };
+                sets.push((p.tag, 0));
+                if u16::from(r.device_class) != fluxor_abi::registry::fs::ID {
+                    for &t in crate::trust_anchors::embedded_tags(param) {
+                        sets.push((t, cond::EXTENDED));
+                    }
+                }
+            }
+            if sets.len() > 256 {
+                return Err(Error::Module(format!(
+                    "the `{contract}` claim is exercised {} ways, past the 256 groups a claim \
+                     carries",
+                    sets.len()
+                )));
+            }
+            for (group, (tag, flags)) in sets.into_iter().enumerate() {
+                let group = group as u8;
+                out.extend(when.iter().cloned().map(|mut e| {
+                    e.group = group;
+                    e
+                }));
+                out.push(CondEntry {
+                    subject: cond::SUBJECT_CLAIM,
+                    index,
+                    param: tag,
+                    group,
+                    flags,
+                    values: CondValues::Set,
+                });
+            }
+        }
+        if out.len() > usize::from(u8::MAX) {
+            return Err(Error::Module(format!(
+                "the manifest states {} conditions, past the 255 its block carries",
+                out.len()
+            )));
+        }
+        Ok(out)
     }
 
     /// Everything the module may call, as the kernel checks it: the named
@@ -2693,6 +3176,9 @@ impl Manifest {
         self.selected_variant = Some(variant.to_string());
         for (k, v) in &decl.capacities {
             self.capacities.insert(k.clone(), *v);
+        }
+        if let (Some(rule), Some(base)) = (self.heap_per_param.as_mut(), decl.heap_per_param_base) {
+            rule.base = Some(base);
         }
         if let (Some(rule), Some(over)) = (self.heap_from_params.as_mut(), &decl.heap_from_params) {
             if let Some(tags) = &over.tags {
@@ -2953,13 +3439,17 @@ impl Manifest {
             let instance = r.instance.unwrap_or(0xFF);
             let selector = claim_selector(&r)?;
             let active_when_params = claim_active_when(&r)?;
+            let optional = r.optional.unwrap_or(false);
+            let conditioned =
+                !active_when_params.is_empty() || r.when.as_ref().is_some_and(|t| !t.is_empty());
             resources.push(ResourceClaim {
+                claim: ResourceClaim::claim_byte(optional, conditioned),
                 device_class: cid,
                 access_mode,
                 instance,
                 selector,
                 active_when_params,
-                optional: r.optional.unwrap_or(false),
+                optional,
                 variants: r.variants.clone().unwrap_or_default(),
                 when: match r.when.clone() {
                     Some(t) if t.is_empty() => {
@@ -2982,6 +3472,9 @@ impl Manifest {
         let mut scoped_grants: Vec<ScopedGrant> = Vec::new();
         for entry in toml_val.grants.unwrap_or_default() {
             let (word, bit) = grant_from_name(entry.name())?;
+            if word == 0 && fluxor_abi::registry::module_providable(u16::from(bit)) {
+                return Err(provided_contract_grant(&entry));
+            }
             if entry.variants().is_empty() && entry.when()?.is_empty() {
                 grants[word] |= 1u64 << bit;
             } else {
@@ -2990,7 +3483,6 @@ impl Manifest {
                     bit,
                     variants: entry.variants().to_vec(),
                     when: entry.when()?,
-                    resolved: None,
                 });
             }
         }
@@ -3024,6 +3516,8 @@ impl Manifest {
         let provider_contracts =
             provider_contract_ids(&toml_val.provider_contracts.unwrap_or_default())?;
         validate_edge_ports(&ports, &provider_contracts)?;
+        let workload_scope =
+            provider_scope(toml_val.provider_scope.as_deref(), &provider_contracts)?;
         let facts = ModuleFacts {
             mailbox_safe: toml_val.mailbox_safe.unwrap_or(false),
             in_place_writer: toml_val.in_place_writer.unwrap_or(false),
@@ -3040,6 +3534,28 @@ impl Manifest {
             .filter_map(|p| p.requires_capability.clone())
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
+        let workload_instantiable = toml_val.workload_instantiable.unwrap_or(false);
+        if workload_instantiable {
+            let mut held = grants;
+            for sg in &scoped_grants {
+                held[sg.word] |= 1u64 << sg.bit;
+            }
+            if held != [0, 0] {
+                return Err(Error::Module(format!(
+                    "workload_instantiable = true on a module with grants ({}): a module a \
+                     workload runs privileged on a metal node holds no grant, so a workload \
+                     cannot reach past the gateway through it",
+                    grant_names(held).join(", ")
+                )));
+            }
+            if !required_caps.is_empty() {
+                return Err(Error::Module(format!(
+                    "workload_instantiable = true on a module that requires hardware ({}): \
+                     devices are the node's, never a workload's",
+                    required_caps.join(", ")
+                )));
+            }
+        }
         let (capability_facts, capability_fact_params) =
             resolve_capability_facts(capability_facts, abi)?;
         let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
@@ -3095,6 +3611,7 @@ impl Manifest {
                     || p.default.is_some()
                     || p.values.is_some()
                     || p.range.is_some()
+                    || p.max.is_some()
                     || p.required
             }) {
                 return Err(Error::Module(format!(
@@ -3240,24 +3757,62 @@ impl Manifest {
                 (_, None) => {} // no default — zero / empty
             }
 
-            // Validate range bounds.
-            let range = if let Some([min, max]) = p.range {
-                if matches!(ptype, ManifestParamType::Str | ManifestParamType::Enum) {
+            // Bounds: `range = [min, max]` (numeric) or `max = N` (a
+            // numeric value, a string's bytes), within the type's ceiling.
+            let ceiling = match ptype {
+                ManifestParamType::U8 | ManifestParamType::Enum | ManifestParamType::Str => {
+                    u32::from(u8::MAX)
+                }
+                ManifestParamType::U16 => u32::from(u16::MAX),
+                ManifestParamType::U32 => u32::MAX,
+            };
+            let range = match (p.range, p.max) {
+                (Some(_), Some(_)) => {
                     return Err(Error::Module(format!(
-                        "param '{}': `range` only applies to numeric types",
+                        "param '{}': state `range` or `max`, not both",
                         p.name
                     )));
                 }
-                if min > max {
+                (Some(_), None)
+                    if matches!(ptype, ManifestParamType::Str | ManifestParamType::Enum) =>
+                {
                     return Err(Error::Module(format!(
-                        "param '{}': range min ({}) > max ({})",
-                        p.name, min, max
+                        "param '{}': `range` bounds a numeric value; a string takes `max` \
+                         (its bytes)",
+                        p.name
                     )));
                 }
-                Some((min, max))
-            } else {
-                None
+                (None, Some(_)) if matches!(ptype, ManifestParamType::Enum) => {
+                    return Err(Error::Module(format!(
+                        "param '{}': an enum is bounded by its `values`",
+                        p.name
+                    )));
+                }
+                (Some([min, max]), None) => Some((min, max)),
+                (None, Some(max)) => Some((0, max)),
+                (None, None) => None,
             };
+            if let Some((min, max)) = range {
+                if min > max {
+                    return Err(Error::Module(format!(
+                        "param '{}': range min ({min}) > max ({max})",
+                        p.name
+                    )));
+                }
+                if max > ceiling {
+                    return Err(Error::Module(format!(
+                        "param '{}': bound {max} is past its type's {ceiling}",
+                        p.name
+                    )));
+                }
+                let numeric = !matches!(ptype, ManifestParamType::Str);
+                if numeric && p.default.is_some() && (default_num < min || default_num > max) {
+                    return Err(Error::Module(format!(
+                        "param '{}': default {default_num} is outside {min}..={max}",
+                        p.name
+                    )));
+                }
+            }
 
             // A `required` param must not also carry a `default` — that
             // would be contradictory. Catch the schema error early.
@@ -3380,6 +3935,7 @@ impl Manifest {
                 let ResolvedCapacities {
                     capacities,
                     heap_rule: heap_from_params,
+                    heap_param_base: heap_per_param_base,
                     ..
                 } = resolve_capacities(v.capacities.unwrap_or_default(), abi, &scope)?;
                 variants.push(VariantDecl {
@@ -3390,6 +3946,7 @@ impl Manifest {
                     omit_capabilities: v.omit_capabilities,
                     capacities,
                     heap_from_params,
+                    heap_per_param_base,
                 });
             }
         }
@@ -3403,6 +3960,9 @@ impl Manifest {
             demand_rule: demand_from_params,
             heap_demand_rule: heap_per_demand,
             heap_param_rule: heap_per_param,
+            // Module scope states the whole rule; only a variant states a
+            // base alone.
+            heap_param_base: _,
         } = resolve_capacities(toml_val.capacities.unwrap_or_default(), abi, "capacities")?;
         let heap_from_params = match heap_rule {
             None => None,
@@ -3425,14 +3985,16 @@ impl Manifest {
             }),
         };
         // The per-demand bytes are added to the type's own cap: the heap
-        // rule's `base` when it has one, else the rule's own — exactly one.
+        // rule's `base` when it has one, else `heap_per_param`'s when the type
+        // also counts params, else the rule's own — exactly one.
         if let Some(rule) = &heap_per_demand {
-            match (heap_from_params.is_some(), rule.base.is_some()) {
+            let elsewhere = heap_from_params.is_some() || heap_per_param.is_some();
+            match (elsewhere, rule.base.is_some()) {
                 (true, true) => {
                     return Err(Error::Module(
                         "capacities.heap_per_demand states a `base`, but the module's \
-                         heap_from_params rule already does — the per-demand bytes are added \
-                         to that rule's figure; drop `base` here"
+                         heap_from_params or heap_per_param rule already does — the per-demand \
+                         bytes are added to that rule's figure; drop `base` here"
                             .into(),
                     ))
                 }
@@ -3446,16 +4008,6 @@ impl Manifest {
                 }
                 _ => {}
             }
-        }
-        // One per-unit rule grows a type's heap: the two add to the same
-        // figure, and a type holding a pool's demand and a counted table
-        // states one rule for the larger and sizes the other within it.
-        if heap_per_demand.is_some() && heap_per_param.is_some() {
-            return Err(Error::Module(
-                "capacities.heap_per_demand and capacities.heap_per_param both grow the heap \
-                 per unit — a type states one"
-                    .into(),
-            ));
         }
         if let Some(rule) = &heap_per_param {
             match (heap_from_params.is_some(), rule.base.is_some()) {
@@ -3532,6 +4084,15 @@ impl Manifest {
                 )));
             }
         }
+        if heap_per_param.as_ref().and_then(|r| r.base).is_none() {
+            if let Some(v) = variants.iter().find(|v| v.heap_per_param_base.is_some()) {
+                return Err(Error::Module(format!(
+                    "variant '{}' changes capacities.heap_per_param's `base`, but the module \
+                     declares no heap_per_param rule with a `base` at module scope",
+                    v.name
+                )));
+            }
+        }
         if heap_from_params.is_none() {
             if let Some(v) = variants.iter().find(|v| v.heap_from_params.is_some()) {
                 return Err(Error::Module(format!(
@@ -3602,6 +4163,13 @@ impl Manifest {
             stack_bytes_64: 0, // set by pack from the built artefact
             arena_bytes: 0,    // likewise
             provider_contracts,
+            workload_scope,
+            workload_instantiable,
+            lanes: toml_val.lanes.map(|l| LanesDecl {
+                param: l.capacity_param,
+                tag: 0,
+                default: 0,
+            }),
             facts,
             ports,
             resources,
@@ -3618,8 +4186,10 @@ impl Manifest {
             capabilities,
             observability,
             builtin,
+            host_provider: toml_val.host_provider,
             selected_variant: variants.iter().find(|v| v.default).map(|v| v.name.clone()),
             scoped_grants,
+            conditions: Vec::new(),
             variants,
             capacities,
             heap_from_params,
@@ -3674,37 +4244,13 @@ impl Manifest {
             .ports
             .iter()
             .any(|p| p.buffer_size != 0 || p.max_record != 0);
-        // The conditional-grant block, last in the manifest: a count, then
-        // per grant its word, bit, parameter tag, flags and values. Only
-        // resolved conditions go in — an unresolved one would be a name the
-        // kernel cannot read, so `resolve_grant_conditions` is what puts a
-        // grant here, and a manifest packed without it carries no block.
-        let mut cond_block: Vec<u8> = Vec::new();
-        let conds: Vec<(&ScopedGrant, &ResolvedCondition)> = self
-            .scoped_grants
-            .iter()
-            .filter(|g| self.variant_applies(&g.variants))
-            .filter_map(|g| g.resolved.as_ref().map(|r| (g, r)))
-            .collect();
-        if !conds.is_empty() {
-            cond_block.push(conds.len().min(u8::MAX as usize) as u8);
-            for (g, r) in &conds {
-                cond_block.push(g.word as u8);
-                cond_block.push(g.bit);
-                cond_block.extend_from_slice(&u16::from(r.tag).to_le_bytes());
-                cond_block.push(if r.when_unset {
-                    fluxor_abi::wire::fmod::COND_GRANT_WHEN_UNSET
-                } else {
-                    0
-                });
-                cond_block.push(r.values.len().min(u8::MAX as usize) as u8);
-                for v in &r.values {
-                    cond_block.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-        }
+        // The conditions block, last in the manifest: a count, then each
+        // entry. Only resolved conditions go in (`resolve_conditions`, which
+        // has the schema); a manifest packed without them carries no block.
+        let cond_block = conditions_block(&self.conditions);
+        let resources: Vec<&ResourceClaim> = self.emitted_resources().collect();
         let var_size = self.ports.len() * 4
-            + self.resources.len() * 4
+            + resources.len() * 4
             + self.dependencies.len() * 8
             + if has_port_capacity {
                 self.ports.len() * 8
@@ -3713,6 +4259,7 @@ impl Manifest {
             }
             + 2
             + 4
+            + fluxor_abi::wire::fmod::LANES_BLOCK_SIZE
             + self.provider_contracts.len() * 2
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
@@ -3731,7 +4278,7 @@ impl Manifest {
         buf.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         buf.push(MANIFEST_VERSION);
         buf.push(self.ports.len() as u8);
-        buf.push(self.resources.len() as u8);
+        buf.push(resources.len() as u8);
         buf.push(self.dependencies.len() as u8);
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
@@ -3763,11 +4310,24 @@ impl Manifest {
             | (if cond_block.is_empty() {
                 0
             } else {
-                fluxor_abi::wire::fmod::FLAG_COND_GRANTS
+                fluxor_abi::wire::fmod::FLAG_CONDITIONS
+            })
+            | (if self.workload_scope {
+                fluxor_abi::wire::fmod::FLAG_WORKLOAD_SCOPE
+            } else {
+                0
             });
         buf.push(flags);
-        // byte 13: provided contracts, listed after the arena block.
-        buf.push(self.provider_contracts.len() as u8);
+        // byte 13: provided contracts, listed after the arena block, and the
+        // `workload_instantiable` fact in its top bit.
+        buf.push(
+            self.provider_contracts.len() as u8
+                | if self.workload_instantiable {
+                    fluxor_abi::wire::fmod::PROVIDES_WORKLOAD_INSTANTIABLE
+                } else {
+                    0
+                },
+        );
         // bytes 14..18: one instance's state in 64-byte units.
         buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
         // bytes 18..34: the grants, which the kernel checks every call
@@ -3797,12 +4357,13 @@ impl Manifest {
             buf.push(p.index);
         }
 
-        // Resources (4 bytes each)
-        for r in &self.resources {
+        // Resources (4 bytes each): the selected variant's claims, each with
+        // its claim byte.
+        for r in &resources {
             buf.push(r.device_class);
             buf.push(r.access_mode);
             buf.push(r.instance);
-            buf.push(0);
+            buf.push(r.claim);
         }
 
         // Dependencies (8 bytes each)
@@ -3825,6 +4386,8 @@ impl Manifest {
         // Stack, arena and provided contracts: every module states them.
         buf.extend_from_slice(&self.stack_bytes_64.to_le_bytes());
         buf.extend_from_slice(&self.arena_bytes.to_le_bytes());
+        let (lanes_tag, lanes_default) = self.lanes.as_ref().map_or((0, 0), |l| (l.tag, l.default));
+        buf.extend_from_slice(&[lanes_tag, lanes_default]);
         for id in &self.provider_contracts {
             buf.extend_from_slice(&id.to_le_bytes());
         }
@@ -3848,8 +4411,8 @@ impl Manifest {
         if let Some(d) = &self.abi_surface {
             buf.extend_from_slice(d);
         }
-        // Last, after the attestation: a manifest declaring no condition is
-        // byte-identical to one packed before the block existed.
+        // Last, after the attestation: its length is walked from its own
+        // bytes.
         buf.extend_from_slice(&cond_block);
 
         debug_assert_eq!(buf.len(), total);
@@ -3888,7 +4451,7 @@ impl Manifest {
             manifest_grants, MANIFEST_FLAGS_AT, MANIFEST_PROVIDES_AT, MANIFEST_STATE_AT,
         };
         let flags = data[MANIFEST_FLAGS_AT];
-        let provides_count = data[MANIFEST_PROVIDES_AT] as usize;
+        let provides_count = fluxor_abi::wire::fmod::provides_count(data[MANIFEST_PROVIDES_AT]);
         let grants = manifest_grants(&data[..MANIFEST_HEADER_SIZE]);
         let at = MANIFEST_STATE_AT;
         let state_bytes_64 =
@@ -3907,6 +4470,7 @@ impl Manifest {
             + if has_port_capacity { port_count * 8 } else { 0 }
             + 2
             + 4
+            + fluxor_abi::wire::fmod::LANES_BLOCK_SIZE
             + provides_count * 2
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
@@ -3915,25 +4479,31 @@ impl Manifest {
                 0
             }
             + if has_abi_surface { 32 } else { 0 };
-        // The conditional-grant block is variable length, so its size comes
-        // from walking its own count — derivable from the bytes, which is
-        // what keeps the check below exact rather than a lower bound.
-        let has_cond_grants = flags & fluxor_abi::wire::fmod::FLAG_COND_GRANTS != 0;
-        let expected_size = expected_size
-            + if has_cond_grants {
-                let Some(n) = data
-                    .get(expected_size..)
-                    .and_then(fluxor_abi::wire::fmod::cond_grants_block_len)
-                else {
-                    return Err(Error::Module(
-                        "the manifest flags a conditional-grant block it does not carry whole"
-                            .to_string(),
-                    ));
-                };
-                n
+        // The conditions block is variable length, so its size comes from
+        // walking its own count — derivable from the bytes, which is what
+        // keeps the check below exact rather than a lower bound. It is
+        // checked with the records it conditions, as the loader checks it.
+        let has_conditions = flags & fluxor_abi::wire::fmod::FLAG_CONDITIONS != 0;
+        let records = data
+            .get(MANIFEST_HEADER_SIZE + port_count * 4..)
+            .and_then(|r| r.get(..resource_count * 4))
+            .ok_or_else(|| Error::Module("the manifest's resource records are cut short".into()))?;
+        let cond_at = expected_size;
+        let cond_len = fluxor_abi::wire::fmod::validate_conditions(
+            records,
+            if has_conditions {
+                data.get(cond_at..)
             } else {
-                0
-            };
+                None
+            },
+        )
+        .map_err(|e| {
+            Error::Module(format!(
+                "the manifest's claims or conditions block are malformed: {e:?}"
+            ))
+        })?;
+        let expected_size = expected_size + cond_len;
+        let conditions = read_conditions(data.get(cond_at..cond_at + cond_len).unwrap_or(&[]));
 
         // EXACT size, not a lower bound: the serializer emits exact sizes,
         // so slack is at best corruption and at worst a substitution attack
@@ -3988,9 +4558,10 @@ impl Manifest {
                 // The binary manifest does not carry the selector.
                 selector: ClaimSelector::Default,
                 active_when_params: Vec::new(),
-                optional: false,
+                optional: data[offset + 3] == fluxor_abi::wire::fmod::claim::OPTIONAL,
                 variants: Vec::new(),
                 when: Vec::new(),
+                claim: data[offset + 3],
             });
             offset += 4;
         }
@@ -4040,6 +4611,12 @@ impl Manifest {
             data[offset + 3],
         ]);
         offset += 4;
+        let lanes = (data[offset] != 0).then(|| LanesDecl {
+            param: String::new(),
+            tag: data[offset],
+            default: data[offset + 1],
+        });
+        offset += fluxor_abi::wire::fmod::LANES_BLOCK_SIZE;
         let provider_contracts = (0..provides_count)
             .map(|i| u16::from_le_bytes([data[offset + 2 * i], data[offset + 2 * i + 1]]))
             .collect();
@@ -4079,11 +4656,17 @@ impl Manifest {
             // Resolved at pack time: an artifact carries the grant set its
             // build holds, never the declaration it came from.
             scoped_grants: Vec::new(),
+            conditions,
             hardware_targets,
             state_bytes_64,
             stack_bytes_64,
             arena_bytes,
             provider_contracts,
+            lanes,
+            workload_scope: flags & fluxor_abi::wire::fmod::FLAG_WORKLOAD_SCOPE != 0,
+            workload_instantiable: data[MANIFEST_PROVIDES_AT]
+                & fluxor_abi::wire::fmod::PROVIDES_WORKLOAD_INSTANTIABLE
+                != 0,
             facts: ModuleFacts::default(), // header flag bits, not manifest bytes
             ports,
             resources,
@@ -4100,6 +4683,7 @@ impl Manifest {
             capabilities: Vec::new(), // not serialized in binary format
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
+            host_provider: None,
             variants: Vec::new(), // toml-only, not serialized
             selected_variant: None,
             capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
@@ -4306,7 +4890,7 @@ struct TomlManifest {
     state_bytes_64: Option<u32>,
     ports: Option<Vec<TomlPort>>,
     resources: Option<Vec<TomlResource>>,
-    /// Top-level `grants = ["key_vault", "timer.discipline", …]`: what the
+    /// Top-level `grants = ["monitor", "timer.discipline", …]`: what the
     /// module may call beyond the contracts its `[[resources]]` claim.
     grants: Option<Vec<GrantEntry>>,
     dependencies: Option<Vec<TomlDependency>>,
@@ -4314,6 +4898,12 @@ struct TomlManifest {
     provides: Option<Vec<String>>,
     /// Registry contracts the module serves through `module_provider_dispatch`.
     provider_contracts: Option<Vec<String>>,
+    /// Whom those providers serve: `"owner"` (default) or `"workloads"`.
+    provider_scope: Option<String>,
+    /// The node vouches for the module serving inside a workload.
+    workload_instantiable: Option<bool>,
+    /// `[lanes]`: the workload lanes the module serves.
+    lanes: Option<TomlLanes>,
     /// Header facts (`ModuleFacts`).
     mailbox_safe: Option<bool>,
     in_place_writer: Option<bool>,
@@ -4327,6 +4917,8 @@ struct TomlManifest {
     observability: Option<TomlObservability>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
+    /// `[host_provider]`: served by a host provider process.
+    host_provider: Option<HostProvider>,
     /// `[[variant]]` feature-set variants.
     variant: Option<Vec<TomlVariant>>,
     /// `[capacities]` table — module-scope capacity declarations, each a
@@ -4559,7 +5151,12 @@ struct TomlRequiresWhen {
     capability: String,
     /// `when = { param = "value", other = ["a", "b"] }` — every parameter
     /// must match one of its listed values.
+    #[serde(default)]
     when: std::collections::BTreeMap<String, TomlWhenValues>,
+    /// `active_when_params = ["roots"]` — one of these params is set
+    /// non-empty.
+    #[serde(default)]
+    active_when_params: Option<Vec<String>>,
     /// `fact = { clock = "core" }` — the values of the capability's facts
     /// the module can work with; see [`RequiresWhen::facts`].
     #[serde(default)]
@@ -4598,6 +5195,10 @@ pub struct RequiresWhen {
     /// `(param, admitted values)`, ordered by parameter name — a TOML
     /// inline table has no declaration order worth preserving.
     pub when: Vec<(String, Vec<String>)>,
+    /// Params one of which the instance sets non-empty
+    /// (`active_when_params`); empty, no such condition. With `when`, both
+    /// hold.
+    pub active_when_params: Vec<String>,
     /// `(fact, accepted values)` of the capability, ordered by fact name:
     /// the target must provide the capability with each fact at one of the
     /// values (`counter.cycles` with `clock = "core"`). Empty when the
@@ -4750,8 +5351,10 @@ struct TomlParam {
     /// Required for `type = "enum"`: list of legal value names. Each maps
     /// to its index (0..len-1) on the wire.
     values: Option<Vec<String>>,
-    /// Optional inclusive `[min, max]` for numeric types.
+    /// Inclusive `[min, max]` of a numeric param's value.
     range: Option<[u32; 2]>,
+    /// Inclusive upper bound: a numeric param's value, a `str`'s bytes.
+    max: Option<u32>,
     /// `required = true` makes YAML omission a build error. Implies no
     /// safe default exists for this param — falling back would
     /// silently misconfigure the graph.
@@ -4862,6 +5465,9 @@ struct ResolvedCapacities {
     demand_rule: Vec<DemandFromParams>,
     heap_demand_rule: Option<HeapPerDemand>,
     heap_param_rule: Option<HeapPerParam>,
+    /// `[variant.capacities] heap_per_param = { base = N }`: the variant's
+    /// own base for the module-scope per-param rule.
+    heap_param_base: Option<u32>,
 }
 
 /// One `demand_from_params` table, checked: a pool a module declares demand
@@ -4921,9 +5527,23 @@ fn resolve_capacities(
         let field = format!("{scope}.{name}");
         if name == HEAP_PER_PARAM_KEY {
             if scope != "capacities" {
-                return Err(Error::Module(format!(
-                    "{field}: `{name}` is a module-scope rule; a variant cannot change it"
-                )));
+                // A variant changes the rule's `base` alone: its feature set
+                // moves the fixed part of its heap (a workspace one build
+                // carries and another does not), never what a counted param
+                // costs.
+                let TomlCapacity::HeapRule(TomlHeapFromParams {
+                    tags: None,
+                    base: Some(base),
+                    included: None,
+                }) = value
+                else {
+                    return Err(Error::Module(format!(
+                        "{field}: a variant changes `{name}`'s `base` alone — \
+                         `{name} = {{ base = ... }}`; the counted params are module scope"
+                    )));
+                };
+                out.heap_param_base = Some(base.resolve(abi, &format!("{field}.base"))?);
+                continue;
             }
             let TomlCapacity::HeapParamRule(r) = value else {
                 return Err(Error::Module(format!(
@@ -5539,8 +6159,11 @@ mod tests {
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
-        // Head, one port record, then the stack and arena blocks.
-        assert_eq!(pb.len(), MANIFEST_HEADER_SIZE + 4 + 2 + 4);
+        // Head, one port record, then the stack, arena and lanes blocks.
+        assert_eq!(
+            pb.len(),
+            MANIFEST_HEADER_SIZE + 4 + 2 + 4 + fluxor_abi::wire::fmod::LANES_BLOCK_SIZE
+        );
         assert!(Manifest::from_bytes(&pb).is_ok());
     }
 
@@ -5631,8 +6254,12 @@ mod tests {
     fn empty_manifest_roundtrip() {
         let m = Manifest::default();
         let bytes = m.to_bytes();
-        // The head, then the stack and arena blocks every manifest carries.
-        assert_eq!(bytes.len(), MANIFEST_HEADER_SIZE + 2 + 4);
+        // The head, then the stack, arena and lanes blocks every manifest
+        // carries.
+        assert_eq!(
+            bytes.len(),
+            MANIFEST_HEADER_SIZE + 2 + 4 + fluxor_abi::wire::fmod::LANES_BLOCK_SIZE
+        );
         let m2 = Manifest::from_bytes(&bytes).unwrap();
         assert_eq!(m2.module_version, m.module_version);
         assert!(m2.ports.is_empty());
@@ -5677,6 +6304,7 @@ mod tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         });
         m.dependencies.push(Dependency {
             name_hash: 0x12345678,
@@ -5710,6 +6338,7 @@ mod tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         }); // GPIO
         m.resources.push(ResourceClaim {
             device_class: fluxor_abi::registry::pio::ID as u8,
@@ -5720,6 +6349,7 @@ mod tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         }); // PIO
         m.resources.push(ResourceClaim {
             device_class: 0x3F,
@@ -5730,6 +6360,7 @@ mod tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         }); // highest representable position
         m.grants = [
             1u64 << fluxor_abi::registry::key_vault::ID,
@@ -5748,6 +6379,132 @@ mod tests {
         // The packed head carries the same set, and reads back as it.
         let back = Manifest::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(back.grants, m.grant_set().unwrap());
+    }
+
+    /// `provider_scope = "workloads"` packs as the manifest flag the kernel
+    /// reads, only on a module providing a contract a workload layer may
+    /// serve; `"owner"` (the default) packs nothing.
+    #[test]
+    fn workload_instantiable_packs_beside_the_provider_count_and_refuses_grants_and_hardware() {
+        use fluxor_abi::wire::fmod::{
+            provides_count, MANIFEST_PROVIDES_AT, PROVIDES_WORKLOAD_INSTANTIABLE,
+        };
+        let base = "version = \"1.0.0\"\nprovides = [\"storage.object\", \"storage.namespace\"]\n\
+                    provider_contracts = [\"storage.object\", \"storage.namespace\"]\n";
+        let vouched = Manifest::from_toml_str_for_target(
+            &format!("{base}workload_instantiable = true\n"),
+            None,
+        )
+        .expect("a workload_instantiable provider");
+        assert!(vouched.workload_instantiable);
+        let bytes = vouched.to_bytes();
+        let byte = bytes[MANIFEST_PROVIDES_AT];
+        assert_ne!(byte & PROVIDES_WORKLOAD_INSTANTIABLE, 0);
+        assert_eq!(
+            provides_count(byte),
+            2,
+            "the count is unchanged beside the fact"
+        );
+        let back = Manifest::from_bytes(&bytes).unwrap();
+        assert!(back.workload_instantiable);
+        assert_eq!(back.provider_contracts, vouched.provider_contracts);
+
+        let plain = Manifest::from_toml_str_for_target(base, None).expect("a plain provider");
+        assert!(!plain.workload_instantiable);
+        assert_eq!(plain.to_bytes()[MANIFEST_PROVIDES_AT], 2);
+
+        for (toml, want) in [
+            ("grants = [\"lend.borrow\"]\n", "with grants"),
+            (
+                "grants = [{ name = \"seal_key\", when = { seal = [0] } }]\n",
+                "with grants",
+            ),
+        ] {
+            let e = Manifest::from_toml_str_for_target(
+                &format!("{base}workload_instantiable = true\n{toml}"),
+                None,
+            )
+            .expect_err("refused")
+            .to_string();
+            assert!(e.contains(want), "{toml}: {e}");
+        }
+    }
+
+    #[test]
+    fn provider_scope_packs_the_workload_flag_and_is_held_to_workload_contracts() {
+        let layer = Manifest::from_toml_str_for_target(
+            "version = \"1.0.0\"\nprovides = [\"fs\"]\nprovider_contracts = [\"fs\"]\n\
+             provider_scope = \"workloads\"\n",
+            None,
+        )
+        .expect("an fs workload layer");
+        assert!(layer.workload_scope);
+        let bytes = layer.to_bytes();
+        assert_ne!(
+            bytes[fluxor_abi::wire::fmod::MANIFEST_FLAGS_AT]
+                & fluxor_abi::wire::fmod::FLAG_WORKLOAD_SCOPE,
+            0
+        );
+        assert!(Manifest::from_bytes(&bytes).unwrap().workload_scope);
+
+        for scope in ["", "provider_scope = \"owner\"\n"] {
+            let owner = Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"1.0.0\"\nprovides = [\"fs\"]\nprovider_contracts = [\"fs\"]\n{scope}"
+                ),
+                None,
+            )
+            .expect("an owner-scoped provider");
+            assert!(!owner.workload_scope);
+            assert_eq!(
+                owner.to_bytes()[fluxor_abi::wire::fmod::MANIFEST_FLAGS_AT]
+                    & fluxor_abi::wire::fmod::FLAG_WORKLOAD_SCOPE,
+                0
+            );
+        }
+
+        for (toml, want) in [
+            ("provider_scope = \"workloads\"\n", "no provider_contracts"),
+            (
+                "provides = [\"storage.object\"]\nprovider_contracts = [\"storage.object\"]\n\
+                 provider_scope = \"workloads\"\n",
+                "not a contract a workload layer serves",
+            ),
+            (
+                "provides = [\"fs\"]\nprovider_contracts = [\"fs\"]\nprovider_scope = \"node\"\n",
+                "the scopes are",
+            ),
+        ] {
+            let e =
+                Manifest::from_toml_str_for_target(&format!("version = \"1.0.0\"\n{toml}"), None)
+                    .expect_err("refused")
+                    .to_string();
+            assert!(e.contains(want), "{toml}: {e}");
+        }
+    }
+
+    /// A contract a module provides is claimed, never granted: the bare and
+    /// the scoped grant forms are both refused, pointing at the claim.
+    #[test]
+    fn a_grant_naming_a_module_provided_contract_is_refused() {
+        for grants in [
+            "grants = [\"key_vault\"]",
+            "grants = [{ name = \"key_vault\", variants = [\"disk\"] }]",
+            "grants = [{ name = \"key_vault\", when = { aead = [1] } }]",
+        ] {
+            let toml = format!("version = \"1.0.0\"\n{grants}\n");
+            let e = Manifest::from_toml_str_for_target(&toml, None).unwrap_err();
+            let e = e.to_string();
+            assert!(
+                e.contains("requires_contract = \"key_vault\"") && e.contains("not granted"),
+                "{grants}: {e}"
+            );
+            if grants.contains("variants") {
+                assert!(e.contains("variants = [\"disk\"]"), "{e}");
+            }
+        }
+        let claim = "version = \"1.0.0\"\n[[resources]]\nrequires_contract = \"key_vault\"\naccess = \"write\"\n";
+        Manifest::from_toml_str_for_target(claim, None).expect("the claim form");
     }
 
     /// A top-level key written below a `[[resources]]` header is that
@@ -5773,6 +6530,7 @@ mod tests {
             optional: false,
             variants: Vec::new(),
             when: Vec::new(),
+            claim: fluxor_abi::wire::fmod::claim::REQUIRED,
         });
         assert!(m.grant_set().is_err());
     }
@@ -5828,7 +6586,7 @@ default = true
     /// does not need.
     const SCOPED_GRANT_MANIFEST: &str = r#"
 version = "1.0.0"
-grants = ["fs", { name = "key_vault", variants = ["disk"] }]
+grants = ["diag", { name = "counters", variants = ["disk"] }]
 
 [[ports]]
 name = "encoded"
@@ -5852,9 +6610,9 @@ default = true
 
     #[test]
     fn scoped_grants_and_claims_follow_the_selected_variant() {
-        let kv = grant_from_name("key_vault").expect("key_vault");
+        let kv = grant_from_name("counters").expect("counters");
         let trust = grant_from_name("trust").expect("trust");
-        let fs = grant_from_name("fs").expect("fs");
+        let fs = grant_from_name("diag").expect("diag");
 
         // The default variant is `disk`, which does make both calls.
         let disk = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
@@ -5862,7 +6620,7 @@ default = true
         assert_ne!(
             g[kv.0] & (1u64 << kv.1),
             0,
-            "disk seals, so it holds key_vault"
+            "disk seals, so it holds counters"
         );
         assert_ne!(g[trust.0] & (1u64 << trust.1), 0, "disk claims trust");
         assert_ne!(
@@ -5878,7 +6636,7 @@ default = true
         assert_eq!(
             g[kv.0] & (1u64 << kv.1),
             0,
-            "the volatile build never seals, so it must not hold key_vault"
+            "the volatile build never seals, so it must not hold counters"
         );
         assert_eq!(
             g[trust.0] & (1u64 << trust.1),
@@ -5898,7 +6656,7 @@ default = true
     /// artifact disagree with its own manifest in exactly that field.
     #[test]
     fn packed_grants_are_the_manifests_resolved_set_per_variant() {
-        let kv = grant_from_name("key_vault").expect("key_vault");
+        let kv = grant_from_name("counters").expect("counters");
         let trust = grant_from_name("trust").expect("trust");
 
         let disk = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
@@ -5921,7 +6679,7 @@ default = true
         assert_eq!(
             packed.grants[kv.0] & (1u64 << kv.1),
             0,
-            "the volatile artifact must not carry key_vault"
+            "the volatile artifact must not carry counters"
         );
         assert_eq!(
             packed.grants[trust.0] & (1u64 << trust.1),
@@ -5954,102 +6712,149 @@ default = true
         }
     }
 
-    /// A `when` condition reaches the artifact as the kernel reads it: the
+    /// One param of [`schema_of`]: `(tag, type, default, name, enums)`.
+    type SchemaParamSpec<'a> = (u8, u8, u32, &'a str, &'a [(&'a str, u8)]);
+
+    /// A schema of params (`fluxor_abi::wire::param_schema`), each bounded
+    /// by its type's ceiling.
+    fn schema_of(params: &[SchemaParamSpec<'_>]) -> Vec<u8> {
+        use fluxor_abi::wire::param_schema::{encode_into, encoded_len, type_ceiling, Entry};
+        let entries: Vec<Entry<'_>> = params
+            .iter()
+            .map(|&(tag, ptype, default, name, enums)| Entry {
+                tag,
+                ptype,
+                default,
+                min: 0,
+                max: type_ceiling(ptype),
+                name,
+                enums,
+            })
+            .collect();
+        let mut b = vec![0u8; encoded_len(&entries)];
+        encode_into(&entries, &mut b);
+        b
+    }
+
+    /// A params TLV of `(tag, value)` basic entries, then `ext` extended
+    /// `(tag, value)` entries past the terminator.
+    fn tlv(basic: &[(u8, &[u8])], ext: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut v = vec![0xFE, 0x01, 0, 0];
+        for (t, b) in basic {
+            v.extend_from_slice(&[*t, b.len() as u8]);
+            v.extend_from_slice(b);
+        }
+        v.extend_from_slice(&[0xFF, 0x00]);
+        for (t, b) in ext {
+            v.extend_from_slice(&[*t, 0, (b.len() >> 8) as u8, b.len() as u8]);
+            v.extend_from_slice(b);
+        }
+        v
+    }
+
+    /// The packed manifest's resource records and conditions block, as the
+    /// kernel loader reads and checks them.
+    fn packed_claims(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use fluxor_abi::wire::fmod::{
+            validate_conditions, ManifestLayout, FLAG_CONDITIONS, MANIFEST_FLAGS_AT,
+            MANIFEST_HEADER_SIZE,
+        };
+        let at = MANIFEST_HEADER_SIZE + bytes[5] as usize * 4;
+        let records = bytes[at..at + bytes[6] as usize * 4].to_vec();
+        let block = if bytes[MANIFEST_FLAGS_AT] & FLAG_CONDITIONS != 0 {
+            let from = ManifestLayout::read(bytes).expect("layout").conditions;
+            let n = validate_conditions(&records, Some(&bytes[from..])).expect("valid block");
+            bytes[from..from + n].to_vec()
+        } else {
+            validate_conditions(&records, None).expect("valid records");
+            Vec::new()
+        };
+        (records, block)
+    }
+
+    /// Whether each packed record is required for `params`, by the
+    /// kernel's evaluator over the packed bytes.
+    fn required(bytes: &[u8], params: &[u8]) -> Vec<bool> {
+        let (records, block) = packed_claims(bytes);
+        records
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(i, r)| fluxor_abi::wire::fmod::claim_required(r, i as u8, &block, params))
+            .collect()
+    }
+
+    fn packed(src: &str, schema: &[u8]) -> Vec<u8> {
+        let mut m = parse_toml(src).expect("parse");
+        m.resolve_conditions(schema).expect("resolve");
+        m.abi_surface = Some([7u8; 32]);
+        m.to_bytes()
+    }
+
+    /// A grant's `when` reaches the artifact as the kernel reads it: the
     /// parameter's tag, its values, and whether the schema default satisfies
     /// it. The kernel has no schema and no names, so if this resolution is
     /// wrong or missing the grant is simply never admitted.
     #[test]
     fn a_grant_condition_is_resolved_against_the_schema_and_packed() {
-        use fluxor_abi::wire::fmod::{
-            for_each_cond_grant, ManifestLayout, COND_GRANT_WHEN_UNSET, FLAG_COND_GRANTS,
-        };
+        use fluxor_abi::wire::fmod::{cond, grant_holds};
         let src = r#"
 version = "1.0.0"
-grants = [{ name = "key_vault", when = { aead = [1, 2] } }]
-
-[[ports]]
-name = "encoded"
-direction = "input"
-content_type = "OctetStream"
+grants = [{ name = "counters", when = { aead = [1, 2] } }]
 "#;
-        // schema: magic 'SP', one param `aead`, type 1, default 0, tag 7
-        let mut schema = vec![0x53, 0x50, 0x00, 1];
-        schema.extend_from_slice(&[7, 1, 0, 0, 0, 0]);
-        schema.push(4);
-        schema.extend_from_slice(b"aead");
-
-        let mut m = parse_toml(src).expect("parse");
-        m.resolve_grant_conditions(&schema).expect("resolve");
-        let r = m.scoped_grants[0].resolved.as_ref().expect("resolved");
-        assert_eq!(r.tag, 7, "the parameter's name became its tag");
-        assert_eq!(r.values, vec![1, 2]);
+        let (word, bit) = grant_from_name("counters").expect("counters");
+        let schema = schema_of(&[(7, 1, 0, "aead", &[])]);
+        let bytes = packed(src, &schema);
+        let back = Manifest::from_bytes(&bytes).expect("round trip");
+        assert_eq!(
+            back.conditions,
+            vec![CondEntry {
+                subject: if word == 0 {
+                    cond::SUBJECT_CONTRACT_GRANT
+                } else {
+                    cond::SUBJECT_OP_GRANT
+                },
+                index: bit,
+                param: 7,
+                group: 0,
+                flags: 0,
+                values: CondValues::Int(vec![1, 2]),
+            }]
+        );
+        let (_, block) = packed_claims(&bytes);
+        let holds = |p: &[u8]| grant_holds(&block, word as u8, bit, p);
+        assert!(holds(&tlv(&[(7, &[1, 0])], &[])), "aead = 1 seals");
+        assert!(holds(&tlv(&[(7, &[2, 0])], &[])), "aead = 2 seals");
+        assert!(!holds(&tlv(&[(7, &[0, 0])], &[])), "aead = 0 does not");
         assert!(
-            !r.when_unset,
-            "the default is 0, which is not a sealing suite, so an instance              that sets nothing does not need the vault"
+            !holds(&tlv(&[], &[])),
+            "nor does an instance that sets none"
         );
 
-        let bytes = m.to_bytes();
-        let flags = bytes[12];
-        assert_ne!(flags & FLAG_COND_GRANTS, 0, "the block is flagged");
-        let layout = ManifestLayout::read(&bytes).expect("layout");
-        let mut seen = Vec::new();
-        for_each_cond_grant(&bytes[layout.cond_grants..], |g| {
-            seen.push((g.word, g.bit, g.param_id, g.flags));
-            let block = &bytes[layout.cond_grants..];
-            assert!(g.needed(block, Some(1)), "aead = 1 seals");
-            assert!(g.needed(block, Some(2)), "aead = 2 seals");
-            assert!(!g.needed(block, Some(0)), "aead = 0 does not");
-            assert!(
-                !g.needed(block, None),
-                "nor does an instance that sets none"
-            );
-        });
-        let kv = grant_from_name("key_vault").expect("key_vault");
-        assert_eq!(seen, vec![(kv.0 as u8, kv.1, 7u16, 0u8)]);
-
-        // A default that DOES satisfy the condition sets the unset flag, so
-        // an instance configuring nothing still needs the grant.
-        let mut schema2 = vec![0x53, 0x50, 0x00, 1];
-        schema2.extend_from_slice(&[7, 1, 1, 0, 0, 0]);
-        schema2.push(4);
-        schema2.extend_from_slice(b"aead");
-        let mut m2 = parse_toml(src).expect("parse");
-        m2.resolve_grant_conditions(&schema2).expect("resolve");
-        let b2 = m2.to_bytes();
-        let l2 = ManifestLayout::read(&b2).expect("layout");
-        for_each_cond_grant(&b2[l2.cond_grants..], |g| {
-            assert_ne!(g.flags & COND_GRANT_WHEN_UNSET, 0);
-            assert!(g.needed(&b2[l2.cond_grants..], None));
-        });
+        // A default that satisfies the condition: an instance configuring
+        // nothing still needs the grant.
+        let bytes = packed(src, &schema_of(&[(7, 1, 1, "aead", &[])]));
+        let (_, block) = packed_claims(&bytes);
+        assert!(grant_holds(&block, word as u8, bit, &tlv(&[], &[])));
     }
 
     /// The manifest's size is checked exactly, to refuse anything appended
     /// past the canonical offset. A variable-length block keeps that only if
-    /// its length comes from its own bytes — so a conditional-grant manifest
-    /// must round-trip, and one byte more must not.
+    /// its length comes from its own bytes, so a manifest with conditions
+    /// round-trips, signs, and one byte more is refused.
     #[test]
-    fn a_conditional_grant_manifest_is_exactly_its_size() {
+    fn a_conditions_manifest_is_exactly_its_size() {
         let src = r#"
 version = "1.0.0"
-grants = [{ name = "key_vault", when = { aead = [1, 2] } }]
-
-[[ports]]
-name = "encoded"
-direction = "input"
-content_type = "OctetStream"
+grants = [{ name = "counters", when = { aead = [1, 2] } }]
 "#;
-        let mut schema = vec![0x53, 0x50, 0x00, 1];
-        schema.extend_from_slice(&[3, 1, 0, 0, 0, 0]);
-        schema.push(4);
-        schema.extend_from_slice(b"aead");
-        let mut m = parse_toml(src).expect("parse");
-        m.resolve_grant_conditions(&schema).expect("resolve");
-        m.abi_surface = Some([7u8; 32]);
-        let bytes = m.to_bytes();
-
-        let back = Manifest::from_bytes(&bytes).expect("a conditional manifest round-trips");
-        assert_eq!(back.grants, m.grant_set().expect("grant_set"));
-
+        let bytes = packed(src, &schema_of(&[(3, 1, 0, "aead", &[])]));
+        let back = Manifest::from_bytes(&bytes).expect("round-trips");
+        assert_eq!(back.to_bytes(), bytes);
+        let image = vec![0u8; fluxor_abi::wire::fmod::MODULE_HEADER_SIZE];
+        assert!(
+            fluxor_abi::wire::fmod::signing_envelope(&image, &bytes, |_| {}).is_ok(),
+            "the signing envelope covers the block"
+        );
         let mut slack = bytes.clone();
         slack.push(0);
         assert!(
@@ -6062,24 +6867,235 @@ content_type = "OctetStream"
     fn a_grant_condition_on_an_unknown_parameter_is_refused() {
         let src = r#"
 version = "1.0.0"
-grants = [{ name = "key_vault", when = { aeed = [1] } }]
-
-[[ports]]
-name = "encoded"
-direction = "input"
-content_type = "OctetStream"
+grants = [{ name = "counters", when = { aeed = [1] } }]
 "#;
-        let mut schema = vec![0x53, 0x50, 0x00, 1];
-        schema.extend_from_slice(&[7, 1, 0, 0, 0, 0]);
-        schema.push(4);
-        schema.extend_from_slice(b"aead");
         let mut m = parse_toml(src).expect("parse");
         let err = m
-            .resolve_grant_conditions(&schema)
+            .resolve_conditions(&schema_of(&[(7, 1, 0, "aead", &[])]))
             .expect_err("must refuse");
         let msg = format!("{err}");
         assert!(msg.contains("aeed"), "names the bad parameter: {msg}");
         assert!(msg.contains("aead"), "and what is declared: {msg}");
+    }
+
+    /// Every claim kind and entry kind packs and reads back: `REQUIRED`,
+    /// `OPTIONAL`, and `CONDITIONAL` on an integer `when` (`INT_IN`), a
+    /// string `when` (`STR_IN`), and `active_when_params` (`SET`, one group
+    /// each, an embedded credential's extended tag among them).
+    #[test]
+    fn every_claim_kind_round_trips() {
+        use fluxor_abi::wire::fmod::{claim, cond};
+        let src = r#"
+version = "1.0.0"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[[resources]]
+requires_contract = "trust"
+access = "read"
+optional = true
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { custody = ["token"] }
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+when = { label = ["x", "y"] }
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["cert_file", "label"]
+"#;
+        let schema = schema_of(&[
+            (3, 0, 0, "custody", &[("software", 0), ("token", 1)]),
+            (6, 3, 0, "cert_file", &[]),
+            (5, 3, 0, "label", &[]),
+        ]);
+        let bytes = packed(src, &schema);
+        let back = Manifest::from_bytes(&bytes).expect("round trip");
+        let claims: Vec<u8> = back.resources.iter().map(|r| r.claim).collect();
+        assert_eq!(
+            claims,
+            vec![
+                claim::REQUIRED,
+                claim::OPTIONAL,
+                claim::CONDITIONAL,
+                claim::CONDITIONAL,
+                claim::CONDITIONAL
+            ]
+        );
+        let entry = |index, param, group, flags, values| CondEntry {
+            subject: cond::SUBJECT_CLAIM,
+            index,
+            param,
+            group,
+            flags,
+            values,
+        };
+        assert_eq!(
+            back.conditions,
+            vec![
+                entry(2, 3, 0, 0, CondValues::Int(vec![1])),
+                entry(
+                    3,
+                    5,
+                    0,
+                    0,
+                    CondValues::Str(vec![b"x".to_vec(), b"y".to_vec()])
+                ),
+                entry(4, 6, 0, 0, CondValues::Set),
+                entry(
+                    4,
+                    crate::trust_anchors::TAG_CERT,
+                    1,
+                    cond::EXTENDED,
+                    CondValues::Set
+                ),
+                entry(4, 5, 2, 0, CondValues::Set),
+            ]
+        );
+        assert_eq!(back.to_bytes(), bytes, "the packed form reads back whole");
+    }
+
+    /// Claims decide "must be served" by the kernel's evaluator over the
+    /// packed bytes: `custody` unset leaves the vault's `key_custody` claim
+    /// unexercised and `token` exercises it; an optional claim never is; a
+    /// `fs` claim is exercised by a path, never by an embedded credential,
+    /// which still exercises the vault.
+    #[test]
+    fn claims_are_required_as_their_params_exercise_them() {
+        let src = r#"
+version = "1.0.0"
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { custody = ["token"] }
+
+[[resources]]
+requires_contract = "trust"
+access = "read"
+optional = true
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
+active_when_params = ["cert_file"]
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["cert_file"]
+"#;
+        let schema = schema_of(&[
+            (3, 0, 0, "custody", &[("software", 0), ("token", 1)]),
+            (6, 3, 0, "cert_file", &[]),
+        ]);
+        let bytes = packed(src, &schema);
+        assert_eq!(
+            required(&bytes, &tlv(&[], &[])),
+            vec![false, false, false, false]
+        );
+        assert_eq!(
+            required(&bytes, &tlv(&[(3, &[1])], &[])),
+            vec![true, false, false, false],
+            "custody: token"
+        );
+        assert_eq!(
+            required(&bytes, &tlv(&[(6, b"/etc/c.der")], &[])),
+            vec![false, false, true, true],
+            "a path is read through fs and its key taken by the vault"
+        );
+        assert_eq!(
+            required(
+                &bytes,
+                &tlv(&[], &[(crate::trust_anchors::TAG_CERT, b"der")])
+            ),
+            vec![false, false, false, true],
+            "an embedded credential is never read through fs"
+        );
+    }
+
+    /// Two `when` claims on one contract: the contract is required when
+    /// either holds, each record answering for itself.
+    #[test]
+    fn two_when_claims_require_their_contract_on_either() {
+        let src = r#"
+version = "1.0.0"
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { custody = ["token"] }
+
+[[resources]]
+requires_contract = "key_custody"
+access = "write"
+when = { mode = ["1"] }
+"#;
+        let schema = schema_of(&[
+            (3, 0, 0, "custody", &[("software", 0), ("token", 1)]),
+            (6, 0, 0, "mode", &[]),
+        ]);
+        let bytes = packed(src, &schema);
+        let any = |p: &[u8]| required(&bytes, p).into_iter().any(|r| r);
+        assert!(!any(&tlv(&[], &[])));
+        assert!(any(&tlv(&[(3, &[1])], &[])), "custody: token");
+        assert!(any(&tlv(&[(6, &[1])], &[])), "mode: 1");
+    }
+
+    /// A contract a module may provide is granted only through claims, so a
+    /// grant condition on one is refused, as is a string `when` on a param
+    /// whose value spans entries.
+    #[test]
+    fn conditions_the_kernel_could_not_read_are_refused() {
+        let grant = r#"
+version = "1.0.0"
+grants = [{ name = "counters", when = { mode = [1] } }]
+"#;
+        let mut m = parse_toml(grant).expect("parse");
+        m.scoped_grants[0].word = 0;
+        m.scoped_grants[0].bit = fluxor_abi::registry::key_vault::ID as u8;
+        let e = m
+            .resolve_conditions(&schema_of(&[(6, 0, 0, "mode", &[])]))
+            .expect_err("a claimable contract's grant condition");
+        assert!(format!("{e}").contains("condition the claim"), "{e}");
+
+        let chunked = r#"
+version = "1.0.0"
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+when = { label = ["x"] }
+"#;
+        let mut m = parse_toml(chunked).expect("parse");
+        let e = m
+            .resolve_conditions(&schema_of(&[(5, 6, 0, "label", &[])]))
+            .expect_err("STR_IN on a chunked param");
+        assert!(format!("{e}").contains("StrChunked"), "{e}");
+    }
+
+    #[test]
+    fn a_claim_condition_on_an_undeclared_param_or_value_is_refused() {
+        let claim = |when: &str| {
+            format!(
+                "version = \"1.0.0\"\n[[resources]]\nrequires_contract = \"key_custody\"\naccess = \"write\"\nwhen = {when}\n"
+            )
+        };
+        let schema = schema_of(&[(3, 0, 0, "custody", &[("software", 0), ("token", 1)])]);
+        let mut m = parse_toml(&claim("{ custdy = [\"token\"] }")).expect("parse");
+        let e = m.resolve_conditions(&schema).unwrap_err().to_string();
+        assert!(e.contains("custdy"), "{e}");
+        let mut m = parse_toml(&claim("{ custody = [\"tokn\"] }")).expect("parse");
+        let e = m.resolve_conditions(&schema).unwrap_err().to_string();
+        assert!(e.contains("tokn"), "{e}");
     }
 
     #[test]
@@ -6364,6 +7380,55 @@ scratch = 512
         );
     }
 
+    /// A variant states its own `base` for the module-scope
+    /// `heap_per_param` rule (a workspace only its feature set carries);
+    /// the counted params stay module scope, and a variant cannot restate
+    /// them.
+    #[test]
+    fn a_variant_changes_the_heap_per_param_base_alone() {
+        const TOML: &str = r#"
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+[[variant]]
+name = "small"
+features = []
+default = true
+
+[[variant]]
+name = "big"
+features = ["big"]
+[variant.capacities]
+heap_per_param = { base = { default = 70000, aarch64 = 80000 } }
+
+[capacities]
+heap_per_param = { base = 512, params = [{ tag = 1, default = 8, bytes_each = 100 }] }
+"#;
+        let m = Manifest::from_toml_str_for_target(TOML, Some("aarch64")).expect("parses");
+        assert_eq!(m.heap_per_param.as_ref().and_then(|r| r.base), Some(512));
+        let mut big = m.clone();
+        big.apply_variant("big").expect("big");
+        let rule = big.heap_per_param.as_ref().expect("rule");
+        assert_eq!(rule.base, Some(80000));
+        assert_eq!(rule.params, m.heap_per_param.as_ref().unwrap().params);
+        let mut small = m.clone();
+        small.apply_variant("small").expect("small");
+        assert_eq!(small.heap_per_param, m.heap_per_param);
+
+        let restated = TOML.replace(
+            "heap_per_param = { base = { default = 70000, aarch64 = 80000 } }",
+            "heap_per_param = { base = 1, params = [{ tag = 1, default = 8, bytes_each = 1 }] }",
+        );
+        let e = Manifest::from_toml_str_for_target(&restated, Some("aarch64")).unwrap_err();
+        assert!(e.to_string().contains("`base` alone"), "{e}");
+        let no_rule = TOML.replace(
+            "heap_per_param = { base = 512, params = [{ tag = 1, default = 8, bytes_each = 100 }] }",
+            "",
+        );
+        let e = Manifest::from_toml_str_for_target(&no_rule, Some("aarch64")).unwrap_err();
+        assert!(e.to_string().contains("no heap_per_param rule"), "{e}");
+    }
+
     /// `[capacities] heap_from_params` resolves per ABI like any capacity,
     /// and a variant's `[variant.capacities]` changes only the fields it
     /// names.
@@ -6629,6 +7694,14 @@ store_subscriptions = 1
     const RELEASED_LAYOUT: &[(&str, &str, &str, u8)] = &[
         ("host_asset_index", "paths", "str", 10),
         ("host_asset_source", "path", "str", 10),
+        ("host_lane", "runtime", "str", 10),
+        ("host_lane", "runtime_digest", "str", 17),
+        ("host_lane", "channels", "str", 11),
+        ("host_lane", "args", "str", 12),
+        ("host_lane", "overload", "enum", 13),
+        ("host_lane", "serves", "str", 14),
+        ("host_lane", "lane_target", "str", 15),
+        ("host_lane", "lanes", "u8", 16),
         ("host_image_codec", "width", "u32", 10),
         ("host_image_codec", "height", "u32", 11),
         ("host_image_codec", "scale_mode", "enum", 12),
@@ -6656,6 +7729,7 @@ store_subscriptions = 1
         ("linux_net", "max_conns", "u32", 10),
         ("linux_net", "write_buf_kib", "u32", 11),
         ("linux_net", "listen_backlog", "u32", 12),
+        ("linux_net", "lanes", "u8", 13),
         ("linux_pointer", "path", "str", 10),
         ("linux_pointer", "width", "u32", 11),
         ("linux_pointer", "height", "u32", 12),

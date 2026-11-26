@@ -441,6 +441,10 @@ pub static CORE_TICKS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MA
 /// announced is picked up by running the next pass at once.
 pub static CORE_INTERRUPTS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
 
+/// Per-core: the deadline timer fired since the gated entry on this core
+/// began (`isolation::el0::call` clears it, the lower-EL IRQ path reads it).
+pub static DEADLINE_FIRED: [AtomicBool; MAX_CORES] = [const { AtomicBool::new(false) }; MAX_CORES];
+
 /// Per-core last interrupted PC (ELR_EL1), latched by the timer IRQ. When a
 /// core's scheduler loop hangs but timer IRQs still fire, this is the PC of
 /// the spinning code — map it with `rust-objdump -d` on the firmware ELF.
@@ -488,6 +492,17 @@ pub unsafe extern "C" fn irq_handler() {
     // same tick a second time. Everything else is ended here. EOI always takes
     // the whole IAR value: for an SGI it carries the source CPU.
     let timer_tick = irq_id == gic::timer_ppi();
+    // The deadline timer: a gated entry on this core reached its deadline.
+    // Disarmed before its EOI (its line is level-triggered); the lower-EL
+    // IRQ path that follows forces the entry out.
+    if irq_id != 0 && irq_id == gic::deadline_ppi() {
+        crate::arch::aarch64::timer::deadline_disarm();
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+        gic::end_of_interrupt(iar);
+        DEADLINE_FIRED[(current_core_id() as usize).min(MAX_CORES - 1)]
+            .store(true, Ordering::Release);
+        return;
+    }
     if !timer_tick {
         gic::end_of_interrupt(iar);
     }

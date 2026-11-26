@@ -16,12 +16,10 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-// Fault type codes (must match src/kernel/exec/step_guard.rs::fault_type).
-const FAULT_NONE: u8 = 0;
-const FAULT_TIMEOUT: u8 = 1;
-const FAULT_STEP_ERROR: u8 = 2;
-const FAULT_MPU: u8 = 4;
-const FAULT_DRAIN_TIMEOUT: u8 = 5;
+// Fault type codes: the ABI's, which the kernel's step guard uses.
+use fluxor_abi::contracts::workload::owners::{
+    FAULT_DRAIN_TIMEOUT, FAULT_MPU, FAULT_NONE, FAULT_STEP_ERROR, FAULT_TIMEOUT,
+};
 
 fn fault_kind_str(k: u8) -> &'static str {
     match k {

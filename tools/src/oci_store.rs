@@ -1179,12 +1179,27 @@ pub struct WorkloadEnvBinding {
     pub required: bool,
 }
 
+/// One endpoint a workload image listens on, as `workload-image.json`
+/// lists it under `endpoints` and the image's config blob carries it. The
+/// image asks for it; its creator grants it (`CREATE`'s `net`/`endpoint`
+/// option) or the workload is refused that listen.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadEndpoint {
+    /// `tcp` or `udp`.
+    pub protocol: String,
+    /// 1..=65535.
+    pub port: u16,
+}
+
 /// A workload image's config blob ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadImageConfig {
     /// Every env binding, in the order the image lists them.
     #[serde(default)]
     pub env: Vec<WorkloadEnvBinding>,
+    /// Every endpoint the image listens on, in the order it lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<WorkloadEndpoint>,
 }
 
 impl WorkloadImageConfig {
@@ -1228,6 +1243,8 @@ pub struct WorkloadImagePublish<'a> {
     pub modules: &'a [WorkloadModule],
     /// The image's env bindings, carried in its config blob.
     pub env: &'a [WorkloadEnvBinding],
+    /// The endpoints it listens on, carried in its config blob.
+    pub endpoints: &'a [WorkloadEndpoint],
     pub provenance: &'a str,
     pub source_rev: Option<&'a str>,
     pub ref_name: &'a str,
@@ -1238,9 +1255,10 @@ pub struct WorkloadImagePublish<'a> {
 /// its `.fmod` bytes, which is the pin a node's kernel admits it by — so a
 /// node pins exactly what the manifest names, and a registry stores a module
 /// shared by many images once. The config is a [`WorkloadImageConfig`]
-/// ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]): the image's env bindings, so a
-/// puller learns the names a workload must give from the manifest and one blob,
-/// before it asks a node.
+/// ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]): the image's env bindings and the
+/// endpoints it listens on, so a puller learns the names a workload must
+/// give and the endpoints to grant it from the manifest and one blob, before
+/// it asks a node.
 pub fn publish_workload_image(
     store: &OciStore,
     a: &WorkloadImagePublish<'_>,
@@ -1248,6 +1266,7 @@ pub fn publish_workload_image(
     let _index_lock = store.lock_index()?;
     let config = serde_json::to_vec(&WorkloadImageConfig {
         env: a.env.to_vec(),
+        endpoints: a.endpoints.to_vec(),
     })
     .map_err(|e| Error::Config(format!("workload image config: {e}")))?;
     let (config_digest, config_size) = store.put_blob(&config)?;
@@ -3109,6 +3128,7 @@ mod tests {
                     graph: b"FLXG",
                     modules: &modules,
                     env,
+                    endpoints: &[],
                     provenance: PROVENANCE_LOCAL,
                     source_rev: None,
                     ref_name: tag,

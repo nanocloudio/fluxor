@@ -77,7 +77,7 @@ clean:
 #
 # Bootstrap ONLY — first build on an empty-store machine:
 # build the tools CLI, the linux runtime, the wasm kernel and the
-# launcher; publish the CLI, fluxor-linux and fluxor.wasm into the local OCI store with the freshly built
+# launcher; publish the CLI, fluxor-linux, the host providers and fluxor.wasm into the local OCI store with the freshly built
 # tools binary (publish auto-includes the CLI for fluxor); install the
 # resolving launcher as ~/.cargo/bin/fluxor. After this, every publish
 # supersedes the CLI in place — there is nothing to reinstall.
@@ -91,7 +91,8 @@ clean:
 # rebuild is picked up with no re-install.
 install:
 	cargo build --release -p fluxor-tools -p fluxor-launcher -p fluxor-rig-observers --target $(HOST_TRIPLE)
-	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
+	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target $(HOST_TRIPLE)
+	cargo build --release --bins -p fluxor-provider-hsm -p fluxor-provider-net --target $(HOST_TRIPLE)
 	tools/firmware.sh wasm
 	$(HOST_DIR)/fluxor publish --only runtime
 	install -D -m755 $(LAUNCHER) $(BINDIR)/fluxor

@@ -1236,8 +1236,36 @@ const CUSTODY_ATTEST_CMD_LEN: usize = sc::FLOW_HEADER_LEN + 1 + 32;
 /// signature, so only a vault that has stopped answering is given up on.
 const CUSTODY_SIGN_MS: u64 = 30_000;
 
-/// `OPEN_OR_GENERATE` a key under `label`; the handle, or -1. `pub_out`
-/// receives the public half when the suite has one.
+/// Milliseconds a command may wait for the vault to make the continuity
+/// master durable before it is refused (`TlsState::vault_held`): the
+/// medium's write, not a computation, so only a store that has stopped
+/// answering is given up on.
+const CONT_VAULT_MS: u64 = 5_000;
+
+/// The largest command held for the vault: a custody WRAP (flow header,
+/// op, challenge, evidence).
+const VAULT_HELD_MAX: usize = sc::FLOW_HEADER_LEN + 1 + 32 + sc::custody::EVIDENCE_MAX;
+
+/// A command whose flow key the vault cannot answer yet (`EAGAIN`) is held
+/// whole and handled again at the next step, the commands behind it unread.
+/// False once it has waited `CONT_VAULT_MS`: it is answered as refused.
+unsafe fn hold_for_vault(s: &mut TlsState, msg_type: u8, p: &[u8]) -> bool {
+    let now = dev_millis(&*s.syscalls).max(1);
+    if s.vault_held_since == 0 {
+        s.vault_held_since = now;
+    }
+    if p.len() > VAULT_HELD_MAX || now.wrapping_sub(s.vault_held_since) > CONT_VAULT_MS {
+        return false;
+    }
+    s.vault_held[..p.len()].copy_from_slice(p);
+    s.vault_held_len = p.len() as u16;
+    s.vault_held_type = msg_type;
+    true
+}
+
+/// `OPEN_OR_GENERATE` a key under `label`; the handle, or the vault's
+/// negative errno (`EAGAIN` while a key it just made is not yet durable).
+/// `pub_out` receives the public half when the suite has one.
 unsafe fn cont_vault_open_or_generate(
     sys: &SyscallTable,
     suite: u16,
@@ -1255,19 +1283,14 @@ unsafe fn cont_vault_open_or_generate(
     let Some(n) = kv::open::encode(&mut arg, &req) else {
         return -1;
     };
-    let rc = (sys.provider_call)(
+    (sys.provider_call)(
         -1,
         kv::OPEN_OR_GENERATE,
         arg.as_mut_ptr(),
         n,
         pub_out.as_mut_ptr(),
         pub_out.len(),
-    );
-    if rc < 0 {
-        -1
-    } else {
-        rc
-    }
+    )
 }
 
 /// `AEAD_SEAL` `pt` under `handle` with `aad` into `out` as
@@ -1370,8 +1393,8 @@ unsafe fn cont_vault_destroy(sys: &SyscallTable, handle: i32) {
 }
 
 /// The continuity master's handle, opening (or generating) it on first
-/// use. -1 when no vault answers: continuity that cannot be sealed is not
-/// offered.
+/// use; the vault's negative errno when it cannot answer: continuity that
+/// cannot be sealed is not offered, and `EAGAIN` is asked again.
 unsafe fn cont_vault_handle(s: &mut TlsState) -> i32 {
     if s.cont_vault_handle >= 0 {
         return s.cont_vault_handle;
@@ -1392,7 +1415,7 @@ unsafe fn cont_vault_handle(s: &mut TlsState) -> i32 {
 unsafe fn cont_derive_key(s: &mut TlsState, flow: &[u8; sc::FLOW_ID_BYTES], epoch: u32) -> i32 {
     let master = cont_vault_handle(s);
     if master < 0 {
-        return -1;
+        return master;
     }
     use kv::derive as d;
     let ctx_len = sc::FLOW_ID_BYTES + 4;
@@ -1506,7 +1529,8 @@ unsafe fn cont_key_put(
 }
 
 /// The sealing key of `(flow, epoch)`: one a custody transfer brought, else
-/// this vault's derivation from its master. -1 when neither is possible.
+/// this vault's derivation from its master. Negative when neither is
+/// possible: `EAGAIN` while the master is not yet durable, else -1.
 unsafe fn cont_flow_key(s: &mut TlsState, flow: &[u8; sc::FLOW_ID_BYTES], epoch: u32) -> i32 {
     if let Some(i) = cont_key_find(s, &[KEY_IMPORTED], flow, epoch) {
         s.cont_keys[i].used = true;
@@ -1520,7 +1544,7 @@ unsafe fn cont_flow_key(s: &mut TlsState, flow: &[u8; sc::FLOW_ID_BYTES], epoch:
     };
     let h = cont_derive_key(s, flow, epoch);
     if h < 0 {
-        return -1;
+        return if h == abi::errno::EAGAIN { h } else { -1 };
     }
     cont_key_put(s, i, KEY_DERIVED, flow, epoch, h);
     h
@@ -3683,6 +3707,14 @@ unsafe fn handle_cut_export(s: &mut TlsState, p: &[u8]) {
         );
         return;
     }
+    // The sealing key first: a master the vault has just made is not
+    // handed out until it is durable, and the cut waits for it.
+    let (kflow, kepoch) = (s.sessions[idx].cont.flow_id, s.sessions[idx].cont.epoch);
+    if cont_flow_key(s, &kflow, kepoch) == abi::errno::EAGAIN
+        && hold_for_vault(s, sc::CMD_SC_CUT_EXPORT, p)
+    {
+        return;
+    }
     let len = encode_checkpoint(s, idx, &flow, epoch);
     if len == 0 {
         cont_reply(s, &flow, epoch, sc::CR_CUT, sc::STATUS_NOT_READY, &[]);
@@ -5007,12 +5039,20 @@ unsafe fn handle_custody(s: &mut TlsState, p: &[u8]) {
         cu::UNWRAP => custody_unwrap(s, &flow, epoch, body),
         _ => Err((sc::STATUS_UNSUPPORTED, 0)),
     };
+    let r = match r {
+        Err(VAULT_PENDING) if hold_for_vault(s, sc::CMD_SC_CUSTODY, p) => return,
+        Err(VAULT_PENDING) => Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT)),
+        r => r,
+    };
     if let Err((status, reason)) = r {
         custody_reply(s, &flow, epoch, op, status, reason, &[]);
     }
 }
 
 type CustodyResult = Result<(), (u8, u8)>;
+
+/// A custody op waiting on the vault (`hold_for_vault`); never answered.
+const VAULT_PENDING: (u8, u8) = (sc::STATUS_NOT_READY, sc::custody::why::VAULT);
 
 /// ATTEST `[challenge:32]`: a fresh recipient under `name`, its record
 /// taken from the vault and handed to the custody identity to sign; the
@@ -5234,6 +5274,9 @@ unsafe fn custody_wrap(
     }
     let (kf, ke) = (s.sessions[idx].cont.flow_id, s.sessions[idx].cont.epoch);
     let key = cont_flow_key(s, &kf, ke);
+    if key == abi::errno::EAGAIN {
+        return Err(VAULT_PENDING);
+    }
     if key < 0 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }
@@ -5560,14 +5603,25 @@ unsafe fn continuity_step(s: &mut TlsState) -> bool {
     if custody_attest_step(s) {
         did_work = true;
     }
+    let held = s.vault_held_len as usize;
+    if held != 0 {
+        let cmd = s.vault_held;
+        s.vault_held_len = 0;
+        continuity_dispatch(s, s.vault_held_type, &cmd[..held]);
+        if s.vault_held_len == 0 {
+            s.vault_held_since = 0;
+        }
+        did_work = true;
+    }
     if s.cont_in < 0 {
         return did_work;
     }
     let sys = &*s.syscalls;
     let mut drained = 0u32;
-    // An ATTEST held behind the one being signed stops the drain: the
-    // commands after it stay unread, in order, until it is handled.
-    while drained < CONT_DRAIN_BUDGET && s.custody_held_len == 0 {
+    // An ATTEST held behind the one being signed, or a command waiting on
+    // the vault, stops the drain: the commands after it stay unread, in
+    // order, until it is handled.
+    while drained < CONT_DRAIN_BUDGET && s.custody_held_len == 0 && s.vault_held_len == 0 {
         let poll = (sys.channel_poll)(s.cont_in, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;

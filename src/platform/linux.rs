@@ -41,244 +41,8 @@ struct CliArgs {
     image_path: String,
 }
 
-/// `fluxor-linux vault-import --module <type> --label <label> --suite
-/// <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]`: provision one symmetric key
-/// into this host's durable vault for module type `<type>`, sealed exactly as
-/// the kernel vault seals a key it generated, so that module's later `OPEN` by
-/// label finds it. Labels live in their module type's namespace, so the key is
-/// provisioned for the module that will open it. The consumer that needs a
-/// shared secret provisioned out of band — a TSIG key for the dns module — has
-/// no other path to one: `OPEN_OR_GENERATE` would mint a key nobody else
-/// holds.
-///
-/// `--wrap yes` adds `WRAP` to an `aead-key`'s uses: a key that seals other
-/// key material and may leave the vault only wrapped to an attested
-/// recipient. The vault checks an open's uses against the key's and never
-/// widens them, so a key provisioned for such an open must carry them from
-/// the start. (`tls`'s continuity keys are not provisioned this way: each
-/// flow's is derived from a master its vault makes and moves vault to vault
-/// by custody transfer.)
-///
-/// Needs `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`),
-/// the same two the runtime unseals with. The key is 32 bytes; the label is
-/// at most 64 bytes. Exits 0 on success, 1 otherwise.
-fn vault_import(args: &[String]) -> ! {
-    use fluxor::abi::contracts::key_vault as kv;
-    let mut module = String::new();
-    let mut label = String::new();
-    let mut suite = String::new();
-    let mut key_hex = String::new();
-    let mut wrap = String::new();
-    let mut i = 0;
-    while i < args.len() {
-        let next = args.get(i + 1).cloned().unwrap_or_default();
-        match args[i].as_str() {
-            "--module" => module = next,
-            "--label" => label = next,
-            "--suite" => suite = next,
-            "--key-hex" => key_hex = next,
-            "--wrap" => wrap = next,
-            other => {
-                eprintln!("error: vault-import: unknown argument: {other}");
-                process::exit(1);
-            }
-        }
-        i += 2;
-    }
-    let (suite_id, usage) = match suite.as_str() {
-        "hmac-sha256" => (
-            kv::suite::HMAC_SHA256,
-            kv::usage::SIGN | kv::usage::VERIFY | kv::usage::PERSIST,
-        ),
-        "aead-key" => (
-            kv::suite::AEAD_KEY,
-            kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST,
-        ),
-        _ => {
-            eprintln!("error: vault-import: --suite must be hmac-sha256 or aead-key");
-            process::exit(1);
-        }
-    };
-    let usage = match (wrap.as_str(), suite_id) {
-        ("" | "no", _) => usage,
-        ("yes", kv::suite::AEAD_KEY) => usage | kv::usage::WRAP,
-        _ => {
-            eprintln!("error: vault-import: --wrap yes applies to an aead-key only");
-            process::exit(1);
-        }
-    };
-    if module.is_empty() {
-        eprintln!("error: vault-import: --module names the module type that opens the key");
-        process::exit(1);
-    }
-    if label.is_empty() || label.len() > kv::MAX_LABEL {
-        eprintln!(
-            "error: vault-import: --label must be 1..={} bytes",
-            kv::MAX_LABEL
-        );
-        process::exit(1);
-    }
-    let key: Option<Vec<u8>> = if key_hex.len() == 64 {
-        (0..32)
-            .map(|k| u8::from_str_radix(&key_hex[2 * k..2 * k + 2], 16).ok())
-            .collect()
-    } else {
-        None
-    };
-    let Some(mut key) = key else {
-        eprintln!("error: vault-import: --key-hex must be 64 hex characters (32 bytes)");
-        process::exit(1);
-    };
-    fluxor::kernel::boot(&LINUX_HAL_OPS);
-    let namespace = fluxor::abi::wire::fnv1a32(module.as_bytes());
-    // SAFETY: single-threaded CLI; nothing else touches the vault.
-    let rc = unsafe {
-        fluxor::kernel::security::key_vault::import_persisted(
-            namespace,
-            label.as_bytes(),
-            suite_id,
-            usage,
-            &key,
-        )
-    };
-    for b in key.iter_mut() {
-        // SAFETY: `b` is a live, exclusively-borrowed byte.
-        unsafe { core::ptr::write_volatile(b, 0) };
-    }
-    match rc {
-        Ok(()) => {}
-        Err(e) if e == fluxor::abi::errno::ENOSYS => {
-            eprintln!(
-                "error: vault-import: this host cannot keep keys (set FLUXOR_SEAL_KEY, 64 hex, and FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
-            );
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: vault-import: the key could not be stored durably ({e})");
-            process::exit(1);
-        }
-    }
-    println!("vault-import: {label} ({suite}) sealed");
-    process::exit(0);
-}
-
-/// `fluxor-linux vault-identity --module <type> --label <label>`: the P-256
-/// signing identity module type `<type>` opens under `<label>` in this
-/// host's durable vault — generated there if it does not exist yet — printed
-/// as its public key (`vault-identity: <label> <65-byte SEC1 hex>`). The
-/// private half is generated inside the vault and only ever sealed; what an
-/// operator takes away is the public half a relying party is told to trust,
-/// as `tls`'s custody identity (`tls-custody`) is for the authority that
-/// decides a transfer of a connection's continuity key. Needs the same
-/// `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`) as
-/// `vault-import`.
-fn vault_identity(args: &[String]) -> ! {
-    use fluxor::abi::contracts::key_vault as kv;
-    let mut module = String::new();
-    let mut label = String::new();
-    let mut i = 0;
-    while i < args.len() {
-        let next = args.get(i + 1).cloned().unwrap_or_default();
-        match args[i].as_str() {
-            "--module" => module = next,
-            "--label" => label = next,
-            other => {
-                eprintln!("error: vault-identity: unknown argument: {other}");
-                process::exit(1);
-            }
-        }
-        i += 2;
-    }
-    if module.is_empty() || label.is_empty() || label.len() > kv::MAX_LABEL {
-        eprintln!("error: vault-identity: --module <type> --label <1..=64 bytes>");
-        process::exit(1);
-    }
-    fluxor::kernel::boot(&LINUX_HAL_OPS);
-    let namespace = fluxor::abi::wire::fnv1a32(module.as_bytes());
-    // SAFETY: single-threaded CLI; nothing else touches the vault.
-    let rc = unsafe {
-        fluxor::kernel::security::key_vault::identity_public(namespace, label.as_bytes())
-    };
-    match rc {
-        Ok(public) => {
-            let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
-            println!("vault-identity: {label} {hex}");
-            process::exit(0);
-        }
-        Err(e) if e == fluxor::abi::errno::ENOSYS => {
-            eprintln!(
-                "error: vault-identity: this host cannot keep keys (set FLUXOR_SEAL_KEY, 64 hex, and FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
-            );
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: vault-identity: the identity could not be opened or made ({e})");
-            process::exit(1);
-        }
-    }
-}
-
-/// `fluxor-linux reclaim`: collect every dead instance's host objects (links,
-/// routes, policy tables, tunables, claims) from the host registry, without
-/// starting a runtime — a service manager's post-stop hook
-/// (`ExecStopPost=`). With `FLUXOR_INSTANCE` (or `FLUXOR_STATE_DIR`) naming
-/// the instance, reports whether that tag was reclaimed. Exit 0 when it was
-/// (or there was nothing to reclaim), 2 when the named instance is still
-/// live in another runtime, 1 on an error or a reclaim left pending.
-fn reclaim(args: &[String]) -> ! {
-    use fluxor::platform::linux::instance::{reclaim_from_env, Reclaimed};
-    if let Some(other) = args.first() {
-        eprintln!("error: reclaim: unknown argument: {other}");
-        process::exit(1);
-    }
-    let list = |v: &[String]| {
-        if v.is_empty() {
-            "none".to_string()
-        } else {
-            v.join(" ")
-        }
-    };
-    match reclaim_from_env() {
-        Ok(Reclaimed::All(done)) => {
-            println!("reclaim: collected {}", list(&done));
-            process::exit(0);
-        }
-        Ok(Reclaimed::Tag(tag, done)) => {
-            println!(
-                "reclaim: instance {tag} reclaimed; collected {}",
-                list(&done)
-            );
-            process::exit(0);
-        }
-        Ok(Reclaimed::Live(tag, done)) => {
-            println!("reclaim: instance {tag} is live; collected {}", list(&done));
-            process::exit(2);
-        }
-        Ok(Reclaimed::Pending(tag, done)) => {
-            println!(
-                "reclaim: instance {tag} left pending (see the log); collected {}",
-                list(&done)
-            );
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: reclaim: host registry unavailable (errno {e})");
-            process::exit(1);
-        }
-    }
-}
-
 fn parse_args() -> CliArgs {
     let args: Vec<String> = env::args().collect();
-    if args.get(1).map(String::as_str) == Some("vault-import") {
-        vault_import(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("vault-identity") {
-        vault_identity(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("reclaim") {
-        reclaim(&args[2..]);
-    }
     let mut image_path = String::new();
 
     let mut i = 1;
@@ -295,9 +59,6 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --image <node.img>");
-                eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]");
-                eprintln!("       fluxor-linux vault-identity --module <type> --label <label>   (print, making if absent, a P-256 identity's public key)");
-                eprintln!("       fluxor-linux reclaim   (collect dead instances' host objects; FLUXOR_INSTANCE names one)");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!(
@@ -323,8 +84,6 @@ fn parse_args() -> CliArgs {
                 println!("host-playback");
                 #[cfg(feature = "host-image")]
                 println!("host-image");
-                #[cfg(feature = "host-hsm")]
-                println!("host-hsm");
                 process::exit(0);
             }
             // Everything after `--` is the app's argv — cli_in reads it
@@ -347,23 +106,20 @@ fn parse_args() -> CliArgs {
     CliArgs { image_path }
 }
 
-// The platform providers (FS/proc/net registry), the per-owner status writer,
-// and the owner-drain driver compile into the fluxor library at
-// `fluxor::platform::linux::{providers, owner_status, owner_drain}` so the host
+// The platform providers (FS/proc/net registry) and the owner facts writer
+// compile into the fluxor library at
+// `fluxor::platform::linux::{providers, owner_facts}` so the host
 // test harness can exercise them directly. Bring the binary-facing entry points
 // into scope so the flat registration (`runtime.rs`) and boot/watch sites
 // (`linux.rs` body) resolve them by name.
-use fluxor::platform::linux::owner_drain::{arm_drain, drain_tick, synthesize_restart_terminals};
-use fluxor::platform::linux::owner_status::OwnerStatusWriter;
-use fluxor::platform::linux::providers::{linux_fs_dispatch, linux_proc_dispatch, LINUX_NET};
-include!("linux/object.rs");
-include!("linux/namespace.rs");
+use fluxor::platform::linux::host_lane::HOST_LANE;
+use fluxor::platform::linux::owner_facts::OwnerFactsWriter;
+use fluxor::platform::linux::providers::linux_fs_dispatch;
 // The `workload` provider (class `workload`) and its host-process backend (the
 // `host_backend` namespace/cgroup mechanism) compile into the fluxor library at
 // `fluxor::platform::linux::{workload, host_backend}` so the host test harness can
 // exercise them directly. Bring the binary-facing entry points into scope so
-// the flat provider-registration (`runtime.rs`) and owner-drain
-// (`owner_drain.rs`) sites resolve them by name.
+// the flat provider-registration (`runtime.rs`) site resolves them by name.
 use fluxor::platform::linux::workload::linux_workload_dispatch;
 // TLV param walkers + per-instance state helpers, in the library so the
 // library provider modules can reach them; glob-imported so the flat
@@ -427,7 +183,6 @@ use fluxor::abi::platform::native::linux as native;
 /// first graph is prepared: a graph names each by its name hash, and the
 /// splice resolves it here when the loader does not.
 static NATIVE_MODULES: &[(u32, &scheduler::NativeVtable)] = &[
-    (native::linux_net::NAME_HASH, &LINUX_NET),
     (native::cli_in::NAME_HASH, &CLI_IN),
     (native::cli_out::NAME_HASH, &CLI_OUT),
     (native::host_asset_source::NAME_HASH, &HOST_ASSET_SOURCE),
@@ -448,6 +203,7 @@ static NATIVE_MODULES: &[(u32, &scheduler::NativeVtable)] = &[
     ),
     (native::linux_pointer::NAME_HASH, &LINUX_POINTER),
     (native::linux_eth::NAME_HASH, &LINUX_ETH),
+    (native::host_lane::NAME_HASH, &HOST_LANE),
 ];
 
 /// Prepare and instantiate the installed `STATIC_CONFIG`: the splice stages
@@ -673,15 +429,14 @@ fn main() {
         stage_plan_from(path);
         last_plan_mtime = plan_mtime(path);
     }
-    // Node-agent mode also PUBLISHES per-owner live status next to the plan
-    // it consumes (`owner_status.json`, atomic replace) so `fluxor agent
-    // status` can report truthful per-workload state. Absent file / absent
-    // FLUXOR_PLAN ⇒ no runtime status surfaced.
-    let mut owner_status = plan_path
+    // Node-agent mode also writes the kernel's owner facts next to the plan
+    // it consumes (`owner_facts::FILE_NAME`, atomic replace) for the node
+    // agent to render. Absent FLUXOR_PLAN ⇒ none written.
+    let mut owner_facts = plan_path
         .as_deref()
-        .map(|p| OwnerStatusWriter::new(std::path::Path::new(p)));
-    // Per-owner log rings are flushed into `logs/` beside `owner_status.json`,
-    // on the same tick. `fluxor agent logs` resolves this directory the same way.
+        .map(|p| OwnerFactsWriter::new(std::path::Path::new(p)));
+    // Per-owner log rings are flushed into `logs/` beside the plan, on the
+    // same tick. `fluxor agent logs` resolves this directory the same way.
     let logs_dir: Option<std::path::PathBuf> = plan_path.as_deref().map(|p| {
         std::path::Path::new(p)
             .parent()
@@ -698,26 +453,10 @@ fn main() {
     // graph. Boot-only (not re-run on live rebuild). No-op without workloads.
     scheduler::admit_resident_workloads_from_config();
 
-    // A revocation the just-applied plan still lists, naming an owner that was
-    // NOT reinstalled, was mid-drain when the previous process died: the drain
-    // is forfeited and recorded as drain-timeout-by-restart — unless the
-    // previous process already persisted that workload's terminal outcome,
-    // which the status writer seeds from the file it finds at startup.
-    synthesize_restart_terminals(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        &owner_status
-            .as_ref()
-            .map(|w| w.seeded_terminated_uids())
-            .unwrap_or_default(),
-    );
-
-    // Publish the initial owner status immediately (before the first 100 ms
+    // Publish the initial owner facts immediately (before the first 100 ms
     // watch window) so an orchestrator polling right after activation sees
     // the runtime up rather than a stale/absent file.
-    if let Some(w) = owner_status.as_mut() {
+    if let Some(w) = owner_facts.as_mut() {
         w.tick();
     }
     if let Some(dir) = logs_dir.as_deref() {
@@ -769,7 +508,7 @@ fn main() {
             stop = Some(StopDrain::begin());
         }
         if stop.as_ref().is_some_and(StopDrain::over) {
-            finish_stop(owner_status.as_mut(), logs_dir.as_deref());
+            finish_stop(owner_facts.as_mut(), logs_dir.as_deref());
         }
 
         // Node-agent generation update: the agent recommits + republishes the
@@ -779,13 +518,14 @@ fn main() {
         // ms-per-iteration loop would otherwise check too rarely).
         if plan_path.is_some() && last_plan_check.elapsed() >= Duration::from_millis(100) {
             last_plan_check = Instant::now();
-            // Settle armed drains BEFORE consuming a new plan: a drain that
-            // already reached quiescence or its deadline becomes a terminal
-            // record (and its owner is freed) first, so the plan update never
-            // races a finished drain. A still-live drain is protected on the
-            // other side: the delta path refuses a plan that drops a retained
-            // revocation while its owner is installed.
-            drain_tick(
+            // Settle drains BEFORE consuming a new plan: a drain that already
+            // reached quiescence or its deadline frees its owner and records
+            // the outcome first, so the plan update never races a finished
+            // drain. A still-live drain is protected on the other side: the
+            // delta path refuses a plan that drops a retained revocation while
+            // its owner is installed. The kernel arbitrates; this clock is the
+            // platform's.
+            fluxor::kernel::workload::owner_plan::drain_tick(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -800,30 +540,22 @@ fn main() {
                     // A pure-drain generation (records moved from the
                     // assignment section to the revocation section, nothing
                     // else) applies as a live delta: the departing owner flips
-                    // to Draining and the drain driver takes over — no
-                    // rebuild, co-resident owners untouched. Anything
-                    // structural falls through to the rebuild.
-                    match fluxor::kernel::workload::owner_plan::try_apply_drain_delta(arm_drain) {
-                        Some(_) => {}
-                        None => {
-                            // Structural plan: not a pure-drain delta, but it may
-                            // still revoke owners. Arm their drains before the
-                            // rebuild so each gets a terminal record — the rebuild's
-                            // reset drops the owner from the table and the next
-                            // drain_tick finalises it, instead of it vanishing
-                            // untracked.
-                            fluxor::kernel::workload::owner_plan::arm_staged_revocation_drains(
-                                arm_drain,
-                            );
-                            scheduler::request_rebuild();
-                        }
+                    // to Draining and `drain_tick` frees it — no rebuild,
+                    // co-resident owners untouched. Anything structural falls
+                    // through to the rebuild.
+                    if fluxor::kernel::workload::owner_plan::try_apply_drain_delta().is_none() {
+                        // Structural plan: not a pure-drain delta, but it may
+                        // still revoke owners. They stop admitting before the
+                        // rebuild, whose apply records each forfeited.
+                        fluxor::kernel::workload::owner_plan::begin_staged_revocation_drains();
+                        scheduler::request_rebuild();
                     }
                 }
             }
-            // Same cadence as the plan watch: publish per-owner live status
-            // (no-op write when the derived state is unchanged) and flush the
-            // per-owner log rings to their files.
-            if let Some(w) = owner_status.as_mut() {
+            // Same cadence as the plan watch: publish the owner facts (no-op
+            // write when they are unchanged) and flush the per-owner log
+            // rings to their files.
+            if let Some(w) = owner_facts.as_mut() {
                 w.tick();
             }
             if let Some(dir) = logs_dir.as_deref() {
@@ -841,11 +573,10 @@ fn main() {
             let count = build_graph_linux();
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
             log::info!("[reconfigure] rebuilt graph: {count} modules");
-            // Observe re-activation NOW, before the rebuilt modules step: a
-            // previously-terminated owner that faults again within the 100 ms
-            // status cadence would otherwise re-terminate unobserved and its
-            // aggregate restart (Terminated → re-activated) go uncounted.
-            if let Some(w) = owner_status.as_mut() {
+            // Publish the rebuilt owners' facts now, before their modules
+            // step: a reader sees the re-activation even when an owner
+            // faults again within the 100 ms cadence.
+            if let Some(w) = owner_facts.as_mut() {
                 w.tick();
             }
             if let Some(dir) = logs_dir.as_deref() {
@@ -870,7 +601,7 @@ fn main() {
         if stop.is_some() && all_done {
             // Stopping, and nothing is left to drain.
             log::info!("[stop] drained; exiting");
-            finish_stop(owner_status.as_mut(), logs_dir.as_deref());
+            finish_stop(owner_facts.as_mut(), logs_dir.as_deref());
         }
         if cli_done || all_done {
             // Node-agent mode (FLUXOR_PLAN set): the runtime is the node's

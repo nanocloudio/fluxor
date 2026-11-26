@@ -159,10 +159,11 @@ pub(crate) const INTERRUPT_MODE_KEYS: [&str; 2] = ["max_cycles", "irq"];
 
 /// Why a module holding `manifest`'s grants cannot run in an `exec: mode`
 /// (`timer` or `irq`) domain, if it cannot: the calls that run on the
-/// primary core (flash, the `reconfigure` contract and its op grants, the
-/// key vault) answer `ENOTSUP` in handler mode, so a module holding one of
-/// them would hold a grant it can never use. The refusal names the module
-/// and the grant.
+/// primary core (flash, the `reconfigure` contract and its op grants)
+/// answer `ENOTSUP` in handler mode, so a module holding one of them would
+/// hold a grant it can never use. The refusal names the module and the
+/// grant. (A module provider such as the key vault runs in its caller's
+/// domain, which `validate_provider_domains` checks.)
 pub(crate) fn isr_grant_refusal(
     name: &str,
     mode: &str,
@@ -170,13 +171,13 @@ pub(crate) fn isr_grant_refusal(
 ) -> Option<String> {
     // Everything the kernel lets it call: named grants and claimed contracts.
     let grants = manifest.grant_set().unwrap_or(manifest.grants);
-    let grant = crate::manifest::grant_names(grants).into_iter().find(|g| {
-        matches!(*g, "flash" | "key_vault" | "reconfigure") || g.starts_with("reconfigure.")
-    })?;
+    let grant = crate::manifest::grant_names(grants)
+        .into_iter()
+        .find(|g| matches!(*g, "flash" | "reconfigure") || g.starts_with("reconfigure."))?;
     Some(format!(
-        "module '{name}' is in an `exec: {mode}` domain and holds the `{grant}` grant: flash, \
-         reconfigure and key vault calls run on the primary core and answer ENOTSUP from an \
-         interrupt handler. Move the module to a cooperative domain, or drop the grant."
+        "module '{name}' is in an `exec: {mode}` domain and holds the `{grant}` grant: flash \
+         and reconfigure calls run on the primary core and answer ENOTSUP from an interrupt \
+         handler. Move the module to a cooperative domain, or drop the grant."
     ))
 }
 
@@ -778,10 +779,6 @@ mod tests {
             ("grants = [\"flash\"]", "flash"),
             ("grants = [\"reconfigure.ota\"]", "reconfigure.ota"),
             ("grants = [\"reconfigure.owner\"]", "reconfigure.owner"),
-            (
-                "[[resources]]\nrequires_contract = \"key_vault\"\naccess = \"read\"",
-                "key_vault",
-            ),
         ] {
             let why = isr_grant_refusal("beat", "timer", &manifest(grants))
                 .unwrap_or_else(|| panic!("{grants} is refused"));

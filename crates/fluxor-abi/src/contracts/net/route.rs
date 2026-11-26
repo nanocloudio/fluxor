@@ -21,17 +21,16 @@
 // realization would take effect on this node, and an entry the host defeats
 // reads `refused(reason)` or `unknown`, never silently nothing.
 //
-// Every op answers `EACCES` to a module not acting with the node's
-// authority. SEGMENTS, ROUTES, HOLD and READ also need `net_route.table`;
-// REPORT and TAKE need `net_route.stack` and are the realizing module's,
-// admitted from the registered net-identity provider alone.
+// The tables are held and realized by the node's net provider (the `ip`
+// module on metal, the host net provider on Linux). Every op answers
+// `EACCES` to a module not acting with the node's authority; SEGMENTS,
+// ROUTES, HOLD, READ and RESYNC_END also need `net_route.table`.
 //
 // Little-endian integers; addresses in network order, family-tagged and 16
 // bytes wide (IPv4 in the first four, the rest zero), so IPv6 needs no format
 // change.
 
-/// Provider class id (opcode class 0x16xx). Mirrors
-/// `kernel::module::provider::contract::NET_ROUTE`.
+/// Provider class id (opcode class 0x16xx).
 pub const CLASS: u16 = super::super::super::registry::net_route::ID;
 
 /// Capability bitmap. handle=-1 (or a bound handle); `arg` out is exactly 4
@@ -82,25 +81,17 @@ pub use super::super::super::registry::net_route::HOLD;
 /// consistently (the caller keeps its previous copy).
 pub use super::super::super::registry::net_route::READ;
 
-/// A realizing module provider (the bare-metal network stack) reports
-/// per-entry state. handle=-1, `data` in = `[entry]×n` ([`entry`]), each indexed
-/// into the tables of the provider's last [`TAKE`]. Admitted only from the
-/// registered net-identity provider, holding `net_route.stack`; a platform that
-/// realizes the tables itself never calls it. All entries are recorded or
-/// none. Returns 0, `EINVAL` (malformed, or an index past its table),
-/// `EACCES` (not the provider), or `EAGAIN` when the tables moved since that
-/// TAKE (the provider takes again and reports against those).
-pub use super::super::super::registry::net_route::REPORT;
-
-/// The table contents, for a realizing module provider. handle=-1, `data`
-/// out: `[table_generation:u64][n_segments:u8][rsv:u8]
-/// [n_routes:u16][n_held:u16][rsv:u16]` then the segments, routes and held
-/// records in their wire layouts. Returns the byte count; `ERANGE` when the
-/// records do not fit, with the header still written as far as the buffer
-/// holds it (an 8-byte buffer is a cheap poll of the generation; a
-/// [`TAKE_HEAD`]-byte one also learns the counts it is missing); `EINVAL`
-/// under 8 bytes. Same admission as [`REPORT`].
-pub use super::super::super::registry::net_route::TAKE;
+/// The writer has pushed everything it holds — segments, peer routes, held
+/// addresses, the node's policy tables and its workloads' addresses — after
+/// the provider started again. handle=-1, no `arg`, no `data`. Returns 0, or
+/// `EACCES` to a module not acting with the node's authority. A provider that
+/// kept host state from an earlier start (the Linux host provider: links,
+/// addresses, routes and rule tables outlive its process) holds that state
+/// until this call, then removes whatever was not pushed again; a provider
+/// that keeps nothing across a start (`ip`) answers 0 and does nothing. A
+/// provider that is not told within its own bound ends the resync itself,
+/// so a node with no writer that resyncs keeps no stale state.
+pub use super::super::super::registry::net_route::RESYNC_END;
 
 /// Capability bits: set only when the realization would take effect.
 pub mod caps {
@@ -118,7 +109,7 @@ pub mod caps {
     pub const HOLD_ANNOUNCE: u32 = 1 << 5;
 }
 
-/// Address families (the `workload` contract's `NET_FAM_*` values).
+/// Address families.
 pub const FAM_IPV4: u8 = 4;
 pub const FAM_IPV6: u8 = 6;
 
@@ -170,10 +161,7 @@ pub mod held {
     pub const FENCED: u8 = 1;
 }
 
-/// TAKE's header before the records.
-pub const TAKE_HEAD: usize = 8 + 1 + 1 + 2 + 2 + 2;
-
-/// One entry's state, as READ answers it and REPORT states it:
+/// One entry's state, as READ answers it:
 /// ```text
 /// [kind:u8][state:u8][reason:u8][cutoff_kind:u8][index:u16][rsv:u16]
 /// [install_gen:u32][rsv:u32][cutoff:u64]
@@ -605,7 +593,7 @@ pub fn write_entry(out: &mut [u8], at: usize, e: &EntryState) -> Option<usize> {
     Some(entry::SIZE)
 }
 
-/// The leading u64 of a READ or TAKE buffer.
+/// The leading u64 of a READ buffer.
 pub fn generation(b: &[u8]) -> Option<u64> {
     u64_le(b, 0)
 }

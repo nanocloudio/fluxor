@@ -32,9 +32,8 @@
 //! - A kernel-internal function (registered at startup via `register()`).
 //! - A PIC module export (registered by the loader via
 //!   `register_module_provider()` after the module publishes a
-//!   manifest's `provider_contracts`). Module providers form a chain
-//!   (stack) per contract. Middleware modules (TLS, compression)
-//!   intercept calls and forward to the layer below via `CHAIN_NEXT`.
+//!   manifest's `provider_contracts`). Module providers form a stack of
+//!   layers per contract.
 //!
 //! Each layer carries an **instance selector**: `0` for the default
 //! provider, or the hash of a short name (a volume, say) for a keyed one.
@@ -48,7 +47,16 @@
 //!
 //! The name `platform` is reserved: a bind to it reaches the platform's own
 //! (kernel-registered) provider of the contract beneath any module layers —
-//! the host filesystem under a graph-local `fat32`, say.
+//! the host filesystem under a graph-local `fat32`, say. A platform provider
+//! registered node-only ([`register_node_only`]) serves callers acting with
+//! the node's authority alone, however they reach it.
+//!
+//! Each layer also carries a **scope**. An owner-scoped layer serves the
+//! owner whose module registered it (and owners acting with that owner's
+//! authority). A workload-scoped layer, registered only by a node-owned
+//! module, serves every caller acting with an authority of its own — the
+//! workloads — and never the node: it is how a workload reaches what the
+//! node holds, rooted and charged by the module that serves it.
 //!
 //! An **edge contract** (`storage.block`, `net_tx_drain`) has no default and
 //! no chain: it is served by the module at the other end of one of the
@@ -93,15 +101,12 @@ pub mod contract {
     pub const FS: u16 = crate::abi::registry::fs::ID;
     pub const STORAGE_NAMESPACE: u16 = crate::abi::registry::storage_namespace::ID;
     pub const STORAGE_OBJECT: u16 = crate::abi::registry::storage_object::ID;
-    pub const KEY_VAULT: u16 = crate::abi::registry::key_vault::ID;
     pub const PLATFORM_NIC_RING: u16 = crate::abi::registry::platform_nic_ring::ID;
     pub const PLATFORM_DMA: u16 = crate::abi::registry::platform_dma::ID;
     pub const PLATFORM_DMA_FD: u16 = crate::abi::registry::platform_dma_fd::ID;
     pub const PCIE_DEVICE: u16 = crate::abi::registry::pcie_device::ID;
     pub const STREAM_CLOCK: u16 = crate::abi::registry::stream_clock::ID;
     pub const TRUST: u16 = crate::abi::registry::trust::ID;
-    pub const NET_POLICY: u16 = crate::abi::registry::net_policy::ID;
-    pub const NET_ROUTE: u16 = crate::abi::registry::net_route::ID;
     pub const WORKLOAD: u16 = crate::abi::registry::workload::ID;
     pub const HOST_PROCESS: u16 = crate::abi::registry::host_process::ID;
     pub const HOST_MOUNT: u16 = crate::abi::registry::host_mount::ID;
@@ -203,7 +208,7 @@ pub fn contract_of(h: i32) -> Option<ContractId> {
 
 /// The rule the registry declares for `op` (`gate::op_rule`).
 fn rule_of(op: u32) -> Option<crate::abi::registry::gate::OpRule> {
-    crate::abi::registry::gate::op_rule(op & !CHAIN_NEXT)
+    crate::abi::registry::gate::op_rule(op)
 }
 
 /// Whether `op` answers a handle the kernel wraps in a route: its rule mints
@@ -215,7 +220,10 @@ fn op_mints(op: u32) -> bool {
         && rule_of(op).is_some_and(|r| {
             matches!(
                 r.handle,
-                HandleUse::Mints | HandleUse::ScopedMints | HandleUse::MintedMints
+                HandleUse::Mints
+                    | HandleUse::ScopedMints
+                    | HandleUse::MintedMints
+                    | HandleUse::AcceptedMints
             )
         })
 }
@@ -299,7 +307,10 @@ pub fn provider_open(contract: ContractId, open_op: u32, config: &[u8]) -> i32 {
 ///      inner index.
 ///   1. A native contract's op goes to its vtable with the handle as is.
 ///   2. A handle: its route's provider, with the provider's own index.
-///   3. `handle == -1`: the contract's default provider.
+///   3. A handle of a contract the op's contract accepts (`accepts` in the
+///      registry): resolved as that contract's, then delivered to the op's
+///      contract's provider when one provider serves both.
+///   4. `handle == -1`: the contract's default provider.
 pub fn provider_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     // Defense in depth: interrupt-mode (`timer`/`irq`) modules must not reach
     // `provider_call` — the contract is "bridge-only I/O, no syscalls".
@@ -313,10 +324,17 @@ pub fn provider_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -
     }
     // The doorbell a provider is handed is the kernel's to hand: a module
     // naming one would bind its own provider to another module's wake.
-    if op & !CHAIN_NEXT == crate::abi::kernel_abi::doorbell::BIND_DOORBELL {
+    if op == crate::abi::kernel_abi::doorbell::BIND_DOORBELL {
         return errno::EACCES;
     }
-    if handle >= 0 && rule_of(op).is_none_or(|r| r.handle != HandleUse::Value) {
+    let rule = rule_of(op);
+    if handle < 0
+        && rule.is_some_and(|r| matches!(r.handle, HandleUse::Accepted | HandleUse::AcceptedMints))
+    {
+        // The op acts on what the handle names: there is no default.
+        return EBADF;
+    }
+    if handle >= 0 && rule.is_none_or(|r| r.handle != HandleUse::Value) {
         call_by_handle(handle, op, arg, data)
     } else {
         call_by_class(handle, op, arg, data)
@@ -359,6 +377,17 @@ fn call_by_handle(h: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
             None => errno::ENOSYS,
         };
     }
+    // An op that takes another contract's handle (`accepts`) takes that
+    // and nothing else; every other op takes its own contract's.
+    let accepted = rule_of(op)
+        .is_some_and(|r| matches!(r.handle, HandleUse::Accepted | HandleUse::AcceptedMints));
+    if accepted {
+        return if c != class && crate::abi::registry::handle_accepted(class, c) {
+            call_accepted(h, class, op, arg, data)
+        } else {
+            EBADF
+        };
+    }
     // A handle names one contract: an op of another through it names
     // nothing, before any provider sees it. The fence query is every
     // storage contract's own (`fence::QUERY_OP`), forwarded by the kernel.
@@ -374,6 +403,42 @@ fn call_by_handle(h: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
         return errno::EACCES;
     }
     call_route(idx, generation, r, op, arg, data)
+}
+
+/// An op of contract `class` through `h`, a handle of a contract `class`
+/// accepts: the handle resolves as its own contract's, for its owner, and
+/// the op reaches `class`'s provider with what that provider calls the
+/// handle — so only a provider serving both contracts is reached. A handle
+/// the op mints is `class`'s.
+fn call_accepted(h: i32, class: ContractId, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    let (_, _, r) = match route_of(h) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !route_owner_ok(&r, h, "provider_call") {
+        return errno::EACCES;
+    }
+    if r.bound || r.class_routed || default_target(class) != Some(r.target()) {
+        return EBADF;
+    }
+    let target = r.target();
+    let rc = call_target(class, target, r.inner, op, arg, data);
+    if rc >= 0 && op_mints(op) {
+        let selector = match target {
+            Target::Platform => PLATFORM_SELECTOR,
+            Target::Module(_) => 0,
+        };
+        return mint(Mint {
+            contract: class,
+            selector,
+            target,
+            inner: rc,
+            bound: false,
+            class_routed: false,
+            signals: op_signals(op),
+        });
+    }
+    rc
 }
 
 /// An op by its opcode's class: `handle` is `-1`, a value the op takes in
@@ -528,18 +593,6 @@ pub fn provider_close(handle: i32) -> i32 {
     close_route(idx, generation, &r)
 }
 
-/// What the platform does when an owner is released: close what the owner
-/// holds open on the platform and drop its storage. Registered by the
-/// platform at init; called from `notify_owner_released` after the module
-/// observers, while the owner's entry still resolves.
-static mut OWNER_RELEASE_HOOK: Option<fn(crate::kernel::workload::owner::OwnerHandle)> = None;
-
-/// Register the platform's owner-release hook. One hook; the last wins.
-pub fn register_owner_release_hook(hook: fn(crate::kernel::workload::owner::OwnerHandle)) {
-    // SAFETY: platform init, before any owner is released.
-    unsafe { *core::ptr::addr_of_mut!(OWNER_RELEASE_HOOK) = Some(hook) };
-}
-
 /// Drop every route. Called on `scheduler::reset` so a new graph inherits no
 /// handle of the old one; the generations stay, so none of them names a
 /// route of the new graph.
@@ -631,8 +684,32 @@ pub const MAX_CHAIN_DEPTH: usize = 4; // rp2350
 #[cfg(not(feature = "rp"))]
 pub const MAX_CHAIN_DEPTH: usize = 8; // bcm2712 / host
 
-/// Flag ORed onto opcode to dispatch to the next provider below the caller.
-pub use crate::abi::registry::CHAIN_NEXT;
+/// Whom a module provider layer serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LayerScope {
+    /// The owner of the module that registered it, and owners acting with
+    /// that owner's authority.
+    Owner,
+    /// Every caller acting with an authority of its own (the workloads) and
+    /// no caller acting with the node's. Registered by a node-owned module
+    /// alone.
+    Workloads,
+}
+
+impl LayerScope {
+    const fn byte(self) -> u8 {
+        match self {
+            LayerScope::Owner => 0,
+            LayerScope::Workloads => 1,
+        }
+    }
+}
+
+/// Whether a layer's scope byte is [`LayerScope::Workloads`].
+#[inline]
+fn serves_workloads(scope: u8) -> bool {
+    scope == LayerScope::Workloads.byte()
+}
 
 /// A single layer in a provider chain.
 struct ProviderLayer {
@@ -640,8 +717,12 @@ struct ProviderLayer {
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
     /// The owner of the module that registered the layer: the one owner
-    /// whose modules the layer serves (see `layer_visible`).
+    /// whose modules an owner-scoped layer serves (see `layer_visible`).
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// Whom the layer serves, as [`LayerScope::byte`]: a plain byte, so the
+    /// table's empty slots stay all-zero (`.bss`) rather than taking their
+    /// `None` from an enum's spare values.
+    scope: u8,
     /// Instance selector (FNV-1a hash of a short volume/instance string,
     /// shared with modules via `abi::provider_selector::hash`). `0` =
     /// unkeyed / default provider — the target of the class-byte
@@ -655,6 +736,12 @@ struct ProviderLayer {
 struct ProviderEntry {
     /// Kernel-internal dispatch (None if no kernel provider).
     kernel_dispatch: Option<ProviderDispatch>,
+    /// The kernel provider serves callers acting with the node's authority
+    /// alone ([`register_node_only`]).
+    kernel_node_only: bool,
+    /// The kernel provider is told of every owner release
+    /// ([`observe_owner_release`]).
+    kernel_observes: bool,
     /// Module provider chain (stack). chain[depth-1] is the top.
     chain: [Option<ProviderLayer>; MAX_CHAIN_DEPTH],
     /// Number of active layers in the chain.
@@ -665,6 +752,8 @@ impl ProviderEntry {
     const fn empty() -> Self {
         Self {
             kernel_dispatch: None,
+            kernel_node_only: false,
+            kernel_observes: false,
             chain: [const { None }; MAX_CHAIN_DEPTH],
             depth: 0,
         }
@@ -689,6 +778,50 @@ pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
     }
 }
 
+/// Register a kernel-internal provider that serves callers acting with the
+/// node's authority alone: every other caller is answered `EACCES`, by
+/// class byte or a `platform` bind alike. The host
+/// filesystem is one: a workload reaches node storage only through a
+/// workload-scoped layer that roots it.
+pub fn register_node_only(contract: ContractId, dispatch: ProviderDispatch) {
+    register(contract, dispatch);
+    // SAFETY: boot-time registration, as `register`.
+    unsafe {
+        PROVIDERS[contract as usize].kernel_node_only = true;
+    }
+}
+
+/// Tell the kernel provider of `contract` of every owner release, as a
+/// module provider that observes releases is told: its dispatch is called
+/// with `OWNER_RELEASED` and the same record, after the module observers,
+/// while the owner still resolves. Registered at platform init, after
+/// [`register`].
+pub fn observe_owner_release(contract: ContractId) {
+    let idx = contract as usize;
+    assert!(idx < MAX_PROVIDERS, "contract id out of range");
+    // SAFETY: boot-time registration, as `register`.
+    unsafe {
+        PROVIDERS[idx].kernel_observes = true;
+    }
+}
+
+/// Call the kernel provider `handler` of `entry` for the calling module:
+/// `EACCES` when it is node-only and the caller acts with an authority of
+/// its own.
+fn call_kernel(
+    handler: ProviderDispatch,
+    node_only: bool,
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
+) -> i32 {
+    if node_only && !crate::kernel::exec::scheduler::caller_authority().is_node() {
+        return errno::EACCES;
+    }
+    handler(handle, opcode, arg, data)
+}
+
 /// Contracts a PIC module is allowed to provide. The loader calls
 /// `register_module_provider` after resolving a module's
 /// manifest naming the contract in `provider_contracts` — a
@@ -696,9 +829,9 @@ pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
 /// Only the contracts where it is architecturally legitimate for a module to
 /// be the provider are admitted — those the registry marks `module_provided`
 /// (the HAL peripherals, FS, the `storage.namespace` / `storage.object`
-/// surfaces, the runtime parameter store). CHANNEL / TIMER / BUFFER / EVENT /
-/// KEY_VAULT and the internal dispatch bucket are kernel-only and must not be
-/// replaceable by a module.
+/// surfaces, the key vault, the runtime parameter store). CHANNEL / TIMER /
+/// BUFFER / EVENT and the internal dispatch bucket are kernel-only and must
+/// not be replaceable by a module.
 #[inline]
 fn is_module_providable(contract: ContractId) -> bool {
     crate::abi::registry::module_providable(contract)
@@ -839,16 +972,18 @@ fn release_edge_server(module_idx: ModuleId) {
 /// Pushes the module onto the top of the chain, or for an edge contract
 /// records it as that contract's server on its edges. Returns 0 on success;
 /// EINVAL if `contract` is out of range or the dispatch pointer is outside
-/// the module's code region; EACCES if `contract` is not module-providable or
-/// `selector` is the reserved `platform` name; EBUSY if the module already
-/// holds a layer of this contract, the selector is already taken, or the
-/// chain is full.
+/// the module's code region; EACCES if `contract` is not module-providable,
+/// `selector` is the reserved `platform` name, or a module the node does not
+/// own registers a workload-scoped layer; EBUSY if the module already holds a
+/// layer of this contract, the selector is already taken, or the chain is
+/// full.
 pub fn register_module_provider(
     contract: ContractId,
     module_idx: ModuleId,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
     selector: u32,
+    scope: LayerScope,
 ) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
@@ -862,6 +997,25 @@ pub fn register_module_provider(
     }
     if !dispatch_in_code(module_idx, dispatch) {
         return errno::EINVAL;
+    }
+    let owner = crate::kernel::exec::scheduler::module_owner(module_idx as usize);
+    // A workload layer serves every workload with what the node holds: only
+    // the node may stand one up, and only of a contract the registry lets a
+    // workload layer serve.
+    if scope == LayerScope::Workloads && !crate::abi::registry::workload_servable(contract) {
+        log::error!(
+            "[provider] module {module_idx} registers a workload-scoped layer for contract \
+             0x{contract:04x}, which no workload layer serves"
+        );
+        return errno::EACCES;
+    }
+    if scope == LayerScope::Workloads && !owner.is_node() {
+        log::error!(
+            "[provider] module {module_idx} (owner slot {}) registers a workload-scoped layer \
+             for contract 0x{contract:04x}; only a node-owned module serves workloads",
+            owner.slot
+        );
+        return errno::EACCES;
     }
     // An edge contract is served per edge, addressed by module: it has no
     // chain, no default and no selector.
@@ -909,10 +1063,17 @@ pub fn register_module_provider(
         // this also catches a genuine hash collision between two distinct
         // volume names, which no amount of config validation could see. The
         // config validator (`validate_single_provider`) blocks the graph
-        // earlier; this is the kernel-side backstop.
+        // earlier; this is the kernel-side backstop. Only layers one caller
+        // could see together collide: two of one owner's, or two workload
+        // layers. A workload's own provider beside the node's, or the
+        // node's workload layer beside the node's own, serve different
+        // callers and shadow nothing.
         for i in 0..entry.depth as usize {
             if let Some(ref layer) = entry.chain[i] {
-                if layer.selector == selector {
+                if layer.selector == selector
+                    && layer.scope == scope.byte()
+                    && (scope == LayerScope::Workloads || layer.owner == owner)
+                {
                     let which = if selector == 0 {
                         "a second unkeyed provider"
                     } else {
@@ -933,8 +1094,9 @@ pub fn register_module_provider(
             module_idx,
             dispatch,
             state,
+            owner,
+            scope: scope.byte(),
             selector,
-            owner: crate::kernel::exec::scheduler::module_owner(module_idx as usize),
         });
         entry.depth += 1;
         log::info!(
@@ -983,15 +1145,10 @@ pub fn release_module_providers(module_idx: ModuleId) {
     // module to land in it would inherit a subscription it never asked for.
     clear_owner_release_observer(module_idx);
     clear_pool_sampler(module_idx);
-    // A net.route writer that goes releases its tables' bindings; the tables
-    // and what they realized stay.
-    crate::kernel::net_route::release_module(module_idx as usize);
     // Before the chain is compacted, so the departing module's own routed
     // handles are closed at owners that are still registered.
     release_routes_of(module_idx);
     release_edge_server(module_idx);
-    // A departing net.policy enforcer stops vouching for its tables.
-    crate::kernel::net_policy::release_enforcer(module_idx);
     // SAFETY: called from scheduler module-finish path; scheduler thread.
     unsafe {
         let p = &raw mut PROVIDERS;
@@ -1031,9 +1188,9 @@ pub fn release_module_providers(module_idx: ModuleId) {
 // away, or it holds them until the next reset. The kernel is the only party
 // that knows, so it has to say so.
 //
-// The platform's owner-release hook covers what the platform's own providers
-// hold for an owner. This is the module-provider counterpart. Both are
-// delivered from `free_owner` itself rather than from the drain driver, so
+// Module providers opt in by manifest; a platform's own provider opts in at
+// registration ([`observe_owner_release`]). Both hear the same op with the
+// same record, delivered from `free_owner` itself rather than from the drain driver, so
 // the paths that never reach the drain driver — the workload verbs (KILL,
 // DESTROY), `FREE_OWNER` and admission rollback — are covered too.
 //
@@ -1094,13 +1251,12 @@ pub fn clear_owner_release_observer(module_idx: ModuleId) {
 // Pool sampling: module-provided pools
 // ============================================================================
 //
-// A pool can be served by a module provider instead of a kernel table (the
-// store's subscriptions, under a module `storage.namespace` provider). The
-// ledger keeps no counters, so it pulls the pool's in-use figure from that
-// provider (`resource::POOL_SAMPLE`), and the provider tells it of each
-// refusal (`resource::LEDGER_DENY`). Both go to one module: the system
-// owner's top-most unkeyed layer of the pool's contract — the layer the
-// node's class-byte calls reach.
+// A pool can be served by module providers instead of a kernel table (the
+// store's subscriptions, served by each `store` module from its own heap).
+// The ledger keeps no counters, so it pulls the pool's in-use figure from
+// those providers, summed (`resource::POOL_SAMPLE`), and each tells it of
+// its refusals (`resource::LEDGER_DENY`). Both concern the node's layers of
+// the pool's contract, keyed or not: a node may compose several stores.
 
 /// Providers that answer `POOL_SAMPLE`, by module index. Opt-in, set by the
 /// loader when a provider's manifest says `samples_pool = true`, for the reason
@@ -1146,67 +1302,99 @@ pub fn clear_pool_sampler(module_idx: ModuleId) {
     }
 }
 
-/// The module serving `pool` for the node: the node owner's top-most
-/// unkeyed layer of the pool's contract (`resource::
-/// module_provided_pool_contract`), with its dispatch. `None` for a pool no
-/// module provides, or none registered. The borrow of `PROVIDERS` ends with
-/// the call.
-fn pool_provider_layer(pool: u16) -> Option<(ModuleId, ModuleProviderDispatchFn, *mut u8)> {
-    let contract = crate::abi::contracts::resource::module_provided_pool_contract(pool)?;
+/// Every node-owned module layer of `pool`'s contract (`resource::
+/// module_provided_pool_contract`), each module once, into `out` — only the
+/// modules that asked to be sampled when `marked`; the count. The borrow of
+/// `PROVIDERS` ends with the call.
+fn pool_layers(
+    pool: u16,
+    marked: bool,
+    out: &mut [(ModuleId, ModuleProviderDispatchFn, *mut u8); MAX_CHAIN_DEPTH],
+) -> usize {
+    let Some(contract) = crate::abi::contracts::resource::module_provided_pool_contract(pool)
+    else {
+        return 0;
+    };
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
-        return None;
+        return 0;
     }
+    let mut n = 0usize;
     // SAFETY: scheduler-thread read; nothing here calls into module code.
     unsafe {
-        let p = &raw const PROVIDERS;
-        let entry = &(*p)[idx];
-        for i in (0..entry.depth as usize).rev() {
-            if let Some(ref layer) = entry.chain[i] {
-                if layer.selector == 0 && layer.owner.is_node() {
-                    return Some((layer.module_idx, layer.dispatch, layer.state));
-                }
+        let samplers = &*core::ptr::addr_of!(POOL_SAMPLERS);
+        let entry = &(*core::ptr::addr_of!(PROVIDERS))[idx];
+        for layer in entry.chain[..entry.depth as usize].iter().flatten() {
+            let midx = layer.module_idx as usize;
+            if midx < crate::kernel::exec::scheduler::module_slots()
+                && layer.owner.is_node()
+                && (!marked || samplers.test(midx))
+                && !out[..n].iter().any(|(m, ..)| *m == layer.module_idx)
+            {
+                out[n] = (layer.module_idx, layer.dispatch, layer.state);
+                n += 1;
             }
         }
     }
-    None
+    n
 }
 
-/// Whether `module_idx` is the module serving `pool` ([`pool_provider_layer`])
-/// — the one module `LEDGER_DENY` admits for it.
+/// Whether `module_idx` serves `pool` for the node: it holds a node-owned
+/// layer of the pool's contract — a module `LEDGER_DENY` admits for it.
 pub fn is_pool_provider(pool: u16, module_idx: usize) -> bool {
-    pool_provider_layer(pool).is_some_and(|(m, ..)| m as usize == module_idx)
+    let mut layers = [(
+        NO_MODULE,
+        noop_dispatch as ModuleProviderDispatchFn,
+        core::ptr::null_mut(),
+    ); MAX_CHAIN_DEPTH];
+    let n = pool_layers(pool, false, &mut layers);
+    layers[..n].iter().any(|(m, ..)| *m as usize == module_idx)
 }
 
-/// Ask the module serving `pool` how much of it is in use (`POOL_SAMPLE`):
-/// `Some(n)` from a marked provider that answered, `None` when no module
-/// serves the pool, the one that does never asked to be sampled, or it could
-/// not say. Runs the provider's dispatch in a provider frame on the calling
-/// thread; the caller must not itself be inside that provider's call (the
+/// A dispatch that answers nothing, filling unused sampler rows.
+unsafe extern "C" fn noop_dispatch(
+    _state: *mut u8,
+    _handle: i32,
+    _opcode: u32,
+    _arg: *mut u8,
+    _arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
+) -> i32 {
+    errno::ENOSYS
+}
+
+/// Ask every node-owned module serving `pool` that asked to be sampled how
+/// much of it is in use (`POOL_SAMPLE`) and sum the answers: `Some(n)` when
+/// at least one answered, `None` when none serves the pool or could say. Each
+/// provider's dispatch runs in a provider frame on the calling thread; the
+/// caller must not itself be inside one of those providers' calls (the
 /// ledger asks from its PSTATUS round alone).
 pub fn sample_module_pool(pool: u16) -> Option<u64> {
-    let (module_idx, dispatch, state) = pool_provider_layer(pool)?;
-    let midx = module_idx as usize;
-    // SAFETY: scheduler-thread read of the sampler set.
-    let marked = unsafe {
-        let p = &raw const POOL_SAMPLERS;
-        midx < crate::kernel::exec::scheduler::module_slots() && (*p).test(midx)
-    };
-    if !marked {
-        return None;
+    let mut layers = [(
+        NO_MODULE,
+        noop_dispatch as ModuleProviderDispatchFn,
+        core::ptr::null_mut(),
+    ); MAX_CHAIN_DEPTH];
+    let n = pool_layers(pool, true, &mut layers);
+    let mut total: Option<u64> = None;
+    for &(module_idx, dispatch, state) in &layers[..n] {
+        let mut arg = pool.to_le_bytes();
+        let rc = in_provider_frame(module_idx as usize, || {
+            call_module(
+                dispatch,
+                state,
+                -1,
+                crate::abi::contracts::resource::POOL_SAMPLE,
+                &mut arg[..crate::abi::contracts::resource::POOL_SAMPLE_ARG_LEN],
+                UserSpan::empty(),
+            )
+        });
+        if rc >= 0 {
+            total = Some(total.unwrap_or(0).saturating_add(rc as u64));
+        }
     }
-    let mut arg = pool.to_le_bytes();
-    let rc = in_provider_frame(midx, || {
-        call_module(
-            dispatch,
-            state,
-            -1,
-            crate::abi::contracts::resource::POOL_SAMPLE,
-            &mut arg[..crate::abi::contracts::resource::POOL_SAMPLE_ARG_LEN],
-            UserSpan::empty(),
-        )
-    });
-    (rc >= 0).then_some(rc as u64)
+    total
 }
 
 /// Whether `module_idx` holds at least one registered provider layer.
@@ -1247,9 +1435,46 @@ pub(crate) fn encode_owner_record(owner: crate::kernel::workload::owner::OwnerHa
 /// rather than leaving a stale frame behind.
 pub fn notify_owner_released(owner: crate::kernel::workload::owner::OwnerHandle) {
     notify_module_observers(owner);
-    // SAFETY: scheduler-thread read of a hook set at platform init.
-    if let Some(hook) = unsafe { *core::ptr::addr_of!(OWNER_RELEASE_HOOK) } {
-        hook(owner);
+    notify_kernel_observers(owner);
+}
+
+/// The `OWNER_RELEASED` record for `owner`: its handle as `CALLER_OWNER`
+/// answers it, then its durable uid (zero for the node and for an owner
+/// acting with the node's authority).
+fn owner_released_record(
+    owner: crate::kernel::workload::owner::OwnerHandle,
+) -> [u8; crate::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN] {
+    let mut record = [0u8; crate::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN];
+    record[..8].copy_from_slice(&encode_owner_record(owner));
+    // The uid names what the owner holds on media as its own; an owner acting
+    // with the node's authority holds nothing there as itself.
+    if let Some(e) = crate::kernel::exec::scheduler::owners().lookup(owner) {
+        if !owner.is_node() && e.authority == crate::kernel::workload::owner::Authority::Own {
+            record[8..24].copy_from_slice(&e.owner_uid);
+        }
+    }
+    record
+}
+
+/// The platform half of [`notify_owner_released`]: every kernel provider
+/// that observes releases, in contract order.
+fn notify_kernel_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
+    for idx in 0..MAX_PROVIDERS {
+        // SAFETY: scheduler-thread read; the copy ends the borrow before the
+        // handler runs.
+        let handler = unsafe {
+            let e = &(*core::ptr::addr_of!(PROVIDERS))[idx];
+            e.kernel_dispatch.filter(|_| e.kernel_observes)
+        };
+        if let Some(handler) = handler {
+            let mut record = owner_released_record(owner);
+            handler(
+                -1,
+                crate::abi::internal::reconfigure::OWNER_RELEASED,
+                &mut record,
+                UserSpan::empty(),
+            );
+        }
     }
 }
 
@@ -1300,7 +1525,7 @@ fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
         };
         // A fresh record per handler: one provider scribbling on the buffer
         // must not change what the next one is told.
-        let mut record = encode_owner_record(owner);
+        let mut record = owner_released_record(owner);
         in_provider_frame(midx, || {
             call_module(
                 dispatch,
@@ -1395,7 +1620,7 @@ pub fn dispatch(
         let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[idx] };
         match default_layer_index(entry).and_then(|top| entry.chain[top].as_ref()) {
             Some(layer) => Ok((layer.module_idx, layer.dispatch, layer.state)),
-            None => Err((entry.depth, entry.kernel_dispatch)),
+            None => Err((entry.depth, entry.kernel_dispatch, entry.kernel_node_only)),
         }
     };
     match target {
@@ -1406,14 +1631,14 @@ pub fn dispatch(
         // shape explicitly: the generic "no provider" line below would send the
         // reader looking for a missing module when the real fault is a missing
         // router.
-        Err((depth, None)) if depth > 0 => {
+        Err((depth, None, _)) if depth > 0 => {
             log::error!(
                 "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: {depth} instance-keyed provider(s) registered but no default (unkeyed) one — a `handle == -1` op has no router. Add a policy module (e.g. `mount`) that registers unkeyed and routes to the keyed backends.",
             );
             errno::ENOSYS
         }
-        Err((_, Some(handler))) => {
-            let rc = handler(handle, opcode, arg, data);
+        Err((_, Some(handler), node_only)) => {
+            let rc = call_kernel(handler, node_only, handle, opcode, arg, data);
             if rc == errno::ENOSYS {
                 log::debug!(
                     "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: kernel handler returned ENOSYS"
@@ -1421,56 +1646,10 @@ pub fn dispatch(
             }
             rc
         }
-        Err((_, None)) => {
+        Err((_, None, _)) => {
             log::warn!("[provider] contract 0x{contract:04x} op 0x{opcode:04x}: no provider");
             errno::ENOSYS
         }
-    }
-}
-
-/// Dispatch to the next provider below the caller in the chain.
-///
-/// Called when a module sets the CHAIN_NEXT flag on an opcode.
-/// Finds the caller's position in the chain and dispatches to the layer below.
-/// If the caller is at the bottom (position 0), dispatches to the kernel provider.
-pub fn dispatch_next(
-    caller_module: ModuleId,
-    contract: ContractId,
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: UserSpan<'_>,
-) -> i32 {
-    let idx = contract as usize;
-    if idx >= MAX_PROVIDERS {
-        return errno::ENOSYS;
-    }
-    // The layer below the caller it may reach, else the kernel provider.
-    let target = {
-        // SAFETY: `idx < MAX_PROVIDERS`; the chain is mutated only on the
-        // scheduler thread, and the borrow ends before module code runs.
-        let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[idx] };
-        let caller_pos = (0..entry.depth as usize).rev().find(|&i| {
-            entry.chain[i]
-                .as_ref()
-                .is_some_and(|l| l.module_idx == caller_module)
-        });
-        let below = caller_pos.and_then(|pos| {
-            (0..pos)
-                .rev()
-                .find_map(|b| entry.chain[b].as_ref().filter(|l| layer_visible(l)))
-        });
-        match below {
-            Some(layer) => Ok((layer.module_idx, layer.dispatch, layer.state)),
-            None => Err(entry.kernel_dispatch),
-        }
-    };
-    match target {
-        Ok((midx, f, state)) => in_provider_frame(midx as usize, || {
-            call_module(f, state, handle, opcode, arg, data)
-        }),
-        Err(Some(handler)) => handler(handle, opcode, arg, data),
-        Err(None) => errno::ENOSYS,
     }
 }
 
@@ -1497,79 +1676,58 @@ fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
     None
 }
 
-/// Whether the calling module may reach `layer`: a module of the layer's own
-/// owner may, and so may one that acts with the authority of the layer's
-/// owner. A workload's filesystem serves that workload alone, and the node's
-/// providers serve the node alone: a node provider serving a workload would
-/// act with the node's authority on the workload's behalf, so a workload
-/// reaches storage through providers of its own or through the platform,
-/// which roots it. An owner admitted to act with the node's authority
-/// reaches the node's providers as the node does; its own layers stay its
-/// own, unseen by the node and by its siblings.
+/// Whether the calling module may reach `layer`. An owner-scoped layer: a
+/// module of the layer's own owner may, and so may one that acts with the
+/// authority of the layer's owner — a workload's filesystem serves that
+/// workload alone, and the node's providers serve the node alone, since a
+/// node provider serving a workload would act with the node's authority on
+/// the workload's behalf. A workload-scoped layer: every module acting with
+/// an authority of its own may, and none acting with the node's — the node
+/// reaches what the workload layer roots through the layers beneath it.
 #[inline]
 fn layer_visible(layer: &ProviderLayer) -> bool {
     use crate::kernel::exec::scheduler;
-    layer.owner == scheduler::caller_owner() || layer.owner == scheduler::caller_authority()
+    if serves_workloads(layer.scope) {
+        !scheduler::caller_authority().is_node()
+    } else {
+        layer.owner == scheduler::caller_owner() || layer.owner == scheduler::caller_authority()
+    }
 }
 
-/// The node's own default layer of `contract`: the top-most unkeyed layer a
-/// node-owned module registered, whoever is calling. `None` when the node
-/// has none.
-fn node_default_layer(entry: &ProviderEntry) -> Option<&ProviderLayer> {
-    (0..entry.depth as usize).rev().find_map(|i| {
-        entry.chain[i]
-            .as_ref()
-            .filter(|l| l.selector == 0 && l.owner.is_node())
-    })
+/// Whether `module_idx` holds a workload-scoped layer of any contract.
+pub fn holds_workload_layer(module_idx: usize) -> bool {
+    // SAFETY: scheduler-thread read; nothing here calls into module code.
+    unsafe {
+        (*core::ptr::addr_of!(PROVIDERS)).iter().any(|e| {
+            e.chain[..e.depth as usize]
+                .iter()
+                .flatten()
+                .any(|l| l.module_idx as usize == module_idx && serves_workloads(l.scope))
+        })
+    }
 }
 
-/// Deliver an op to the node's own default provider of `contract` (the
-/// node's `fat32` for `fs`), in that provider's frame, whoever the caller
-/// is. `ENOSYS` when the node has none.
-///
-/// This is the one way past [`layer_visible`], and it is the platform's: a
-/// platform rooting layer (the bare-metal owner roots) answers a workload's
-/// call by rewriting it beneath the workload's own root and handing it to
-/// the node's provider here. No syscall, contract op or module export
-/// reaches it, and the only caller is a kernel-registered provider handing
-/// down a request it has already confined: a path to it from anywhere else
-/// would hand a workload the node's whole namespace.
-/// `tests/harness/tests/node_default_reach_lint.rs` holds every caller to
-/// the platform rooting layers.
-pub fn dispatch_node_default(
-    contract: ContractId,
-    handle: i32,
-    opcode: u32,
-    arg: &mut [u8],
-    data: UserSpan<'_>,
-) -> i32 {
+/// Whether something other than a workload's own modules serves `contract`
+/// to a workload acting with its own authority: a workload-scoped layer, or a
+/// kernel provider that is not node-only. A contract no module may provide
+/// is the kernel's, and an edge contract is served across the workload's
+/// own edges: both are answered `true`.
+pub fn served_to_workload(contract: ContractId) -> bool {
     let idx = contract as usize;
-    if idx >= MAX_PROVIDERS {
-        return errno::ENOSYS;
-    }
-    // SAFETY: scheduler-thread read; the layer's pair is copied out before
-    // module code runs.
-    let target = unsafe {
-        let entry = &(*core::ptr::addr_of!(PROVIDERS))[idx];
-        node_default_layer(entry).map(|l| (l.module_idx, l.dispatch, l.state))
-    };
-    match target {
-        Some((midx, f, state)) => in_provider_frame(midx as usize, || {
-            call_module(f, state, handle, opcode, arg, data)
-        }),
-        None => errno::ENOSYS,
-    }
-}
-
-/// The module serving the node's own default layer of `contract`, if any.
-pub fn node_default_module(contract: usize) -> Option<usize> {
-    if contract >= MAX_PROVIDERS {
-        return None;
+    if idx >= MAX_PROVIDERS
+        || !is_module_providable(contract)
+        || crate::abi::registry::contract_is_edge(contract)
+    {
+        return true;
     }
     // SAFETY: scheduler-thread read.
     unsafe {
-        let entry = &(*core::ptr::addr_of!(PROVIDERS))[contract];
-        node_default_layer(entry).map(|l| l.module_idx as usize)
+        let e = &(*core::ptr::addr_of!(PROVIDERS))[idx];
+        (e.kernel_dispatch.is_some() && !e.kernel_node_only)
+            || e.chain[..e.depth as usize]
+                .iter()
+                .flatten()
+                .any(|l| serves_workloads(l.scope))
     }
 }
 
@@ -1870,9 +2028,12 @@ fn call_target(
     let found = match target {
         Target::Platform => {
             // SAFETY: scheduler-thread read; the copy ends the borrow.
-            let k = unsafe { (*core::ptr::addr_of!(PROVIDERS))[contract as usize].kernel_dispatch };
+            let (k, node_only) = unsafe {
+                let e = &(*core::ptr::addr_of!(PROVIDERS))[contract as usize];
+                (e.kernel_dispatch, e.kernel_node_only)
+            };
             return match k {
-                Some(handler) => handler(handle, opcode, arg, data),
+                Some(handler) => call_kernel(handler, node_only, handle, opcode, arg, data),
                 None => errno::ENODEV,
             };
         }

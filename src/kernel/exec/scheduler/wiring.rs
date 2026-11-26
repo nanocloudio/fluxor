@@ -21,9 +21,15 @@ fn collect_channels(
     for edge in edges.iter() {
         let matches = match direction {
             // A tap edge is written by the kernel's mirror, not the tapped
-            // module: it is never one of that module's outputs.
-            Side::Out => edge.from_module == module_idx && !edge.tap,
-            Side::In => edge.to_module == module_idx && edge.is_ctrl() == ctrl_only,
+            // module: it is never one of that module's outputs. A lane's
+            // target takes the lane's channels with `LANE_TAKE`, never as
+            // ports.
+            Side::Out => edge.from_module == module_idx && !edge.tap && edge.lane != LaneEnd::From,
+            Side::In => {
+                edge.to_module == module_idx
+                    && edge.is_ctrl() == ctrl_only
+                    && edge.lane != LaneEnd::To
+            }
         };
         // Producer reads `channel`; consumer reads `consumer_channel`
         // when a platform bridge has split the edge, otherwise `channel`.
@@ -304,6 +310,7 @@ pub fn instantiate_one_module(
                 },
                 params,
                 static_name,
+                SCHED.protection[instantiated],
             )
         };
         clear_instantiation_state();

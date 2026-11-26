@@ -216,6 +216,14 @@ pub struct ContinuityState {
     attest: CustodyAttest,
     attest_held: [u8; CUSTODY_ATTEST_CMD_LEN],
     attest_held_len: u8,
+    /// A command waiting for the vault to make the continuity master
+    /// durable (`hold_for_vault`), held whole (`vault_held_len` bytes, 0
+    /// for none, of command `vault_held_type`) since `vault_held_since`
+    /// (ms, 0 when none is held).
+    vault_held: [u8; VAULT_HELD_MAX],
+    vault_held_len: u16,
+    vault_held_type: u8,
+    vault_held_since: u64,
 }
 
 /// Initialise the continuity state in-place over the module's zeroed
@@ -250,6 +258,8 @@ unsafe fn continuity_init(s: &mut QuicState) {
     s.continuity.signer_open = false;
     s.continuity.attest = NO_CUSTODY_ATTEST;
     s.continuity.attest_held_len = 0;
+    s.continuity.vault_held_len = 0;
+    s.continuity.vault_held_since = 0;
 }
 
 // ─── Bounded writer / reader ───────────────────────────────────────────
@@ -355,8 +365,9 @@ impl<'a> Reader<'a> {
 
 // ─── Vault sealing (labelled `quic-continuity`) ────────────────────────
 
-/// Open (or lazily generate) the continuity sealing key. Returns -1 if the
-/// vault refuses, in which case no checkpoint can be produced or imported.
+/// Open (or lazily generate) the continuity sealing key. Negative if the
+/// vault refuses, in which case no checkpoint can be produced or imported:
+/// `E_AGAIN` while the master it just made is not yet durable, else -1.
 unsafe fn cont_vault_key(s: &mut QuicState, flow: &[u8; CONT_FLOW_ID_BYTES], epoch: u32) -> i32 {
     // The flow's own sealing key (`custody.rs`): unwrapped by a custody
     // transfer, else derived here from the continuity master.
@@ -1565,6 +1576,13 @@ unsafe fn cont_apply_cut_export(s: &mut QuicState, payload: &[u8]) {
         );
         return;
     }
+    // The sealing key first: a master the vault has just made is not
+    // handed out until it is durable, and the cut waits for it.
+    if cont_vault_key(s, &flow, epoch) == E_AGAIN
+        && hold_for_vault(s, sc::CMD_SC_CUT_EXPORT, payload)
+    {
+        return;
+    }
     let n = serialize_checkpoint(s, idx, &flow, epoch);
     if n == 0 {
         cont_reply(
@@ -2683,14 +2701,24 @@ unsafe fn cont_pump(s: &mut QuicState) {
     cont_keys_sweep(s);
     cont_service(s);
     custody_attest_step(s);
+    let held = s.continuity.vault_held_len as usize;
+    if held != 0 {
+        let cmd = s.continuity.vault_held;
+        s.continuity.vault_held_len = 0;
+        cont_apply(s, s.continuity.vault_held_type, &cmd[..held]);
+        if s.continuity.vault_held_len == 0 {
+            s.continuity.vault_held_since = 0;
+        }
+    }
     if s.cont_in < 0 {
         return;
     }
     let sys = &*s.syscalls;
     let mut budget = 0;
-    // An ATTEST held behind the one being signed stops the drain: the
-    // commands after it stay unread, in order, until it is handled.
-    while budget < 8 && s.continuity.attest_held_len == 0 {
+    // An ATTEST held behind the one being signed, or a command waiting on
+    // the vault, stops the drain: the commands after it stay unread, in
+    // order, until it is handled.
+    while budget < 8 && s.continuity.attest_held_len == 0 && s.continuity.vault_held_len == 0 {
         let poll = (sys.channel_poll)(s.cont_in, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;

@@ -533,14 +533,14 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     gem_write(base, GEM_TBQPH, (tx_dma >> 32) as u32);
     gem_write(base, GEM_TXQBASE, tx_dma as u32);
 
-    // Ask the kernel for the hardware-provisioned MAC (sourced from the
-    // firmware-provided DTB). Fall back to DEFAULT_MAC — a locally-
-    // administered address — if the kernel has nothing for us.
-    const SYS_GET_HW_ETHERNET_MAC: u32 = abi::registry::kernel::GET_HW_ETHERNET_MAC;
+    // The board's provisioned MAC, a fact the firmware handed the kernel
+    // (the device tree). Fall back to DEFAULT_MAC — a locally-administered
+    // address — when the board gave none.
     let mut probed = [0u8; 6];
+    probed[0] = abi::kernel_abi::board_fact::ETHERNET_MAC;
     s.mac = if (sys.provider_call)(
         -1,
-        SYS_GET_HW_ETHERNET_MAC,
+        abi::kernel_abi::BOARD_FACT,
         probed.as_mut_ptr(),
         6,
         core::ptr::null_mut(),
