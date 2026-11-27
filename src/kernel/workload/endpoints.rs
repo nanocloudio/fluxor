@@ -11,9 +11,16 @@
 //! An owner granted nothing holds nothing: a network stack refuses its
 //! every listening bind. The admitted endpoints are kept per owner slot,
 //! stamped with the owner's generation, so a slot's next owner never reads
-//! the last one's. An endpoint is one owner's at a time: an admission naming
-//! one another live owner holds, by its admission or by the plan, is
-//! refused.
+//! the last one's.
+//!
+//! An endpoint is leased on the addresses its owner can listen on. An owner
+//! admitted without `own_address` may listen on the node's shared
+//! addresses, so among such owners an endpoint is one owner's at a time: an
+//! admission naming one another of them holds, by its admission or by the
+//! plan, is refused. An owner admitted with `own_address` listens on its own
+//! addresses alone (the stack refuses it the shared ones), so its endpoints
+//! are no lease there and collide with no other owner's. A plan names no
+//! address: its owners count as sharing the node's.
 
 use crate::abi::contracts::net::net_proto::grant;
 use crate::kernel::sys::errno;
@@ -27,12 +34,15 @@ pub type Endpoint = [u8; grant::ENDPOINT_LEN];
 struct Admitted {
     /// The generation of the owner they are for.
     generation: u32,
+    /// The owner listens on addresses of its own only.
+    own_address: bool,
     count: u8,
     endpoints: [Endpoint; grant::MAX_ADMITTED_ENDPOINTS],
 }
 
 const NONE: Admitted = Admitted {
     generation: 0,
+    own_address: false,
     count: 0,
     endpoints: [[0; grant::ENDPOINT_LEN]; grant::MAX_ADMITTED_ENDPOINTS],
 };
@@ -59,27 +69,32 @@ pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::Table
     Ok(())
 }
 
-/// The admitted endpoints of the live owner `owner`; empty for an owner
-/// admitted with none, or one no longer live.
-fn admitted_of(owner: OwnerHandle) -> &'static [Endpoint] {
+/// What the live owner `owner` was admitted with; [`NONE`] for an owner
+/// admitted with nothing, or one no longer live.
+fn admitted_of(owner: OwnerHandle) -> &'static Admitted {
     if crate::kernel::exec::scheduler::owners()
         .lookup(owner)
         .is_none()
     {
-        return &[];
+        return &NONE;
     }
     // SAFETY: scheduler-thread state; no mutable borrow is live.
     let t = unsafe { &*core::ptr::addr_of!(ADMITTED) };
     match t.get(usize::from(owner.slot)) {
-        Some(e) if e.generation == owner.generation => {
-            &e.endpoints[..usize::from(e.count).min(grant::MAX_ADMITTED_ENDPOINTS)]
-        }
-        _ => &[],
+        Some(e) if e.generation == owner.generation => e,
+        _ => &NONE,
     }
 }
 
-/// Whether a live owner other than `me` holds `ep`: admitted with it, or
-/// granted it by the plan.
+impl Admitted {
+    fn endpoints(&self) -> &[Endpoint] {
+        &self.endpoints[..usize::from(self.count).min(grant::MAX_ADMITTED_ENDPOINTS)]
+    }
+}
+
+/// Whether a live owner other than `me` that may listen on the node's
+/// shared addresses holds `ep`: admitted with it and without
+/// `own_address`, or granted it by the plan.
 fn held_elsewhere(me: OwnerHandle, ep: &Endpoint) -> bool {
     if crate::kernel::workload::owner_plan::plan_grants_elsewhere(
         me.slot,
@@ -95,22 +110,28 @@ fn held_elsewhere(me: OwnerHandle, ep: &Endpoint) -> bool {
             return false;
         }
         owners.entry_at(slot).is_some_and(|e| {
-            admitted_of(OwnerHandle {
+            let a = admitted_of(OwnerHandle {
                 slot: slot as u16,
                 generation: e.generation,
-            })
-            .contains(ep)
+            });
+            !a.own_address && a.endpoints().contains(ep)
         })
     })
 }
 
 /// Grant the just-admitted owner `owner` the endpoints `endpoints`, each
-/// `[protocol u8][port u16 LE]`. `EINVAL` for a malformed endpoint (a
-/// protocol other than tcp or udp, port 0, one named twice), `E2BIG` past
-/// [`grant::MAX_ADMITTED_ENDPOINTS`], `EEXIST` for one another live owner
-/// holds, `ESRCH` for an owner that is not live. Nothing is granted unless
+/// `[protocol u8][port u16 LE]`, and with `own_address` confine it to
+/// addresses of its own. `EINVAL` for a malformed endpoint (a protocol
+/// other than tcp or udp, port 0, one named twice), `E2BIG` past
+/// [`grant::MAX_ADMITTED_ENDPOINTS`], `EEXIST` for one that another live
+/// owner sharing the node's addresses holds while `owner` would share them
+/// too, `ESRCH` for an owner that is not live. Nothing is granted unless
 /// all of them are. Scheduler thread.
-pub fn admit(owner: OwnerHandle, endpoints: impl Iterator<Item = Endpoint>) -> Result<(), i32> {
+pub fn admit(
+    owner: OwnerHandle,
+    own_address: bool,
+    endpoints: impl Iterator<Item = Endpoint>,
+) -> Result<(), i32> {
     if owner.is_node()
         || crate::kernel::exec::scheduler::owners()
             .lookup(owner)
@@ -120,6 +141,7 @@ pub fn admit(owner: OwnerHandle, endpoints: impl Iterator<Item = Endpoint>) -> R
     }
     let mut entry = Admitted {
         generation: owner.generation,
+        own_address,
         ..NONE
     };
     for ep in endpoints {
@@ -134,7 +156,7 @@ pub fn admit(owner: OwnerHandle, endpoints: impl Iterator<Item = Endpoint>) -> R
         {
             return Err(errno::EINVAL);
         }
-        if held_elsewhere(owner, &ep) {
+        if !own_address && held_elsewhere(owner, &ep) {
             return Err(errno::EEXIST);
         }
         entry.endpoints[i] = ep;
@@ -161,17 +183,27 @@ pub fn listed(bytes: &[u8]) -> impl Iterator<Item = Endpoint> + '_ {
 }
 
 /// `OWNER_GRANTS`: owner `(slot, generation)`'s grant records into `out`,
-/// the plan's then its admission's. Their length (0: granted nothing),
-/// `ERANGE` with the length needed as `[len u32]` in `arg` when `out` is
-/// short. Scheduler thread only.
+/// the plan's then its admission's (its endpoints, then `OWN_ADDRESS` when
+/// it was admitted with it). Their length (0: granted nothing), `ERANGE`
+/// with the length needed as `[len u32]` in `arg` when `out` is short.
+/// Scheduler thread only.
 pub fn owner_grants(slot: u16, generation: u32, arg: &mut [u8], out: &mut [u8]) -> i32 {
     let mut need = crate::kernel::workload::owner_plan::plan_grants(slot, generation, out);
-    for ep in admitted_of(OwnerHandle { slot, generation }) {
+    let admitted = admitted_of(OwnerHandle { slot, generation });
+    for ep in admitted.endpoints() {
         let end = need + grant::HEAD + grant::ENDPOINT_LEN;
         if let Some(d) = out.get_mut(need..end) {
             d[0..2].copy_from_slice(&grant::ENDPOINT.to_le_bytes());
             d[2..4].copy_from_slice(&(grant::ENDPOINT_LEN as u16).to_le_bytes());
             d[4..].copy_from_slice(ep);
+        }
+        need = end;
+    }
+    if admitted.own_address {
+        let end = need + grant::HEAD;
+        if let Some(d) = out.get_mut(need..end) {
+            d[0..2].copy_from_slice(&grant::OWN_ADDRESS.to_le_bytes());
+            d[2..4].copy_from_slice(&0u16.to_le_bytes());
         }
         need = end;
     }

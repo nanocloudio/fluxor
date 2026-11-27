@@ -840,6 +840,46 @@ impl OciStore {
         Ok(Some(self.read_blob(&layer.digest)?))
     }
 
+    /// The `manifest.toml` each `.fmod` in `digests` was published with,
+    /// by `.fmod` digest: the metadata layer of the module artefact whose
+    /// `.fmod` layer is those bytes. A digest no module artefact carries is
+    /// absent from the answer.
+    pub fn module_manifests_by_fmod(
+        &self,
+        digests: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut found = std::collections::BTreeMap::new();
+        if digests.is_empty() {
+            return Ok(found);
+        }
+        for d in &self.read_index()?.manifests {
+            if d.annotations.get(ANN_KIND).map(String::as_str) != Some("module") {
+                continue;
+            }
+            let Ok(manifest) = self.read_manifest(d) else {
+                continue;
+            };
+            let Some(fmod) = manifest
+                .layers
+                .iter()
+                .find(|l| l.media_type == MT_FLUXOR_MODULE)
+                .map(|l| l.digest.clone())
+            else {
+                continue;
+            };
+            if !digests.contains(&fmod.as_str()) || found.contains_key(&fmod) {
+                continue;
+            }
+            if let Some(text) = self.module_manifest_toml_blob(&manifest)? {
+                found.insert(fmod, text);
+                if found.len() == digests.len() {
+                    break;
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Remove a reference from the index, then delete every blob no longer
     /// reachable from any remaining indexed manifest. Content shared with
     /// other tags survives (content addressing does the refcounting).

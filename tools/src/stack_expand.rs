@@ -503,6 +503,7 @@ pub fn id_table_rows(
         search_paths: s.search_paths.clone(),
         install_root: s.install_root.clone(),
         store_dir: s.store_dir.clone(),
+        package: s.package.clone(),
     })
     .map_err(|e| Error::Config(e.to_string()))?;
     Ok(move |ty: &str, variant: Option<&str>| {
@@ -1962,6 +1963,7 @@ wiring = []
             search_paths: Vec::new(),
             install_root: None,
             store_dir: Some(tmp.join("store")),
+            package: None,
         })
         .unwrap();
 

@@ -361,6 +361,11 @@ fn target_module_root(
     project_root: &std::path::Path,
     desc: &crate::target::TargetDescriptor,
 ) -> Result<PathBuf> {
+    // A package's launch reads the modules the package carries, and no
+    // other root.
+    if let Some(package) = crate::module_resolver::package_scope() {
+        return Ok(package);
+    }
     crate::modules_build::select_module_root(
         explicit,
         project_root.join(crate::modules_build::modules_dir_for(desc)),

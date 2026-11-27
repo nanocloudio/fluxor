@@ -12,6 +12,7 @@ fn test_resolver(
         search_paths: search.iter().map(|p| p.to_path_buf()).collect(),
         install_root: None,
         store_dir: Some(project.join("store")),
+        package: None,
     })
     .expect("test resolver")
 }
@@ -2492,6 +2493,7 @@ mod scheduler_validation_tests {
                 search_paths: vec![dir.path().to_path_buf()],
                 install_root: None,
                 store_dir: Some(dir.path().join("store")),
+                package: None,
             })
             .unwrap()
         };
@@ -9647,6 +9649,7 @@ mod pinned_variant_tests {
             search_paths: Vec::new(),
             install_root: None,
             store_dir: Some(dir.path().join("store")),
+            package: None,
         })
         .unwrap();
         (dir, r)
@@ -9681,6 +9684,55 @@ mod pinned_variant_tests {
             "port 8080 packed from the pinned schema: {:?}",
             built.params
         );
+    }
+
+    /// A param that names a module by its bytes is rendered from the build
+    /// the resolver reads: its pack an FXMT table holding exactly that
+    /// `.fmod`, its pin the SHA-256 of it, both lowercase hex. A native or
+    /// unresolved type is refused.
+    #[test]
+    fn a_module_pack_and_pin_render_from_the_resolved_build() {
+        use fluxor_abi::wire::fmod::table;
+        use sha2::{Digest, Sha256};
+        let (_dir, r) = project();
+        let module = json!({
+            "name": "driver",
+            "params": { "pack": "${module_pack:feeder}", "pin": "${module_pin:feeder}" },
+        });
+        let out = render_module_bytes("driver", module, &r).unwrap();
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let feeder = fmod("feeder", &[]);
+        assert_eq!(
+            unhex(out["params"]["pin"].as_str().unwrap()),
+            Sha256::digest(&feeder).to_vec()
+        );
+        let pack = unhex(out["params"]["pack"].as_str().unwrap());
+        let le16 = |at: usize| usize::from(u16::from_le_bytes([pack[at], pack[at + 1]]));
+        let le32 = |at: usize| u32::from_le_bytes(pack[at..at + 4].try_into().unwrap());
+        assert_eq!(&pack[table::MAGIC..table::MAGIC + 4], b"FXMT");
+        assert_eq!(le16(table::MODULE_COUNT), 1);
+        let entry = table::HEADER_SIZE;
+        assert_eq!(
+            le32(entry + table::ENTRY_NAME_HASH),
+            crate::hash::fnv1a_hash(b"feeder")
+        );
+        let at = le32(entry + table::ENTRY_OFFSET) as usize;
+        let len = le32(entry + table::ENTRY_SIZE_AT) as usize;
+        assert_eq!(
+            &pack[at..at + len],
+            &feeder[..],
+            "the pack holds the built module"
+        );
+
+        let e = render_module_bytes("driver", json!({ "p": "${module_pin:absent}" }), &r)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'absent'"), "{e}");
     }
 
     #[test]

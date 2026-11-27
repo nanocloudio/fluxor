@@ -305,4 +305,5 @@ include!("placement.rs"); // members composed from another node
 include!("generate.rs"); // boot config encode, ModuleCaps, generate_config_ext
 include!("lanes.rs"); // the node graph's lanes to its lane targets
 include!("host_provider.rs"); // native modules a host provider serves, as host lanes
+include!("module_pack.rs"); // module packs and pins a param names by module
 include!("tests.rs"); // #[cfg(test)] suites

@@ -740,7 +740,7 @@ workloads:
 | Owner | Commands run as the workload's owner: a listen (a nonzero port) needs the owner's `net.endpoint` grant for it, and what they open is stamped with it |
 | Events | Every message about something the lane opened — accepts, data, closes, connect results — goes to the lane's events channel and nowhere else; a full lane back-pressures only its own sockets |
 | Isolation | A lane sends on and closes only what it opened; the node's own lanes cannot touch a workload's connections either |
-| Teardown | Freeing the owner detaches its lanes and closes everything they opened |
+| Teardown | Freeing the owner detaches its lanes, closes everything they opened and releases every address it held, `ADDR_DEL` or not; an address is its owner's by slot and generation, so a later owner of the slot never inherits it |
 
 A workload owner's grants are what the kernel's `OWNER_GRANTS` answers
 for it, and nothing else opens a port: the committed owner plan's (a
@@ -750,10 +750,19 @@ workload's `endpoints:` (above), carried in its boot record, or the
 creator acting with the node's authority may give. An owner granted
 nothing listens nowhere. The grant is what lets an owner holding no
 address listen on the node's shared addresses; an owner holding one
-listens on its own addresses alone. An endpoint is one live owner's at a
-time, and an admission naming one another owner holds is refused. The
-node owner's lanes are not gated: they listen on the node's addresses,
-any port. `linux_net` and `ip` apply one rule.
+listens on its own addresses alone. A `CREATE` that gives its workload an
+address of its own says so with the `net`/`own_address` option: that
+owner is confined to its own addresses, and listens nowhere
+(`EADDRNOTAVAIL`) while it holds none. An endpoint is leased on the
+addresses its owner can reach. Among owners that may listen on the
+node's shared addresses (every owner not confined, plan owners among
+them) it is one live owner's at a time, and an admission naming one such
+an owner holds is refused `EEXIST`. A confined owner's endpoints collide
+with no other owner's, so the replicas of one workload, each on an
+address of its own, may all hold the same port. The node owner's lanes
+are not gated: they listen on the node's addresses, any port. `linux_net`
+and `ip` apply one rule; `linux_net` gives a lane's owner no address of
+its own, so a confined owner listens nowhere there.
 
 Two providers implement lanes. On Linux, `linux_net` is the provider (the
 lane target `linux_net`, its `host_lane` carrying each lane to the host
@@ -772,7 +781,8 @@ both surfaces on a lane:
   `EACCES` unless the owner holds a `net.endpoint` grant for that
   protocol and port. Port 0, an ephemeral source, is no claim.
 - A port another lane listens on at an overlapping address is
-  `EADDRINUSE`, so no two lanes are offered the same connections.
+  `EADDRINUSE`, stream and datagram alike, so no two lanes are offered the
+  same traffic. The node's wildcard never overlaps an owned address.
 - A workload that holds addresses sources only from them, per family: its
   IPv4 address for IPv4 (the node's primary for an IPv4 destination
   outside its cluster prefixes), its IPv6 address for IPv6. A family it

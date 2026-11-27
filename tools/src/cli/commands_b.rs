@@ -1654,7 +1654,7 @@ fn build_one_from(
             // anchored to the resolved project root (not the
             // caller's cwd) so `fluxor run <path>` finds the same modules from
             // any directory.
-            if !crate::modules_build::holds_fmod(&modules_dir) {
+            if r.spec().package.is_none() && !crate::modules_build::holds_fmod(&modules_dir) {
                 return Err(Error::Config(format!(
                     "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
                      project root (`fluxor inspect` shows where that is) first.",

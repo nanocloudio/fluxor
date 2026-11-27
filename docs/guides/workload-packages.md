@@ -149,18 +149,25 @@ a pinned package, digest-verified, to:
 ```text
 target/fluxor/packages/<name>/
   workload.json  graph.yaml  resources.json
-  modules/<module>.fmod
+  modules/<module>.fmod  modules/<module>.toml
   .fluxor-sync-stamp
 ```
+
+Each module comes with the `manifest.toml` it was published with
+(`<module>.toml`), taken from the store's module artefact that carries those
+bytes, so a run of the package resolves its modules from the package alone:
+never from the `fluxor.lock` or tree of the project it is run in.
 
 `fluxor run <name>` runs the project's own `packaging/` package of that name
 when it ships one, else the package its `fluxor.lock` pins (materialising it
 if `sync` has not). It also takes a package directory or a source manifest
 path. The graph is rendered with the run's values and built against the
-package's own `modules/` when it has them (a pinned, materialised package),
-else the project's module directory; every module the package pins is
-checked against its digest first, and a rendered graph that loads a module
-the package does not pin is refused. Every run composes the image it runs
+package's own `modules/`, which every emitted and materialised package
+carries; every module the package pins is checked against its digest first,
+and a rendered graph that loads a module the package does not pin is
+refused. An installed applet is composed for the project it was installed
+from (its signing key, target definition and Fluxor catalog), whichever
+directory it is run in. Every run composes the image it runs
 this way, against the runtime it runs: the image pins the host providers
 beside that binary. The rendered graph and image live in a private per-user
 directory (`$XDG_RUNTIME_DIR/fluxor-run/`, else `fluxor-run-<uid>` in the

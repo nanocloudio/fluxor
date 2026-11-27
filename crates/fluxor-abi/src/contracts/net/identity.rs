@@ -14,6 +14,13 @@
 // the workload. A coordinator that moves service addresses (a VIP
 // controller) is the writer on a node with no workload creator.
 //
+// A workload's address is its owner's, by owner slot AND generation, and no
+// longer than the owner lives: when the kernel frees the owner (its lanes
+// detach, or its host process ends) the provider releases every address it
+// holds, `ADDR_DEL` or not, and an install naming a generation the slot no
+// longer holds is refused (`refusal::OWNER`). A later owner of the slot
+// never inherits an address of an earlier one.
+//
 // An `ADDR_ADD` of an address the same owner already holds is answered
 // `MSG_ADDR_ADDED` again (a writer re-issuing after its own restart); one that
 // would move an address another owner holds is refused, unless the writer
@@ -37,12 +44,15 @@ pub const FRAME_HDR: usize = 3;
 
 /// Install a workload's secondary local address.
 /// Payload: `[addr: 16][prefix_len: 1][owner_tag: 2 LE]`, then optionally
-/// `[flags: u8]` ([`install`]) and, after the flags, `[segment: u16 LE]`
-/// (`addr` is a 16-byte address slot, IPv4 in bytes 0..4 in network order — the
-/// provider's `LocalAddr` layout, so it copies in with no re-order; `owner_tag`
-/// is the workload's owner slot; `segment` ≥ 1 names the `net.route` segment
-/// the address joins, which must exist and hold it — otherwise the install is
-/// refused `refusal::SEGMENT` — and 0 or absent joins none).
+/// `[flags: u8]` ([`install`]), after the flags `[segment: u16 LE]`, and
+/// after the segment `[owner_gen: u32 LE]` (`addr` is a 16-byte address slot,
+/// IPv4 in bytes 0..4 in network order — the provider's `LocalAddr` layout, so
+/// it copies in with no re-order; `owner_tag` is the workload's owner slot
+/// and `owner_gen` that owner's generation, which an install naming a
+/// workload owner (`owner_tag != 0`) must carry, or it is refused
+/// `refusal::OWNER`; `segment` ≥ 1 names the `net.route` segment the address
+/// joins, which must exist and hold it — otherwise the install is refused
+/// `refusal::SEGMENT` — and 0 or absent joins none).
 pub use super::super::super::registry::msg::identity::ADDR_ADD;
 
 /// A workload owner's name-service context: the resolver its lanes' name
@@ -254,7 +264,9 @@ pub mod refusal {
     /// The segment the install names does not exist, does not hold the
     /// address, or the address is its gateway.
     pub const SEGMENT: u8 = 10;
-    /// The address is held by another owner.
+    /// The address is held by another owner, or the install names a
+    /// workload owner without its generation or with one its slot no
+    /// longer holds.
     pub const OWNER: u8 = 11;
 }
 
@@ -290,8 +302,13 @@ pub const ARM_AUTH_VERDICT_LEN: usize = 16 + 4 + 32 + 1;
 /// Byte length of an `ADDR_ADD` payload: `[addr:16][prefix_len:1][owner_tag:2]`.
 pub const ADDR_ADD_PAYLOAD_LEN: usize = 19;
 
-/// The longest `ADDR_ADD` payload: the flags byte and the segment after it.
-pub const ADDR_ADD_PAYLOAD_MAX: usize = ADDR_ADD_PAYLOAD_LEN + 1 + 2;
+/// The longest `ADDR_ADD` payload: the flags byte, the segment and the
+/// owner's generation after it ([`ADDR_ADD_OWNED_LEN`]).
+pub const ADDR_ADD_PAYLOAD_MAX: usize = ADDR_ADD_OWNED_LEN;
+
+/// Byte length of an `ADDR_ADD` naming a workload owner: through
+/// `owner_gen`.
+pub const ADDR_ADD_OWNED_LEN: usize = ADD_OWNER_GEN_OFF + 4;
 
 /// Byte length of an `ADDR_DEL` payload: `[addr:16]`.
 pub const ADDR_DEL_PAYLOAD_LEN: usize = 16;
@@ -311,6 +328,9 @@ pub const ADD_OWNER_TAG_OFF: usize = 17;
 pub const ADD_FLAGS_OFF: usize = 19;
 /// Offset of the optional segment (u16 LE) within an `ADDR_ADD` payload.
 pub const ADD_SEGMENT_OFF: usize = 20;
+/// Offset of the owner's generation (u32 LE) within an `ADDR_ADD` payload:
+/// required when `owner_tag` names a workload owner.
+pub const ADD_OWNER_GEN_OFF: usize = 22;
 
 /// `OWNER_RESOLVER` payload layout.
 pub mod owner_resolver {

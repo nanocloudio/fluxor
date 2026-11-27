@@ -2832,6 +2832,7 @@ wiring:
                 search_paths: Vec::new(),
                 install_root: None,
                 store_dir: Some(store_root.clone()),
+                package: None,
             })
             .unwrap()
         };

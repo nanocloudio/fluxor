@@ -1433,9 +1433,14 @@ unsafe fn send_dg_ep_error(st: &mut Sockets, lane: usize, ep: u8, errno: u8) {
 /// draining or paused owner binds nothing new — same-owner re-binds of held
 /// ports never reach this, they take the use-class fast path), and a
 /// listening bind (a nonzero port) must be one of the owner's
-/// `net.endpoint` grants: an owner granted nothing listens nowhere. Port 0
-/// (an ephemeral source) claims nothing. The node owner's lanes are ungated.
-/// Returns the refusal errno, or None to proceed.
+/// `net.endpoint` grants: an owner granted nothing listens nowhere. A lane
+/// listens on the node's addresses (this provider gives a lane's owner no
+/// address of its own: `identity` realizes host-process owners only), so an
+/// owner whose grants confine it to addresses of its own (`OWN_ADDRESS`)
+/// listens nowhere here (`EADDRNOTAVAIL`): its endpoints are no lease on
+/// the node's addresses. Port 0 (an ephemeral source) claims nothing. The
+/// node owner's lanes are ungated. Returns the refusal errno, or None to
+/// proceed.
 fn new_bind_refusal(st: &Sockets, lane: usize, protocol: u8, port: u16) -> Option<u8> {
     let commander = lane_owner(st, lane);
     if commander.is_node() {
@@ -1454,14 +1459,21 @@ fn new_bind_refusal(st: &Sockets, lane: usize, protocol: u8, port: u16) -> Optio
     if port == 0 {
         return None; // an ephemeral source port claims nothing
     }
-    if np::grant::grants_endpoint(&g.grants, protocol, port) {
-        None
-    } else {
+    if !np::grant::grants_endpoint(&g.grants, protocol, port) {
         log::warn!(
             "[linux_net] bind port {port} refused: no grant to owner slot {}",
             commander.slot
         );
         Some(13) // EACCES
+    } else if np::grant::own_address(&g.grants) {
+        log::warn!(
+            "[linux_net] bind port {port} refused: owner slot {} listens on addresses of \
+             its own only, and holds none here",
+            commander.slot
+        );
+        Some(99) // EADDRNOTAVAIL
+    } else {
+        None
     }
 }
 

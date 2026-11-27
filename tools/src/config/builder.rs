@@ -2700,6 +2700,7 @@ fn build_module_entry_in(
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
     let normalized_module = pin_host_lane(type_name, normalized_module, r)?;
+    let normalized_module = render_module_bytes(name, normalized_module, r)?;
     // PIC modules embed their schema in the `.fmod`; native modules declare
     // it in their manifest's `[[params]]`. Both feed the same TLV packer, so
     // the wire format is identical at the kernel boundary; a native module's

@@ -20,9 +20,10 @@
 //!
 //! - `NOT_UNICAST`: not an IPv4 unicast address, or IPv6 (this provider
 //!   realizes IPv4 only).
-//! - `OWNER`: another owner holds the address, or the owner tag names the
+//! - `OWNER`: another owner holds the address, the owner tag names the
 //!   node (the node's own addresses are the host's; an address the node
-//!   answers for is a `net_route` held address).
+//!   answers for is a `net_route` held address), or the install carries no
+//!   owner generation, or one other than the slot's owner's.
 //! - `TABLE_FULL`: the owner already holds another address (one identity
 //!   per workload).
 //! - `SEGMENT`: the segment is not in the table, does not hold the
@@ -38,8 +39,10 @@
 //! An `ADDR_ADD` of an address its owner already holds answers
 //! `MSG_ADDR_ADDED` again with the same token and generation. `ADDR_DEL`
 //! is not answered when it removes; it discards the address's connection
-//! state and its attachment. An owner that is gone loses its address the
-//! same way. `OWNER_RESOLVER` is the socket data plane's, not this
+//! state and its attachment. An owner that is gone (its process ended, or
+//! the runtime released it) loses its address the same way: an address is
+//! its owner's by slot and generation, and a later owner of the slot never
+//! inherits it. `OWNER_RESOLVER` is the socket data plane's, not this
 //! control half's, and is not acted on here.
 
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -66,6 +69,8 @@ struct Owner {
 /// One installed address.
 struct Installed {
     owner: u16,
+    /// The generation of the owner `owner` names.
+    owner_gen: u32,
     addr: [u8; 4],
     link: String,
     token: [u8; 16],
@@ -163,18 +168,22 @@ impl Identity {
         });
     }
 
-    /// That owner's process is gone: its address leaves the node.
+    /// That owner is gone (its process ended, or the runtime released it):
+    /// its address leaves the node, and an install still waiting for it is
+    /// dropped.
     pub fn owner_gone(&mut self, slot: u16, generation: u32) {
-        let before = self.owners.len();
         self.owners
             .retain(|o| !(o.slot == slot && o.generation == generation));
-        if self.owners.len() == before {
-            return;
-        }
-        while let Some(i) = self.installed.iter().position(|x| x.owner == slot) {
+        while let Some(i) = self
+            .installed
+            .iter()
+            .position(|x| x.owner == slot && x.owner_gen == generation)
+        {
             let x = self.installed.swap_remove(i);
             remove(&x);
         }
+        self.waiting
+            .retain(|(_, p)| owner_of(p) != Some((slot, generation)));
     }
 
     /// One record off `addr_ctl`.
@@ -236,6 +245,7 @@ impl Identity {
         let flags = p.get(id::ADD_FLAGS_OFF).copied().unwrap_or(0);
         let prefix_len = p[id::ADD_PREFIX_LEN_OFF];
         let owner = u16::from_le_bytes([p[id::ADD_OWNER_TAG_OFF], p[id::ADD_OWNER_TAG_OFF + 1]]);
+        let owner_gen = owner_of(&p).map(|(_, g)| g);
         let segment = p
             .get(id::ADD_SEGMENT_OFF..id::ADD_SEGMENT_OFF + 2)
             .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
@@ -248,16 +258,30 @@ impl Identity {
         {
             return self.refuse(a16, op, r::NOT_UNICAST);
         }
-        if owner == 0 {
+        let Some(owner_gen) = owner_gen.filter(|_| owner != 0) else {
+            return self.refuse(a16, op, r::OWNER);
+        };
+        // A slot whose owner this provider knows is that owner's: an install
+        // naming another generation names one that is gone.
+        if self
+            .owners
+            .iter()
+            .any(|o| o.slot == owner && o.generation != owner_gen)
+        {
             return self.refuse(a16, op, r::OWNER);
         }
         if let Some(i) = self.installed.iter().position(|x| x.addr == addr) {
-            if self.installed[i].owner == owner {
+            let x = &self.installed[i];
+            if (x.owner, x.owner_gen) == (owner, owner_gen) {
                 return self.added(i);
             }
             return self.refuse(a16, op, r::OWNER);
         }
-        if self.installed.iter().any(|x| x.owner == owner) {
+        if self
+            .installed
+            .iter()
+            .any(|x| (x.owner, x.owner_gen) == (owner, owner_gen))
+        {
             return self.refuse(a16, op, r::TABLE_FULL);
         }
         if flags & id::install::DISARMED != 0 {
@@ -279,7 +303,11 @@ impl Identity {
                 _ => return self.refuse(a16, op, r::SEGMENT),
             }
         };
-        let Some(o) = self.owners.iter().position(|o| o.slot == owner) else {
+        let Some(o) = self
+            .owners
+            .iter()
+            .position(|o| o.slot == owner && o.generation == owner_gen)
+        else {
             if Instant::now() < deadline {
                 self.waiting.push((deadline, p));
             } else {
@@ -315,6 +343,7 @@ impl Identity {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.installed.push(Installed {
             owner,
+            owner_gen,
             addr,
             link,
             token,
@@ -322,6 +351,17 @@ impl Identity {
         });
         self.added(self.installed.len() - 1);
     }
+}
+
+/// The `(owner_tag, owner_gen)` an `ADDR_ADD` payload names: `None` without
+/// the generation.
+fn owner_of(p: &[u8]) -> Option<(u16, u32)> {
+    let t = p.get(id::ADD_OWNER_TAG_OFF..id::ADD_OWNER_TAG_OFF + 2)?;
+    let g = p.get(id::ADD_OWNER_GEN_OFF..id::ADD_OWNER_GEN_OFF + 4)?;
+    Some((
+        u16::from_le_bytes([t[0], t[1]]),
+        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+    ))
 }
 
 fn dotted(a: [u8; 4]) -> String {
@@ -443,4 +483,101 @@ pub fn reclaim_links(ctx: &instance::ReclaimCtx<'_>) -> Result<(), i32> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn told(slot: u16, generation: u32) -> Owner {
+        Owner {
+            slot,
+            generation,
+            pid: 0,
+            netlink: None,
+        }
+    }
+
+    fn held(owner: u16, owner_gen: u32, last: u8) -> Installed {
+        Installed {
+            owner,
+            owner_gen,
+            addr: [192, 0, 2, last],
+            link: format!("fxtest{owner}g{owner_gen}"),
+            token: [0; 16],
+            generation: 1,
+        }
+    }
+
+    fn add_payload(last: u8, owner: u16, owner_gen: Option<u32>) -> Vec<u8> {
+        let mut p = vec![0u8; id::ADDR_ADD_PAYLOAD_MAX];
+        p[..4].copy_from_slice(&[192, 0, 2, last]);
+        p[id::ADD_PREFIX_LEN_OFF] = 24;
+        p[id::ADD_OWNER_TAG_OFF..id::ADD_OWNER_TAG_OFF + 2].copy_from_slice(&owner.to_le_bytes());
+        match owner_gen {
+            Some(g) => p[id::ADD_OWNER_GEN_OFF..].copy_from_slice(&g.to_le_bytes()),
+            None => p.truncate(id::ADD_OWNER_GEN_OFF),
+        }
+        p
+    }
+
+    fn refusals(i: &mut Identity) -> Vec<u8> {
+        i.take_events()
+            .iter()
+            .filter(|e| e.first() == Some(&id::MSG_ADDR_REFUSED))
+            .map(|e| e[id::FRAME_HDR + 17])
+            .collect()
+    }
+
+    /// A released owner's addresses leave with it, `ADDR_DEL` or not, and
+    /// only that generation's: the slot's later owner keeps its own.
+    #[test]
+    fn a_released_owner_takes_its_addresses_with_it() {
+        let mut i = Identity::default();
+        i.owners.push(told(6, 1));
+        i.installed.push(held(6, 1, 6));
+        i.installed.push(held(7, 1, 7));
+        i.owner_gone(6, 2);
+        assert_eq!(i.installed.len(), 2, "another generation's release");
+        i.owner_gone(6, 1);
+        assert_eq!(i.installed.iter().map(|x| x.owner).collect::<Vec<_>>(), [7]);
+        assert!(i.owners.is_empty());
+    }
+
+    /// A slot's next owner, told, releases what an earlier generation
+    /// left there.
+    #[test]
+    fn a_new_generation_of_the_slot_releases_the_earlier_ones() {
+        let mut i = Identity::default();
+        i.owners.push(told(6, 1));
+        i.installed.push(held(6, 1, 6));
+        i.owner(
+            OwnerFact {
+                slot: 6,
+                generation: 2,
+                owner_uid: [6; 16],
+                pid: 0,
+            },
+            None,
+        );
+        assert!(i.installed.is_empty());
+    }
+
+    /// An install names its owner's generation: none, or one the slot's
+    /// told owner does not hold, is refused; a waiting install is dropped
+    /// with its owner.
+    #[test]
+    fn an_install_names_a_live_owner_generation() {
+        let mut i = Identity::default();
+        i.owners.push(told(6, 2));
+        i.add(add_payload(6, 6, None), Instant::now());
+        i.add(add_payload(6, 6, Some(1)), Instant::now());
+        assert_eq!(refusals(&mut i), [id::refusal::OWNER, id::refusal::OWNER]);
+        let later = Instant::now() + Duration::from_secs(60);
+        i.add(add_payload(5, 5, Some(1)), later);
+        assert_eq!(i.waiting.len(), 1, "waits for its owner's facts");
+        i.owner_gone(5, 1);
+        assert!(i.waiting.is_empty(), "dropped with its owner");
+        assert!(refusals(&mut i).is_empty());
+    }
 }

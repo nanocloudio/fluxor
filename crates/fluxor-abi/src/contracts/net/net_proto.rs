@@ -1069,17 +1069,28 @@ pub const REQUESTER_TAG_NONE: RequesterTag = 0;
 ///
 /// A workload owner's lane listens (binds a nonzero port) only where the
 /// owner holds an [`ENDPOINT`] grant for that protocol and port: an owner
-/// with none listens nowhere (`EACCES`). The grant is what lets an owner
-/// that holds no address of its own listen on the node's shared addresses;
-/// an owner holding an address listens on its own addresses alone. Port 0
-/// (an ephemeral source) is never a claim and never gated. The node owner's
-/// lanes are not gated: they listen on the node's addresses, any port.
+/// with none listens nowhere (`EACCES`). Where it listens is the owner's
+/// reach:
+/// - an owner holding an address of its own listens on its own addresses
+///   alone;
+/// - an owner holding none listens on the node's shared addresses, unless
+///   its grants carry [`OWN_ADDRESS`]: then it listens nowhere
+///   (`EADDRNOTAVAIL`) until it holds one.
+///
+/// Port 0 (an ephemeral source) is never a claim and never gated. The node
+/// owner's lanes are not gated: they listen on the node's addresses, any
+/// port.
 pub mod grant {
     /// `net.endpoint`: the owner may bind `[protocol u8][port u16 LE]`
     /// (`protocol` an IP protocol number, [`PROTO_TCP`] or [`PROTO_UDP`]).
     pub const ENDPOINT: u16 = 1;
     /// Bytes of an [`ENDPOINT`] grant.
     pub const ENDPOINT_LEN: usize = 3;
+    /// `net.own_address`: a reach fact carried in the grant set, no bytes.
+    /// The owner listens on addresses of its own only, never on the node's
+    /// shared ones. Its [`ENDPOINT`]s are therefore no lease on the node's
+    /// addresses, and another owner may be granted the same ones.
+    pub const OWN_ADDRESS: u16 = 2;
     /// Bytes of a grant record's `[kind u16][len u16]` head.
     pub const HEAD: usize = 4;
     /// IP protocol numbers an endpoint names.
@@ -1094,6 +1105,20 @@ pub mod grant {
     /// Whether the grant records in `grants` hold an [`ENDPOINT`] for
     /// `(protocol, port)`. A malformed record ends the walk.
     pub fn grants_endpoint(grants: &[u8], protocol: u8, port: u16) -> bool {
+        any_record(grants, |kind, body| {
+            kind == ENDPOINT
+                && matches!(*body, [p, a, b] if p == protocol && u16::from_le_bytes([a, b]) == port)
+        })
+    }
+
+    /// Whether the grant records in `grants` carry [`OWN_ADDRESS`]. A
+    /// malformed record ends the walk.
+    pub fn own_address(grants: &[u8]) -> bool {
+        any_record(grants, |kind, body| kind == OWN_ADDRESS && body.is_empty())
+    }
+
+    /// Whether some whole record `(kind, body)` of `grants` satisfies `f`.
+    fn any_record(grants: &[u8], f: impl Fn(u16, &[u8]) -> bool) -> bool {
         let mut at = 0usize;
         loop {
             let (Some(&k0), Some(&k1), Some(&l0), Some(&l1)) = (
@@ -1104,19 +1129,15 @@ pub mod grant {
             ) else {
                 return false;
             };
-            let kind = u16::from_le_bytes([k0, k1]);
-            let len = u16::from_le_bytes([l0, l1]) as usize;
             let body = at + HEAD;
-            if kind == ENDPOINT && len == ENDPOINT_LEN {
-                if let (Some(&p), Some(&a), Some(&b)) =
-                    (grants.get(body), grants.get(body + 1), grants.get(body + 2))
-                {
-                    if p == protocol && u16::from_le_bytes([a, b]) == port {
-                        return true;
-                    }
-                }
+            let end = body + u16::from_le_bytes([l0, l1]) as usize;
+            let Some(b) = grants.get(body..end) else {
+                return false;
+            };
+            if f(u16::from_le_bytes([k0, k1]), b) {
+                return true;
             }
-            at = body + len;
+            at = end;
         }
     }
 }

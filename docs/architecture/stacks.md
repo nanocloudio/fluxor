@@ -478,6 +478,37 @@ another project. Typical providers: a document compiler that turns an
 application's HTML and CSS into a document image, a package packer, a
 font-atlas generator.
 
+### Module packs and pins
+
+A workload that brings its own modules (`SOURCE_FMOD_PACK`) carries them
+as a module pack, an FXMT module table, and admits each by its pin, the
+SHA-256 of its `.fmod`. A module param names both by module, never by
+bytes:
+
+```yaml
+modules:
+  - name: churn_driver
+    params:
+      pack_hex: "${module_pack:churn_probe}"
+      pin_hex: "${module_pin:churn_probe}"
+```
+
+| Placeholder | Renders as |
+|---|---|
+| `${module_pack:<type>[,<type>…]}` | the module table `fluxor build --emit=table` packs for a graph of exactly those modules, in that order, as lowercase hex |
+| `${module_pin:<type>}` | the SHA-256 of the type's `.fmod`, as 64 lowercase hex digits |
+
+Each build renders them from the modules the graph's resolver finds for its
+target and module ABI, as it resolves the graph's own modules (a pin,
+the project's tree, the catalog), so a graph never holds a module's bytes
+or digest and neither goes stale when the module or the SDK changes. Naming
+a type in a pack does not put it in the node image. The placeholder is the
+whole value of a module param: inside a longer value, a type named twice, a
+pin of more than one type, a type that resolves nowhere, and a native type
+(no `.fmod`) are refused, naming the instance. The module that takes the
+value reads it as a string; a pack is as long as its table, so the param is
+a chunked string (`str_chunked`).
+
 ## Expansion
 
 `include:` expands on the parsed graph before every other pass, ahead of

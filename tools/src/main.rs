@@ -283,13 +283,13 @@ fn main() {
         Commands::ComposeLaunch {
             graph,
             output,
-            module_root,
+            package_modules,
             runtime,
             applet,
         } => workload_src::compose_launch_image(
             &graph,
             &output,
-            &module_root,
+            &package_modules,
             &runtime,
             applet.as_deref(),
             verbose,

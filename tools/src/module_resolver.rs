@@ -22,6 +22,12 @@
 //!    these places is refused as ambiguous.
 //! 3. **Fluxor's catalog** (the install root), for native modules only.
 //!
+//! A launch of a workload package resolves against the package alone
+//! ([`with_package_modules`]): each module it carries, as the `.fmod` and
+//! `manifest.toml` it was packed with, then the catalog for native modules.
+//! No `fluxor.lock`, tree or search path is read, so what a package runs is
+//! the same from any directory and inside any project.
+//!
 //! Nothing else is read: no working directory, no sibling checkout.
 
 use crate::error::{Error, Result};
@@ -52,6 +58,32 @@ fn in_family(name: &str, type_name: &str) -> bool {
             .is_some_and(|v| {
                 !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             })
+}
+
+/// The suffix of a packaged module's manifest, beside its `.fmod`:
+/// `<artifact>.toml`.
+pub const PACKAGED_MANIFEST_EXT: &str = "toml";
+
+thread_local! {
+    /// The package whose modules the resolvers made inside
+    /// [`with_package_modules`] resolve against.
+    static PACKAGE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Run `f`, whose graph resolvers ([`ModuleResolver::for_graph`]) resolve
+/// against the package modules in `dir` alone, then Fluxor's catalog for
+/// native modules.
+pub fn with_package_modules<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+    let outer = PACKAGE.with(|p| p.replace(Some(dir.to_path_buf())));
+    let r = f();
+    PACKAGE.with(|p| p.replace(outer));
+    r
+}
+
+/// The package modules the current scope resolves against, inside
+/// [`with_package_modules`].
+pub fn package_scope() -> Option<PathBuf> {
+    PACKAGE.with(|p| p.borrow().clone())
 }
 
 /// Which build of a module a resolution is for.
@@ -88,6 +120,8 @@ pub enum Origin {
     Tree { dir: PathBuf },
     /// A native module directory in Fluxor's catalog (the install root).
     Catalog { dir: PathBuf },
+    /// A module a workload package carries, in its `modules/` directory.
+    Packaged { dir: PathBuf },
 }
 
 /// One resolved module: manifest, bytes and facts from one origin.
@@ -115,7 +149,7 @@ impl ModuleArtifact {
     pub fn source_dir(&self) -> Option<&Path> {
         match &self.origin {
             Origin::Tree { dir } | Origin::Catalog { dir } => Some(dir),
-            Origin::Pinned { .. } => None,
+            Origin::Pinned { .. } | Origin::Packaged { .. } => None,
         }
     }
 
@@ -143,6 +177,11 @@ impl ModuleArtifact {
                     "was resolved without a module ABI, so it has no .fmod".to_string()
                 }
                 Origin::Catalog { .. } => "is a catalog module, which is never packed".to_string(),
+                Origin::Packaged { dir } => format!(
+                    "is not carried by the package: no {}.fmod in {}",
+                    self.artifact,
+                    dir.display()
+                ),
             };
             return Err(Error::Module(format!("{} {why}", self.label())));
         };
@@ -188,7 +227,9 @@ impl ModuleArtifact {
             Origin::Pinned {
                 reference, digest, ..
             } => format!("pin {reference} ({digest})"),
-            Origin::Tree { dir } | Origin::Catalog { dir } => dir.display().to_string(),
+            Origin::Tree { dir } | Origin::Catalog { dir } | Origin::Packaged { dir } => {
+                dir.display().to_string()
+            }
         }
     }
 }
@@ -208,6 +249,11 @@ pub struct ResolverSpec {
     pub install_root: Option<PathBuf>,
     /// The OCI store; `None` is the configured one (`oci_store::store_root`).
     pub store_dir: Option<PathBuf>,
+    /// A workload package's `modules/`: each module it carries as
+    /// `<artifact>.fmod` beside its manifest, `<artifact>.toml`. When set,
+    /// these and the catalog's native modules are all that resolve: no
+    /// `fluxor.lock`, tree or search path is read.
+    pub package: Option<PathBuf>,
 }
 
 /// A `fluxor.lock` module pin.
@@ -232,7 +278,12 @@ impl ModuleResolver {
             .canonicalize()
             .unwrap_or_else(|_| spec.project_root.clone());
         let mut search_paths = Vec::new();
-        for p in &spec.search_paths {
+        let tree_paths: &[PathBuf] = if spec.package.is_some() {
+            &[]
+        } else {
+            &spec.search_paths
+        };
+        for p in tree_paths {
             let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
             if !canon.starts_with(&project) {
                 return Err(Error::Config(format!(
@@ -247,23 +298,28 @@ impl ModuleResolver {
                 search_paths.push(canon);
             }
         }
-        let lock = crate::store_resolve::read_store_lock(&project).map_err(|e| {
-            Error::Config(format!(
-                "{}/fluxor.lock is unreadable: {e}",
-                project.display()
-            ))
-        })?;
+        let lock = match spec.package {
+            Some(_) => None,
+            None => crate::store_resolve::read_store_lock(&project).map_err(|e| {
+                Error::Config(format!(
+                    "{}/fluxor.lock is unreadable: {e}",
+                    project.display()
+                ))
+            })?,
+        };
         let mut pins = Vec::new();
         if let Some(lock) = lock {
             crate::store_resolve::check_module_pin_targets(&lock.artifacts)
                 .map_err(|e| Error::Config(e.to_string()))?;
             pins.extend(lock.artifacts.into_iter().filter(|a| a.kind == "module"));
         }
+        // The project's own catalog is its tree, which a package's
+        // resolution does not read: there the catalog is kept.
         let install_root = spec
             .install_root
             .as_ref()
             .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-            .filter(|p| *p != project);
+            .filter(|p| *p != project || spec.package.is_some());
         Ok(ModuleResolver {
             spec: ResolverSpec {
                 project_root: project,
@@ -281,6 +337,8 @@ impl ModuleResolver {
     /// ABI of its target (none: [`Abi::Unplaced`]), the shelf `--module-root`
     /// / `$FLUXOR_MODULE_ROOT` / `target/fluxor/<abi>/modules`, the YAML's
     /// `module_search_paths` (config-relative), and the project's catalog.
+    /// Inside [`with_package_modules`], the package's modules instead of the
+    /// lock, the tree and the shelf.
     pub fn for_graph(
         config: &serde_json::Value,
         config_path: &Path,
@@ -304,15 +362,20 @@ impl ModuleResolver {
                     .collect()
             })
             .unwrap_or_default();
-        let (abi, shelf) = match target {
-            Some(desc) => (
+        let package = package_scope();
+        let (abi, shelf) = match (target, &package) {
+            (Some(desc), Some(dir)) => (
+                Abi::Module(desc.module_abi().to_string()),
+                Some(dir.clone()),
+            ),
+            (Some(desc), None) => (
                 Abi::Module(desc.module_abi().to_string()),
                 Some(crate::modules_build::select_module_root(
                     module_root,
                     project_root.join(crate::modules_build::modules_dir_for(desc)),
                 )?),
             ),
-            None => (Abi::Unplaced, None),
+            (None, _) => (Abi::Unplaced, None),
         };
         let install_root = crate::project::install_root(&project_root).map(|r| r.path);
         Self::new(ResolverSpec {
@@ -322,6 +385,26 @@ impl ModuleResolver {
             search_paths,
             install_root,
             store_dir: None,
+            package,
+        })
+    }
+
+    /// The resolver a launch of a package resolves its graph with: the
+    /// package's modules in `dir`, then the catalog of `project_root`, the
+    /// project the launch composes for.
+    pub fn for_package(
+        project_root: &Path,
+        target: &crate::target::TargetDescriptor,
+        dir: &Path,
+    ) -> Result<Self> {
+        Self::new(ResolverSpec {
+            project_root: project_root.to_path_buf(),
+            abi: Abi::Module(target.module_abi().to_string()),
+            shelf: Some(dir.to_path_buf()),
+            search_paths: Vec::new(),
+            install_root: crate::project::install_root(project_root).map(|r| r.path),
+            store_dir: None,
+            package: Some(dir.to_path_buf()),
         })
     }
 
@@ -335,6 +418,7 @@ impl ModuleResolver {
             search_paths: Vec::new(),
             install_root: crate::project::install_root(project_root).map(|r| r.path),
             store_dir: None,
+            package: None,
         })
     }
 
@@ -413,6 +497,9 @@ impl ModuleResolver {
 
     /// Why `T` resolved nowhere: every place searched, and the near misses.
     fn absence(&self, type_name: &str, variant: Option<&str>) -> String {
+        if self.spec.package.is_some() {
+            return self.searched().join(", ");
+        }
         let mut out = format!(
             "not pinned in fluxor.lock, {} (`fluxor inspect <graph>` shows where a graph's \
              modules resolve from)",
@@ -440,6 +527,20 @@ impl ModuleResolver {
 
     /// The places searched, in order.
     pub fn searched(&self) -> Vec<String> {
+        if let Some(dir) = &self.spec.package {
+            let mut out = vec![format!(
+                "not carried by the package (no <artifact>.{PACKAGED_MANIFEST_EXT} in {})",
+                dir.display()
+            )];
+            match &self.spec.install_root {
+                Some(i) => out.push(format!(
+                    "not a native module of Fluxor's catalog at {}",
+                    i.display()
+                )),
+                None => out.push("no Fluxor catalog found".to_string()),
+            }
+            return out;
+        }
         let layers: Vec<&str> = MODULE_LAYERS
             .iter()
             .map(|l| l.trim_start_matches("modules/"))
@@ -567,6 +668,18 @@ impl ModuleResolver {
         type_name: &str,
         variant: Option<&str>,
     ) -> Result<Option<ModuleArtifact>> {
+        if let Some(dir) = &self.spec.package {
+            if let Some(a) = self.materialise_packaged(type_name, variant, dir)? {
+                return Ok(Some(a));
+            }
+            if let Some(dir) = self.catalog_dir(type_name) {
+                let a = self.materialise_dir(type_name, variant, &dir, true)?;
+                if a.is_native() {
+                    return Ok(Some(a));
+                }
+            }
+            return Ok(None);
+        }
         let family: Vec<&Pin> = self
             .pins
             .iter()
@@ -738,6 +851,78 @@ impl ModuleResolver {
             fmod,
             info: OnceCell::new(),
         })
+    }
+
+    /// A module a package carries: `<K>.toml` and `<K>.fmod` in `dir`, or,
+    /// when `V` is that type's default variant, the plain `<T>` pair.
+    fn materialise_packaged(
+        &self,
+        type_name: &str,
+        variant: Option<&str>,
+        dir: &Path,
+    ) -> Result<Option<ModuleArtifact>> {
+        let key = artifact_name(type_name, variant);
+        let mut names = vec![key.clone()];
+        if variant.is_some() {
+            names.push(type_name.to_string());
+        }
+        for name in names {
+            let path = dir.join(format!("{name}.{PACKAGED_MANIFEST_EXT}"));
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let manifest = accept(&text, self.spec.abi.name(), variant).map_err(|why| {
+                Error::Config(format!(
+                    "module '{type_name}' is carried by the package at {} but its manifest is \
+                     rejected: {why}",
+                    path.display()
+                ))
+            })?;
+            if name != key && default_variant(&manifest) != variant {
+                continue;
+            }
+            let fmod = match &self.spec.abi {
+                Abi::Module(_) => Some(dir.join(format!("{name}.fmod"))).filter(|p| p.is_file()),
+                Abi::Unplaced => None,
+            };
+            return Ok(Some(ModuleArtifact {
+                type_name: type_name.to_string(),
+                variant: variant.map(str::to_string),
+                artifact: name,
+                origin: Origin::Packaged {
+                    dir: dir.to_path_buf(),
+                },
+                manifest,
+                fmod,
+                info: OnceCell::new(),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// The `manifest.toml` text `a` was resolved from: a package carries it
+    /// beside the module's `.fmod`.
+    pub fn manifest_text(&self, a: &ModuleArtifact) -> Result<String> {
+        let read = |path: PathBuf| {
+            std::fs::read_to_string(&path)
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+        };
+        match &a.origin {
+            Origin::Tree { dir } | Origin::Catalog { dir } => read(dir.join("manifest.toml")),
+            Origin::Packaged { dir } => {
+                read(dir.join(format!("{}.{PACKAGED_MANIFEST_EXT}", a.artifact)))
+            }
+            Origin::Pinned { digest, .. } => {
+                let pin = self
+                    .pins
+                    .iter()
+                    .find(|p| &p.digest == digest)
+                    .ok_or_else(|| {
+                        Error::Config(format!("{}: no pin {digest} in fluxor.lock", a.label()))
+                    })?;
+                self.pin_manifest_text(pin)
+            }
+        }
     }
 
     /// A module directory's artefact: its `manifest.toml`, and the shelf's

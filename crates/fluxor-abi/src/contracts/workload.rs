@@ -196,7 +196,16 @@ pub mod volume {
 /// workload's lane listens on a port only where its owner holds one, so a
 /// graph workload created with none listens nowhere. The creator grants
 /// them, so only a creator acting with the node's authority may (`EACCES`
-/// otherwise), and an endpoint another live owner holds is `EEXIST`.
+/// otherwise).
+///
+/// An endpoint is leased on the addresses its owner can listen on. An
+/// owner created without [`own_address`] may listen on the node's shared
+/// addresses, so its endpoints are exclusive among all such owners: one
+/// that another live owner without [`own_address`] holds (by its admission
+/// or by the committed plan) is `EEXIST`. An owner created with
+/// [`own_address`] listens on its own addresses alone, so its endpoints
+/// collide with no other owner's.
+///
 /// The graph backend lists the entry in [`OPTIONS`]; the host-process
 /// backend does not (a host process's sockets are the host's, not a lane's)
 /// and answers a required one `ENOSYS`, so a creator marks every endpoint
@@ -206,6 +215,24 @@ pub mod endpoint {
     pub const KEY: &[u8] = b"endpoint";
     /// Bytes of an entry's value.
     pub const LEN: usize = 3;
+}
+
+/// The graph workload's owner listens on addresses of its own only: an
+/// options entry on [`CREATE`], namespace [`own_address::NS`], key
+/// [`own_address::KEY`], empty value, at most once. A creator that gives
+/// the workload an address of its own (`net::identity`'s `ADDR_ADD`, after
+/// the `CREATE` and before `START`) states it here.
+///
+/// The owner's grants then carry `net_proto::grant::OWN_ADDRESS`. A network
+/// stack anchors its listens at the owner's own addresses and refuses
+/// (`EADDRNOTAVAIL`) a listen while it holds none, so its [`endpoint`]s are
+/// no lease on the node's shared addresses. Only a creator acting with the
+/// node's authority may give it (`EACCES` otherwise). The graph backend
+/// lists the entry in [`OPTIONS`]; the host-process backend does not and
+/// answers a required one `ENOSYS`.
+pub mod own_address {
+    pub const NS: &[u8] = b"net";
+    pub const KEY: &[u8] = b"own_address";
 }
 
 /// `CAPS` — backend capability discovery. `handle = -1` (or a bound handle);

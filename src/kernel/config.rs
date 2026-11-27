@@ -506,24 +506,38 @@ const _: () = assert!(
     "the telemetry ring holds one whole PSTATUS round"
 );
 
-/// One PSTATUS round for `max_modules` slots: a `STEP` (52 B) and a `RES`
-/// (28 B) per module slot and a `POOL` (32 B) per kernel resource pool. The
-/// scheduler emits a round in one burst with no drain between, so a ring
-/// smaller than this drops the tail of every round.
+/// One PSTATUS round for `max_modules` slots: a `STEP` and a `RES` record
+/// per module slot and a `POOL` record per ledger row, the kernel pools and
+/// the module-served ones (`resource_ledger::emit_all`). The scheduler
+/// emits a round in one burst with no drain between, so a ring smaller than
+/// this drops the tail of every round.
 pub const fn pstatus_round(max_modules: usize) -> usize {
-    max_modules * (52 + 28) + crate::abi::contracts::resource::KERNEL_POOL_COUNT * 32
+    use crate::abi::contracts::resource as res;
+    pstatus_round_with(max_modules, res::KERNEL_POOL_COUNT + res::MODULE_POOL_COUNT)
 }
 
-/// A telemetry ring for `max_modules` slots: the next power of two over one
-/// PSTATUS round, and never under 32 KiB.
-#[cfg(not(feature = "rp"))]
-const fn telemetry_ring_for(max_modules: usize) -> usize {
-    let p = pstatus_round(max_modules).next_power_of_two();
+/// One PSTATUS round for `max_modules` slots and `pools` ledger rows, each
+/// record at the size the telemetry contract writes it.
+pub const fn pstatus_round_with(max_modules: usize, pools: usize) -> usize {
+    use crate::abi::contracts::telemetry as tlm;
+    max_modules * (tlm::PSTATUS_STEP_SIZE + tlm::PSTATUS_RES_SIZE) + pools * tlm::PSTATUS_POOL_SIZE
+}
+
+/// The telemetry ring for a PSTATUS round of `round` bytes: the next power
+/// of two over it, and never under 32 KiB.
+pub const fn telemetry_ring_holding(round: usize) -> usize {
+    let p = round.next_power_of_two();
     if p > 32768 {
         p
     } else {
         32768
     }
+}
+
+/// A telemetry ring for `max_modules` slots ([`telemetry_ring_holding`]).
+#[cfg(not(feature = "rp"))]
+const fn telemetry_ring_for(max_modules: usize) -> usize {
+    telemetry_ring_holding(pstatus_round(max_modules))
 }
 const _: () = assert!(
     HEAP_SEGMENTS >= 1 && HEAP_SEGMENTS <= 32,

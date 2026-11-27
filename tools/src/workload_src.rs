@@ -26,7 +26,8 @@
 //! target/fluxor/<name>/
 //!   workload.json                    # all implementations
 //!   <target>/{workload.json, graph.yaml, resources.json,   # flat triple —
-//!             node.img}                                   # agent-committable
+//!             node.img,                                   # agent-committable
+//!             modules/<artifact>.{fmod,toml}}             # what a launch loads
 //! ```
 //!
 //! `workload.json` is duplicated into each target dir so that dir is
@@ -116,6 +117,8 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
 struct PackageModules {
     /// Each artefact's name and bytes, in declaration order.
     artefacts: Vec<(String, Vec<u8>)>,
+    /// Each artefact's name and the `manifest.toml` text it resolved with.
+    manifests: Vec<(String, String)>,
     /// The resident state they record, in bytes.
     state: u64,
     /// How many record none.
@@ -136,6 +139,7 @@ fn package_modules(
 ) -> Result<PackageModules> {
     let fixtures = r.project_root().join("modules/fixtures");
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut manifests: Vec<(String, String)> = Vec::new();
     let mut own: Vec<String> = Vec::new();
     let (mut state, mut unknown) = (0u64, 0usize);
     for entry in &facts.entries {
@@ -161,14 +165,42 @@ fn package_modules(
         if matches!(a.origin, crate::module_resolver::Origin::Tree { .. }) {
             own.push(a.artifact.clone());
         }
+        manifests.push((a.artifact.clone(), r.manifest_text(&a)?));
         out.push((a.artifact.clone(), info.data.clone()));
     }
     Ok(PackageModules {
         artefacts: out,
+        manifests,
         state,
         unknown,
         own,
     })
+}
+
+/// A package's `modules/`: each module it pins as the `.fmod` and the
+/// `manifest.toml` (`<artifact>.toml`) it was packed with, so a launch of
+/// the package resolves its modules from the package alone. Whatever an
+/// earlier emit left there is replaced.
+fn write_package_modules(
+    dir: &Path,
+    modules: &[(String, Vec<u8>)],
+    manifests: &[(String, String)],
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    for (name, bytes) in modules {
+        std::fs::write(dir.join(format!("{name}.fmod")), bytes)?;
+    }
+    for (name, text) in manifests {
+        std::fs::write(
+            dir.join(format!(
+                "{name}.{}",
+                crate::module_resolver::PACKAGED_MANIFEST_EXT
+            )),
+            text,
+        )?;
+    }
+    Ok(())
 }
 
 /// Does the graph include a stack: an `include:` of its own, or one in any
@@ -216,18 +248,6 @@ fn package_graph(
     }
     let expanded = serde_yaml::to_string(&doc).map_err(|e| at(format!("serialise graph: {e}")))?;
     Ok((expanded, declared))
-}
-
-/// The directory holding the `.fmod` artefacts a linux run of this project
-/// loads, by the shared module-root resolution (`explicit` is
-/// `--module-root`).
-fn linux_module_dir(project_root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
-    crate::modules_build::module_root(
-        explicit,
-        project_root,
-        &project_root.join("target/fluxor"),
-        "linux",
-    )
 }
 
 fn sha256_ref(bytes: &[u8]) -> String {
@@ -365,10 +385,12 @@ pub fn emit_package(
         // so a partial sum is visible as such.
         let PackageModules {
             artefacts: modules,
+            manifests,
             state: derived_state,
             unknown: unknown_state_modules,
             own,
         } = package_modules(&facts, &r)?;
+        write_package_modules(&target_dir.join("modules"), &modules, &manifests)?;
         for name in own {
             if !package_own.contains(&name) {
                 package_own.push(name);
@@ -648,7 +670,7 @@ pub struct RunParams {
     pub flags: Vec<String>,
     pub file: Option<PathBuf>,
     /// `--module-root`: where a source manifest's build reads `.fmod`s from.
-    /// A built package's own pinned `modules/` always wins over it.
+    /// A launch runs the modules the built package carries.
     pub module_root: Option<PathBuf>,
 }
 
@@ -1067,23 +1089,27 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Launch a package's linux implementation. `runtime` names the binary to
-/// run, else the project's staged one. `applet` marks an applet run: the
+/// Launch a package's linux implementation. `installed` is what an applet
+/// was installed with: the runtime it runs and the project whose signing
+/// key, target definition and Fluxor catalog its image is composed with;
+/// without it, the package's own project and its staged runtime. `applet`
+/// marks an applet run: the
 /// runtime keeps its own log records out of the program's stderr — fd 2 is
 /// the program's alone — and files them under the applet's name instead, so
 /// a CLI package's output is only what the program itself wrote.
 ///
 /// Every launch composes the image it runs ([`compose_for_launch`]): the
 /// package's template is rendered with the run's checked values and
-/// composed against the package's own pinned modules — `modules/` when the
-/// package carries them, else the emitting project's built modules — each
-/// verified against the digest `workload.json` pins, and against the
-/// runtime this launch runs. A `node.img` the package's producer built is
-/// never what a launch runs.
+/// composed against the modules the package carries in its `modules/`, each
+/// `.fmod` verified against the digest `workload.json` pins and read with
+/// the manifest it was packed with, and against the runtime this launch
+/// runs. Nothing is resolved from the current directory's project or its
+/// `fluxor.lock`. A `node.img` the package's producer built is never what a
+/// launch runs.
 fn launch_package(
     path: &Path,
     app_args: &[String],
-    runtime: Option<&Path>,
+    installed: Option<&AppletEntry>,
     applet: Option<&str>,
     operator: Operator<'_>,
     params: &RunParams,
@@ -1145,7 +1171,11 @@ fn launch_package(
         }
     }
 
-    let project_root = crate::project::root_for_config(&dir);
+    let project_root = match installed {
+        Some(entry) => entry.project()?,
+        None => crate::project::root_for_config(&dir),
+    };
+    let runtime = installed.and_then(|e| e.runtime.as_deref());
     // A recorded runtime is the one this package's modules were packed
     // against. If it has gone, say so and name it: running the package
     // against whatever binary the current directory resolves to would
@@ -1177,12 +1207,21 @@ fn launch_package(
     // launch writes, so its directory is private and goes away on every exit
     // path.
     let scratch = LaunchScratch::create(&manifest.name)?;
-    let module_root = if target_dir.join("modules").is_dir() {
-        target_dir.join("modules")
-    } else {
-        linux_module_dir(&project_root, params.module_root.as_deref())?
-    };
+    let module_root = target_dir.join("modules");
     for m in &imp.modules {
+        let toml = module_root.join(format!(
+            "{}.{}",
+            m.name,
+            crate::module_resolver::PACKAGED_MANIFEST_EXT
+        ));
+        if !toml.is_file() {
+            return Err(Error::Config(format!(
+                "package module '{}': the package carries no manifest for it ({}) — re-emit \
+                 the package (`fluxor build <workload.toml>`) or re-sync it",
+                m.name,
+                toml.display()
+            )));
+        }
         let fmod = module_root.join(format!("{}.fmod", m.name));
         let bytes = std::fs::read(&fmod).map_err(|e| {
             Error::Config(format!(
@@ -1209,12 +1248,10 @@ fn launch_package(
     // otherwise pull in an unverified artefact.
     let facts = graph_facts(&rendered)?;
     let graph = scratch.dir.join("graph.yaml");
-    let r = crate::module_resolver::ModuleResolver::for_graph(
-        &serde_json::to_value(params::parse_graph(&rendered).map_err(Error::Config)?.doc)
-            .map_err(|e| Error::Config(e.to_string()))?,
-        &graph,
-        Some(&crate::target::load_target("linux", &project_root)?),
-        Some(&module_root),
+    let r = crate::module_resolver::ModuleResolver::for_package(
+        &project_root,
+        &crate::target::load_target("linux", &project_root)?,
+        &module_root,
     )?;
     for entry in &facts.entries {
         let (name, ty, variant) = crate::module_resolver::entry_identity(entry)
@@ -1234,7 +1271,7 @@ fn launch_package(
         &LaunchComposition {
             graph: &graph,
             output: &image,
-            module_root: &module_root,
+            package_modules: &module_root,
             runtime: &linux_bin,
             applet: is_applet.then_some(manifest.name.as_str()),
             project_root: &project_root,
@@ -1314,13 +1351,13 @@ fn launch_package(
 }
 
 /// The image one launch composes: the rendered graph, where the image goes,
-/// the verified modules, the runtime the launch runs, the applet whose
+/// the package's verified modules, the runtime the launch runs, the applet whose
 /// graph it is, the project whose signing key and target definition it
 /// takes, and where the composer's report is kept.
 struct LaunchComposition<'a> {
     graph: &'a Path,
     output: &'a Path,
-    module_root: &'a Path,
+    package_modules: &'a Path,
     runtime: &'a Path,
     applet: Option<&'a str>,
     project_root: &'a Path,
@@ -1356,8 +1393,8 @@ fn compose_for_launch(
         .arg(c.graph)
         .arg("--output")
         .arg(c.output)
-        .arg("--module-root")
-        .arg(c.module_root)
+        .arg("--package-modules")
+        .arg(c.package_modules)
         .arg("--runtime")
         .arg(c.runtime);
     if let Some(name) = c.applet {
@@ -1396,19 +1433,23 @@ fn compose_for_launch(
 }
 
 /// `fluxor compose-launch`: compose the image a launch runs
-/// ([`compose_for_launch`]), pinning the providers beside `runtime`, as an
-/// applet's graph when `applet` names one.
+/// ([`compose_for_launch`]) from the package modules in `package_modules`
+/// alone, pinning the providers beside `runtime`, as an applet's graph when
+/// `applet` names one.
 pub fn compose_launch_image(
     graph: &Path,
     output: &Path,
-    module_root: &Path,
+    package_modules: &Path,
     runtime: &Path,
     applet: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
     let compose = || {
-        crate::config::compose_on_runtime(runtime, || {
-            crate::build_one_from(graph, Some(output), Some(module_root), verbose).map(|_| ())
+        crate::module_resolver::with_package_modules(package_modules, || {
+            crate::config::compose_on_runtime(runtime, || {
+                crate::build_one_from(graph, Some(output), Some(package_modules), verbose)
+                    .map(|_| ())
+            })
         })
     };
     match applet {
@@ -1442,12 +1483,36 @@ fn registry_path() -> PathBuf {
     PathBuf::from("applets.toml")
 }
 
-/// One catalogue entry: the cached package, and the runtime it was built
-/// against when the installing project had one staged.
+/// One catalogue entry: the cached package, the runtime it was built
+/// against when the installing project had one staged, and the project it
+/// was installed from, whose signing key, target definition and Fluxor
+/// catalog its launches compose with.
 #[derive(Clone, Debug)]
 pub struct AppletEntry {
     pub package: PathBuf,
     pub runtime: Option<PathBuf>,
+    pub project: Option<PathBuf>,
+}
+
+impl AppletEntry {
+    /// The project a launch of this applet composes for: the one recorded
+    /// at install, else the project the package lies in. A package outside
+    /// every project with none recorded is refused, never composed for
+    /// whatever project the current directory is in.
+    fn project(&self) -> Result<PathBuf> {
+        if let Some(p) = &self.project {
+            return Ok(p.clone());
+        }
+        crate::project::discover_from(&self.package)
+            .map(|r| r.path)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "applet package {} records no project it was installed from — reinstall \
+                     it (`fluxor install`)",
+                    self.package.display()
+                ))
+            })
+    }
 }
 
 fn load_registry() -> Result<BTreeMap<String, AppletEntry>> {
@@ -1466,6 +1531,7 @@ fn load_registry() -> Result<BTreeMap<String, AppletEntry>> {
                     AppletEntry {
                         package: PathBuf::from(package),
                         runtime: v.get("runtime").and_then(|r| r.as_str()).map(PathBuf::from),
+                        project: v.get("project").and_then(|r| r.as_str()).map(PathBuf::from),
                     },
                 );
             }
@@ -1481,19 +1547,14 @@ fn save_registry(reg: &BTreeMap<String, AppletEntry>) -> Result<()> {
     }
     let mut text = String::from("# fluxor applet registry: name -> installed package\n[applets]\n");
     for (k, v) in reg {
-        match &v.runtime {
-            Some(runtime) => text.push_str(&format!(
-                "{} = {{ package = {:?}, runtime = {:?} }}\n",
-                k,
-                v.package.display().to_string(),
-                runtime.display().to_string()
-            )),
-            None => text.push_str(&format!(
-                "{} = {{ package = {:?} }}\n",
-                k,
-                v.package.display().to_string()
-            )),
+        let mut fields = vec![format!("package = {:?}", v.package.display().to_string())];
+        if let Some(runtime) = &v.runtime {
+            fields.push(format!("runtime = {:?}", runtime.display().to_string()));
         }
+        if let Some(project) = &v.project {
+            fields.push(format!("project = {:?}", project.display().to_string()));
+        }
+        text.push_str(&format!("{k} = {{ {} }}\n", fields.join(", ")));
     }
     std::fs::write(&path, text)?;
     Ok(())
@@ -1558,6 +1619,7 @@ pub fn install_applet(
         AppletEntry {
             package: dir.clone(),
             runtime,
+            project: Some(project_root.canonicalize().unwrap_or(project_root)),
         },
     );
     save_registry(&reg)?;
@@ -1606,7 +1668,7 @@ pub fn exec_applet(
             return launch_package(
                 &entry.package,
                 args,
-                entry.runtime.as_deref(),
+                Some(entry),
                 Some(name),
                 Operator { ca, identity },
                 &RunParams::default(),

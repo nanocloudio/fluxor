@@ -287,6 +287,7 @@ impl Handler for Net {
         if let Some(s) = self.sockets.as_mut() {
             s.close_owner_conns(Owner { slot, generation });
         }
+        self.identity.owner_gone(slot, generation);
     }
 
     fn wake(&self) -> Wake {

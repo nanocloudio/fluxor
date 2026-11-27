@@ -695,6 +695,11 @@ pub struct LocalAddr {
     /// under it (`EBUSY` on the SEGMENTS replace).
     pub segment: u16,
     pub fence_deadline_ms: u32,
+    /// The generation of the owner `owner_tag` names (0 for the node): an
+    /// address is that owner's and no later owner's of the slot. Released
+    /// when that owner's lanes detach, and when the slot is seen held by
+    /// another generation (`release_stale_owner`).
+    pub owner_gen: u32,
 }
 
 /// `LocalAddr::fence_kind`: a fence whose boundary is not settled yet.
@@ -714,6 +719,7 @@ impl LocalAddr {
             _fence_pad: 0,
             segment: 0,
             fence_deadline_ms: 0,
+            owner_gen: 0,
         }
     }
 
@@ -4337,9 +4343,12 @@ enum DgBind {
 /// Reachability is what makes two binds conflict, not the numeric port. An
 /// owner's bind serves every address that owner holds, so two of the same
 /// owner's binds are one identity whichever of its slots anchors them;
-/// `LOCAL_SLOT_ANY` is held to overlap every concrete slot. Two concrete
-/// slots of different owners never overlap, which is why the same port
-/// bound at two workloads' addresses is two sockets. TCP listeners are a different protocol and never conflict
+/// otherwise two binds conflict where [`binds_overlap`] says delivery would
+/// offer both the same traffic, as a stream listen's does: the wildcard
+/// overlaps the node's addresses, never an owner's. Two concrete slots of
+/// different owners never overlap, which is why the same port bound at two
+/// workloads' addresses, or at one workload's and the node's wildcard, is
+/// two sockets. TCP listeners are a different protocol and never conflict
 /// here — `find_listener_indexed` already excludes datagram slots in the
 /// other direction.
 unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, lane: u8) -> DgBind {
@@ -4361,7 +4370,7 @@ unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, l
                 }
                 return DgBind::Conflict;
             }
-            if c.local_slot == LOCAL_SLOT_ANY || slot == LOCAL_SLOT_ANY {
+            if binds_overlap(s, c.local_slot, c.owner_tag, slot, owner_tag) {
                 return DgBind::Conflict;
             }
         }
@@ -10539,7 +10548,7 @@ unsafe fn addr_ctl_readd(
     slot: u16,
     a16: &[u8; 16],
     prefix_len: u8,
-    owner_tag: u16,
+    (owner_tag, owner_gen): (u16, u32),
     segment: u16,
 ) {
     let held = s.local_addrs[slot as usize].owner_tag;
@@ -10551,6 +10560,7 @@ unsafe fn addr_ctl_readd(
     a.prefix_len = prefix_len;
     a.segment = segment;
     a.owner_tag = owner_tag;
+    a.owner_gen = owner_gen;
     let (token, generation) = (a.token, a.generation);
     if held != owner_tag {
         s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
@@ -10568,18 +10578,29 @@ unsafe fn addr_ctl_readd(
 /// zero; an address already configured is re-added ([`addr_ctl_readd`]; the
 /// primary is off-limits); a segment the install names must hold it; a full
 /// table refuses. Sends a single same-subnet gratuitous ARP on first
-/// insertion. owner_tag stamps the slot's owner and is enforced on bind and
-/// source selection (see `slot_for_owner` / `bind_serves`).
+/// insertion. `(owner_tag, owner_gen)` stamps the slot's owner and is
+/// enforced on bind and source selection (see `slot_for_owner` /
+/// `bind_serves`). An install naming a workload owner whose slot a lane of
+/// another generation holds is stale and refused (`refusal::OWNER`); one
+/// naming a live generation first releases any address an earlier owner of
+/// the slot left (`release_stale_owner`).
 unsafe fn addr_ctl_add(
     s: &mut IpState,
     addr16: *const u8,
     prefix_len: u8,
-    owner_tag: u16,
+    (owner_tag, owner_gen): (u16, u32),
     flags: u8,
     segment: u16,
 ) {
     let mut a16 = [0u8; 16];
     core::ptr::copy_nonoverlapping(addr16, a16.as_mut_ptr(), 16);
+    if owner_tag != 0 {
+        if lane_owner_gen(s, owner_tag).is_some_and(|g| g != owner_gen) {
+            addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::OWNER);
+            return;
+        }
+        release_stale_owner(s, owner_tag, owner_gen);
+    }
     if segment != 0 {
         let family = if flags & netid::install::FAMILY6 != 0 {
             abi::contracts::net::route::FAM_IPV6
@@ -10592,7 +10613,7 @@ unsafe fn addr_ctl_add(
         }
     }
     if flags & netid::install::FAMILY6 != 0 {
-        addr_ctl_add6(s, &a16, prefix_len, owner_tag, flags, segment);
+        addr_ctl_add6(s, &a16, prefix_len, (owner_tag, owner_gen), flags, segment);
         return;
     }
     let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
@@ -10601,7 +10622,7 @@ unsafe fn addr_ctl_add(
     }
     if let Some(slot) = local_slot_for_dst(s, ipv4) {
         if slot != 0 {
-            addr_ctl_readd(s, slot, &a16, prefix_len, owner_tag, segment);
+            addr_ctl_readd(s, slot, &a16, prefix_len, (owner_tag, owner_gen), segment);
         }
         return;
     }
@@ -10625,6 +10646,7 @@ unsafe fn addr_ctl_add(
             a.generation = generation;
             a.prefix_len = prefix_len;
             a.owner_tag = owner_tag;
+            a.owner_gen = owner_gen;
             a.segment = segment;
             a.flags = if armed { ADDR_FLAG_ARMED } else { 0 };
             let _ = index::insert(&mut s.addr_index, index::mix32(ipv4 ^ s.index_seed), i);
@@ -10659,7 +10681,7 @@ unsafe fn addr_ctl_add6(
     s: &mut IpState,
     a16: &[u8; 16],
     prefix_len: u8,
-    owner_tag: u16,
+    (owner_tag, owner_gen): (u16, u32),
     flags: u8,
     segment: u16,
 ) {
@@ -10673,7 +10695,7 @@ unsafe fn addr_ctl_add6(
         return;
     }
     if let Some(slot) = v6t::slot_of_v6(s, a16) {
-        addr_ctl_readd(s, slot, a16, prefix_len, owner_tag, segment);
+        addr_ctl_readd(s, slot, a16, prefix_len, (owner_tag, owner_gen), segment);
         return;
     }
     let Some(token) = mint_token(s) else {
@@ -10699,6 +10721,7 @@ unsafe fn addr_ctl_add6(
     a.token = token;
     a.generation = generation;
     a.segment = segment;
+    a.owner_gen = owner_gen;
     log_info(s, b"[ip] addr_ctl add (ipv6)");
     let mut p = [0u8; 36];
     p[..16].copy_from_slice(a16);
@@ -10817,23 +10840,74 @@ unsafe fn close_released(s: &mut IpState, idx: usize, kind: u8) {
 unsafe fn addr_ctl_del(s: &mut IpState, addr16: &[u8; 16]) {
     match addr_ctl_slot(s, addr16) {
         Some(slot) if slot != 0 => {
-            let ipv4 = s.local_addrs[slot as usize].ipv4();
-            v6t::forget_local(s, slot);
-            let addrs = s.local_addrs.as_ptr();
-            let seed = s.index_seed;
-            let _ = index::remove(
-                &mut s.addr_index,
-                index::mix32(ipv4 ^ seed),
-                slot as usize,
-                |i| index::mix32((*addrs.add(i)).ipv4() ^ seed),
-            );
-            s.local_addrs[slot as usize] = LocalAddr::empty();
-            s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
-            release_slot_bindings(s, slot);
+            remove_local(s, slot);
             log_info(s, b"[ip] addr_ctl del");
         }
         _ => {}
     }
+}
+
+/// Remove secondary local slot `slot`: it ages out at once, and nothing
+/// latched to it sends again (`release_slot_bindings`).
+unsafe fn remove_local(s: &mut IpState, slot: u16) {
+    let ipv4 = s.local_addrs[slot as usize].ipv4();
+    v6t::forget_local(s, slot);
+    let addrs = s.local_addrs.as_ptr();
+    let seed = s.index_seed;
+    let _ = index::remove(
+        &mut s.addr_index,
+        index::mix32(ipv4 ^ seed),
+        slot as usize,
+        |i| index::mix32((*addrs.add(i)).ipv4() ^ seed),
+    );
+    s.local_addrs[slot as usize] = LocalAddr::empty();
+    s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
+    release_slot_bindings(s, slot);
+}
+
+/// Release every address owner `(owner_tag, owner_gen)` holds: the owner is
+/// gone (its lanes detached), so what it held leaves the node whether or
+/// not its writer says `ADDR_DEL`.
+unsafe fn release_owner(s: &mut IpState, owner_tag: u16, owner_gen: u32) {
+    release_owned_where(s, owner_tag, |g| g == owner_gen);
+}
+
+/// Release every address an owner of slot `owner_tag` other than
+/// generation `owner_gen` left: a slot held by a new generation means the
+/// earlier owner is gone, so nothing of its may serve the new one.
+unsafe fn release_stale_owner(s: &mut IpState, owner_tag: u16, owner_gen: u32) {
+    release_owned_where(s, owner_tag, |g| g != owner_gen);
+}
+
+unsafe fn release_owned_where(s: &mut IpState, owner_tag: u16, gen: impl Fn(u32) -> bool) {
+    if owner_tag == 0 {
+        return;
+    }
+    let mut i = 1;
+    while i < MAX_LOCAL_ADDRS {
+        let a = &s.local_addrs[i];
+        if a.is_active() && a.owner_tag == owner_tag && gen(a.owner_gen) {
+            remove_local(s, i as u16);
+            log_info(s, b"[ip] address released with its owner");
+        }
+        i += 1;
+    }
+}
+
+/// The generation of the owner of slot `owner_tag` that holds a live lane
+/// here, if any.
+unsafe fn lane_owner_gen(s: &IpState, owner_tag: u16) -> Option<u32> {
+    let mut j = 1u8;
+    while j <= s.lane_cap {
+        if let Some(l) = lane_at(s, j).filter(|l| l.active != 0 && l.owner_slot == owner_tag) {
+            return Some(l.owner_gen);
+        }
+        if j == u8::MAX {
+            break;
+        }
+        j += 1;
+    }
+    None
 }
 
 /// Drain the address-control port (in[2]) and apply what its single writer
@@ -10876,7 +10950,28 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
                 } else {
                     0
                 };
-                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag, flags, segment);
+                // A workload owner's install names its generation.
+                if owner_tag != 0 && plen < netid::ADDR_ADD_OWNED_LEN {
+                    let mut a16 = [0u8; 16];
+                    a16.copy_from_slice(&buf[..16]);
+                    addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::OWNER);
+                    count += 1;
+                    continue;
+                }
+                let owner_gen = if owner_tag != 0 {
+                    let g = netid::ADD_OWNER_GEN_OFF;
+                    u32::from_le_bytes([buf[g], buf[g + 1], buf[g + 2], buf[g + 3]])
+                } else {
+                    0
+                };
+                addr_ctl_add(
+                    s,
+                    buf.as_ptr(),
+                    prefix_len,
+                    (owner_tag, owner_gen),
+                    flags,
+                    segment,
+                );
             }
             IP_OWNER_RESOLVER if plen >= netid::owner_resolver::OWNER => {
                 let p = buf.get(..plen).unwrap_or(&[]);
@@ -10969,8 +11064,11 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 /// nowhere. Granted, it is anchored at its owner's own address when the
 /// owner holds one, and serves every address it holds of either family
 /// (`bind_serves`); the grant is what lets an owner holding none listen on
-/// the wildcard. Port 0 (an ephemeral source) is never a claim. An owner
-/// the kernel said is draining binds nothing new.
+/// the wildcard, unless its grants confine it to addresses of its own
+/// (`OWN_ADDRESS`): then it listens nowhere (`EADDRNOTAVAIL`) until it
+/// holds one, for its endpoints are no lease on the node's addresses.
+/// Port 0 (an ephemeral source) is never a claim. An owner the kernel said
+/// is draining binds nothing new.
 unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16, u16), i8> {
     let Some(l) = lane_at(s, s.cur_lane).map(|l| *l) else {
         return Err(-13); // EACCES: no such lane
@@ -10981,21 +11079,32 @@ unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16,
     if l.owner_slot == 0 {
         return Ok((0, LOCAL_SLOT_ANY));
     }
-    if port != 0 && !owner_granted(s, l.owner_slot, l.owner_gen, protocol, port) {
-        return Err(-13);
+    let own = slot_for_owner(s, l.owner_slot);
+    if port != 0 {
+        let (granted, own_address) = owner_grants_for(s, l.owner_slot, l.owner_gen, protocol, port);
+        if !granted {
+            return Err(-13);
+        }
+        if own_address && own.is_none() {
+            return Err(-99); // EADDRNOTAVAIL: no address of its own yet
+        }
     }
-    Ok((
-        l.owner_slot,
-        slot_for_owner(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY),
-    ))
+    Ok((l.owner_slot, own.unwrap_or(LOCAL_SLOT_ANY)))
 }
 
 /// Bytes of an owner's grants a bind reads at once.
 const GRANTS_BUF: usize = 512;
 
-/// Whether owner `(slot, gen)` is granted `(protocol, port)`. Grants past
+/// Whether owner `(slot, gen)` is granted `(protocol, port)`, and whether
+/// its grants confine it to addresses of its own. Grants past
 /// [`GRANTS_BUF`] are not read, and a bind they would grant is refused.
-unsafe fn owner_granted(s: &IpState, slot: u16, gen: u32, protocol: u8, port: u16) -> bool {
+unsafe fn owner_grants_for(
+    s: &IpState,
+    slot: u16,
+    gen: u32,
+    protocol: u8,
+    port: u16,
+) -> (bool, bool) {
     let mut arg = [0u8; 8];
     arg[0..2].copy_from_slice(&slot.to_le_bytes());
     arg[4..8].copy_from_slice(&gen.to_le_bytes());
@@ -11009,13 +11118,14 @@ unsafe fn owner_granted(s: &IpState, slot: u16, gen: u32, protocol: u8, port: u1
         grants.len(),
     );
     if rc < 0 {
-        return false;
+        return (false, false);
     }
     let n = (rc as usize).min(GRANTS_BUF);
-    abi::contracts::net::net_proto::grant::grants_endpoint(
-        grants.get(..n).unwrap_or(&[]),
-        protocol,
-        port,
+    let grants = grants.get(..n).unwrap_or(&[]);
+    use abi::contracts::net::net_proto::grant;
+    (
+        grant::grants_endpoint(grants, protocol, port),
+        grant::own_address(grants),
     )
 }
 
@@ -11082,6 +11192,9 @@ unsafe fn lanes_take(s: &mut IpState) {
                     }
                     j += 1;
                 }
+                // A slot held by this generation: anything an earlier owner
+                // of it left is released before the lane can bind.
+                release_stale_owner(s, owner_slot, owner_gen);
                 if let Some(l) = lane_at(s, j).filter(|l| l.active == 0) {
                     *l = NetLane {
                         active: 1,
@@ -11122,6 +11235,8 @@ unsafe fn lanes_take(s: &mut IpState) {
                     j += 1;
                 }
                 owner_rctx_forget(s, owner_slot, owner_gen);
+                // The owner is gone: what addresses it held leave with it.
+                release_owner(s, owner_slot, owner_gen);
             }
             net_lane::OP_DRAIN => {
                 let mut j = 1u8;

@@ -244,6 +244,7 @@ pub fn admit_resident_workloads_from_config() {
                 // lanes may listen on, and all they may.
                 if let Err(rc) = crate::kernel::workload::endpoints::admit(
                     handle,
+                    false,
                     crate::kernel::workload::endpoints::listed(workload.endpoints),
                 ) {
                     log::error!(

@@ -27,8 +27,10 @@
 // The backend knows little of a workload's network: its address and name
 // service are the node agent's to give the node's net provider before START
 // (`net::identity` on the provider's `addr_ctl`); the endpoints it may
-// listen on are the `CREATE`'s `net`/`endpoint` options, which only a
-// creator acting with the node's authority gives (`endpoints::admit`); and
+// listen on are the `CREATE`'s `net`/`endpoint` options, and whether it
+// listens on addresses of its own only its `net`/`own_address` option,
+// which only a creator acting with the node's authority gives
+// (`endpoints::admit`); and
 // its lanes are kernel facts with no content
 // (`kernel::workload::lanes`).
 //
@@ -487,13 +489,19 @@ unsafe fn seat_pending(
     if let Err(e) = install_storage_line(staged_add.handle(), req) {
         return abandon(staged_add, e);
     }
-    // The endpoints its options grant, checked whole by `parse_create`.
+    // The endpoints its options grant and its reach, checked whole by
+    // `parse_create`.
     let opts = wl::CreateHeader::parse(buf).map_or(0..0, |(_, _, o)| o);
+    let own_address = wl::opt::iter(&buf[opts.clone()])
+        .filter_map(Result::ok)
+        .any(|o| is_own_address(&o));
     let endpoints = wl::opt::iter(&buf[opts])
         .filter_map(Result::ok)
         .filter(is_endpoint)
         .flat_map(|o| crate::kernel::workload::endpoints::listed(o.val));
-    if let Err(e) = crate::kernel::workload::endpoints::admit(staged_add.handle(), endpoints) {
+    if let Err(e) =
+        crate::kernel::workload::endpoints::admit(staged_add.handle(), own_address, endpoints)
+    {
         return abandon(staged_add, e);
     }
     let src_graph = &buf[req.graph_off..req.graph_off + req.graph_len];
@@ -613,21 +621,30 @@ unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<Create
     if graph_len < fluxor_contracts::graph::HEADER_LEN {
         return Err(errno::EINVAL); // not a composed graph
     }
-    // The options: the endpoints the creator grants the owner, required or
-    // not (a grant is never dropped); any other entry this backend does not
-    // realize, so a required one is refused before anything is staged and an
-    // advisory one is ignored.
+    // The options: the endpoints the creator grants the owner and whether it
+    // listens on addresses of its own only, required or not (a grant is
+    // never dropped, nor a confinement); any other entry this backend does
+    // not realize, so a required one is refused before anything is staged
+    // and an advisory one is ignored.
     // They are admitted with the owner (`seat_pending`).
+    let mut own_address = false;
     for o in wl::opt::iter(&buf[opts.clone()]) {
         let o = o.map_err(|()| errno::EINVAL)?;
+        let net = is_endpoint(&o) || is_own_address(&o);
+        // Granting the node's endpoints, and saying where they are
+        // reached, is the node's to do.
+        if net && scheduler::caller_authority() != OWNER_NODE {
+            return Err(errno::EACCES);
+        }
         if is_endpoint(&o) {
-            // Granting the node's endpoints is the node's to do.
-            if scheduler::caller_authority() != OWNER_NODE {
-                return Err(errno::EACCES);
-            }
             if o.val.len() != wl::endpoint::LEN {
                 return Err(errno::EINVAL);
             }
+        } else if is_own_address(&o) {
+            if !o.val.is_empty() || own_address {
+                return Err(errno::EINVAL);
+            }
+            own_address = true;
         } else if o.required() {
             return Err(errno::ENOSYS);
         }
@@ -660,6 +677,11 @@ unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<Create
 /// Whether `o` is a `net`/`endpoint` option.
 fn is_endpoint(o: &wl::opt::Entry<'_>) -> bool {
     o.ns == wl::endpoint::NS && o.key == wl::endpoint::KEY
+}
+
+/// Whether `o` is a `net`/`own_address` option.
+fn is_own_address(o: &wl::opt::Entry<'_>) -> bool {
+    o.ns == wl::own_address::NS && o.key == wl::own_address::KEY
 }
 
 /// Begin the CREATE's add, or check a continuation names the one being
@@ -893,11 +915,15 @@ fn workload_caps() -> u32 {
 }
 
 /// `OPTIONS`: the options entries the graph backend realizes: the endpoints
-/// a creator grants the owner (`net`/`endpoint`). A graph workload's
+/// a creator grants the owner (`net`/`endpoint`) and its confinement to
+/// addresses of its own (`net`/`own_address`). A graph workload's
 /// environment is bound into its params by its creator, and the rest of its
 /// network is the node's net provider's.
 fn workload_options(out: &mut [u8]) -> i32 {
-    match write_option_directory(out, &[(wl::endpoint::NS, &[wl::endpoint::KEY])]) {
+    match write_option_directory(
+        out,
+        &[(wl::endpoint::NS, &[wl::endpoint::KEY, wl::own_address::KEY])],
+    ) {
         0 => errno::ERANGE,
         n => n as i32,
     }

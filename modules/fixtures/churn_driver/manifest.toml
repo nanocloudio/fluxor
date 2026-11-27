@@ -33,6 +33,9 @@ grants = ["workload.create"]
 # node's image need not hold churn_probe at all (leave it out of
 # `workload_modules:`). Every cycle then stages the pack as the workload's own
 # code, runs it, and frees it with the workload.
+# A graph names both by module (`${module_pack:churn_probe}`,
+# `${module_pin:churn_probe}`) and the build renders them from the module it
+# resolves.
 
 timer_class = "wall_clock"
 

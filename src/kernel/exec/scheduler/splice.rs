@@ -1630,13 +1630,33 @@ pub fn finish(mut st: StagedAdd) -> Result<OwnerHandle, AddError> {
     // of the graph that feeds it from earlier in the graph's order (an edge
     // back up the order closes a cycle the composer accepted, and gating it
     // would deadlock the cycle); completion waits on every feeder.
+    //
+    // A lane joins its writer and reader to the module of the graph that
+    // serves it. Its events edge feeds the reader, which waits on the
+    // server wherever the two sit in the order: a lane is no edge of the
+    // order, and its commands edge, the way back, gates nothing, so the
+    // pair closes no cycle that could hold. A node module reading the
+    // network stack's events steps once the stack is ready, not before.
     let position = |l: u16| st.graph.order().position(|m| m == l);
-    for r in st.graph.edges() {
-        if let (Endpoint::New(a), Endpoint::New(b)) = (r.from, r.to) {
+    let local = |slot: usize| (0..n).find(|&k| st.slot(k) == slot).map(|k| k as u16);
+    for (i, r) in st.graph.edges().enumerate() {
+        let (ends, gates) = match (r.from, r.to) {
+            (Endpoint::New(a), Endpoint::New(b)) => (Some((a, b)), position(a) < position(b)),
+            (Endpoint::New(a), Endpoint::Lane { .. }) => (
+                local(sched().edges[edge_base + i].to_module).map(|b| (a, b)),
+                false,
+            ),
+            (Endpoint::Lane { .. }, Endpoint::New(b)) => (
+                local(sched().edges[edge_base + i].from_module).map(|a| (a, b)),
+                true,
+            ),
+            _ => (None, false),
+        };
+        if let Some((a, b)) = ends {
             let (from, to) = (st.slot(usize::from(a)), st.slot(usize::from(b)));
             let s = sched();
             s.completion_mask[to].set(from);
-            if position(a) < position(b) {
+            if gates {
                 s.upstream_mask[to].set(from);
             }
         }

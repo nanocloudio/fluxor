@@ -469,6 +469,7 @@ pub fn materialize_package(store: &OciStore, e: &Artifact, dest: &Path) -> Resul
     };
     if let Some(stamp) = read_sync_stamp(dest) {
         if stamp.digest == e.digest
+            && carries_module_manifests(&dest.join("modules"))
             && stamp.content.as_deref()
                 == Some(crate::store_publish::tree_content_digest(dest)?.as_str())
         {
@@ -542,6 +543,24 @@ pub fn materialize_package(store: &OciStore, e: &Artifact, dest: &Path) -> Resul
             read_manifest_layer_blob(store, &e.name, &e.digest, &l.digest)?,
         ));
     }
+    // Each module carries the manifest it was published with: a package's
+    // modules are published artefacts (its publish refuses one that is
+    // not), found by the digest of their bytes, so a launch of the package
+    // resolves them from the package alone.
+    let digests: Vec<&str> = imp.modules.iter().map(|m| m.digest.as_str()).collect();
+    let found = store.module_manifests_by_fmod(&digests)?;
+    let mut manifests: Vec<(&str, &[u8])> = Vec::new();
+    for m in &imp.modules {
+        let text = found.get(&m.digest).ok_or_else(|| {
+            Error::Config(format!(
+                "workload package '{}' pins module '{}' at {}, and no module artefact in the \
+                 store carries those bytes, so its manifest cannot be materialised with it — \
+                 publish the module (`fluxor publish`) and sync again",
+                e.name, m.name, m.digest
+            ))
+        })?;
+        manifests.push((m.name.as_str(), text.as_slice()));
+    }
     install_tree_atomic(dest, &e.digest, |tmp| {
         fs::write(tmp.join("workload.json"), &workload_json)?;
         fs::write(tmp.join("graph.yaml"), &graph_yaml)?;
@@ -549,6 +568,15 @@ pub fn materialize_package(store: &OciStore, e: &Artifact, dest: &Path) -> Resul
         fs::create_dir_all(tmp.join("modules"))?;
         for (name, bytes) in &modules {
             fs::write(tmp.join("modules").join(format!("{name}.fmod")), bytes)?;
+        }
+        for (name, text) in &manifests {
+            fs::write(
+                tmp.join("modules").join(format!(
+                    "{name}.{}",
+                    crate::module_resolver::PACKAGED_MANIFEST_EXT
+                )),
+                text,
+            )?;
         }
         Ok(())
     })?;
@@ -558,6 +586,20 @@ pub fn materialize_package(store: &OciStore, e: &Artifact, dest: &Path) -> Resul
         modules.len(),
         dest.display()
     ))
+}
+
+/// Whether every `.fmod` in a materialised package's `modules/` has its
+/// manifest beside it.
+fn carries_module_manifests(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    entries.flatten().all(|e| {
+        let p = e.path();
+        p.extension().is_none_or(|x| x != "fmod")
+            || p.with_extension(crate::module_resolver::PACKAGED_MANIFEST_EXT)
+                .is_file()
+    })
 }
 
 /// Materialise the package `fluxor.lock` pins under `name`, if it pins one,
@@ -1440,6 +1482,115 @@ mod tests {
         let order = topo_order(&[consumer, provider]).unwrap();
         let names: Vec<&str> = order.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["web", "app"]);
+    }
+
+    /// A materialised package carries each module's manifest beside its
+    /// `.fmod`: the one the module artefact carrying those bytes was
+    /// published with. A package whose module no published artefact carries
+    /// is refused, naming the module.
+    #[test]
+    fn a_materialised_package_carries_its_modules_manifests() {
+        use crate::oci_store::{
+            publish_module, sha256_hex_prefixed, ModulePublish, PackageArtifact,
+            PROVENANCE_PUBLISHED,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = OciStore::open(dir.path().join("store")).unwrap();
+        let fmod = b"router-fmod".to_vec();
+        let resources = br#"{"modules":1,"edges":0,"stateBytes":1024,"bufferBytes":0}"#.to_vec();
+        let graph = b"modules: []\n".to_vec();
+        let workload = format!(
+            r#"{{
+  "schemaVersion": 1,
+  "name": "demo",
+  "version": "1.0.0",
+  "contract": {{
+    "configSchema": {{ "digest": "sha256:{cfg}" }},
+    "health": {{ "readiness": "r", "liveness": "l" }},
+    "update": {{ "drainTimeoutMs": 1000, "statePolicy": "discard" }}
+  }},
+  "implementations": [ {{
+    "target": {{ "family": "linux", "architecture": "aarch64", "fluxorAbi": 1 }},
+    "graph": {{ "digest": "{graph_d}" }},
+    "modules": [ {{ "name": "router", "digest": "{fmod_d}" }} ],
+    "resources": {{ "digest": "{res_d}" }},
+    "bindings": {{ "imports": {{}}, "exports": {{}}, "health": {{ "r": "m.r", "l": "m.l" }} }}
+  }} ]
+}}"#,
+            cfg = "ab".repeat(32),
+            graph_d = sha256_hex_prefixed(&graph),
+            res_d = sha256_hex_prefixed(&resources),
+            fmod_d = sha256_hex_prefixed(&fmod),
+        );
+        let meta = ArtifactMeta {
+            project: "proj",
+            provenance: PROVENANCE_PUBLISHED,
+            source_rev: None,
+            abi_surface_hex: "ee",
+            input_digest_hex: None,
+            ci_digest_hex: None,
+        };
+        let modules = vec![("router".to_string(), fmod.clone())];
+        let txn = store.begin_publish().unwrap();
+        let prepared = store
+            .prepare_package(
+                &PackageArtifact {
+                    workload_json: &workload,
+                    resources_json: &resources,
+                    graph_yaml: &graph,
+                    modules: &modules,
+                    ref_name: "demo:1.0.0",
+                },
+                &meta,
+            )
+            .unwrap();
+        store
+            .commit_publish(&txn, "proj", "0.1.0", vec![prepared], None)
+            .unwrap();
+        drop(txn);
+        let desc = store.resolve("demo:1.0.0").unwrap();
+        let pin = Artifact {
+            kind: "package".into(),
+            name: "demo".into(),
+            project: "proj".into(),
+            target: None,
+            digest: desc.digest.clone(),
+            reference: "demo:1.0.0".into(),
+            content: None,
+        };
+
+        let dest = dir.path().join("demo");
+        let e = materialize_package(&store, &pin, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("module 'router'") && e.contains("publish the module"),
+            "{e}"
+        );
+
+        let manifest = "[module]\nname = \"router\"\n";
+        publish_module(
+            &store,
+            &ModulePublish {
+                name: "router",
+                target: "aarch64",
+                fmod_bytes: &fmod,
+                manifest_toml: Some(manifest),
+                provenance: PROVENANCE_PUBLISHED,
+                source_rev: None,
+                ref_name: "aarch64/router:0.1.0",
+            },
+        )
+        .unwrap();
+        materialize_package(&store, &pin, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("modules/router.fmod")).unwrap(),
+            fmod
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("modules/router.toml")).unwrap(),
+            manifest
+        );
     }
 
     /// A name or target that is not one path component never reaches a

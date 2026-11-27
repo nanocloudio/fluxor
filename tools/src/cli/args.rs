@@ -252,9 +252,10 @@ enum Commands {
         /// Where the image is written.
         #[arg(long)]
         output: PathBuf,
-        /// The verified modules the graph loads.
+        /// The package's verified modules, each `.fmod` beside its
+        /// manifest: the only modules the graph resolves besides native ones.
         #[arg(long, value_name = "DIR")]
-        module_root: PathBuf,
+        package_modules: PathBuf,
         /// The Linux runtime the launch runs; its providers are pinned.
         #[arg(long)]
         runtime: PathBuf,
