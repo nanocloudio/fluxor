@@ -137,6 +137,7 @@ fn compose(out: &mut [u8], width: u16, height: u16) -> Option<usize> {
     put(&Record::FillRect {
         rect: vd::Rect { x: 0, y: 0, w, h },
         colour: [16, 24, 40, 255],
+        current: false,
     })?;
     put(&Record::FillRRect {
         rect: vd::Rect {
@@ -147,6 +148,7 @@ fn compose(out: &mut [u8], width: u16, height: u16) -> Option<usize> {
         },
         radii: vd::Radii([[12 * vd::FX_ONE; 2]; 4]),
         colour: [230, 120, 30, 255],
+        current: false,
     })?;
     let mut entries = [0u8; RUN * vd::GLYPH_ENTRY];
     for i in 0..RUN {

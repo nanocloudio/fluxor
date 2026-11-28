@@ -578,6 +578,11 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
             // Raster inputs a producer's SURFACE records name, against what
             // the consumer has.
             ("surfaces", FACT_NUMERIC),
+            // The most commands, and flattened segments (a path's `edges`),
+            // of one path: what a producer's paths stay within, against
+            // what the consumer draws in its time.
+            ("path_commands", FACT_NUMERIC),
+            ("path_edges", FACT_NUMERIC),
         ],
     ),
     (
@@ -691,6 +696,9 @@ pub const DRAW_OPS: &[&str] = &[
     "translate",
     "surface",
     "res_ref",
+    "fill_path",
+    "stroke_path",
+    "current_color",
 ];
 
 /// The wire byte for a raster format, or `None` for a name outside
@@ -880,6 +888,8 @@ pub const NUMERIC_FACT_RULES: &[(&str, FactRule)] = &[
     ("band_rows", FactRule::Ceiling),
     ("refresh_mhz", FactRule::Floor),
     ("surfaces", FactRule::Ceiling),
+    ("path_commands", FactRule::Ceiling),
+    ("path_edges", FactRule::Ceiling),
     ("width", FactRule::Ceiling),
     ("height", FactRule::Ceiling),
     ("max_nodes", FactRule::Ceiling),

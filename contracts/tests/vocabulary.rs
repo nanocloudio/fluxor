@@ -70,13 +70,17 @@ fn positional_tables_hold_their_order() {
             "clip_rrect",
             "translate",
             "surface",
-            "res_ref"
+            "res_ref",
+            "fill_path",
+            "stroke_path",
+            "current_color"
         ]
     );
     assert_eq!(raster_format_byte("rgba8"), Some(1));
     assert_eq!(pixmap_format_byte("rgba8"), Some(0));
     assert_eq!(draw_op_bit("res_ref"), Some(9));
-    assert_eq!(draw_op_bit("fill_path"), None);
+    assert_eq!(draw_op_bit("current_color"), Some(12));
+    assert_eq!(draw_op_bit("fill_paths"), None);
 }
 
 #[test]
@@ -162,7 +166,9 @@ fn the_draw_and_raster_facts_are_declared() {
             "damage",
             "atomic",
             "refresh_mhz",
-            "surfaces"
+            "surfaces",
+            "path_commands",
+            "path_edges"
         ]
     );
     assert_eq!(
@@ -237,10 +243,12 @@ fn each_numeric_fact_compares_by_its_rule() {
         ("width", Ceiling),
         ("height", Ceiling),
         ("max_nodes", Ceiling),
+        ("path_commands", Ceiling),
+        ("path_edges", Ceiling),
     ] {
         assert_eq!(fact_rule(fact, FACT_NUMERIC), rule, "{fact}");
     }
-    assert_eq!(NUMERIC_FACT_RULES.len(), 15);
+    assert_eq!(NUMERIC_FACT_RULES.len(), 17);
     // An enumerated fact is a subset whatever its name.
     assert_eq!(fact_rule("max_payload", &["a", "b"]), FactRule::Subset);
 }

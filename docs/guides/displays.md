@@ -127,9 +127,37 @@ per surface pixel:
 | A background, a rounded rectangle and a line of glyphs | 6.6 |
 | 32 opaque rounded rectangles | 12.7 |
 | A translucent fill of the whole surface | 17.8 |
+| A background and 20 filled 48-pixel icons (path resources) | 20.7 |
+| A background and a filled disc across the surface (a path) | 22.9 |
+| A background and an 8-pixel stroke of that disc | 39.2 |
+| A background and the 20 icons stroked a pixel wide | 63.3 |
 | A background, 32 rounded rectangles, 32 borders and 400 glyphs | 30.6 |
 | 1,800 a8 glyphs | 32.7 |
 | A document of 721 records | 41.4 |
+
+Paths cost by their edges more than by their area. On the same model,
+with the default `path_bytes`:
+
+| Path | Instructions |
+|---|---|
+| A covered pixel of a large fill (the disc) | 25 (17 with a whole band of cells) |
+| A covered pixel of a 48-pixel filled icon | about 230 |
+| A covered pixel of a large stroke (the 8-pixel ring) | about 600 (390 with a whole band of cells) |
+| A covered pixel of a hairline-thin stroked icon | about 1,200 |
+| Flattening a 256-segment circle again for a band it crosses | about 29,000 |
+| Flattening a 48-pixel icon again for a band it crosses, and its edges | about 40,000 |
+| Stroking a 48-pixel icon's outline again for a band it crosses | about 150,000 |
+
+A path is flattened again in every band, and every strip of `path_bytes`,
+it crosses; a curve whose control points all miss the strip is not.
+For a small icon that is about a quarter of what it costs; the rest is
+its edges, row by row. So on one core of the RP2350 a frame of 20 filled
+icons over a background, about 4.8 million instructions, draws at about
+20 refreshes a second, and the same icons stroked at about 7: give a
+picture of icons the band cache, which brings a refresh that shows it
+again back to a few instructions a pixel. A shape as wide as the panel
+draws faster with `path_bytes` holding a whole band (30,720 at 480
+wide), since it is then flattened once a band.
 
 A cycle is not an instruction: allow about one and a half cycles for each,
 more for code running from flash with a cold cache. By that measure the
@@ -198,15 +226,24 @@ the instance state:
 | Read buffer | `record_bytes` | 1,024 |
 | `surface0` (two buffers) | `surface_bytes` × 2 | 0 |
 | Band cache | `cache_bytes` | 0 |
+| Path cells | `path_bytes` | 7,680 |
 | State | | about 6,400 |
-| **Total** | | **about 109,400** |
+| **Total** | | **about 117,100** |
 
 The ring and scratch factors are for a row of 480 pixels, the widest the
 driver takes. The smallest useful instance, bands of 8 rows with a ring of
-24, two 4 KiB frames and every resource a `RES_REF`, takes 43,776 bytes of
-heap. The kernel keeps one table of 64 list entries for every scan list of
+24, two 4 KiB frames, every resource a `RES_REF` and path cells for one
+row, takes 45,696 bytes of heap. The kernel keeps one table of 64 list entries for every scan list of
 the node: a panel's bands (`height / band_rows`, at least three) must fit
 what the table has free, or the scan fails to start and the log says so.
+
+Path cells are the only memory a path costs beyond its resource bytes:
+one `i32` a pixel of the rows a path is drawn through at a time. A path
+is drawn as many rows at a time as `path_bytes` holds at the columns it
+reaches, flattened again for each such strip, so the default's four rows
+of a full-width path, or 40 rows of a 48-pixel icon, cost nothing in
+memory whatever the path's size or its number of segments. `path_bytes`
+must hold one row of `width`.
 
 A frame larger than `frame_bytes`, more defined resource bytes than
 `resource_bytes`, or a record larger than `record_bytes` is a stream fault:

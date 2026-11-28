@@ -7050,6 +7050,8 @@ mod port_fact_tests {
             ("VideoDraw", "resource_bytes"),
             ("VideoDraw", "frame_bytes"),
             ("VideoDraw", "surfaces"),
+            ("VideoDraw", "path_commands"),
+            ("VideoDraw", "path_edges"),
             ("AudioEncoded", "max_payload"),
         ] {
             let e = edge_of(ct, &format!("{fact} = 2048"), &format!("{fact} = 1024"))
@@ -7082,6 +7084,8 @@ mod port_fact_tests {
             "resource_bytes",
             "frame_bytes",
             "surfaces",
+            "path_commands",
+            "path_edges",
             "max_payload",
             // Judged by the banding rule on an edge.
             "band_rows",

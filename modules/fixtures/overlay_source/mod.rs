@@ -105,6 +105,7 @@ fn compose(out: &mut [u8]) -> Option<usize> {
         },
         radii: vd::Radii([[fx(10); 2]; 4]),
         colour: [16, 24, 40, 200],
+        current: false,
     })?;
     for item in 0..3i32 {
         let chosen = item == 1;
@@ -120,6 +121,7 @@ fn compose(out: &mut [u8]) -> Option<usize> {
             } else {
                 [200, 208, 220, 96]
             },
+            current: false,
         })?;
     }
     put(&Record::Commit { revision: 1 })?;

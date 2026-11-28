@@ -5,8 +5,15 @@ use super::paint::Painter;
 use super::replay::Index;
 use super::resources::Store;
 use fluxor_abi::contracts::video_draw::{
-    parse, resync, Admitted, Fault, Parse, Record, Sequence, HEADER,
+    parse, resync, Admitted, Fault, Parse, Record, Sequence, HEADER, RES_PATH, RES_PATH_PACK,
 };
+
+/// Whether live resource `id` of `sequence` is a path or a path pack.
+fn is_path(sequence: &Sequence<'_>, id: u16) -> bool {
+    sequence
+        .resource(id)
+        .is_some_and(|r| r.kind() == RES_PATH || r.kind() == RES_PATH_PACK)
+}
 
 /// What `Ingest::advance` reached.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,16 +84,27 @@ fn file(
         (Admitted::Stream, _) => store.clear(),
         (Admitted::End, _) => {}
         (Admitted::ResourceComplete { id }, Record::ResData { offset, bytes, .. }) => {
-            let verdict = if store.data(id, *offset, bytes) {
-                store.complete(id)
+            let stored = store.data(id, *offset, bytes);
+            if is_path(sequence, id) {
+                let header = if stored {
+                    store.complete_path(id)
+                } else {
+                    None
+                };
+                sequence.resolve_path(id, header)?;
             } else {
-                None
-            };
-            sequence.resolve(id, verdict)?;
+                let verdict = if stored { store.complete(id) } else { None };
+                sequence.resolve(id, verdict)?;
+            }
         }
         (Admitted::ResourceReferenced { id }, Record::ResRef(r)) => {
-            let verdict = store.reference(r);
-            sequence.resolve(id, verdict)?;
+            if is_path(sequence, id) {
+                let header = store.reference_path(r);
+                sequence.resolve_path(id, header)?;
+            } else {
+                let verdict = store.reference(r);
+                sequence.resolve(id, verdict)?;
+            }
         }
         (Admitted::ResourceComplete { id } | Admitted::ResourceReferenced { id }, _) => {
             sequence.resolve(id, None)?;

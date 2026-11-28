@@ -41,7 +41,8 @@ capabilities = ["video.draw", "video.raster"]
 # | 6   | resource_bytes | u32  | 16384   | Bytes of defined resources live at once. |
 # | 7   | record_bytes   | u32  | 2048    | The largest record read: a producer keeps each RES_DATA and GLYPHS record within it. |
 # | 8   | surface_bytes  | u32  | 0       | The largest surface each raster input holds, in its own format; 0 for a graph with no surfaces. |
-# | 9-12 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack or one strike. |
+# | 9-12 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack, one strike, a path or a path pack. |
+# | 13  | path_bytes     | u32  | 7680    | Cells paths are drawn through, four bytes a pixel: at least one row of the widest stream. A path is drawn as many rows at a time as fit at the columns it reaches. |
 
 [[params]]
 name = "pack0"
@@ -68,7 +69,7 @@ required = true
 # holds them where the target has the room.
 buffer_size = { default = 8192, aarch64 = 32768, wasm32 = 32768 }
 [ports.facts]
-ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref"]
+ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref", "fill_path", "stroke_path", "current_color"]
 pixmap_formats = ["rgba8", "rgb565"]
 glyph_formats = ["a1", "a8"]
 max_depth = 8
@@ -76,6 +77,8 @@ max_resources = 16
 damage = ["full"]
 atomic = ["yes", "no"]
 surfaces = 2
+path_commands = 4096
+path_edges = 16384
 
 [[ports]]
 name = "surface0"
@@ -118,7 +121,7 @@ regions = ["damage"]
 [capacities]
 # One block from the heap: the read buffer, two retained frames, the
 # resource arena, the band, one output row (four bytes a pixel of `width`)
-# and two buffers for each of the two raster inputs.
+# two buffers for each of the two raster inputs and the path cells.
 heap_per_param = { base = 192, params = [
     { tag = 1, default = 480, bytes_each = 4 },
     { tag = 4, default = 23040, bytes_each = 1 },
@@ -126,6 +129,7 @@ heap_per_param = { base = 192, params = [
     { tag = 6, default = 16384, bytes_each = 1 },
     { tag = 7, default = 2048, bytes_each = 1 },
     { tag = 8, default = 0, bytes_each = 4 },
+    { tag = 13, default = 7680, bytes_each = 1 },
 ] }
 
 [observability]

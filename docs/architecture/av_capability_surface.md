@@ -88,10 +88,10 @@ colours are sRGB `[r][g][b][a]`, not premultiplied.
 | Group | Records |
 |---|---|
 | Stream control | `STREAM` (surface extent, band height, nesting depth, resource limits, the producer's generation), `END` |
-| Resources | `RES_DEF` and `RES_DATA` (a glyph strike or a pixmap, usable once whole and its SHA-256 matches), `RES_DROP`, `RES_REF` (bytes the consumer already holds, found by digest) |
+| Resources | `RES_DEF` and `RES_DATA` (a glyph strike, a pixmap or a path, usable once whole and its SHA-256 matches), `RES_DROP`, `RES_REF` (bytes the consumer already holds, found by digest: a glyph pack or strike, a path or a path pack) |
 | Frames and bands | `FRAME` (generation, revision, damage), `BAND`, `COMMIT` |
-| Paint state | `SAVE`, `RESTORE`, `CLIP_RECT`, `CLIP_RRECT`, `TRANSLATE` |
-| Drawing | `FILL_RECT`, `FILL_RRECT`, `BORDER`, `PIXMAP`, `GLYPHS`, `SURFACE` |
+| Paint state | `SAVE`, `RESTORE`, `CLIP_RECT`, `CLIP_RRECT`, `TRANSLATE`, `CURRENT_COLOR` |
+| Drawing | `FILL_RECT`, `FILL_RRECT`, `BORDER`, `PIXMAP`, `GLYPHS`, `SURFACE`, `FILL_PATH`, `STROKE_PATH` |
 
 - **Frames.** Records from `FRAME` to `COMMIT` are one frame, composited
   in stream order. `damage` is the region the frame repaints.
@@ -105,6 +105,28 @@ colours are sRGB `[r][g][b][a]`, not premultiplied.
   over a picture another producer draws. The raster arrives on its own
   edge at its own pace, and a consumer that retains the frame's records
   redraws them when that picture changes.
+- **Paths.** A path is a resource: its bounding box, its command count
+  and its worst-case flattened segment count, then `MOVE`, `LINE`,
+  `QUAD`, `CUBIC` and `CLOSE` commands in `i32` fixed point. It is sent
+  once (or held by the consumer, alone or in a path pack) and drawn by
+  `FILL_PATH` (non-zero or even-odd) and `STROKE_PATH` (width, miter,
+  round or bevel joins, butt, round or square caps, a miter limit) any
+  number of times. Each drawing record places the path with a 2×2
+  matrix in 16.16 fixed point and a translation, so one definition is
+  sharp at every device pixel ratio, rotated or skewed. The consumer
+  flattens curves after the transform, in device pixels, to within 3/64
+  of a pixel, and strokes with the pen carried through the matrix, as
+  SVG does. Coverage is the signed area each segment leaves in each
+  pixel, the method font rasterisers use, in integers; the contract's
+  header comment states every step, and the conformance vectors pin it.
+  An icon or a gauge face costs a few bytes a frame to draw again: a
+  row of icons is one path resource each and one record each a frame.
+- **The current colour.** `CURRENT_COLOR` sets a colour in the paint
+  state (opaque black at `FRAME` and every `BAND`, saved and restored
+  with the rest). Flag `0x01` on `FILL_RECT`, `FILL_RRECT`, `BORDER`
+  (all four sides), `GLYPHS`, `FILL_PATH` or `STROKE_PATH` paints in it,
+  so a retained frame changes the colour of every flagged record with
+  one record, and an icon takes the colour of where it is drawn.
 - **Faults.** A record out of place, a value out of range, a resource
   that cannot be used or resolved, or a limit of the consumer exceeded
   is a stream fault: the consumer discards the frame in progress, keeps
@@ -118,14 +140,20 @@ gives the same bytes on every target. Its consumers:
 
 | Module | Draws into | Retains | Takes |
 |---|---|---|---|
-| `st7701s` (`draw`) | the panel, a band of `band_rows` rows at a time, again every refresh | two frames of `frame_bytes`; the frame shown changes whole at a refresh | every operation; damage `full`; one surface (`surface0`); `refresh_mhz` is its param ([displays.md](../guides/displays.md)) |
-| `draw_raster` (`draw`) | region rasters on `pixels`, a band at a time, when a frame commits or a surface changes | two frames of `frame_bytes`; its consumer holds the pixels | every operation; damage `full`; two surfaces |
+| `st7701s` (`draw`) | the panel, a band of `band_rows` rows at a time, again every refresh | two frames of `frame_bytes`; the frame shown changes whole at a refresh | every operation; damage `full`; one surface (`surface0`); paths of up to 1,024 commands and 8,192 segments; `refresh_mhz` is its param ([displays.md](../guides/displays.md)) |
+| `draw_raster` (`draw`) | region rasters on `pixels`, a band at a time, when a frame commits or a surface changes | two frames of `frame_bytes`; its consumer holds the pixels | every operation; damage `full`; two surfaces; paths of up to 4,096 commands and 16,384 segments |
+
+Paths are drawn through a strip of cells, four bytes a pixel, that each
+consumer sizes with its `path_bytes` param: as many rows of a path at a
+time as fit at the columns it reaches. That is the only memory a path
+takes beyond its resource bytes; `path_commands` and `path_edges` bound
+the time one costs.
 
 `video.draw` facts, declared under a port's `[ports.facts]`:
 
 | Fact | Values | Edge rule |
 |---|---|---|
-| `ops` | `fill_rect fill_rrect border pixmap glyphs clip_rect clip_rrect translate surface res_ref` | producer ⊆ consumer |
+| `ops` | `fill_rect fill_rrect border pixmap glyphs clip_rect clip_rrect translate surface res_ref fill_path stroke_path current_color` | producer ⊆ consumer |
 | `pixmap_formats` | `rgba8 rgb565` | producer ⊆ consumer |
 | `glyph_formats` | `a1 a8` | producer ⊆ consumer |
 | `max_depth`, `max_resources`, `resource_bytes` | u32 | producer ≤ consumer |
@@ -135,6 +163,7 @@ gives the same bytes on every target. Its consumers:
 | `atomic` | `yes no` | producer ⊆ consumer; a producer that needs a frame shown whole declares `yes` |
 | `refresh_mhz` | u32 | consumer ≤ producer: the refresh a consumer scans at against the band rate the producer sustains |
 | `surfaces` | u32 | raster inputs the producer's `SURFACE` records name ≤ the consumer's |
+| `path_commands`, `path_edges` | u32 | the most commands, and flattened segments (`edges`), of a producer's paths ≤ the consumer's; a path past the consumer's is a fault when it would become usable |
 
 ### 1.3 Region rasters
 

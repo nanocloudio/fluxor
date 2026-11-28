@@ -97,8 +97,9 @@ deferred_ready = true
 # | 23  | surface_bytes   | u32  | 0       | The largest surface `surface0` holds, in its own format; 0 for a graph without it. |
 # | 24  | underrun_rgb565 | u16  | 0       | The colour of a band that was not drawn in time. |
 # | 25  | status_s        | u8   | 0       | Seconds between `[st7701s] measured_mhz=… refreshes=… underruns=…` log lines; 0 for none. |
-# | 26-29 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack or one strike. |
+# | 26-29 | pack0 … pack3 | str  | unset   | An asset RES_REF records may name: a `GPK1` glyph pack, one strike, a path or a path pack. |
 # | 30  | cache_bytes     | u32  | 0       | The band cache: 0 for none, else at least four bytes a band. |
+# | 31  | path_bytes      | u32  | 7680    | Cells paths are drawn through, four bytes a pixel: at least one row of `width`. A path is drawn as many rows at a time as fit at the columns it reaches. |
 
 [[params]]
 name = "pack0"
@@ -125,11 +126,13 @@ required = false
 # when the picture changes, not once a refresh.
 rate_class_default = "transaction"
 [ports.facts]
-ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref"]
+ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref", "fill_path", "stroke_path", "current_color"]
 pixmap_formats = ["rgba8", "rgb565"]
 glyph_formats = ["a1", "a8"]
 max_depth = 8
 max_resources = 16
+path_commands = 1024
+path_edges = 8192
 resource_bytes = { param = "resource_bytes" }
 frame_bytes = { param = "frame_bytes" }
 damage = ["full"]
@@ -164,7 +167,7 @@ access = "write"
 [capacities]
 # One block from the heap: the ring (two bytes a pixel of a 480-pixel row),
 # the scratch band (three), two retained frames, the resource arena, the
-# read buffer, two buffers for `surface0` and the band cache.
+# read buffer, two buffers for `surface0`, the band cache and the path cells.
 heap_per_param = { base = 128, params = [
     { tag = 19, default = 48, bytes_each = 960 },
     { tag = 18, default = 16, bytes_each = 1440 },
@@ -173,6 +176,7 @@ heap_per_param = { base = 128, params = [
     { tag = 22, default = 1024, bytes_each = 1 },
     { tag = 23, default = 0, bytes_each = 2 },
     { tag = 30, default = 0, bytes_each = 1 },
+    { tag = 31, default = 7680, bytes_each = 1 },
 ] }
 
 [observability]

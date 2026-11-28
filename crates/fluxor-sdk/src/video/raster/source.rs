@@ -3,6 +3,7 @@
 
 use super::round::{div255, from_rgb565};
 use fluxor_abi::contracts::glyph_pack::{self as gp, Bitmap, FORMAT_A1};
+use fluxor_abi::contracts::video_draw::path::Path;
 use fluxor_abi::contracts::video_draw::{PIXMAP_RGB565, PIXMAP_RGBA8};
 use fluxor_abi::contracts::video_raster;
 
@@ -181,6 +182,11 @@ pub trait Resources {
     fn strike(&self, id: u16) -> Option<Strike<'_>>;
     /// Pixmap resource `id`, when it is usable.
     fn pixmap(&self, id: u16) -> Option<Texels<'_>>;
+    /// Path resource `id`, when it is usable. A consumer that draws no
+    /// paths has none.
+    fn path(&self, _id: u16) -> Option<Path<'_>> {
+        None
+    }
 }
 
 /// The consumer's raster inputs.

@@ -24,7 +24,8 @@
 // EVERY RECORD is a 4-byte header and then `len` payload bytes:
 //
 //   [0]     kind   u8
-//   [1]     flags  u8   zero
+//   [1]     flags  u8   zero, or FLAG_CURRENT_COLOR (0x01) on a kind that
+//                       takes it (see CURRENT COLOUR)
 //   [2..4]  len    u16  payload bytes; a fixed-size kind has exactly its
 //                       stated len
 //
@@ -61,13 +62,21 @@
 //          per pixel.
 //   kind 3 GLYPH_PACK    RES_REF only: a whole glyph pack the consumer
 //          holds; `selector` is the ppem of the strike used.
+//   kind 4 PATH          format: PATH_FX. No kind header (RES_DEF len 40):
+//          the path's header is the first bytes of its data (see PATHS),
+//          so a defined and a referenced path read the same way.
+//   kind 5 PATH_PACK     RES_REF only: a path pack the consumer holds;
+//          `selector` is the 1-based index of the path used (see PATHS).
 //
 // A defined resource is filled by RES_DATA chunks at explicit offsets and
 // becomes usable only when all `total_len` bytes have arrived and their
 // SHA-256 equals `digest`. RES_REF names bytes the consumer already holds
 // in place, found by `digest`; one it cannot resolve is a fault. A RES_REF
-// names a GLYPH_STRIKE (`selector` 0) or a GLYPH_PACK; a pixmap has no
-// place for its extent in the record and is always defined. `id` is below
+// names a GLYPH_STRIKE or a PATH (`selector` 0), a GLYPH_PACK or a
+// PATH_PACK; a pixmap has no place for its extent in the record and is
+// always defined. A path, defined or referenced, becomes usable only when
+// it is also a valid path within the consumer's `path_commands` and
+// `path_edges` (see PATHS). `id` is below
 // the stream's `max_resources`; the sum of live `total_len` of defined
 // resources stays within `resource_bytes` (a referenced resource costs
 // nothing against it); redefining a live id is a fault. RES_DROP takes
@@ -104,14 +113,23 @@
 //   0x32 CLIP_RECT   len 16  [rect]
 //   0x33 CLIP_RRECT  len 48  [rect][radii]
 //   0x34 TRANSLATE   len 8   [dx fx][dy fx]
+//   0x35 CURRENT_COLOR len 4 [colour]
 //
-// The state is a translation (initially zero) and a clip: one rectangle
-// (initially the damage region, intersected with the band in a banded
-// stream; each CLIP_RECT intersects it exactly) and an ordered list of
-// rounded rectangles (each CLIP_RRECT appends one; at most `max_depth`
-// live). Clips take their shape in current coordinates; TRANSLATE adds;
-// SAVE pushes the whole state and RESTORE pops it. Every fx sum is computed
-// in i64 and is a fault if it leaves i32.
+// The state is a translation (initially zero), a current colour
+// (initially opaque black) and a clip: one rectangle (initially the damage
+// region, intersected with the band in a banded stream; each CLIP_RECT
+// intersects it exactly) and an ordered list of rounded rectangles (each
+// CLIP_RRECT appends one; at most `max_depth` live). Clips take their
+// shape in current coordinates; TRANSLATE adds; CURRENT_COLOR sets the
+// current colour; SAVE pushes the whole state and RESTORE pops it. Every
+// fx sum is computed in i64 and is a fault if it leaves i32.
+//
+// CURRENT COLOUR. Flag 0x01 on FILL_RECT, FILL_RRECT, GLYPHS, FILL_PATH or
+// STROKE_PATH paints in the current colour instead of the record's own
+// colour field; on BORDER it replaces all four side colours. The colour
+// bytes it replaces are zero. The flag on any other kind is a fault. A
+// retained frame changes the colour of every flagged record with one
+// record, and an icon resource takes the colour of where it is drawn.
 //
 // DRAWING
 //
@@ -123,6 +141,13 @@
 //                            then n × [glyph u16][dx i16][dy i16]
 //   0x45 SURFACE     len 28  [input u8][filter u8][0 u16][src prect]
 //                            [dst rect]
+//   0x50 FILL_PATH   len 32  [path u16][rule u8][0 u8][colour][transform]
+//   0x51 STROKE_PATH len 40  [path u16][join u8][cap u8][colour][transform]
+//                            [width fx][miter_limit u16][0 u16]
+//
+//   transform  [a i32][b i32][c i32][d i32][tx fx][ty fx], 24 bytes: the
+//              matrix in 16.16 fixed point (MATRIX_ONE is 1.0), SVG's
+//              order: x' = a x + c y + tx, y' = b x + d y + ty.
 //
 // BORDER: widths and colours run top, right, bottom, left; `rect` is the
 // border box. PIXMAP scales `src` of resource `id` into `dst`; `filter` is
@@ -138,9 +163,109 @@
 //
 // Every drawing operation is translated, then clipped, then composited.
 //
-// RESERVED. Kinds 0x35 (a current colour), 0x50–0x52 (paths) and flag 0x01
-// on the colour-carrying kinds are held for path drawing; until then each
-// is an unknown kind or a non-zero flag, and so a fault.
+// PATHS. A path is a resource: sent once, drawn by FILL_PATH and
+// STROKE_PATH any number of times, at any scale. Its data (PATH_FX):
+//
+//   [x0 fx][y0 fx][x1 fx][y1 fx]   bounding box, inclusive; x0 <= x1,
+//                                  y0 <= y1
+//   [commands u32][edges u32]      then `commands` commands, each a verb
+//                                  byte and its points, [x fx][y fx] each:
+//     0 MOVE 1 point   1 LINE 1   2 QUAD 2 (control, end)
+//     3 CUBIC 3 (control, control, end)   4 CLOSE 0
+//
+// in the path's own coordinates. Every subpath begins with MOVE (anything
+// but MOVE after CLOSE is invalid); no arcs (a producer converts them to
+// cubics). Every point lies inside the box, and the box inside
+// ±PATH_COORD_MAX. `edges` is the most flattened segments the path can
+// take whatever its transform: 1 a MOVE (its subpath's closing segment), 1
+// a LINE, CURVE_SEGMENTS_MAX a QUAD or CUBIC, 0 a CLOSE; it states what a
+// consumer checks, and must equal that sum. `commands` and `edges` bound
+// the time a path costs, at most PATH_COMMANDS_MAX and PATH_EDGES_MAX and
+// at most the consumer's `path_commands` and `path_edges`. The data ends
+// with the last command. A path breaking any of this is refused when it
+// would become usable, after its digest: never drawn in part.
+//
+// A path pack (RES_REF kind PATH_PACK) is [count u32][offset u32 × count]
+// then the paths: path `i` (selector `i + 1`) runs from its offset, from
+// the pack's start, to the next offset or the pack's end; the offsets
+// increase and the first is 4 + 4 × count.
+//
+// Placing. The transform's matrix entries are within ±MATRIX_MAX (a scale
+// of at most 32); (tx, ty) plus the translation stay within ±PLACE_MAX on
+// each axis. A point (x, y) of the path lands at device
+// x' = ((a x + c y + 2^15) >> 16) + tx + translation (arithmetic shift,
+// i64), and likewise y'. Every device point is then within 2^27 fx.
+// Curves are flattened after the transform, in device fx: a QUAD takes n
+// segments, n the least power of two with 12 n² >= d, d the L1 length of
+// P0 − 2 P1 + P2; a CUBIC the least with 4 n² >= d, d the larger L1 length
+// of P0 − 2 P1 + P2 and P1 − 2 P2 + P3; n at most CURVE_SEGMENTS_MAX. So a
+// chord strays at most 3 fx (about a twentieth of a pixel) from its curve
+// below that cap. Point i is the Bernstein form at t = i / n with its
+// numerator (n³ or n² times the point) computed exactly and then rounded,
+// `(num + (2^s >> 1)) >> s` with 2^s the denominator.
+//
+// Filling. FILL_PATH fills every subpath, closed or not, by `rule`:
+// RULE_NONZERO or RULE_EVENODD. A pixel's coverage comes from the signed
+// area each segment leaves in each pixel cell of its row (the method font
+// rasterisers use). A segment from (x0, y0) to (x1, y1), y0 < y1 (a
+// segment going up counts negative, a level one nothing), is cut at each
+// pixel row: at a row boundary Y it is at x0 + floor((Y − y0)(x1 − x0) /
+// (y1 − y0)). Within a row, a piece from its left end (xl, yl) to its
+// right end (xr, yr) is cut at each column boundary X at
+// yl + floor((X − xl)(yr − yl) / (xr − xl)) (a vertical piece is one
+// cell). A part of it in cell c with downward height dy (fx, signed by
+// the segment's direction) between x positions xa and xb (0..=64 within
+// the cell) adds 128 dy − dy (xa + xb) to cell c and dy (xa + xb) to cell
+// c + 1. Along the row the running sum s of the cells is twice the
+// winding-weighted area in 1/4096 pixel: 8192 is a whole pixel inside
+// once. Non-zero takes v = min(|s|, 8192); even-odd v = |s| mod 16384,
+// folded to 16384 − v above 8192. The coverage is (v × 255 + 4096) >> 13,
+// the rounding of an area's coverage at twice its resolution.
+// Where contours overlap inside one pixel this is a defined
+// approximation, not the true area: the vectors pin it. Rows are
+// independent of each other, so any band height gives the same pixels;
+// cells left of the drawn columns sum into the first, and those right of
+// them do not count. The clip rectangle's area coverage and each rounded
+// clip then combine in as for FILL_RRECT.
+//
+// Stroking. STROKE_PATH strokes each subpath with the pen of a circle of
+// diameter `width` in the path's own coordinates carried through the
+// matrix (an ellipse under a non-uniform scale, as SVG strokes), filled
+// non-zero. `width` is 0..=STROKE_WIDTH_MAX (0 draws nothing); `join` is
+// JOIN_MITER, JOIN_ROUND or JOIN_BEVEL; `cap` CAP_BUTT, CAP_ROUND or
+// CAP_SQUARE; `miter_limit` is 8.8 fixed point in MITER_MIN..=MITER_MAX;
+// the trailing u16 is held for dashes. The outline is one contour an open
+// subpath (the left side forward, the end cap, the right side back, the
+// start cap), two a closed one; segments of no length are dropped. At a
+// vertex the side the path turns away from takes the join and the other
+// side passes through the vertex. `join` is used where two commands meet
+// and at a closed subpath's start; inside one flattened curve the join is
+// round. A subpath whose points all coincide but that has a drawing
+// command draws a dot: a disc for round caps, a square along the path's x
+// axis for square caps, nothing for butt; a CLOSE counts as a drawing
+// command.
+//
+// The outline's segments are filled as FILL_PATH's are, so every step is
+// the integer arithmetic stated here. The pen's geometry, in the path's
+// own coordinates with unit vectors of
+// length 2^14: a segment's direction u is the device segment taken back
+// through the matrix's adjugate (negated when the determinant is negative),
+// shifted right until each part is below 2^15, then u × 2^14 / |u|; its
+// left normal is n = (−u.y, u.x). A pen offset k (2^14 units of half the
+// width) lands at device ((a k.x + c k.y) × width + 2^30) >> 31, and
+// likewise in y with b and d. A segment's sides are p + o and p − o, o
+// the device offset of its n. A miter is kept when (2^28 + n1·n2) × limit² >=
+// 2^45 and reaches (n1 + n2) × 2^28 / (2^28 + n1·n2), rounded; otherwise
+// the join is a bevel. Round joins and caps take the points of the unit
+// circle at k × 2π / 64 (UNIT_CIRCLE), every (64 / N)th, that lie strictly
+// between the two offsets, N the least of 8, 16, 32 and 64 with
+// 3 N² >= 5 r, r = width (|a| + |b| + |c| + |d|) >> 17. Every rounding is
+// the floor of the value plus a half.
+//
+// The rows a path can paint are its box's corners through the transform,
+// widened by 1 fx; a stroke's also by the pen's reach, ((|b| + |d|) r' >>
+// 16) + 2 fx in y (|a| + |c| in x), with r = width × max(miter_limit when
+// the join is a miter, 1.5 as 384) >> 9 and r' = r + (r >> 10) + 4.
 //
 // FAULTS. On any fault the consumer discards the current frame, keeps its
 // last committed output, counts the fault, and skips records by their
@@ -174,12 +299,31 @@ pub const KIND_RESTORE: u8 = 0x31;
 pub const KIND_CLIP_RECT: u8 = 0x32;
 pub const KIND_CLIP_RRECT: u8 = 0x33;
 pub const KIND_TRANSLATE: u8 = 0x34;
+pub const KIND_CURRENT_COLOR: u8 = 0x35;
 pub const KIND_FILL_RECT: u8 = 0x40;
 pub const KIND_FILL_RRECT: u8 = 0x41;
 pub const KIND_BORDER: u8 = 0x42;
 pub const KIND_PIXMAP: u8 = 0x43;
 pub const KIND_GLYPHS: u8 = 0x44;
 pub const KIND_SURFACE: u8 = 0x45;
+pub const KIND_FILL_PATH: u8 = 0x50;
+pub const KIND_STROKE_PATH: u8 = 0x51;
+
+/// The flag that paints a record in the current colour.
+pub const FLAG_CURRENT_COLOR: u8 = 0x01;
+
+/// Whether `kind` takes `FLAG_CURRENT_COLOR`.
+pub const fn takes_current_color(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_FILL_RECT
+            | KIND_FILL_RRECT
+            | KIND_BORDER
+            | KIND_GLYPHS
+            | KIND_FILL_PATH
+            | KIND_STROKE_PATH
+    )
+}
 
 /// Payload lengths of the fixed-size kinds, and the fixed parts of the
 /// others.
@@ -202,6 +346,64 @@ pub const PIXMAP_LEN: usize = 28;
 pub const GLYPHS_FIXED: usize = 16;
 pub const GLYPH_ENTRY: usize = 6;
 pub const SURFACE_LEN: usize = 28;
+pub const CURRENT_COLOR_LEN: usize = 4;
+pub const TRANSFORM_LEN: usize = 24;
+pub const FILL_PATH_LEN: usize = 32;
+pub const STROKE_PATH_LEN: usize = 40;
+
+/// 1.0 in a transform's 16.16 matrix entries.
+pub const MATRIX_ONE: i32 = 1 << 16;
+/// The largest magnitude of a matrix entry: a scale of 32.
+pub const MATRIX_MAX: i32 = 1 << 21;
+/// The largest magnitude of a path coordinate, fx (16,384 pixels).
+pub const PATH_COORD_MAX: i32 = 1 << 20;
+/// The largest magnitude of a path's placement, its transform's
+/// translation plus the paint state's, on each axis, fx.
+pub const PLACE_MAX: i32 = 1 << 26;
+/// The widest stroke, fx in the path's coordinates (1,024 pixels).
+pub const STROKE_WIDTH_MAX: i32 = 1 << 16;
+/// Miter limits, 8.8 fixed point: 1.0 to 16.0.
+pub const MITER_MIN: u16 = 1 << 8;
+pub const MITER_MAX: u16 = 16 << 8;
+/// The most segments one curve is flattened into.
+pub const CURVE_SEGMENTS_MAX: u32 = 64;
+/// The most commands, and flattened segments, a path may have.
+pub const PATH_COMMANDS_MAX: u32 = 65_535;
+pub const PATH_EDGES_MAX: u32 = 65_536;
+
+/// Fill rules.
+pub const RULE_NONZERO: u8 = 0;
+pub const RULE_EVENODD: u8 = 1;
+/// Stroke joins.
+pub const JOIN_MITER: u8 = 0;
+pub const JOIN_ROUND: u8 = 1;
+pub const JOIN_BEVEL: u8 = 2;
+/// Stroke caps.
+pub const CAP_BUTT: u8 = 0;
+pub const CAP_ROUND: u8 = 1;
+pub const CAP_SQUARE: u8 = 2;
+
+/// `sin(k × π / 32) × 2^14`, rounded, for `k` in `0..=16`: a quarter of the
+/// unit circle round joins and caps are drawn from. Point `k` of the
+/// circle (`k` in `0..64`) is `(cos, sin)` of `k × π / 32`.
+pub const UNIT_CIRCLE: [i32; 17] = [
+    0, 1606, 3196, 4756, 6270, 7723, 9102, 10394, 11585, 12665, 13623, 14449, 15137, 15679, 16069,
+    16305, 16384,
+];
+
+/// Point `k` (taken mod 64) of the unit circle, 2^14 units: `(cos, sin)`
+/// of `k × π / 32`.
+pub const fn unit_circle(k: u32) -> (i32, i32) {
+    let k = k % 64;
+    let r = (k % 16) as usize;
+    let (c, s) = (UNIT_CIRCLE[16 - r], UNIT_CIRCLE[r]);
+    match k / 16 {
+        0 => (c, s),
+        1 => (-s, c),
+        2 => (-c, -s),
+        _ => (s, -c),
+    }
+}
 
 /// The most glyphs one GLYPHS record carries.
 pub const GLYPHS_MAX: usize = (u16::MAX as usize - GLYPHS_FIXED) / GLYPH_ENTRY;
@@ -270,12 +472,30 @@ pub mod off {
     pub const SURFACE_RESERVED: usize = 2;
     pub const SURFACE_SRC: usize = 4;
     pub const SURFACE_DST: usize = 12;
+
+    /// FILL_PATH and STROKE_PATH: the path, two bytes (rule, or join and
+    /// cap), the colour and the transform.
+    pub const PATH_ID: usize = 0;
+    pub const PATH_RULE: usize = 2;
+    pub const PATH_JOIN: usize = 2;
+    pub const PATH_RESERVED: usize = 3;
+    pub const PATH_CAP: usize = 3;
+    pub const PATH_COLOUR: usize = 4;
+    pub const PATH_TRANSFORM: usize = 8;
+    pub const STROKE_WIDTH: usize = 32;
+    pub const STROKE_MITER: usize = 36;
+    pub const STROKE_RESERVED: usize = 38;
 }
 
 /// Resource kinds.
 pub const RES_GLYPH_STRIKE: u8 = 1;
 pub const RES_PIXMAP: u8 = 2;
 pub const RES_GLYPH_PACK: u8 = 3;
+pub const RES_PATH: u8 = 4;
+pub const RES_PATH_PACK: u8 = 5;
+
+/// The path format byte: commands in i32 fx.
+pub const PATH_FX: u8 = 0;
 
 /// Pixmap format bytes: positions in `vocabulary::PIXMAP_FORMATS`.
 /// `PIXMAP_RGBA8`: bytes red, green, blue, alpha, not premultiplied.
@@ -296,20 +516,24 @@ pub const FILTER_BILINEAR: u8 = 1;
 
 /// Operation bits, for a consumer's `Limits::ops`: bit positions in
 /// `vocabulary::DRAW_OPS`. SAVE and RESTORE are always admitted.
-pub const OP_FILL_RECT: u16 = 1 << 0;
-pub const OP_FILL_RRECT: u16 = 1 << 1;
-pub const OP_BORDER: u16 = 1 << 2;
-pub const OP_PIXMAP: u16 = 1 << 3;
-pub const OP_GLYPHS: u16 = 1 << 4;
-pub const OP_CLIP_RECT: u16 = 1 << 5;
-pub const OP_CLIP_RRECT: u16 = 1 << 6;
-pub const OP_TRANSLATE: u16 = 1 << 7;
-pub const OP_SURFACE: u16 = 1 << 8;
-pub const OP_RES_REF: u16 = 1 << 9;
+/// `OP_CURRENT_COLOR` admits CURRENT_COLOR and the flag.
+pub const OP_FILL_RECT: u32 = 1 << 0;
+pub const OP_FILL_RRECT: u32 = 1 << 1;
+pub const OP_BORDER: u32 = 1 << 2;
+pub const OP_PIXMAP: u32 = 1 << 3;
+pub const OP_GLYPHS: u32 = 1 << 4;
+pub const OP_CLIP_RECT: u32 = 1 << 5;
+pub const OP_CLIP_RRECT: u32 = 1 << 6;
+pub const OP_TRANSLATE: u32 = 1 << 7;
+pub const OP_SURFACE: u32 = 1 << 8;
+pub const OP_RES_REF: u32 = 1 << 9;
+pub const OP_FILL_PATH: u32 = 1 << 10;
+pub const OP_STROKE_PATH: u32 = 1 << 11;
+pub const OP_CURRENT_COLOR: u32 = 1 << 12;
 /// Number of allocated operation bits.
-pub const OP_COUNT: u8 = 10;
+pub const OP_COUNT: u8 = 13;
 /// Every allocated operation bit.
-pub const OPS_ALL: u16 = (1 << OP_COUNT) - 1;
+pub const OPS_ALL: u32 = (1 << OP_COUNT) - 1;
 
 /// Bytes in one pixel of a pixmap `format`, or `None` for an unallocated
 /// byte.
@@ -347,6 +571,32 @@ pub struct PRect {
 /// `[r, g, b, a]`, sRGB-encoded, not premultiplied.
 pub type Colour = [u8; 4];
 
+/// Where a path is drawn: a 16.16 matrix and a translation in fx, SVG's
+/// order (`x' = a x + c y + tx`, `y' = b x + d y + ty`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transform {
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+    pub d: i32,
+    pub tx: i32,
+    pub ty: i32,
+}
+
+impl Transform {
+    /// No scale, no rotation, at `(tx, ty)`.
+    pub const fn at(tx: i32, ty: i32) -> Transform {
+        Transform {
+            a: MATRIX_ONE,
+            b: 0,
+            c: 0,
+            d: MATRIX_ONE,
+            tx,
+            ty,
+        }
+    }
+}
+
 /// A STREAM record's fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stream {
@@ -364,7 +614,7 @@ pub struct Stream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResDef {
     pub id: u16,
-    /// `RES_GLYPH_STRIKE` or `RES_PIXMAP`.
+    /// `RES_GLYPH_STRIKE`, `RES_PIXMAP` or `RES_PATH`.
     pub kind: u8,
     pub format: u8,
     pub total_len: u32,
@@ -378,10 +628,12 @@ pub struct ResDef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResRef {
     pub id: u16,
-    /// `RES_GLYPH_STRIKE` or `RES_GLYPH_PACK`.
+    /// `RES_GLYPH_STRIKE`, `RES_GLYPH_PACK`, `RES_PATH` or
+    /// `RES_PATH_PACK`.
     pub kind: u8,
     pub format: u8,
-    /// A pack's strike, by ppem; zero for a strike.
+    /// A glyph pack's strike, by ppem; a path pack's path, from 1; zero
+    /// for a strike or a path.
     pub selector: u32,
     pub digest: [u8; 32],
 }
@@ -391,6 +643,8 @@ pub struct ResRef {
 pub struct Glyphs<'a> {
     pub res: u16,
     pub colour: Colour,
+    /// Painted in the current colour; `colour` is then zero.
+    pub current: bool,
     pub x: i32,
     pub y: i32,
     /// `GLYPH_ENTRY` bytes a glyph.
@@ -408,6 +662,7 @@ impl<'a> Glyphs<'a> {
         Some(Self {
             res,
             colour,
+            current: false,
             x,
             y,
             entries,
@@ -492,14 +747,18 @@ pub enum Record<'a> {
         dx: i32,
         dy: i32,
     },
+    CurrentColor(Colour),
+    /// `current`: painted in the current colour, `colour` zero.
     FillRect {
         rect: Rect,
         colour: Colour,
+        current: bool,
     },
     FillRRect {
         rect: Rect,
         radii: Radii,
         colour: Colour,
+        current: bool,
     },
     Border {
         rect: Rect,
@@ -507,6 +766,8 @@ pub enum Record<'a> {
         /// Top, right, bottom, left.
         widths: [i32; 4],
         colours: [Colour; 4],
+        /// Every side in the current colour, `colours` zero.
+        current: bool,
     },
     Pixmap {
         id: u16,
@@ -521,6 +782,28 @@ pub enum Record<'a> {
         src: PRect,
         dst: Rect,
     },
+    FillPath {
+        path: u16,
+        /// `RULE_*`.
+        rule: u8,
+        colour: Colour,
+        current: bool,
+        transform: Transform,
+    },
+    StrokePath {
+        path: u16,
+        /// `JOIN_*`.
+        join: u8,
+        /// `CAP_*`.
+        cap: u8,
+        colour: Colour,
+        current: bool,
+        transform: Transform,
+        /// fx, in the path's coordinates.
+        width: i32,
+        /// 8.8 fixed point.
+        miter_limit: u16,
+    },
 }
 
 /// Why a stream is refused. Every fault ends the frame in progress; the
@@ -529,7 +812,8 @@ pub enum Record<'a> {
 pub enum Fault {
     /// A kind byte this contract does not allocate.
     UnknownKind,
-    /// A non-zero flags byte.
+    /// A flags byte other than zero, or than `FLAG_CURRENT_COLOR` on a kind
+    /// that takes it.
     BadFlags,
     /// A fixed-size kind with another `len`, or a variable one whose `len`
     /// its fields cannot fill.
@@ -539,10 +823,12 @@ pub enum Fault {
     /// A record that cannot fit the reader's carry buffer.
     Oversize,
     /// An enumerated byte outside its values: a filter, a resource kind or
-    /// format, a selector on a kind that takes none.
+    /// format, a selector on a kind that takes none, a fill rule, join or
+    /// cap, a miter limit outside `MITER_MIN..=MITER_MAX`.
     BadValue,
     /// A negative extent, radius or width; an empty surface; a pixmap
-    /// source with `w` or `h` 0.
+    /// source with `w` or `h` 0; a matrix entry past `MATRIX_MAX`; a stroke
+    /// width past `STROKE_WIDTH_MAX`.
     BadGeometry,
     /// A resource definition whose `total_len` its kind and extent do not
     /// give.
@@ -574,20 +860,22 @@ pub enum Fault {
     StackOverflow,
     /// More than `max_depth` live rounded clips.
     ClipOverflow,
-    /// An fx sum leaving i32.
+    /// An fx sum leaving i32, or a path placed past `PLACE_MAX`.
     FxOverflow,
     /// An operation, pixmap format or glyph format the consumer does not
     /// admit.
     NotAdmitted,
     /// A resource id past `max_resources`, a definition past
-    /// `resource_bytes`, or a redefinition of a live id.
+    /// `resource_bytes`, a redefinition of a live id, or a path past the
+    /// consumer's `path_commands` or `path_edges`.
     ResourceLimit,
     /// RES_DATA for a resource that is not being filled, or reaching past
     /// its `total_len`.
     ResourceData,
     /// A record naming a resource that is not live, not usable, or of the
-    /// wrong kind; a resource whose bytes failed their digest or a
-    /// reference the consumer could not resolve.
+    /// wrong kind; a resource whose bytes failed their digest, or are not
+    /// the strike or path they are defined as; a reference the consumer
+    /// could not resolve.
     ResourceUnusable,
     /// A glyph index past its strike.
     GlyphIndex,
@@ -688,8 +976,39 @@ const fn fixed_len(kind: u8) -> Option<usize> {
         KIND_BORDER => BORDER_LEN,
         KIND_PIXMAP => PIXMAP_LEN,
         KIND_SURFACE => SURFACE_LEN,
+        KIND_CURRENT_COLOR => CURRENT_COLOR_LEN,
+        KIND_FILL_PATH => FILL_PATH_LEN,
+        KIND_STROKE_PATH => STROKE_PATH_LEN,
         _ => return None,
     })
+}
+
+/// The colour at `at`, or zero under the current-colour flag, where any
+/// other bytes are a fault.
+fn paint_at(b: &[u8], at: usize, current: bool) -> Result<Colour, Fault> {
+    let c = colour_at(b, at);
+    if current && c != [0; 4] {
+        return Err(Fault::Reserved);
+    }
+    Ok(c)
+}
+
+fn transform_at(b: &[u8], at: usize) -> Result<Transform, Fault> {
+    let t = Transform {
+        a: i32_at(b, at),
+        b: i32_at(b, at + 4),
+        c: i32_at(b, at + 8),
+        d: i32_at(b, at + 12),
+        tx: i32_at(b, at + 16),
+        ty: i32_at(b, at + 20),
+    };
+    if [t.a, t.b, t.c, t.d]
+        .iter()
+        .any(|m| m.unsigned_abs() > MATRIX_MAX as u32)
+    {
+        return Err(Fault::BadGeometry);
+    }
+    Ok(t)
 }
 
 fn sample_at(p: &[u8], filter: usize, src: usize, dst: usize) -> Result<(u8, PRect, Rect), Fault> {
@@ -703,7 +1022,7 @@ fn sample_at(p: &[u8], filter: usize, src: usize, dst: usize) -> Result<(u8, PRe
     Ok((p[filter], s, rect_at(p, dst)?))
 }
 
-fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
+fn parse_payload(kind: u8, current: bool, p: &[u8]) -> Result<Record<'_>, Fault> {
     Ok(match kind {
         KIND_STREAM => {
             if p[off::STREAM_RESERVED] != 0 {
@@ -749,6 +1068,17 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
                         return Err(Fault::BadResource);
                     }
                 }
+                RES_PATH => {
+                    if d.format != PATH_FX {
+                        return Err(Fault::BadValue);
+                    }
+                    if p.len() != RES_DEF_FIXED {
+                        return Err(Fault::BadLen);
+                    }
+                    if (d.total_len as usize) < path::HEADER {
+                        return Err(Fault::BadResource);
+                    }
+                }
                 RES_PIXMAP => {
                     let Some(bpp) = pixmap_bytes_per_pixel(d.format) else {
                         return Err(Fault::BadValue);
@@ -791,12 +1121,17 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
                 selector: u32_at(p, off::RES_SELECTOR),
                 digest: digest_at(p, off::RES_DIGEST),
             };
-            let selector_ok = match r.kind {
-                RES_GLYPH_STRIKE => r.selector == 0,
-                RES_GLYPH_PACK => r.selector >= 1 && r.selector <= u16::MAX as u32,
+            let (selector_ok, format_ok) = match r.kind {
+                RES_GLYPH_STRIKE => (r.selector == 0, r.format < GLYPH_FORMAT_COUNT),
+                RES_GLYPH_PACK => (
+                    r.selector >= 1 && r.selector <= u16::MAX as u32,
+                    r.format < GLYPH_FORMAT_COUNT,
+                ),
+                RES_PATH => (r.selector == 0, r.format == PATH_FX),
+                RES_PATH_PACK => (r.selector >= 1, r.format == PATH_FX),
                 _ => return Err(Fault::BadValue),
             };
-            if !selector_ok || r.format >= GLYPH_FORMAT_COUNT {
+            if !selector_ok || !format_ok {
                 return Err(Fault::BadValue);
             }
             Record::ResRef(r)
@@ -824,14 +1159,17 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
             dx: i32_at(p, 0),
             dy: i32_at(p, 4),
         },
+        KIND_CURRENT_COLOR => Record::CurrentColor(colour_at(p, 0)),
         KIND_FILL_RECT => Record::FillRect {
             rect: rect_at(p, off::RECT)?,
-            colour: colour_at(p, off::FILL_RECT_COLOUR),
+            colour: paint_at(p, off::FILL_RECT_COLOUR, current)?,
+            current,
         },
         KIND_FILL_RRECT => Record::FillRRect {
             rect: rect_at(p, off::RECT)?,
             radii: radii_at(p, off::RADII)?,
-            colour: colour_at(p, off::FILL_RRECT_COLOUR),
+            colour: paint_at(p, off::FILL_RRECT_COLOUR, current)?,
+            current,
         },
         KIND_BORDER => {
             let mut widths = [0i32; 4];
@@ -841,13 +1179,14 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
                 if widths[i] < 0 {
                     return Err(Fault::BadGeometry);
                 }
-                colours[i] = colour_at(p, off::BORDER_COLOURS + 4 * i);
+                colours[i] = paint_at(p, off::BORDER_COLOURS + 4 * i, current)?;
             }
             Record::Border {
                 rect: rect_at(p, off::RECT)?,
                 radii: radii_at(p, off::RADII)?,
                 widths,
                 colours,
+                current,
             }
         }
         KIND_PIXMAP => {
@@ -873,7 +1212,8 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
             }
             Record::Glyphs(Glyphs {
                 res: u16_at(p, off::GLYPHS_RES),
-                colour: colour_at(p, off::GLYPHS_COLOUR),
+                colour: paint_at(p, off::GLYPHS_COLOUR, current)?,
+                current,
                 x: i32_at(p, off::GLYPHS_X),
                 y: i32_at(p, off::GLYPHS_Y),
                 entries: &p[off::GLYPHS_ENTRIES..],
@@ -890,6 +1230,49 @@ fn parse_payload(kind: u8, p: &[u8]) -> Result<Record<'_>, Fault> {
                 filter,
                 src,
                 dst,
+            }
+        }
+        KIND_FILL_PATH => {
+            if p[off::PATH_RESERVED] != 0 {
+                return Err(Fault::Reserved);
+            }
+            let rule = p[off::PATH_RULE];
+            if rule > RULE_EVENODD {
+                return Err(Fault::BadValue);
+            }
+            Record::FillPath {
+                path: u16_at(p, off::PATH_ID),
+                rule,
+                colour: paint_at(p, off::PATH_COLOUR, current)?,
+                current,
+                transform: transform_at(p, off::PATH_TRANSFORM)?,
+            }
+        }
+        KIND_STROKE_PATH => {
+            if u16_at(p, off::STROKE_RESERVED) != 0 {
+                return Err(Fault::Reserved);
+            }
+            let (join, cap) = (p[off::PATH_JOIN], p[off::PATH_CAP]);
+            let miter_limit = u16_at(p, off::STROKE_MITER);
+            if join > JOIN_BEVEL
+                || cap > CAP_SQUARE
+                || !(MITER_MIN..=MITER_MAX).contains(&miter_limit)
+            {
+                return Err(Fault::BadValue);
+            }
+            let width = i32_at(p, off::STROKE_WIDTH);
+            if !(0..=STROKE_WIDTH_MAX).contains(&width) {
+                return Err(Fault::BadGeometry);
+            }
+            Record::StrokePath {
+                path: u16_at(p, off::PATH_ID),
+                join,
+                cap,
+                colour: paint_at(p, off::PATH_COLOUR, current)?,
+                current,
+                transform: transform_at(p, off::PATH_TRANSFORM)?,
+                width,
+                miter_limit,
             }
         }
         _ => return Err(Fault::UnknownKind),
@@ -914,7 +1297,8 @@ pub fn parse(buf: &[u8], capacity: usize) -> Parse<'_> {
         (KIND_RES_DEF | KIND_RES_DATA | KIND_GLYPHS, None) | (_, Some(_)) => {}
         _ => return Parse::Fault(Fault::UnknownKind),
     }
-    if buf[1] != 0 {
+    let flags = buf[1];
+    if flags != 0 && !(flags == FLAG_CURRENT_COLOR && takes_current_color(kind)) {
         return Parse::Fault(Fault::BadFlags);
     }
     let total = HEADER + len;
@@ -924,7 +1308,7 @@ pub fn parse(buf: &[u8], capacity: usize) -> Parse<'_> {
     if buf.len() < total {
         return Parse::NeedMore;
     }
-    match parse_payload(kind, &buf[HEADER..total]) {
+    match parse_payload(kind, flags != 0, &buf[HEADER..total]) {
         Ok(record) => Parse::Record {
             record,
             consumed: total,
@@ -977,8 +1361,12 @@ pub fn resync(buf: &[u8]) -> Resync {
 }
 
 fn put_header(out: &mut [u8], kind: u8, len: usize) {
+    put_flagged(out, kind, false, len);
+}
+
+fn put_flagged(out: &mut [u8], kind: u8, current: bool, len: usize) {
     out[0] = kind;
-    out[1] = 0;
+    out[1] = if current { FLAG_CURRENT_COLOR } else { 0 };
     out[2..4].copy_from_slice(&(len as u16).to_le_bytes());
 }
 
@@ -1011,6 +1399,12 @@ fn put_u32(p: &mut [u8], at: usize, v: u32) {
     p[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+fn put_transform(p: &mut [u8], at: usize, t: &Transform) {
+    for (i, v) in [t.a, t.b, t.c, t.d, t.tx, t.ty].into_iter().enumerate() {
+        put_u32(p, at + 4 * i, v as u32);
+    }
+}
+
 /// The payload length `record` encodes to.
 fn payload_len(record: &Record<'_>) -> usize {
     match record {
@@ -1033,6 +1427,9 @@ fn payload_len(record: &Record<'_>) -> usize {
         Record::Pixmap { .. } => PIXMAP_LEN,
         Record::Glyphs(g) => GLYPHS_FIXED + g.entries.len(),
         Record::Surface { .. } => SURFACE_LEN,
+        Record::CurrentColor(_) => CURRENT_COLOR_LEN,
+        Record::FillPath { .. } => FILL_PATH_LEN,
+        Record::StrokePath { .. } => STROKE_PATH_LEN,
     }
 }
 
@@ -1129,8 +1526,16 @@ pub fn write(out: &mut [u8], record: &Record<'_>) -> Option<usize> {
             put_u32(p, 0, *dx as u32);
             put_u32(p, 4, *dy as u32);
         }
-        Record::FillRect { rect, colour } => {
-            put_header(head, KIND_FILL_RECT, len);
+        Record::CurrentColor(colour) => {
+            put_header(head, KIND_CURRENT_COLOR, len);
+            p.copy_from_slice(colour);
+        }
+        Record::FillRect {
+            rect,
+            colour,
+            current,
+        } => {
+            put_flagged(head, KIND_FILL_RECT, *current, len);
             put_rect(p, off::RECT, rect);
             p[off::FILL_RECT_COLOUR..].copy_from_slice(colour);
         }
@@ -1138,8 +1543,9 @@ pub fn write(out: &mut [u8], record: &Record<'_>) -> Option<usize> {
             rect,
             radii,
             colour,
+            current,
         } => {
-            put_header(head, KIND_FILL_RRECT, len);
+            put_flagged(head, KIND_FILL_RRECT, *current, len);
             put_rect(p, off::RECT, rect);
             put_radii(p, off::RADII, radii);
             p[off::FILL_RRECT_COLOUR..].copy_from_slice(colour);
@@ -1149,8 +1555,9 @@ pub fn write(out: &mut [u8], record: &Record<'_>) -> Option<usize> {
             radii,
             widths,
             colours,
+            current,
         } => {
-            put_header(head, KIND_BORDER, len);
+            put_flagged(head, KIND_BORDER, *current, len);
             put_rect(p, off::RECT, rect);
             put_radii(p, off::RADII, radii);
             for i in 0..4 {
@@ -1172,7 +1579,7 @@ pub fn write(out: &mut [u8], record: &Record<'_>) -> Option<usize> {
             put_rect(p, off::PIXMAP_DST, dst);
         }
         Record::Glyphs(g) => {
-            put_header(head, KIND_GLYPHS, len);
+            put_flagged(head, KIND_GLYPHS, g.current, len);
             put_u16(p, off::GLYPHS_RES, g.res);
             put_u16(p, off::GLYPHS_COUNT, g.count() as u16);
             p[off::GLYPHS_COLOUR..off::GLYPHS_COLOUR + 4].copy_from_slice(&g.colour);
@@ -1191,6 +1598,38 @@ pub fn write(out: &mut [u8], record: &Record<'_>) -> Option<usize> {
             p[off::SURFACE_FILTER] = *filter;
             put_prect(p, off::SURFACE_SRC, src);
             put_rect(p, off::SURFACE_DST, dst);
+        }
+        Record::FillPath {
+            path,
+            rule,
+            colour,
+            current,
+            transform,
+        } => {
+            put_flagged(head, KIND_FILL_PATH, *current, len);
+            put_u16(p, off::PATH_ID, *path);
+            p[off::PATH_RULE] = *rule;
+            p[off::PATH_COLOUR..off::PATH_COLOUR + 4].copy_from_slice(colour);
+            put_transform(p, off::PATH_TRANSFORM, transform);
+        }
+        Record::StrokePath {
+            path,
+            join,
+            cap,
+            colour,
+            current,
+            transform,
+            width,
+            miter_limit,
+        } => {
+            put_flagged(head, KIND_STROKE_PATH, *current, len);
+            put_u16(p, off::PATH_ID, *path);
+            p[off::PATH_JOIN] = *join;
+            p[off::PATH_CAP] = *cap;
+            p[off::PATH_COLOUR..off::PATH_COLOUR + 4].copy_from_slice(colour);
+            put_transform(p, off::PATH_TRANSFORM, transform);
+            put_u32(p, off::STROKE_WIDTH, *width as u32);
+            put_u16(p, off::STROKE_MITER, *miter_limit);
         }
     }
     match parse(out, total) {
@@ -1224,7 +1663,7 @@ pub fn write_res_data_header(out: &mut [u8], id: u16, offset: u32, len: usize) -
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// `OP_*` bits of the operations it draws.
-    pub ops: u16,
+    pub ops: u32,
     /// A bit per `PIXMAP_*` format byte it takes.
     pub pixmap_formats: u8,
     /// A bit per `GLYPH_*` format byte it takes.
@@ -1245,6 +1684,10 @@ pub struct Limits {
     pub damage_full: bool,
     /// Raster inputs a SURFACE may name.
     pub surfaces: u8,
+    /// The most commands, and flattened segments (`edges`), of a path it
+    /// draws; at most `PATH_COMMANDS_MAX` and `PATH_EDGES_MAX`.
+    pub path_commands: u32,
+    pub path_edges: u32,
 }
 
 /// One resource slot of a `Sequence`.
@@ -1431,6 +1874,8 @@ impl<'t> Sequence<'t> {
         limits.max_depth = limits
             .max_depth
             .min(stack.len().min(u8::MAX as usize) as u8);
+        limits.path_commands = limits.path_commands.min(PATH_COMMANDS_MAX);
+        limits.path_edges = limits.path_edges.min(PATH_EDGES_MAX);
         resources.fill(Resource::FREE);
         Self {
             limits,
@@ -1513,10 +1958,41 @@ impl<'t> Sequence<'t> {
     /// not be resolved, which faults the stream.
     pub fn resolve(&mut self, id: u16, verdict: Option<u32>) -> Result<(), Fault> {
         let result = match (self.resources.get_mut(id as usize), verdict) {
-            (Some(r), Some(glyphs)) if r.state == ResourceState::Unresolved => {
+            (Some(r), Some(glyphs))
+                if r.state == ResourceState::Unresolved
+                    && r.kind != RES_PATH
+                    && r.kind != RES_PATH_PACK =>
+            {
                 r.state = ResourceState::Usable;
                 r.glyphs = glyphs;
                 Ok(())
+            }
+            _ => Err(Fault::ResourceUnusable),
+        };
+        if result.is_err() {
+            self.at = Position::Closed;
+        }
+        result
+    }
+
+    /// The caller's verdict on a path resource `admit` reported complete
+    /// or referenced: `Some(header)` when its bytes are the ones its digest
+    /// names and form a valid path (`path::Path::check`), `None` when they
+    /// do not or the reference could not be resolved. A path past the
+    /// consumer's `path_commands` or `path_edges` faults `ResourceLimit`.
+    pub fn resolve_path(&mut self, id: u16, header: Option<path::Header>) -> Result<(), Fault> {
+        let limits = self.limits;
+        let result = match (self.resources.get_mut(id as usize), header) {
+            (Some(r), Some(h))
+                if r.state == ResourceState::Unresolved
+                    && (r.kind == RES_PATH || r.kind == RES_PATH_PACK) =>
+            {
+                if h.commands > limits.path_commands || h.edges > limits.path_edges {
+                    Err(Fault::ResourceLimit)
+                } else {
+                    r.state = ResourceState::Usable;
+                    Ok(())
+                }
             }
             _ => Err(Fault::ResourceUnusable),
         };
@@ -1543,7 +2019,7 @@ impl<'t> Sequence<'t> {
         self.rounded_clips = 0;
     }
 
-    fn op(&self, bit: u16) -> Result<(), Fault> {
+    fn op(&self, bit: u32) -> Result<(), Fault> {
         if self.limits.ops & bit == 0 {
             return Err(Fault::NotAdmitted);
         }
@@ -1579,6 +2055,38 @@ impl<'t> Sequence<'t> {
         let y = fx_sum(i64::from(r.y), i64::from(self.ty))?;
         fx_sum(i64::from(x), i64::from(r.w))?;
         fx_sum(i64::from(y), i64::from(r.h))?;
+        Ok(())
+    }
+
+    /// The consumer draws paths: fills, strokes or both.
+    fn op_path(&self) -> Result<(), Fault> {
+        if self.limits.ops & (OP_FILL_PATH | OP_STROKE_PATH) == 0 {
+            return Err(Fault::NotAdmitted);
+        }
+        Ok(())
+    }
+
+    /// The current colour, when `current` asks for it, is admitted.
+    fn paint(&self, current: bool) -> Result<(), Fault> {
+        if current {
+            self.op(OP_CURRENT_COLOR)?;
+        }
+        Ok(())
+    }
+
+    /// A path placed at `(tx, ty)` plus the translation stays inside
+    /// `PLACE_MAX`, and names a usable path.
+    fn path(&mut self, path: u16, t: &Transform) -> Result<(), Fault> {
+        let within = |v: i64| v.unsigned_abs() <= PLACE_MAX as u64;
+        if !within(i64::from(t.tx) + i64::from(self.tx))
+            || !within(i64::from(t.ty) + i64::from(self.ty))
+        {
+            return Err(Fault::FxOverflow);
+        }
+        let r = self.named(path)?;
+        if r.kind != RES_PATH && r.kind != RES_PATH_PACK {
+            return Err(Fault::ResourceUnusable);
+        }
         Ok(())
     }
 
@@ -1640,13 +2148,17 @@ impl<'t> Sequence<'t> {
                 return Ok(Admitted::End);
             }
             Record::ResDef(d) => {
-                let formats = if d.kind == RES_PIXMAP {
-                    self.limits.pixmap_formats
+                if d.kind == RES_PATH {
+                    self.op_path()?;
                 } else {
-                    self.limits.glyph_formats
-                };
-                if d.format >= 8 || formats & (1 << d.format) == 0 {
-                    return Err(Fault::NotAdmitted);
+                    let formats = if d.kind == RES_PIXMAP {
+                        self.limits.pixmap_formats
+                    } else {
+                        self.limits.glyph_formats
+                    };
+                    if d.format >= 8 || formats & (1 << d.format) == 0 {
+                        return Err(Fault::NotAdmitted);
+                    }
                 }
                 let live = u64::from(self.live_bytes) + u64::from(d.total_len);
                 if live > u64::from(self.stream.resource_bytes) {
@@ -1690,7 +2202,9 @@ impl<'t> Sequence<'t> {
             },
             Record::ResRef(r) => {
                 self.op(OP_RES_REF)?;
-                if self.limits.glyph_formats & (1 << r.format) == 0 {
+                if r.kind == RES_PATH || r.kind == RES_PATH_PACK {
+                    self.op_path()?;
+                } else if self.limits.glyph_formats & (1 << r.format) == 0 {
                     return Err(Fault::NotAdmitted);
                 }
                 let slot = self.free_slot(r.id)?;
@@ -1823,19 +2337,26 @@ impl<'t> Sequence<'t> {
                 self.tx = tx;
                 self.ty = ty;
             }
-            Record::FillRect { rect, .. } => {
+            Record::CurrentColor(_) => {
+                self.drawing(consumed)?;
+                self.op(OP_CURRENT_COLOR)?;
+            }
+            Record::FillRect { rect, current, .. } => {
                 self.drawing(consumed)?;
                 self.op(OP_FILL_RECT)?;
+                self.paint(*current)?;
                 self.placed(rect)?;
             }
-            Record::FillRRect { rect, .. } => {
+            Record::FillRRect { rect, current, .. } => {
                 self.drawing(consumed)?;
                 self.op(OP_FILL_RRECT)?;
+                self.paint(*current)?;
                 self.placed(rect)?;
             }
-            Record::Border { rect, .. } => {
+            Record::Border { rect, current, .. } => {
                 self.drawing(consumed)?;
                 self.op(OP_BORDER)?;
+                self.paint(*current)?;
                 self.placed(rect)?;
             }
             Record::Pixmap { id, src, dst, .. } => {
@@ -1855,8 +2376,9 @@ impl<'t> Sequence<'t> {
             Record::Glyphs(g) => {
                 self.drawing(consumed)?;
                 self.op(OP_GLYPHS)?;
+                self.paint(g.current)?;
                 let r = self.named(g.res)?;
-                if r.kind == RES_PIXMAP {
+                if r.kind != RES_GLYPH_STRIKE && r.kind != RES_GLYPH_PACK {
                     return Err(Fault::ResourceUnusable);
                 }
                 let mut x = i64::from(fx_sum(i64::from(g.x), i64::from(self.tx))?);
@@ -1877,8 +2399,344 @@ impl<'t> Sequence<'t> {
                     return Err(Fault::SurfaceInput);
                 }
             }
+            Record::FillPath {
+                path,
+                current,
+                transform,
+                ..
+            } => {
+                self.drawing(consumed)?;
+                self.op(OP_FILL_PATH)?;
+                self.paint(*current)?;
+                self.path(*path, transform)?;
+            }
+            Record::StrokePath {
+                path,
+                current,
+                transform,
+                ..
+            } => {
+                self.drawing(consumed)?;
+                self.op(OP_STROKE_PATH)?;
+                self.paint(*current)?;
+                self.path(*path, transform)?;
+            }
         }
         Ok(Admitted::Record)
+    }
+}
+
+/// A path resource's data (`RES_PATH`, format `PATH_FX`) and a path pack
+/// (`RES_PATH_PACK`): see PATHS in the contract's header.
+pub mod path {
+    use super::{Fault, CURVE_SEGMENTS_MAX, PATH_COMMANDS_MAX, PATH_COORD_MAX, PATH_EDGES_MAX};
+
+    /// Bytes of a path's header.
+    pub const HEADER: usize = 24;
+    pub const OFF_X0: usize = 0;
+    pub const OFF_Y0: usize = 4;
+    pub const OFF_X1: usize = 8;
+    pub const OFF_Y1: usize = 12;
+    pub const OFF_COMMANDS: usize = 16;
+    pub const OFF_EDGES: usize = 20;
+
+    /// Command verbs.
+    pub const MOVE: u8 = 0;
+    pub const LINE: u8 = 1;
+    pub const QUAD: u8 = 2;
+    pub const CUBIC: u8 = 3;
+    pub const CLOSE: u8 = 4;
+
+    /// Bytes of one point.
+    pub const POINT: usize = 8;
+
+    /// A path's header: its box, inclusive, and its counts.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Header {
+        pub x0: i32,
+        pub y0: i32,
+        pub x1: i32,
+        pub y1: i32,
+        pub commands: u32,
+        pub edges: u32,
+    }
+
+    /// One command, its points in the path's coordinates (fx).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Command {
+        Move([i32; 2]),
+        Line([i32; 2]),
+        Quad([i32; 2], [i32; 2]),
+        Cubic([i32; 2], [i32; 2], [i32; 2]),
+        Close,
+    }
+
+    impl Command {
+        fn verb(&self) -> u8 {
+            match self {
+                Command::Move(_) => MOVE,
+                Command::Line(_) => LINE,
+                Command::Quad(..) => QUAD,
+                Command::Cubic(..) => CUBIC,
+                Command::Close => CLOSE,
+            }
+        }
+
+        /// The command's points, and how many there are.
+        pub fn points(&self) -> ([[i32; 2]; 3], usize) {
+            match *self {
+                Command::Move(p) | Command::Line(p) => ([p, [0; 2], [0; 2]], 1),
+                Command::Quad(c, p) => ([c, p, [0; 2]], 2),
+                Command::Cubic(c1, c2, p) => ([c1, c2, p], 3),
+                Command::Close => ([[0; 2]; 3], 0),
+            }
+        }
+    }
+
+    /// Points a verb carries; `None` for a byte that is no verb.
+    pub const fn points_of(verb: u8) -> Option<usize> {
+        match verb {
+            MOVE | LINE => Some(1),
+            QUAD => Some(2),
+            CUBIC => Some(3),
+            CLOSE => Some(0),
+            _ => None,
+        }
+    }
+
+    /// The flattened segments a verb can take whatever the transform.
+    pub const fn edges_of(verb: u8) -> u32 {
+        match verb {
+            MOVE | LINE => 1,
+            QUAD | CUBIC => CURVE_SEGMENTS_MAX,
+            _ => 0,
+        }
+    }
+
+    fn i32_at(b: &[u8], at: usize) -> i32 {
+        i32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        i32_at(b, at) as u32
+    }
+
+    /// A path read in place.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Path<'a> {
+        pub header: Header,
+        commands: &'a [u8],
+    }
+
+    impl<'a> Path<'a> {
+        /// The header and the command bytes, unchecked: for drawing a path
+        /// `check` has passed. `None` when the bytes are shorter than a
+        /// header.
+        pub fn read(bytes: &'a [u8]) -> Option<Path<'a>> {
+            if bytes.len() < HEADER {
+                return None;
+            }
+            Some(Path {
+                header: Header {
+                    x0: i32_at(bytes, OFF_X0),
+                    y0: i32_at(bytes, OFF_Y0),
+                    x1: i32_at(bytes, OFF_X1),
+                    y1: i32_at(bytes, OFF_Y1),
+                    commands: u32_at(bytes, OFF_COMMANDS),
+                    edges: u32_at(bytes, OFF_EDGES),
+                },
+                commands: &bytes[HEADER..],
+            })
+        }
+
+        /// The path the bytes are, every rule of the contract checked: the
+        /// box, each point inside it, every subpath opened by MOVE, the
+        /// counts and that the commands fill the bytes exactly. A broken
+        /// rule is `ResourceUnusable`.
+        pub fn check(bytes: &'a [u8]) -> Result<Path<'a>, Fault> {
+            const BAD: Fault = Fault::ResourceUnusable;
+            let path = Path::read(bytes).ok_or(BAD)?;
+            let h = path.header;
+            let within = |v: i32| v.unsigned_abs() <= PATH_COORD_MAX as u32;
+            if h.x0 > h.x1 || h.y0 > h.y1 || ![h.x0, h.y0, h.x1, h.y1].into_iter().all(within) {
+                return Err(BAD);
+            }
+            if h.commands > PATH_COMMANDS_MAX || h.edges > PATH_EDGES_MAX {
+                return Err(BAD);
+            }
+            let (mut count, mut edges) = (0u32, 0u32);
+            let mut open = false;
+            let mut at = 0usize;
+            let b = path.commands;
+            while at < b.len() {
+                let verb = b[at];
+                let points = points_of(verb).ok_or(BAD)?;
+                let end = at + 1 + points * POINT;
+                if end > b.len() {
+                    return Err(BAD);
+                }
+                match verb {
+                    MOVE => open = true,
+                    CLOSE if open => open = false,
+                    _ if open => {}
+                    _ => return Err(BAD),
+                }
+                for i in 0..points {
+                    let x = i32_at(b, at + 1 + i * POINT);
+                    let y = i32_at(b, at + 5 + i * POINT);
+                    if x < h.x0 || x > h.x1 || y < h.y0 || y > h.y1 {
+                        return Err(BAD);
+                    }
+                }
+                count = count.checked_add(1).ok_or(BAD)?;
+                edges = edges.saturating_add(edges_of(verb));
+                at = end;
+            }
+            if count != h.commands || edges != h.edges {
+                return Err(BAD);
+            }
+            Ok(path)
+        }
+
+        /// The commands, in order. On bytes `check` refuses they stop at
+        /// the first that does not fit.
+        pub fn commands(&self) -> Commands<'a> {
+            Commands {
+                bytes: self.commands,
+                at: 0,
+            }
+        }
+    }
+
+    /// The commands of a path.
+    #[derive(Clone)]
+    pub struct Commands<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl Iterator for Commands<'_> {
+        type Item = Command;
+
+        fn next(&mut self) -> Option<Command> {
+            let b = self.bytes;
+            let verb = *b.get(self.at)?;
+            let points = points_of(verb)?;
+            let end = self.at + 1 + points * POINT;
+            if end > b.len() {
+                self.at = b.len();
+                return None;
+            }
+            let p = |i: usize| {
+                let at = self.at + 1 + i * POINT;
+                [i32_at(b, at), i32_at(b, at + 4)]
+            };
+            let command = match verb {
+                MOVE => Command::Move(p(0)),
+                LINE => Command::Line(p(0)),
+                QUAD => Command::Quad(p(0), p(1)),
+                CUBIC => Command::Cubic(p(0), p(1), p(2)),
+                _ => Command::Close,
+            };
+            self.at = end;
+            Some(command)
+        }
+    }
+
+    /// Bytes `commands` encode to, header included.
+    pub fn encoded_len(commands: &[Command]) -> usize {
+        HEADER
+            + commands
+                .iter()
+                .map(|c| 1 + c.points().1 * POINT)
+                .sum::<usize>()
+    }
+
+    /// Write a path of `commands` into the front of `out`, its box the
+    /// tightest around its points (zero for a path without any), its
+    /// counts computed. `None` when `out` is too small or the result is a
+    /// path `Path::check` refuses.
+    pub fn encode(commands: &[Command], out: &mut [u8]) -> Option<usize> {
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for c in commands {
+            let (pts, n) = c.points();
+            for p in &pts[..n] {
+                x0 = x0.min(p[0]);
+                y0 = y0.min(p[1]);
+                x1 = x1.max(p[0]);
+                y1 = y1.max(p[1]);
+            }
+        }
+        if x0 > x1 {
+            (x0, y0, x1, y1) = (0, 0, 0, 0);
+        }
+        let header = Header {
+            x0,
+            y0,
+            x1,
+            y1,
+            commands: u32::try_from(commands.len()).ok()?,
+            edges: commands
+                .iter()
+                .fold(0u32, |e, c| e.saturating_add(edges_of(c.verb()))),
+        };
+        encode_with(&header, commands, out)
+    }
+
+    /// Write a path with the stated `header` (its box and counts as given)
+    /// into the front of `out`. `None` when `out` is too small or the
+    /// result is a path `Path::check` refuses.
+    pub fn encode_with(header: &Header, commands: &[Command], out: &mut [u8]) -> Option<usize> {
+        let total = encoded_len(commands);
+        let out = out.get_mut(..total)?;
+        let h = header;
+        for (i, v) in [h.x0, h.y0, h.x1, h.y1].into_iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out[OFF_COMMANDS..OFF_COMMANDS + 4].copy_from_slice(&h.commands.to_le_bytes());
+        out[OFF_EDGES..OFF_EDGES + 4].copy_from_slice(&h.edges.to_le_bytes());
+        let mut at = HEADER;
+        for c in commands {
+            out[at] = c.verb();
+            at += 1;
+            let (pts, n) = c.points();
+            for p in &pts[..n] {
+                out[at..at + 4].copy_from_slice(&p[0].to_le_bytes());
+                out[at + 4..at + 8].copy_from_slice(&p[1].to_le_bytes());
+                at += POINT;
+            }
+        }
+        Path::check(out).ok()?;
+        Some(total)
+    }
+
+    /// Path `selector` (from 1) of a path pack: its bytes, unchecked as a
+    /// path. `None` when the pack's table does not hold it.
+    pub fn pack_entry(pack: &[u8], selector: u32) -> Option<&[u8]> {
+        if pack.len() < 4 {
+            return None;
+        }
+        let count = u32_at(pack, 0) as usize;
+        let index = (selector as usize).checked_sub(1)?;
+        if index >= count {
+            return None;
+        }
+        let table = count.checked_mul(4)?.checked_add(4)?;
+        if table > pack.len() {
+            return None;
+        }
+        let offset = |i: usize| u32_at(pack, 4 + 4 * i) as usize;
+        let start = offset(index);
+        let end = if index + 1 < count {
+            offset(index + 1)
+        } else {
+            pack.len()
+        };
+        let floor = if index == 0 { table } else { offset(index - 1) };
+        if (index == 0 && start != table) || start < floor || start > end || end > pack.len() {
+            return None;
+        }
+        pack.get(start..end)
     }
 }
 
@@ -2115,3 +2973,17 @@ const _: () = assert!(off::SURFACE_DST + 16 == SURFACE_LEN);
 const _: () = assert!(TRANSLATE_LEN == 8 && COMMIT_LEN == 4);
 const _: () = assert!(GLYPHS_FIXED + GLYPHS_MAX * GLYPH_ENTRY <= u16::MAX as usize);
 const _: () = assert!(GLYPH_FORMAT_COUNT <= 8 && PIXMAP_FORMAT_COUNT <= 8);
+const _: () = assert!(off::PATH_ID + 2 == off::PATH_RULE);
+const _: () = assert!(off::PATH_RULE == off::PATH_JOIN);
+const _: () = assert!(off::PATH_RULE + 1 == off::PATH_RESERVED);
+const _: () = assert!(off::PATH_RESERVED == off::PATH_CAP);
+const _: () = assert!(off::PATH_CAP + 1 == off::PATH_COLOUR);
+const _: () = assert!(off::PATH_COLOUR + 4 == off::PATH_TRANSFORM);
+const _: () = assert!(off::PATH_TRANSFORM + TRANSFORM_LEN == FILL_PATH_LEN);
+const _: () = assert!(FILL_PATH_LEN == off::STROKE_WIDTH);
+const _: () = assert!(off::STROKE_WIDTH + 4 == off::STROKE_MITER);
+const _: () = assert!(off::STROKE_MITER + 2 == off::STROKE_RESERVED);
+const _: () = assert!(off::STROKE_RESERVED + 2 == STROKE_PATH_LEN);
+const _: () = assert!(path::OFF_Y1 + 4 == path::OFF_COMMANDS);
+const _: () = assert!(path::OFF_EDGES + 4 == path::HEADER);
+const _: () = assert!((OP_COUNT as u32) <= u32::BITS);

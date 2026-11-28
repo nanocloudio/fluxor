@@ -34,12 +34,15 @@ direction = "output"
 content_type = "VideoDraw"
 required = true
 [ports.facts]
-ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref"]
+ops = ["fill_rect", "fill_rrect", "border", "pixmap", "glyphs", "clip_rect", "clip_rrect", "translate", "surface", "res_ref", "fill_path", "stroke_path", "current_color"]
 pixmap_formats = ["rgba8", "rgb565"]
 glyph_formats = ["a1", "a8"]
 max_depth = 8
 max_resources = 8
 resource_bytes = 65536
+# What the conformance vectors' paths stay within.
+path_commands = 4096
+path_edges = 16384
 # A frame is replayed from the file, so it is no larger than the file.
 frame_bytes = { param = "file_bytes" }
 damage = ["full"]

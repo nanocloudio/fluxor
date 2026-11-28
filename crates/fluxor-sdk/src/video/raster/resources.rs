@@ -1,12 +1,14 @@
 //! A consumer's resource store: the bytes RES_DEF and RES_DATA deliver, the
-//! SHA-256 check that makes them usable, and the byte strings the consumer
-//! already holds that RES_REF names by digest.
+//! SHA-256 check (and for a strike or a path the check of its form) that
+//! makes them usable, and the byte strings the consumer already holds that
+//! RES_REF names by digest.
 
 use super::source::{Resources, Strike, Texels};
 use crate::crypto::sha256::Sha256;
 use fluxor_abi::contracts::glyph_pack as gp;
+use fluxor_abi::contracts::video_draw::path::{self, Header, Path};
 use fluxor_abi::contracts::video_draw::{
-    ResDef, ResRef, RES_GLYPH_PACK, RES_GLYPH_STRIKE, RES_PIXMAP,
+    ResDef, ResRef, RES_GLYPH_PACK, RES_GLYPH_STRIKE, RES_PATH, RES_PATH_PACK, RES_PIXMAP,
 };
 
 /// A byte string the consumer holds in place (a glyph pack or a strike in
@@ -240,13 +242,7 @@ impl<'m> Store<'m> {
     /// digest its definition stated and, for a strike, parse as one
     /// covering exactly its length.
     pub fn complete(&self, id: u16) -> Option<u32> {
-        let slot = self.slots.get(usize::from(id))?;
-        let bytes = self.bytes(slot)?;
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        if hasher.finalize() != slot.digest {
-            return None;
-        }
+        let (slot, bytes) = self.hashed(id)?;
         match slot.kind {
             RES_PIXMAP => Some(0),
             RES_GLYPH_STRIKE => {
@@ -258,6 +254,64 @@ impl<'m> Store<'m> {
             }
             _ => None,
         }
+    }
+
+    /// Resource `id`'s slot and bytes, when they hash to the digest its
+    /// definition stated.
+    fn hashed(&self, id: u16) -> Option<(&Slot, &[u8])> {
+        let slot = self.slots.get(usize::from(id))?;
+        let bytes = self.bytes(slot)?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        if hasher.finalize() != slot.digest {
+            return None;
+        }
+        Some((slot, bytes))
+    }
+
+    /// The verdict on a defined path whose last byte has arrived, for
+    /// `Sequence::resolve_path`: its header when its bytes hash to the
+    /// digest its definition stated and form a valid path.
+    pub fn complete_path(&self, id: u16) -> Option<Header> {
+        let (slot, bytes) = self.hashed(id)?;
+        if slot.kind != RES_PATH {
+            return None;
+        }
+        Some(Path::check(bytes).ok()?.header)
+    }
+
+    /// Resolve a RES_REF of a path or a path pack against the held byte
+    /// strings, for `Sequence::resolve_path`: the path's header when one
+    /// hashes to its digest and is a valid path (kind PATH) or a pack
+    /// holding a valid path at `selector` (kind PATH_PACK).
+    pub fn reference_path(&mut self, r: &ResRef) -> Option<Header> {
+        let index = self
+            .held
+            .iter()
+            .position(|h| h.digest.as_ref() == Some(&r.digest))?;
+        let bytes = self.held[index].bytes;
+        let entry = match r.kind {
+            RES_PATH => bytes,
+            RES_PATH_PACK => path::pack_entry(bytes, r.selector)?,
+            _ => return None,
+        };
+        let header = Path::check(entry).ok()?.header;
+        let offset = (entry.as_ptr() as usize).checked_sub(bytes.as_ptr() as usize)?;
+        let slot = self.slots.get_mut(usize::from(r.id))?;
+        if slot.place != Place::Free {
+            return None;
+        }
+        *slot = Slot {
+            place: Place::Held(u8::try_from(index).ok()?),
+            kind: RES_PATH,
+            format: r.format,
+            width: 0,
+            height: 0,
+            offset: u32::try_from(offset).ok()?,
+            len: u32::try_from(entry.len()).ok()?,
+            digest: r.digest,
+        };
+        Some(header)
     }
 
     /// Resolve a RES_REF against the held byte strings, for
@@ -325,5 +379,13 @@ impl Resources for Store<'_> {
             return None;
         }
         Texels::pixmap(self.bytes(slot)?, slot.width, slot.height, slot.format)
+    }
+
+    fn path(&self, id: u16) -> Option<Path<'_>> {
+        let slot = self.slots.get(usize::from(id))?;
+        if slot.kind != RES_PATH {
+            return None;
+        }
+        Path::read(self.bytes(slot)?)
     }
 }

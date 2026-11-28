@@ -7,21 +7,28 @@
 //! rectangle; any other shape's coverage is combined with the clip
 //! rectangle's own area coverage; then each rounded clip combines in, in
 //! the order they were set. Combining two coverages is `div255(c1 × c2)`.
+//! A path's coverage is its cells' (`path`), combined with the clip the
+//! same way.
 
 use super::band::{sampled, solid, solid_alpha, solid_pair, Band, BAND_BPP};
 use super::coverage::{join, Reach, Shape, NEAR_PIXELS, PIXEL, WHOLE};
+use super::path::{coverage, flatten, Cells, Fill, Pen, Place, Stroke};
 use super::round::div255;
 use super::source::{glyph_coverage, Resources, Surfaces, Texels};
 use fluxor_abi::contracts::glyph_pack::{row_bytes, FORMAT_A8};
 use fluxor_abi::contracts::video_draw::{
-    Colour, Glyphs, PRect, Radii, Record, Rect, FILTER_BILINEAR,
+    Colour, Glyphs, PRect, Radii, Record, Rect, Transform, FILTER_BILINEAR, RULE_EVENODD,
 };
+
+/// The current colour at FRAME and at every BAND.
+pub const INITIAL_COLOUR: Colour = [0, 0, 0, 255];
 
 /// One saved paint state.
 #[derive(Clone, Copy)]
 pub struct Saved {
     tx: i32,
     ty: i32,
+    current: Colour,
     clip: Shape,
     rounded: usize,
 }
@@ -31,6 +38,7 @@ impl Saved {
     pub const EMPTY: Saved = Saved {
         tx: 0,
         ty: 0,
+        current: INITIAL_COLOUR,
         clip: Shape::EMPTY,
         rounded: 0,
     };
@@ -42,15 +50,32 @@ impl Saved {
 /// stream's `max_depth`. A SAVE past the stack or a rounded clip past the
 /// list, which a validated stream never sends, is counted and otherwise
 /// ignored, so its RESTORE still pairs.
+///
+/// Paths are drawn through a strip of cells, one `i32` a pixel, that
+/// `with_paths` lends: as many rows at a time as fit at the columns a path
+/// reaches. A painter lent no cells, or fewer than one row of a path,
+/// draws no path.
 pub struct Painter<'s> {
     stack: &'s mut [Saved],
     clips: &'s mut [Shape],
+    cells: &'s mut [i32],
     depth: usize,
     unsaved: usize,
     tx: i32,
     ty: i32,
+    current: Colour,
     clip: Shape,
     rounded: usize,
+}
+
+/// What a path record asks of the painter.
+struct PathPaint<'r> {
+    id: u16,
+    transform: &'r Transform,
+    colour: Colour,
+    /// `None` for a fill; a stroke's width, join, cap and miter limit.
+    stroke: Option<(i32, u8, u8, u16)>,
+    evenodd: bool,
 }
 
 fn clamp_fx(v: i64) -> i32 {
@@ -276,13 +301,21 @@ impl<'s> Painter<'s> {
         Painter {
             stack,
             clips,
+            cells: &mut [],
             depth: 0,
             unsaved: 0,
             tx: 0,
             ty: 0,
+            current: INITIAL_COLOUR,
             clip: Shape::EMPTY,
             rounded: 0,
         }
+    }
+
+    /// This painter drawing paths through `cells`.
+    pub fn with_paths(mut self, cells: &'s mut [i32]) -> Self {
+        self.cells = cells;
+        self
     }
 
     /// Reset the state for a frame or a band: an empty stack, no
@@ -292,6 +325,7 @@ impl<'s> Painter<'s> {
         self.unsaved = 0;
         self.tx = 0;
         self.ty = 0;
+        self.current = INITIAL_COLOUR;
         self.rounded = 0;
         let x0 = i64::from(region.x) * PIXEL;
         let y0 = i64::from(region.y) * PIXEL;
@@ -321,6 +355,7 @@ impl<'s> Painter<'s> {
                     *slot = Saved {
                         tx: self.tx,
                         ty: self.ty,
+                        current: self.current,
                         clip: self.clip,
                         rounded: self.rounded,
                     };
@@ -337,6 +372,7 @@ impl<'s> Painter<'s> {
                     let s = self.stack[self.depth];
                     self.tx = s.tx;
                     self.ty = s.ty;
+                    self.current = s.current;
                     self.clip = s.clip;
                     self.rounded = s.rounded;
                 }
@@ -352,6 +388,7 @@ impl<'s> Painter<'s> {
                 self.tx = clamp_fx(i64::from(self.tx) + i64::from(*dx));
                 self.ty = clamp_fx(i64::from(self.ty) + i64::from(*dy));
             }
+            Record::CurrentColor(colour) => self.current = *colour,
             _ => return false,
         }
         true
@@ -369,19 +406,33 @@ impl<'s> Painter<'s> {
         if self.state(record) {
             return;
         }
+        let paint = |current: bool, colour: Colour| if current { self.current } else { colour };
         match record {
-            Record::FillRect { rect, colour } => self.fill_rect(band, rect, *colour),
+            Record::FillRect {
+                rect,
+                colour,
+                current,
+            } => self.fill_rect(band, rect, paint(*current, *colour)),
             Record::FillRRect {
                 rect,
                 radii,
                 colour,
-            } => self.fill_rrect(band, rect, radii, *colour),
+                current,
+            } => self.fill_rrect(band, rect, radii, paint(*current, *colour)),
             Record::Border {
                 rect,
                 radii,
                 widths,
                 colours,
-            } => self.border(band, rect, radii, widths, colours),
+                current,
+            } => {
+                let colours = if *current {
+                    [self.current; 4]
+                } else {
+                    *colours
+                };
+                self.border(band, rect, radii, widths, &colours)
+            }
             Record::Pixmap {
                 id,
                 filter,
@@ -392,7 +443,46 @@ impl<'s> Painter<'s> {
                     self.sample(band, &texels, *filter, *src, dst);
                 }
             }
-            Record::Glyphs(glyphs) => self.glyphs(band, glyphs, resources),
+            Record::Glyphs(glyphs) => {
+                let mut run = *glyphs;
+                run.colour = paint(run.current, run.colour);
+                self.glyphs(band, &run, resources)
+            }
+            Record::FillPath {
+                path,
+                rule,
+                colour,
+                current,
+                transform,
+            } => {
+                let p = PathPaint {
+                    id: *path,
+                    transform,
+                    colour: paint(*current, *colour),
+                    stroke: None,
+                    evenodd: *rule == RULE_EVENODD,
+                };
+                self.path(band, &p, resources);
+            }
+            Record::StrokePath {
+                path,
+                join,
+                cap,
+                colour,
+                current,
+                transform,
+                width,
+                miter_limit,
+            } => {
+                let p = PathPaint {
+                    id: *path,
+                    transform,
+                    colour: paint(*current, *colour),
+                    stroke: Some((*width, *join, *cap, *miter_limit)),
+                    evenodd: false,
+                };
+                self.path(band, &p, resources);
+            }
             Record::Surface {
                 input,
                 filter,
@@ -417,9 +507,15 @@ impl<'s> Painter<'s> {
     /// clip rectangle, reaches every edge of the region, with no rounded
     /// clip set. What those pixels held before does not show.
     pub(super) fn covers(&self, record: &Record<'_>, region: PRect) -> bool {
-        let Record::FillRect { rect, colour } = record else {
+        let Record::FillRect {
+            rect,
+            colour,
+            current,
+        } = record
+        else {
             return false;
         };
+        let colour = if *current { self.current } else { *colour };
         if colour[3] != 255 || self.rounded != 0 {
             return false;
         }
@@ -455,6 +551,23 @@ impl<'s> Painter<'s> {
                 within(Shape::rect(rect, self.tx, self.ty))
             }
             Record::Pixmap { dst, .. } | Record::Surface { dst, .. } => within(self.placed(dst)),
+            Record::FillPath {
+                path, transform, ..
+            } => self.path_rows(*path, transform, None, resources, (c0, c1)),
+            Record::StrokePath {
+                path,
+                transform,
+                width,
+                join,
+                miter_limit,
+                ..
+            } => self.path_rows(
+                *path,
+                transform,
+                Some((*width, *join, *miter_limit)),
+                resources,
+                (c0, c1),
+            ),
             Record::Glyphs(run) => {
                 let Some(strike) = resources.strike(run.res) else {
                     return Some((0, 0));
@@ -846,6 +959,187 @@ impl<'s> Painter<'s> {
                     glyph_coverage(format, row, (px - left) as usize)
                 });
             }
+        }
+    }
+
+    /// The device box a path record can paint, fx, inclusive: the path's
+    /// box through its transform, widened by a stroke's reach (`stroke`:
+    /// width, join, miter limit). `None` when the path is not usable.
+    fn path_box<R: Resources>(
+        &self,
+        id: u16,
+        transform: &Transform,
+        stroke: Option<(i32, u8, u16)>,
+        resources: &R,
+    ) -> Option<(Place, [i32; 4], [i32; 2])> {
+        let path = resources.path(id)?;
+        let place = Place::new(transform, self.tx, self.ty);
+        let [x0, y0, x1, y1] = place.bounds(&path.header);
+        let reach = match stroke {
+            Some((width, join, miter)) => place.reach(width, join, miter),
+            None => [0, 0],
+        };
+        Some((
+            place,
+            [x0 - reach[0], y0 - reach[1], x1 + reach[0], y1 + reach[1]],
+            reach,
+        ))
+    }
+
+    /// The rows a path record can paint inside the clip rows `clip`.
+    fn path_rows<R: Resources>(
+        &self,
+        id: u16,
+        transform: &Transform,
+        stroke: Option<(i32, u8, u16)>,
+        resources: &R,
+        clip: (i32, i32),
+    ) -> (i32, i32) {
+        match self.path_box(id, transform, stroke, resources) {
+            Some((_, [_, y0, _, y1], _)) => ((y0 >> 6).max(clip.0), ((y1 >> 6) + 1).min(clip.1)),
+            None => (0, 0),
+        }
+    }
+
+    /// A path, filled or stroked: flattened into the cells a strip of rows
+    /// at a time, each row's running sum of cells its coverage, combined
+    /// with the clip as for a rounded rectangle.
+    fn path<R: Resources>(&mut self, band: &mut Band<'_>, p: &PathPaint<'_>, resources: &R) {
+        if p.colour[3] == 0 {
+            return;
+        }
+        let stroke = p.stroke.map(|(w, j, _, m)| (w, j, m));
+        let Some((place, [x0, y0, x1, y1], reach)) =
+            self.path_box(p.id, p.transform, stroke, resources)
+        else {
+            return;
+        };
+        let Some(path) = resources.path(p.id) else {
+            return;
+        };
+        let pen = p
+            .stroke
+            .map(|(width, join, cap, miter)| Pen::new(place, width, join, cap, miter));
+        if pen.as_ref().is_some_and(Pen::is_empty) {
+            return;
+        }
+        let (c0, c1) = self.clip.columns();
+        let (r0, r1) = self.clip.rows();
+        let (b0, b1) = band.columns();
+        let (first, end) = Self::rows(band, (y0 >> 6).max(r0), ((y1 >> 6) + 1).min(r1));
+        let lo = (x0 >> 6).max(c0).max(b0);
+        let hi = ((x1 >> 6) + 1).min(c1).min(b1);
+        if first >= end || lo >= hi {
+            return;
+        }
+        let width = hi - lo;
+        let cells = core::mem::take(&mut self.cells);
+        let strip = cells
+            .len()
+            .checked_div(width as usize)
+            .unwrap_or(0)
+            .min(i32::MAX as usize) as i32;
+        let mut y = first;
+        while strip > 0 && y < end {
+            let rows = strip.min(end - y);
+            let Some(mut strip_cells) = Cells::new(&mut *cells, lo, width, y, rows) else {
+                break;
+            };
+            let culled = (y * 64 - reach[1], (y + rows) * 64 + reach[1]);
+            match &pen {
+                None => flatten(&path, &place, culled, &mut Fill::new(&mut strip_cells)),
+                Some(pen) => flatten(
+                    &path,
+                    &place,
+                    culled,
+                    &mut Stroke::new(&mut strip_cells, pen, culled),
+                ),
+            }
+            let mut clips = self.clip_rows(false);
+            for py in y..y + rows {
+                self.path_row(band, py, lo, strip_cells.row(py), clips.at(py), p);
+            }
+            y += rows;
+        }
+        self.cells = cells;
+    }
+
+    /// Composite row `py` of a path from its cells, which start at column
+    /// `lo`. A run of cells that add nothing keeps one coverage, so it is
+    /// painted as one span.
+    fn path_row(
+        &self,
+        band: &mut Band<'_>,
+        py: i32,
+        lo: i32,
+        cells: &[i32],
+        clip: Reach,
+        p: &PathPaint<'_>,
+    ) {
+        let hi = lo + cells.len() as i32;
+        let Some((x0, run)) = band.span(py, lo, hi) else {
+            return;
+        };
+        let skip = (x0 - lo) as usize;
+        let mut sum = 0i32;
+        let mut i = 0usize;
+        while i < cells.len() {
+            sum = sum.wrapping_add(cells[i]);
+            let mut j = i + 1;
+            while j < cells.len() && cells[j] == 0 {
+                j += 1;
+            }
+            let c = coverage(sum, p.evenodd);
+            if c != 0 && j > skip {
+                let from = i.max(skip) - skip;
+                self.path_span(run, py, x0 + from as i32, from..j - skip, c, clip, p.colour);
+            }
+            i = j;
+        }
+    }
+
+    /// Paint `span` of `run` (pixels from column `x`) at coverage `c`
+    /// through the clip.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one span's whole description: where, its coverage, the clip, the paint"
+    )]
+    fn path_span(
+        &self,
+        run: &mut [u8],
+        py: i32,
+        x: i32,
+        span: core::ops::Range<usize>,
+        c: u32,
+        clip: Reach,
+        colour: Colour,
+    ) {
+        let start = span.start;
+        let px_of = |at: usize| x + (at - start) as i32;
+        let mut at = span.start;
+        while at < span.end {
+            let px = px_of(at);
+            if c == 255 && clip.whole(px) {
+                // Whole pixels as far as the clip leaves them whole.
+                let end = (clip.full_hi.saturating_sub(x).max(0) as usize + start).min(span.end);
+                let end = end.max(at + 1);
+                if let Some(out) = run.get_mut(at * BAND_BPP..end * BAND_BPP) {
+                    fill_run(out, colour);
+                }
+                at = end;
+                continue;
+            }
+            let a = if clip.whole(px) {
+                c
+            } else {
+                self.through_clip(px, py, c, false)
+            };
+            if a != 0 {
+                if let Some(out) = run.get_mut(at * BAND_BPP..at * BAND_BPP + BAND_BPP) {
+                    solid(out, colour, a);
+                }
+            }
+            at += 1;
         }
     }
 

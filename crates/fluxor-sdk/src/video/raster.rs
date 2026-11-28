@@ -20,7 +20,8 @@
 //!   refreshes, encoded as runs and literals, and writes them back byte for
 //!   byte.
 //! - `coverage::corner` and `coverage::join` are the contract's reference
-//!   functions for rounded corners and border joins.
+//!   functions for rounded corners and border joins; `path` is its
+//!   reference code for flattening, stroking and a path's coverage.
 //!
 //! Compositing is source-over onto an opaque destination in 8-bit
 //! sRGB-encoded colour with exact integer rounding (`round`). The same
@@ -36,6 +37,7 @@ pub mod coverage;
 pub mod ingest;
 pub mod input;
 pub mod paint;
+pub mod path;
 pub mod replay;
 pub mod resources;
 pub mod round;

@@ -146,6 +146,11 @@ const RING_ROWS_DEFAULT: u16 = 48;
 const FRAME_BYTES_DEFAULT: u32 = 8192;
 const RESOURCE_BYTES_DEFAULT: u32 = 16_384;
 const RECORD_BYTES_DEFAULT: u32 = 1024;
+const PATH_BYTES_DEFAULT: u32 = 7680;
+/// The most commands, and flattened segments, of a path drawn
+/// (`path_commands` and `path_edges` on the `draw` port).
+const PATH_COMMANDS: u32 = 1024;
+const PATH_EDGES: u32 = 8192;
 
 // PIO state machine register indices (`rp_raw::PIO_SM_WRITE_REG`).
 const REG_CLKDIV: u8 = 0;
@@ -260,6 +265,7 @@ pub struct State {
     record_bytes: u32,
     surface_bytes: u32,
     cache_bytes: u32,
+    path_bytes: u32,
     pack_params: [[u8; PACK_PARAM]; PACKS],
     pack_lens: [u8; PACKS],
 
@@ -391,6 +397,8 @@ mod params_def {
         28, pack2, str, 0 => |s, d, len| { keep_pack(s, 2, d, len); };
         29, pack3, str, 0 => |s, d, len| { keep_pack(s, 3, d, len); };
         30, cache_bytes, u32, 0 => |s, d, len| { s.cache_bytes = p_u32(d, len, 0, 0); };
+        31, path_bytes, u32, PATH_BYTES_DEFAULT
+            => |s, d, len| { s.path_bytes = p_u32(d, len, 0, PATH_BYTES_DEFAULT); };
     }
 }
 
@@ -891,6 +899,9 @@ pub unsafe extern "C" fn module_new(
             b"frame_bytes must be non-zero and record_bytes at least 84",
         );
     }
+    if s.path_bytes < 4 * u32::from(s.width) {
+        return refuse(sys, b"path_bytes must hold a row, four bytes a pixel");
+    }
     s.bands = bands as u16;
     s.slots = slots as u16;
     s.slot_bytes = u32::from(s.band_rows) * u32::from(s.width) * 2;
@@ -972,7 +983,7 @@ pub unsafe extern "C" fn module_new(
 
     // One block from the heap: the read buffer, two retained frames, the
     // resource arena, the scratch band, the ring, two buffers for
-    // `surface0`, and the band cache.
+    // `surface0`, the band cache and the path cells.
     let scratch_bytes = usize::from(s.band_rows) * usize::from(s.width) * BAND_BPP;
     let ring_bytes = s.slot_bytes as usize * slots as usize;
     let parts = [
@@ -985,6 +996,7 @@ pub unsafe extern "C" fn module_new(
         s.surface_bytes as usize,
         s.surface_bytes as usize,
         s.cache_bytes as usize,
+        s.path_bytes as usize,
     ];
     let mut total = 0usize;
     for part in parts {
@@ -1033,6 +1045,8 @@ pub unsafe extern "C" fn module_new(
         BandCache::new(memory, s.bands)
     };
     core::ptr::write(&raw mut s.cache, cache);
+    // Carved at an eight-byte boundary: a slice of `i32`.
+    let cells = carve(parts[9]).cast::<i32>();
 
     let limits = vd::Limits {
         ops: vd::OPS_ALL,
@@ -1047,6 +1061,8 @@ pub unsafe extern "C" fn module_new(
         band_rows: 0,
         damage_full: true,
         surfaces: 1,
+        path_commands: PATH_COMMANDS,
+        path_edges: PATH_EDGES,
     };
     // SAFETY: each slice is a distinct part of this instance's state or
     // heap block, both of which live, unmoved, as long as the instance; the
@@ -1072,7 +1088,10 @@ pub unsafe extern "C" fn module_new(
     );
     core::ptr::write(
         &raw mut s.painter,
-        Some(Painter::new(&mut (*me).stack, &mut (*me).clips)),
+        Some(
+            Painter::new(&mut (*me).stack, &mut (*me).clips)
+                .with_paths(core::slice::from_raw_parts_mut(cells, parts[9] / 4)),
+        ),
     );
     if s.draw < 0 {
         write_own_frame(s);

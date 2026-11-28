@@ -49,6 +49,10 @@ const HASH_BYTES_PER_STEP: usize = 4096;
 const ARENA_BASE: u32 = 192;
 /// Bytes of a raster input read in one step.
 const INPUT_BYTES_PER_STEP: usize = 16 * 1024;
+/// The most commands, and flattened segments, of a path drawn
+/// (`path_commands` and `path_edges` on the `draw` port).
+const PATH_COMMANDS: u32 = 4096;
+const PATH_EDGES: u32 = 16_384;
 
 const WIDTH_DEFAULT: u16 = 480;
 const HEIGHT_DEFAULT: u16 = 480;
@@ -56,6 +60,7 @@ const BAND_BYTES_DEFAULT: u32 = 23_040;
 const FRAME_BYTES_DEFAULT: u32 = 8192;
 const RESOURCE_BYTES_DEFAULT: u32 = 16_384;
 const RECORD_BYTES_DEFAULT: u32 = 2048;
+const PATH_BYTES_DEFAULT: u32 = 7680;
 
 /// Nothing of the band has been sent.
 const SEND_NONE: u8 = 0;
@@ -95,6 +100,7 @@ pub struct State {
     resource_bytes: u32,
     record_bytes: u32,
     surface_bytes: u32,
+    path_bytes: u32,
     resources: [vd::Resource; MAX_RESOURCES],
     saves: [vd::Saved; MAX_DEPTH],
     slots: [Slot; MAX_RESOURCES],
@@ -138,6 +144,8 @@ mod params_def {
         10, pack1, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 1, d, len); };
         11, pack2, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 2, d, len); };
         12, pack3, str, 0, max PACK_PARAM => |s, d, len| { keep_pack(s, 3, d, len); };
+        13, path_bytes, u32, PATH_BYTES_DEFAULT
+            => |s, d, len| { s.path_bytes = p_u32(d, len, 0, PATH_BYTES_DEFAULT); };
     }
 }
 
@@ -244,6 +252,8 @@ pub unsafe extern "C" fn module_new(
         Some(b"[draw_raster] refusing to construct: width, height and band_bytes must be non-zero")
     } else if s.frame_bytes == 0 || (s.record_bytes as usize) < vd::HEADER + vd::BORDER_LEN {
         Some(b"[draw_raster] refusing to construct: frame_bytes must be non-zero and record_bytes at least 84")
+    } else if s.path_bytes < 4 * u32::from(widest) {
+        Some(b"[draw_raster] refusing to construct: path_bytes must hold a row, four bytes a pixel")
     } else if s.pack_lens.iter().any(|&n| usize::from(n) > PACK_PARAM) {
         Some(b"[draw_raster] refusing to construct: a pack param is longer than 16 bytes")
     } else {
@@ -264,6 +274,7 @@ pub unsafe extern "C" fn module_new(
         s.surface_bytes as usize,
         s.surface_bytes as usize,
         s.surface_bytes as usize,
+        s.path_bytes as usize,
     ];
     let mut total = 0usize;
     for part in parts {
@@ -304,6 +315,8 @@ pub unsafe extern "C" fn module_new(
         let chan = dev_channel_port(sys, 0, 1 + i as u8);
         core::ptr::write(&raw mut s.inputs[i], Input::new(chan, buffers, cap));
     }
+    // Carved at an eight-byte boundary: a slice of `i32`.
+    let cells = carve(parts[10]).cast::<i32>();
     // The byte strings RES_REF records resolve against: each `pack` param
     // names a program of this instance, read where the node image holds it.
     let mut held = 0usize;
@@ -340,6 +353,8 @@ pub unsafe extern "C" fn module_new(
         band_rows: 0,
         damage_full: true,
         surfaces: INPUTS as u8,
+        path_commands: PATH_COMMANDS,
+        path_edges: PATH_EDGES,
     };
     // SAFETY: each slice is a distinct part of this instance's state or
     // heap block, both of which live, unmoved, as long as the instance; the
@@ -365,7 +380,10 @@ pub unsafe extern "C" fn module_new(
     );
     core::ptr::write(
         &raw mut s.painter,
-        Some(Painter::new(&mut (*me).stack, &mut (*me).clips)),
+        Some(
+            Painter::new(&mut (*me).stack, &mut (*me).clips)
+                .with_paths(core::slice::from_raw_parts_mut(cells, parts[10] / 4)),
+        ),
     );
     0
 }
